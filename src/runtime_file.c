@@ -68,6 +68,19 @@ static uint64_t read_clock_ns(void) {
     __atomic_add_fetch(&read_ns,read_clock_ns()-t0_,__ATOMIC_RELAXED); \
     trace_span("file read",tr_,(uint64_t)(r_>0 ? r_ : 0),0); r_; })
 uint64_t runtime_file_read_ns_take(void) { return __atomic_exchange_n(&read_ns,0,__ATOMIC_RELAXED); }
+/* sotc: SOTC_TRACE "file dest" instant after a read landed in guest memory: a = bytes, b = guest
+ * address, aux = physical page (backing offset >> 12, 0xffffffff when unmapped), for the first-frame
+ * peak study (docs/re-stutters/FIRST-FRAME-PEAK.md: which uploads come from file reads). */
+const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
+const unsigned char *runtime_memory_backing_view(uint64_t *size);
+static void trace_file_dest(const void *buffer, ssize_t n) {
+    if (n<=0 || !trace_now()) return;
+    const unsigned char *base=runtime_memory_backing_view(NULL);
+    const unsigned char *p=base ? runtime_memory_backing_pointer((uintptr_t)buffer) : NULL;
+    const uint32_t page=p ? (uint32_t)((uint64_t)(p-base)>>12) : 0xffffffffu;
+    const uint64_t now=trace_now();
+    trace_push(1,"file dest",now,now,(uint64_t)n,(uint64_t)(uintptr_t)buffer,page);
+}
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 
 int runtime_file_mount(const char *guest,const char *host) {
@@ -386,11 +399,13 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
         ssize_t n=TIMED_READ(host_read(h,staging,size));
         if (n<0) return -errno;
         memcpy(buffer,staging,(size_t)n);
+        trace_file_dest(buffer,n);
         __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
         return n;
     }
     touch_for_write(buffer,size);
     ssize_t n=TIMED_READ(host_read(h,buffer,size));
+    trace_file_dest(buffer,n);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
@@ -403,11 +418,13 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
         ssize_t n=TIMED_READ(pread(h,staging,size,offset));
         if (n<0) return -errno;
         memcpy(buffer,staging,(size_t)n);
+        trace_file_dest(buffer,n);
         __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
         return n;
     }
     touch_for_write(buffer,size);
     ssize_t n=TIMED_READ(pread(h,buffer,size,offset));
+    trace_file_dest(buffer,n);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;

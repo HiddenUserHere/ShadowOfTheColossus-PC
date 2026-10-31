@@ -161,7 +161,7 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': False, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
@@ -549,9 +549,12 @@ def load_settings():
                     except OSError:
                         pass
     sotc_tuning.migrate(saved)  # switches that became on by default drop their old saved "off"
-    if not saved.get('rb_hot_migrated_20261030'):  # hot readbacks: on by default since 30 Oct
-        saved.pop('rb_hot', None)
-        saved['rb_hot_migrated_20261030'] = True
+    # Hot readbacks were on by default in one build (30 Oct) and are off again: a "checked" saved
+    # by that build was its default, not the player's choice, so it is dropped once.
+    if not saved.get('rb_hot_off_20261030'):
+        if saved.get('rb_hot_migrated_20261030'):
+            saved.pop('rb_hot', None)
+        saved['rb_hot_off_20261030'] = True
     settings = {**APP_DEFAULTS, **saved}
     if 'fps_mode' not in saved:  # before the choice: the "uncapped FPS" box
         settings['fps_mode'] = '60' if saved.get('fps60') else '30'
@@ -724,11 +727,11 @@ def game_environment(s):
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
-    # Hot readbacks (buffer_cache.cpp GatherDownloads): on by default since 30 Oct 2026 (mode 2,
-    # the build's default; attract demo ~57 / 40 FPS against 54.8 / 36.4). Known risk: rainbow
-    # garbage and crashes on reused memory (the reason they were off from 22 Oct). Unchecked: 0.
-    if not s.get('rb_hot', True):
-        env['SOTC_RB_HOT'] = '0'
+    # Hot readbacks (buffer_cache.cpp GatherDownloads): off by default (rainbow garbage and
+    # crashes on reused memory). Checked: mode 2, the measured one (attract demo ~57 / 40 FPS
+    # against 54.8 / 36.4).
+    if s.get('rb_hot'):
+        env['SOTC_RB_HOT'] = '2'
     # Bluepoint's debug menu (+RetailBuild=0 served by the port; the game files are not touched).
     if s.get('debug_menu'):
         env['SOTC_DEBUG_MENU'] = '1'

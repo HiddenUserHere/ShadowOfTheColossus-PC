@@ -1,0 +1,79 @@
+// sotc: SOTC_LOAD_WARM=1 (off by default). Learned working set, warmed in idle time
+// (docs/re-stutters/FIRST-FRAME-PEAK.md, phase 1).
+//
+// The first frame of the world after a load binds ~240 MiB of buffers the buffer cache never saw:
+// each new 16 MiB tracking region starts all CPU-dirty, and the binds copy it on the draw thread
+// in that one frame (72 ms of copies in a 225 ms frame), while the frames before it leave the draw
+// thread idle. This module learns, per event key, which 64 KiB pages the binds of the next
+// kWindowNs after the event use, saves them in user/cache/load_warm/<key>.bin, and on the next
+// time the same event happens, hands those pages to the draw thread's idle gaps (BackLoop), which
+// bind them early (residency and a sync copy, BufferCache::WarmRange). It repeats the pages every
+// kRepassNs while the window lasts, so pages the game rewrites after a warm are copied again then.
+//
+// Event key: "gameload" (the game's "st_gameflow() starting game" line: a save or a new game
+// loads). The free-roam areas were keys too until 30 Oct: back in an area, the passes checked
+// gigabytes of clean ranges to upload ~36 MiB, using the draw thread's idle gaps mid-game.
+//
+// Correctness is that of a bind: page tracking stays on, a stale or wrong page costs a copy.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+namespace SotcLoadWarm {
+
+/// SOTC_LOAD_WARM=1, read once.
+bool Enabled() noexcept;
+
+/// SOTC_LOAD_WARM_TEX=1 (off by default, needs SOTC_LOAD_WARM=1): texture records and their warm.
+/// Measured 30 Oct: 16 of thousands of warmed textures were found by a real bind (the T#s of one
+/// session seldom match the next one's), and old records crashed before WarmTexture's range checks.
+bool TexturesEnabled() noexcept;
+
+/// An event: a load or an area change (any thread). Closes the current recording window (its
+/// pages join that key's set, saved by the writer thread) and opens a new one for `key`, whose
+/// saved set becomes the warm queue.
+void OnEvent(const char* key);
+
+/// The draw thread bound [addr, addr + size) (BufferCache::ObtainBuffer). Ignored outside a
+/// recording window and during a warm (the warm's own binds are not recorded).
+void NoteBind(std::uint64_t addr, std::uint64_t size) noexcept;
+
+/// Draw thread, idle (its op queue empty). Calls warm(addr, size) for queued runs for up to
+/// `budget_ns` (checked after each run of at most 1 MiB) or until stop() returns true. Returns the
+/// runs warmed (0: nothing to do now, so the caller waits as usual). `warm` returns the bytes it
+/// uploaded: once a whole pass uploads under kQuietBytes after the window already uploaded
+/// kArrivedBytes (the data arrived, was warmed, and stays clean), the window stops warming.
+/// `warm` and `stop` are plain function pointers with a context, so no allocation happens here.
+using WarmFn = std::uint64_t (*)(void* ctx, std::uint64_t addr, std::uint64_t size);
+using StopFn = bool (*)(void* ctx);
+/// A texture record (see NoteTexture), replayed as an early bind of that texture.
+using TexWarmFn = void (*)(void* ctx, const void* blob, std::size_t size);
+/// `frame`: the presented frame count; at most kFrameCapBytes are uploaded per frame, so warm
+/// copies stay a few ms of a gameplay frame once the world is drawn. Textures (once per window)
+/// go before the buffer runs.
+unsigned WarmIdle(std::uint64_t budget_ns, std::uint64_t frame, WarmFn warm, TexWarmFn tex,
+                  StopFn stop, void* ctx);
+
+/// The draw thread bound a texture: `blob` is what rebuilds its bind (the rasterizer packs the T#
+/// and the shader's image resource; one fixed size per build). Recorded once per window, like the
+/// buffer pages, into <key>.tex.bin.
+void NoteTexture(const void* blob, std::size_t size) noexcept;
+
+/// The size of this build's texture blob (the rasterizer, at static initialisation): a saved
+/// texture file with another size is ignored instead of fixing the size for the process.
+void SetTextureBlobSize(std::size_t size) noexcept;
+
+/// True while a warm queue has work (cheap, relaxed): lets the idle branch skip the call.
+bool HasWork() noexcept;
+
+/// True on this thread while a warm runs (its uploads stay out of the per-flip upload budget).
+bool InWarm() noexcept;
+
+/// RAII marker for the warm's own binds (thread-local), so NoteBind ignores them.
+struct WarmScope {
+    WarmScope() noexcept;
+    ~WarmScope();
+};
+
+} // namespace SotcLoadWarm

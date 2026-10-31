@@ -225,6 +225,9 @@ public:
     bool sotc_zero_filled{};
     /// sotc: the flip of the image's first deferral (~0: never deferred); deferrals stop 2 flips on.
     u64 sotc_deferred_flip{~0ull};
+    /// sotc: SOTC_LOAD_WARM: created by a warm and not yet found by a real bind / found by one.
+    bool sotc_warm_pending{};
+    bool sotc_warm_used{};
     /// sotc: SOTC_POOL_WATCH: hash of the first 64 KiB of guest memory at the first upload.
     u64 sotc_first_hash{};
     u32 sotc_uploads{};

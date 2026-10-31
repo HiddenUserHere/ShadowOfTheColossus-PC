@@ -25,15 +25,22 @@ com `=0` (ou na aba Ajustes experimentais do lançador).
   **Risco conhecido:** em 1 de 4 sessões de teste o jogo fechou ao carregar o save (`sotc: bad PM4
   packet …`); a proteção adicionada depois não disparou de novo, mas a causa não foi confirmada. Se
   o jogo fechar ao carregar, desligue com `SOTC_DROP_FAST=0` (aba Ajustes experimentais).
-- **Leituras rápidas da GPU** (`SOTC_RB_HOT`, agora no modo 2 por padrão; caixa “Mais FPS” do
-  lançador marcada): demo da tela de título ~57 / 40 FPS contra 54,8 / 36,4. **Risco conhecido:**
-  foi desligada em 22/10 por lixo colorido nas pedras do Shrine depois de recarregar o save e por
-  uma queda após 23 min parado no demo. Se aparecer, desmarque a caixa (ou `SOTC_RB_HOT=0`).
 
 **Experimental (desligado por padrão)**
 - Rastreamento da origem das cópias de envio (`SOTC_TRACE`, comando `copysrc` do
   `tools/trace/sotc_trace.py`), staging em memória com cache (`SOTC_STAGING_CACHED`) e aquecimento
   da segunda visão da memória (`SOTC_BACKING_WARM`). Os dois últimos foram medidos sem ganho.
+- **Aquecer a carga do save** (`SOTC_LOAD_WARM=1`): aprende quais buffers o jogo usa nos 20 s depois
+  de carregar o save (`user/cache/load_warm/`) e, na carga seguinte, os envia à GPU nas pausas da
+  thread de desenho, antes do primeiro quadro do mundo. Medido em 30/10: o primeiro quadro caiu de
+  217 ms para 77–142 ms (sessões diferentes, variação grande); a primeira sessão só grava. Para
+  sozinho quando os dados ficam limpos, com no máximo 16 MiB enviados por quadro.
+  `SOTC_LOAD_WARM_TEX=1` faz o mesmo com texturas, mas foi medido sem ganho (só ~1% das texturas
+  aquecidas é reaproveitado) e fica desligado.
+- Trace: `SOTC_TRACE_ONLY=<nomes>` grava só os eventos listados (o modo contínuo cobre uma carga
+  inteira), eventos de leitura de arquivo, mapeamento e endereço físico das cópias, e os tempos da
+  GPU (`SOTC_TRACE_GPU`) voltaram a funcionar (estavam sempre desligados por um erro de ordem de
+  inicialização). Estudo do pico da primeira carga em `docs/re-stutters/FIRST-FRAME-PEAK.md`.
 - **Rastreamento automático (`SOTC_TRACE`, versão 2)**: gravador de linha do tempo que registra, com
   um relógio só, as threads do jogo e do motor. `SOTC_TRACE=1` grava a janela ao redor de cada quadro
   lento; `SOTC_TRACE=2` grava a sessão inteira em pedaços comprimidos (`.sotctrace`, em

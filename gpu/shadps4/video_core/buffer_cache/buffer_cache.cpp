@@ -46,6 +46,8 @@ extern "C" uintptr_t runtime_sotc_heap_table(void);
 
 #include <vk_mem_alloc.h>
 
+#include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM
+
 namespace VideoCore {
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
@@ -53,8 +55,10 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 
 // sotc: SOTC_TRACE reason of the SynchronizeMemory calls on this thread (the "sync copy" aux).
 // 0 untagged, 1 ObtainBuffer normal bind, 2 ObtainBuffer written-extent sync (SOTC_WRITE_EXTENT),
-// 3 SynchronizeDmaBuffers sweep, 4 SynchronizeBinding (no caller in the tree today).
+// 3 SynchronizeDmaBuffers sweep, 4 SynchronizeBinding, 5 SOTC_LOAD_WARM early bind (WarmRange).
 thread_local uint32_t tl_sync_reason = 0;
+// sotc: bytes this thread's buffer syncs uploaded (SOTC_LOAD_WARM: WarmRange returns its share).
+thread_local uint64_t tl_sync_bytes = 0;
 struct SyncReason {
     uint32_t prev = 0;
     bool active = false;
@@ -4735,10 +4739,9 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
     // times) stayed clean. Attract demo, full settings: 54.8 / 36.4 FPS off against ~57 / 40 with
     // mode 2. Keeping the hot data aside until the guest reads it (no speculative writes) cost more
     // than it saved (42.7 / 23.5): copying it on the command processor thread.
-    // sotc: mode 2 by default since 30 Oct 2026 (=0 turns it off), with the risks above.
     static const int hot_mode = [] {
         const char* v = std::getenv("SOTC_RB_HOT");
-        return v ? std::atoi(v) : 2;
+        return v ? std::atoi(v) : 0;
     }();
     // sotc: SOTC_RB_PREFETCH: a prefetch copies its own window only (rb_gather_no_hot).
     const bool hot_enabled = hot_mode != 0 && !rb_gather_no_hot;
@@ -5312,9 +5315,23 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
     }
 }
 
+// sotc: SOTC_LOAD_WARM: an early bind of [addr, addr + size) on the draw thread (idle gaps,
+// Liverpool::BackLoop): ObtainBuffer's read path, residency plus a sync copy of the CPU-dirty
+// bytes, so the real bind finds them clean. Unmapped ranges are skipped. "sync copy" reason 5.
+u64 BufferCache::WarmRange(VAddr addr, u64 size) {
+    if (size == 0 || size > u64{64} << 20 || !memory->IsValidMapping(addr, size)) {
+        return 0;
+    }
+    const SyncReason sync_reason{5};
+    const u64 before = tl_sync_bytes;
+    (void)ObtainBuffer(addr, static_cast<u32>(size), false);
+    return tl_sync_bytes - before; // bytes uploaded: 0 when the range was already clean
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer,
                                                         u32 mark_offset, u32 mark_size) {
+    SotcLoadWarm::NoteBind(device_addr, size); // sotc: SOTC_LOAD_WARM (no-op when off)
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     // sotc: SOTC_STREAM_THRESHOLD=<bytes> (default 16 KiB) for A/B: small read-only buffers are
     // copied into the stream buffer on every bind instead of using the synchronized arena.
@@ -5358,7 +5375,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         SynchronizeMemory(arena, device_addr + mark_offset, mark_size, true, false);
         SynchronizeMemory(arena, device_addr, size, false, false);
     } else {
-        const SyncReason sync_reason{1}; // sotc: SOTC_TRACE reason 1 (normal bind)
+        // sotc: SOTC_TRACE reason 1 (normal bind), or the warm's 5 when WarmRange called it.
+        const SyncReason sync_reason{tl_sync_reason == 5 ? 5u : 1u};
         SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     }
     if (is_texel_buffer && !is_written && SotcStats::kOptOff) {
@@ -6783,6 +6801,7 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
     }
     if (!copies.empty()) {
         const SotcStats::FrameTimer frame_timer{SotcStats::FrameBuffer};
+        tl_sync_bytes += total_size_bytes; // sotc: SOTC_LOAD_WARM (WarmRange's copied bytes)
         if (SotcStats::kFpsLog) {
             SotcStats::frame_copy_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
         }
@@ -6938,9 +6957,24 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
             }
         }
         if (copy_t0) {
-            SotcTrace::PushEvent(SotcTrace::EvSpan, "sync copy", copy_t0, SotcTrace::Now(),
-                                 copy_bytes, device_addr, tl_sync_reason,
+            const uint64_t copy_t1 = SotcTrace::Now();
+            SotcTrace::PushEvent(SotcTrace::EvSpan, "sync copy", copy_t0, copy_t1, copy_bytes,
+                                 device_addr, tl_sync_reason,
                                  static_cast<uint16_t>(std::min<uint64_t>(copy_pieces, 65535)));
+            // sotc: "sync phys" instant: a = backing (physical) offset of the first copied byte
+            // (~0 when unmapped), b = its guest address, aux = bytes of that first piece
+            // (docs/re-stutters/FIRST-FRAME-PEAK.md: uploads matched to file reads by physical
+            // page, across aliased mappings). Here dstOffset is still the guest address.
+            if (!copies.empty()) {
+                const VAddr first = copies.front().dstOffset;
+                const u8* view = runtime_memory_backing_view(nullptr);
+                const u8* p = view ? runtime_memory_backing_pointer(first) : nullptr;
+                const uint64_t phys = p ? static_cast<uint64_t>(p - view) : ~uint64_t{0};
+                SotcTrace::PushEvent(SotcTrace::EvInstant, "sync phys", copy_t1, copy_t1, phys,
+                                     first,
+                                     static_cast<uint32_t>(std::min<uint64_t>(
+                                         copies.front().size, 0xffffffffu)));
+            }
         }
         for (auto& copy : copies) {
             copy.srcOffset += staging.offset;

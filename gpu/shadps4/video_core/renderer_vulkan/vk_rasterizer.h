@@ -77,6 +77,9 @@ public:
     /// sotc: SOTC_ASYNC_IMAGE_CREATE: command processor thread, right after the lookup of the
     /// pipeline of a draw or dispatch (its runtime data in slot 0): queues the creation of the
     /// images its T#s need that do not exist yet (TextureCache::PrefetchTexture).
+    /// sotc: SOTC_LOAD_WARM: early bind of a recorded texture (draw thread, idle).
+    void WarmTexture(const void* data, size_t size);
+
     void PrefetchImages(const Pipeline* pipeline) {
         if (pipeline && texture_cache.ImagePrefetchEnabled()) {
             PrefetchImagesImpl(pipeline);

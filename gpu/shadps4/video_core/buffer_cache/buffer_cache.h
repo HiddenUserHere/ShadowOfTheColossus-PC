@@ -222,6 +222,10 @@ public:
     bool TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, u64 period, VAddr source,
                                u32& path);
 
+    /// sotc: SOTC_LOAD_WARM: early bind (residency and sync copy) of a guest range, draw thread.
+    /// Returns the bytes uploaded (0: already clean).
+    u64 WarmRange(VAddr addr, u64 size);
+
     /// sotc: the arena holding [addr, addr + size) when the whole range is resident in one
     /// arena, else nullptr.
     const Buffer* ResidentArena(VAddr addr, u64 size) const;

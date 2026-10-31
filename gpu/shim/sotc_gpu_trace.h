@@ -27,9 +27,13 @@ namespace SotcGpuTrace {
 
 /// SOTC_TRACE_GPU=1 or 2, with the recorder on. 2 is accepted but behaves as 1: the per-op-batch
 /// stamps are not implemented.
-inline const bool kOn = SotcTrace::kOn && [] {
+/// Reads SOTC_TRACE itself: SotcTrace::kOn is an inline variable of another header, and the
+/// dynamic initialisation order across translation units is not guaranteed (it could still read
+/// false here, which left the GPU timeline off).
+inline const bool kOn = [] {
+    const char* t = std::getenv("SOTC_TRACE");
     const char* v = std::getenv("SOTC_TRACE_GPU");
-    return v && (v[0] == '1' || v[0] == '2');
+    return t && (t[0] == '1' || t[0] == '2') && v && (v[0] == '1' || v[0] == '2');
 }();
 
 class Timeline {

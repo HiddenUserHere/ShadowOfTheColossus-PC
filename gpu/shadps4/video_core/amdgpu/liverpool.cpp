@@ -36,6 +36,7 @@
 #include "bbport_threads.h"
 #include "video_core/amdgpu/draw_prep.h"
 #include "video_core/amdgpu/op_footprint.h" // sotc: SOTC_CULL_EXPRESS
+#include "../../../sotc/load_warm.h"     // sotc: SOTC_LOAD_WARM
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include <xmmintrin.h>
 
@@ -502,6 +503,40 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 // sotc: SOTC_RB_EXACT: a spin-waited label should not wait 200 us for the poll.
                 std::this_thread::sleep_for(std::chrono::microseconds{rbx ? 30 : 200});
                 continue;
+            }
+            // sotc: SOTC_LOAD_WARM: early binds of the learned working set while nothing is
+            // queued, at most 1 ms, stopping as soon as an op or a command arrives
+            // (docs/re-stutters/FIRST-FRAME-PEAK.md). The loop then re-checks the head.
+            if (SotcLoadWarm::HasWork() && rasterizer) {
+                struct WarmCtx {
+                    Liverpool* self;
+                    u64 tail;
+                } ctx{this, tail};
+                const u64 warm_t0 = SotcTrace::kOn ? SotcTrace::Now() : 0;
+                const unsigned runs = SotcLoadWarm::WarmIdle(
+                    1'000'000, // 1 ms
+                    SotcStats::flip_count.load(std::memory_order_relaxed),
+                    [](void* c, std::uint64_t addr, std::uint64_t size) -> std::uint64_t {
+                        return static_cast<WarmCtx*>(c)
+                            ->self->rasterizer->GetBufferCache()
+                            .WarmRange(addr, size);
+                    },
+                    [](void* c, const void* blob, std::size_t size) {
+                        static_cast<WarmCtx*>(c)->self->rasterizer->WarmTexture(blob, size);
+                    },
+                    [](void* c) {
+                        auto* w = static_cast<WarmCtx*>(c);
+                        return w->self->back_head.load(std::memory_order_acquire) != w->tail ||
+                               w->self->num_commands.load(std::memory_order_acquire) != 0;
+                    },
+                    &ctx);
+                if (runs != 0) {
+                    if (warm_t0) { // sotc: SOTC_TRACE "load warm" span, a = runs
+                        SotcTrace::PushEvent(SotcTrace::EvSpan, "load warm", warm_t0,
+                                             SotcTrace::Now(), runs);
+                    }
+                    continue;
+                }
             }
             // sotc: SOTC_FPS_LEAN: the idle time is read only for the reports and the trace.
             const bool idle_timed = SotcStats::kFpsTimers || SotcTrace::kOn;

@@ -206,7 +206,9 @@ Reason codes:
 | 1 | `bind` | ObtainBuffer normal bind |
 | 2 | `written` | ObtainBuffer written-extent sync |
 | 3 | `dma` | DMA sweep (SynchronizeDmaBuffers) |
-| 4 and up | `code N` | other callers (labels not yet assigned; readers show the raw code) |
+| 4 | `code 4` | SynchronizeBinding |
+| 5 | `code 5` | `SOTC_LOAD_WARM` early bind (BufferCache::WarmRange) |
+| 6 and up | `code N` | other callers (labels not yet assigned; readers show the raw code) |
 
 Old traces (before the reason and address fields) have `aux` 0 and `b` = the number of pieces, not
 an address. A reader takes a copy span as old when `aux` is 0 and `b` is below 1 << 20: it counts

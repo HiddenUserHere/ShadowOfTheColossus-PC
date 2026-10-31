@@ -9,6 +9,7 @@
 #endif
 #include "bbport_toggles.h"
 #include "sotc_backing_warm.h" // sotc: SOTC_BACKING_WARM
+#include "../sotc/load_warm.h"   // sotc: SOTC_LOAD_WARM
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/page_manager.h" // sotc: bbgpu_declare_cpu_write (SOTC_WRITE_DECL)
@@ -103,11 +104,25 @@ public:
     }
 };
 
+// sotc: SOTC_TRACE "gpu map" / "gpu unmap" instants: a = bytes, b = guest address, aux = physical
+// page of the start (backing offset >> 12; 0xffffffff when it has no backing). The runtime calls
+// these hooks after dropping its table lock (flush_hooks), so the lookup is safe here.
+static void TraceMapEvent(const char* name, uintptr_t address, uint64_t size) {
+    if (!SotcTrace::kOn) {
+        return;
+    }
+    const u8* view = runtime_memory_backing_view(nullptr);
+    const u8* p = view ? runtime_memory_backing_pointer(address) : nullptr;
+    const u32 page = p ? static_cast<u32>(static_cast<u64>(p - view) >> 12) : 0xffffffffu;
+    const u64 now = SotcTrace::Now();
+    SotcTrace::PushEvent(SotcTrace::EvInstant, name, now, now, size, address, page);
+}
 void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
     rasterizer = rasterizer_;
     // Existing guest mappings are replayed by the runtime when hooks are installed.
     runtime_memory_set_gpu_hooks(
         [](uintptr_t address, uint64_t size) {
+            TraceMapEvent("gpu map", address, size); // sotc: SOTC_TRACE, FIRST-FRAME-PEAK.md 0b
             auto* r = Memory::Instance()->GetRasterizer();
             r->RegisterMemory(address, size);
             r->MapMemory(address, size);
@@ -121,7 +136,10 @@ void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
             if (SotcStats::kCmdStats) SotcStats::inv_map.fetch_add(size, std::memory_order_relaxed);
             if (map_invalidate) r->InvalidateMemory(address, size);
         },
-        [](uintptr_t address, uint64_t size) { Memory::Instance()->GetRasterizer()->UnmapMemory(address, size); },
+        [](uintptr_t address, uint64_t size) {
+            TraceMapEvent("gpu unmap", address, size); // sotc: SOTC_TRACE
+            Memory::Instance()->GetRasterizer()->UnmapMemory(address, size);
+        },
         [](uintptr_t address, uint64_t size) {
             if (SotcStats::kCmdStats) SotcStats::inv_protect.fetch_add(size, std::memory_order_relaxed);
             Memory::Instance()->GetRasterizer()->InvalidateMemory(address, size);
@@ -334,6 +352,7 @@ extern "C" int bbgpu_warmup_finished(void) {
 
 extern "C" void bbgpu_request_texture_flush(void) {
     SotcStats::load_flush.store(true, std::memory_order_relaxed);
+    SotcLoadWarm::OnEvent("gameload"); // sotc: SOTC_LOAD_WARM: a save or a new game loads
 }
 
 extern "C" uint64_t bbgpu_flip_count(void) {

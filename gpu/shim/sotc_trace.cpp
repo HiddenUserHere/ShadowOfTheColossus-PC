@@ -107,6 +107,64 @@ Event MakeEvent(uint8_t kind, uint64_t t0, uint64_t t1, const char* name, uint64
     return Event{t0, t1, name, a, b, aux, kind, 0, flags};
 }
 
+// SOTC_TRACE_ONLY=<name>,<name>,... (unset: everything). Only events with one of these names, plus
+// frames and marks, enter the rings: the stream mode (SOTC_TRACE=2) can then cover a whole load
+// (the full event rate, ~4.6M/s, is ~220 MB/s). "gpu" keeps the GPU timeline, "sample" the
+// sampler's samples. Names are compared once per name pointer (they are string literals or
+// interned), through a small per-thread cache.
+const std::vector<std::string>& OnlyNames() {
+    static const std::vector<std::string> names = [] {
+        std::vector<std::string> out;
+        const char* v = std::getenv("SOTC_TRACE_ONLY");
+        if (!v) {
+            return out;
+        }
+        std::string cur;
+        for (const char* p = v;; ++p) {
+            if (*p == ',' || *p == '\0') {
+                if (!cur.empty()) {
+                    out.push_back(cur);
+                }
+                cur.clear();
+                if (*p == '\0') {
+                    break;
+                }
+            } else {
+                cur += *p;
+            }
+        }
+        return out;
+    }();
+    return names;
+}
+bool OnlyActive() {
+    static const bool active = !OnlyNames().empty();
+    return active;
+}
+bool OnlyKeeps(const Event& e) {
+    if (e.kind == 6 || e.kind == 7) { // frames, marks
+        return true;
+    }
+    const char* key = e.kind == 5 ? "gpu" : e.kind == 3 ? "sample" : e.name;
+    if (!key) {
+        return false;
+    }
+    struct Entry {
+        const char* name;
+        bool keep;
+    };
+    thread_local Entry cache[64] = {};
+    Entry& slot = cache[(reinterpret_cast<uintptr_t>(key) >> 3) & 63];
+    if (slot.name != key) {
+        bool keep = false;
+        for (const auto& n : OnlyNames()) {
+            keep |= n == key;
+        }
+        slot = Entry{key, keep};
+    }
+    return slot.keep;
+}
+
 struct Ring {
     std::unique_ptr<Event[]> ev;
     uint64_t mask = 0;
@@ -120,6 +178,9 @@ struct Ring {
 
     Ring(uint64_t size, Kind k) : ev{new Event[size]}, mask{size - 1}, kind{k} {}
     void Push(const Event& e) {
+        if (OnlyActive() && !OnlyKeeps(e)) {
+            return;
+        }
         const uint64_t h = head.load(std::memory_order_relaxed);
         ev[h & mask] = e;
         head.store(h + 1, std::memory_order_release);

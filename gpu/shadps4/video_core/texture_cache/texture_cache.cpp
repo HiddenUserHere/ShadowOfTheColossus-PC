@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_adaptive.h"
+#include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM (upload budget)
 #include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM (records and replay)
 #include "video_core/texture_cache/host_compatibility.h"
 
@@ -1114,6 +1115,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             SotcStats::images_new.fetch_add(1, std::memory_order_relaxed);
             image_id = slot_images.insert(instance, runtime, slot_image_views, info);
             RegisterImage(image_id);
+            // sotc: SOTC_LOAD_WARM + SOTC_TRACE: which first-frame textures the warm created.
+            if (SotcLoadWarm::Enabled()) {
+                const bool warm = SotcLoadWarm::InWarm();
+                slot_images[image_id].sotc_warm_pending = warm;
+                if (!warm) {
+                    TraceWarmTex("tex new", info.guest_address, info.guest_size);
+                }
+            }
             if (SotcAreaPrewarm::Recording()) { // sotc: SOTC_AREA_PREWARM=2/3: the area's manifest
                 SotcAreaPrewarm::NoteImageCreated(RecordOf(info));
             }
@@ -1127,6 +1136,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     image.tick_prev_accessed = image.tick_accessed_last;
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
+    if (image.sotc_warm_pending && !SotcLoadWarm::InWarm()) { // sotc: SOTC_LOAD_WARM
+        image.sotc_warm_pending = false;
+        image.sotc_warm_used = true;
+        TraceWarmTex("tex warm hit", image.info.guest_address, image.info.guest_size);
+    }
 
     // If the image requested is a subresource of the image from cache record its location.
     if (tail_candidate) {
@@ -1139,6 +1153,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     return image_id;
+}
+
+// sotc: SOTC_LOAD_WARM + SOTC_TRACE instants (a = bytes, b = guest address): "tex new" (a real
+// bind created the image), "tex warm hit" (a real bind found an image the warm created), "tex warm
+// reupload" (such an image had to be uploaded again), "tex warm freed" (deleted before any use).
+void TextureCache::TraceWarmTex(const char* name, VAddr addr, u64 size) {
+    if (SotcTrace::kOn) {
+        const u64 now = SotcTrace::Now();
+        SotcTrace::PushEvent(SotcTrace::EvInstant, name, now, now, size, addr);
+    }
 }
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
@@ -1481,6 +1505,10 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    if (image.sotc_warm_used && !SotcLoadWarm::InWarm()) { // sotc: SOTC_LOAD_WARM: paid again
+        image.sotc_warm_used = false;
+        TraceWarmTex("tex warm reupload", image.info.guest_address, image.info.guest_size);
+    }
     if (SotcStats::kCeiling & SotcStats::CeilingTex) {
         return; // sotc: SOTC_CEILING=tex, measurement only (see sotc_stats.h)
     }
@@ -1606,7 +1634,11 @@ void TextureCache::RefreshImage(Image& image) {
             budget_used = 0;
         }
     }
-    if (upload_budget && !image.sotc_has_data && !is_gpu_modified && budget_used &&
+    // sotc: SOTC_LOAD_WARM: a warm upload (an early bind during a load) is neither deferred nor
+    // counted, or it would push the frame's own first bind of a large texture past the budget
+    // (zero-filled, black for up to kMaxDeferFlips flips).
+    const bool warm_upload = SotcLoadWarm::InWarm();
+    if (upload_budget && !warm_upload && !image.sotc_has_data && !is_gpu_modified && budget_used &&
         image.info.guest_size >= 256_KB && budget_used + image.info.guest_size > upload_budget &&
         image.aspect_mask == vk::ImageAspectFlagBits::eColor &&
         (image.sotc_deferred_flip == ~0ull ||
@@ -1651,7 +1683,9 @@ void TextureCache::RefreshImage(Image& image) {
         }
     }
     image.sotc_has_data = true;
-    budget_used += image.info.guest_size;
+    if (!warm_upload) {
+        budget_used += image.info.guest_size;
+    }
 
     // sotc: SOTC_HOST_IMAGE_COPY=1: a linear image the GPU did not write, re-uploaded whole from guest
     // memory, is written by the host: no staging copy and no command buffer. The image must be
@@ -3008,6 +3042,9 @@ void TextureCache::ReclaimImage(ImageId image_id) {
 
 void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
+    if (image.sotc_warm_pending) { // sotc: SOTC_LOAD_WARM: warmed, never found by a real bind
+        TraceWarmTex("tex warm freed", image.info.guest_address, image.info.guest_size);
+    }
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
     if (const ImageId twin_id = image.parked_twin) {

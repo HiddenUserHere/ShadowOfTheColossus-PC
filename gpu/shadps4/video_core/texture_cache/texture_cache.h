@@ -476,6 +476,9 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
+    /// sotc: SOTC_LOAD_WARM trace instants (texture_cache.cpp).
+    static void TraceWarmTex(const char* name, VAddr addr, u64 size);
+
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 

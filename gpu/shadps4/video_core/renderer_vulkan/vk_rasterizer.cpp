@@ -51,12 +51,27 @@
 #include <vk_mem_alloc.h>
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM (texture records)
 
 // sotc: SOTC_PR_RESOLVE. Generation of the runtime memory table (src/runtime_memory.c); odd while
 // a change is in progress. Same declaration as sotc_bininfo.cpp.
 extern "C" uint64_t runtime_memory_generation(void);
 
 namespace Vulkan {
+
+namespace {
+// sotc: SOTC_LOAD_WARM texture record: what rebuilds a texture bind's ImageDesc (the same
+// constructor BindTexturesFull uses), stored raw per area key (load_warm.cpp).
+struct SotcTexBlob {
+    AmdGpu::Image tsharp;
+    Shader::ImageResource resource;
+};
+static_assert(std::is_trivially_copyable_v<SotcTexBlob>);
+const bool kSotcTexBlobSizeSet = [] {
+    SotcLoadWarm::SetTextureBlobSize(sizeof(SotcTexBlob));
+    return true;
+}();
+} // namespace
 
 // sotc: SOTC_DEDUP_STATE=0 sends the vertex inputs on every draw again (vertex_input_cache in
 // DynamicState, vk_scheduler.h, is then never read or written).
@@ -6189,6 +6204,17 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
             }
 
             image_id = texture_cache.FindImage(desc);
+            // sotc: SOTC_LOAD_WARM: record the plain single-binding sampled textures for the next
+            // load of this area (load_warm.h); storage and mip-fallback binds are not replayed.
+            if (SotcLoadWarm::TexturesEnabled() && num_bindings == 1 &&
+                mip_fallback_mode == Shader::MipStorageFallbackMode::None &&
+                !image_desc.is_written) {
+                SotcTexBlob blob;
+                std::memset(&blob, 0, sizeof blob);
+                blob.tsharp = tsharp;
+                blob.resource = image_desc;
+                SotcLoadWarm::NoteTexture(&blob, sizeof blob);
+            }
             if (rec) { // sotc: SOTC_TEX_BLOCK: the lookup as TryTextureBlock replays it
                 const size_t index = image_bindings.size() - 1;
                 if (!texture_cache.IsPerfectFind(image_id, desc.info)) {
@@ -7690,5 +7716,49 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
     return liverpool->IsGpuSideThreadId(tid);
 }
 #endif
+
+// sotc: SOTC_LOAD_WARM: an early bind of a recorded texture on the draw thread (idle gaps,
+// Liverpool::BackLoop): FindImage and FindTexture with the ImageDesc the real bind builds, so the
+// image is created, tracked (page protection) and uploaded before the first frame needs it. A record
+// whose T# no longer points at mapped GPU memory, or has an invalid format, is skipped.
+void Rasterizer::WarmTexture(const void* data, size_t size) {
+    if (size != sizeof(SotcTexBlob)) {
+        return;
+    }
+    SotcTexBlob blob;
+    std::memcpy(&blob, data, sizeof blob);
+    const AmdGpu::Image& tsharp = blob.tsharp;
+    const auto dfmt = tsharp.GetDataFmt();
+    if (!tsharp || dfmt == AmdGpu::DataFormat::FormatInvalid || !magic_enum::enum_contains(dfmt) ||
+        !magic_enum::enum_contains(tsharp.GetNumberFmt()) ||
+        !memory->IsValidGpuMapping(tsharp.Address(), 0)) {
+        return;
+    }
+    const auto texture_lock = texture_cache.BatchLock();
+    VideoCore::TextureCache::ImageDesc desc(tsharp, blob.resource);
+    // One texture is one call: a large one would hold the draw thread past the idle budget.
+    if (desc.info.guest_size > 16_MB) {
+        return;
+    }
+    // A record is an old T#: its whole range must be mapped now (the image hashes and uploads read
+    // guest memory directly; a range running into unmapped memory crashed the first texture warm,
+    // read fault in XXH3 at 0x108e1dc000), and memory the GPU writes is left to the real bind
+    // (its pages can be read-protected, and the draw thread cannot take that fault).
+    const VAddr base = desc.info.guest_address;
+    const u64 bytes = desc.info.guest_size;
+    if (bytes == 0 || !memory->IsValidMapping(base, bytes) ||
+        buffer_cache.IsRegionGpuModified(base, bytes)) {
+        return;
+    }
+    auto image_id = texture_cache.FindImage(desc);
+    if (!image_id) {
+        return;
+    }
+    // As BindTexturesFull: a stencil image with an associated depth image is read through it.
+    if (const auto depth_image_id = texture_cache.GetAssociatedDepth(texture_cache.GetImage(image_id))) {
+        image_id = depth_image_id;
+    }
+    (void)texture_cache.FindTexture(image_id, desc);
+}
 
 } // namespace Vulkan
