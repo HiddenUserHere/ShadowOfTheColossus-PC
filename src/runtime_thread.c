@@ -438,6 +438,51 @@ static void game_affinity_apply(const char *name) {
     }
 }
 #endif
+/* sotc: SOTC_RAM_REPORT: the host stacks of the live guest threads, as [low, high) from the TEB
+ * stack limits (Windows), noted by host_start and dropped when the thread finishes. The RAM
+ * report's sweep counts the committed private memory inside them as "thread stacks". */
+#define SOTC_STACK_SLOTS 256
+static struct { uintptr_t low, high; } stack_slots[SOTC_STACK_SLOTS];
+static uint64_t stack_live_bytes;
+static void stack_note(uintptr_t low, uintptr_t high, int add) {
+    pthread_mutex_lock(&lock);
+    if (add) {
+        for (size_t i=0;i<SOTC_STACK_SLOTS;++i) {
+            if (!stack_slots[i].high) {
+                stack_slots[i].low=low; stack_slots[i].high=high; stack_live_bytes+=high-low;
+                break;
+            }
+        }
+    } else {
+        for (size_t i=0;i<SOTC_STACK_SLOTS;++i) {
+            if (stack_slots[i].high==high && stack_slots[i].low==low) {
+                stack_live_bytes-=high-low; stack_slots[i].low=0; stack_slots[i].high=0;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&lock);
+}
+/* sotc: RAM report: bytes of the live guest thread stacks. */
+uint64_t runtime_thread_stack_bytes(void) {
+    pthread_mutex_lock(&lock);
+    uint64_t bytes=stack_live_bytes;
+    pthread_mutex_unlock(&lock);
+    return bytes;
+}
+/* sotc: RAM report: the live stacks as (low, high) pairs in out (room for capacity pairs); returns
+ * the number of pairs written. */
+size_t runtime_thread_stack_ranges(uintptr_t (*out)[2], size_t capacity) {
+    size_t n=0;
+    pthread_mutex_lock(&lock);
+    for (size_t i=0;i<SOTC_STACK_SLOTS && n<capacity;++i) {
+        if (stack_slots[i].high) {
+            out[n][0]=stack_slots[i].low; out[n][1]=stack_slots[i].high; ++n;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return n;
+}
 static void *host_start(void *p) {
     GuestThread *t=p;
 #ifdef _WIN32
@@ -447,6 +492,8 @@ static void *host_start(void *p) {
     t->os_handle=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,
                             GetCurrentThreadId());
     pthread_mutex_unlock(&lock);
+    NT_TIB *stack_tib=(NT_TIB *)NtCurrentTeb(); /* sotc: RAM report, stack registry */
+    stack_note((uintptr_t)stack_tib->StackLimit,(uintptr_t)stack_tib->StackBase,1);
 #endif
     attach(t);
     set_host_name(t->name);
@@ -461,6 +508,12 @@ static void *host_start(void *p) {
 #endif
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
+#ifdef _WIN32
+    { /* sotc: RAM report, drop this thread's stack from the registry */
+        NT_TIB *stack_tib=(NT_TIB *)NtCurrentTeb();
+        stack_note((uintptr_t)stack_tib->StackLimit,(uintptr_t)stack_tib->StackBase,0);
+    }
+#endif
     pthread_mutex_lock(&lock);
     t->finished=1; ++exited;
 #ifdef _WIN32

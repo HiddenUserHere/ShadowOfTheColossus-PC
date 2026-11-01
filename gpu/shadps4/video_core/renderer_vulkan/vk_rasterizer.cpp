@@ -1850,6 +1850,9 @@ void CsStatsNote(bool ok, u64 key, bool res_ok, u64 res_key, bool writes, u64 ge
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolved,
                       bool use_resolved, const PreparedDraw* prepared) {
     RENDERER_TRACE;
+    // sotc: SOTC_TEX_PROTECT_BATCH (no-op unless set): texture Tracks of this draw are deferred to
+    // the scope's flush, which runs before the next command (see TexProtectScope).
+    const VideoCore::TexProtectScope tex_protect_scope;
     MdiBreak(); // sotc: SOTC_MDI_STATS
     const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDraw}; // sotc: SOTC_OP_PHASES
 
@@ -1998,6 +2001,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset, const Pipeline* resolved,
                               bool use_resolved, const PreparedDraw* prepared) {
     RENDERER_TRACE;
+    const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDrawIndirect}; // sotc: SOTC_OP_PHASES
 
     scheduler.PopPendingOperations();
@@ -2301,6 +2305,7 @@ struct DirectDispatchGuard {
 
 void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     RENDERER_TRACE;
+    const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     MdiBreak(); // sotc: SOTC_MDI_STATS
     const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDispatch}; // sotc: SOTC_OP_PHASES
 
@@ -2476,6 +2481,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved,
                                   bool use_resolved) {
     RENDERER_TRACE;
+    const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDispatchIndirect}; // sotc: SOTC_OP_PHASES
     MdiBreak(); // sotc: SOTC_MDI_STATS
     if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
@@ -5341,6 +5347,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsize, size, stage.pgm_hash);
                 }
+                // sotc: SOTC_PC_RING=8. A limited read-only bind that starts in an imported arena run
+                // ends at the run end and is served from host memory (BufferCache::PcHostClipLimited).
+                if (!desc.is_written && size < vsize && SotcPcRing::Mode() == 8) {
+                    size = buffer_cache.PcHostClipLimited(vbase, size);
+                }
                 // sotc: SOTC_WRITE_EXTENT. A written binding of a direct dispatch with a rule in
                 // user/write_extent.txt is marked only over the window the rule proves (the
                 // binding itself, its barriers and the aliased image / bind cache invalidations
@@ -5365,7 +5376,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // synchronized as there, and the block stamps are made once per use epoch.
                 // Texel buffers (re-tiled from an aliasing image by every bind) and the stream
                 // ring (small buffers with SOTC_STREAM_THRESHOLD) are not memoized.
-                const bool memo_on = bind_memo_ok && !desc.is_written && !desc.is_formatted;
+                // sotc: SOTC_PC_RING=8. A bind across an arena block edge is never memoized: a hit skips
+                // PcHostMarkCpu, and the ring does not fault the CPU writes of its arena part.
+                const bool memo_on = bind_memo_ok && !desc.is_written && !desc.is_formatted &&
+                                     SotcPcRing::ArenaRelation(vbase, size) != 2;
                 BufferMemo* memo = nullptr;
                 std::pair<const VideoCore::Buffer*, u64> obtained{};
                 bool obtain_called = false; // sotc: SOTC_BIND_MARK_ONCE: ObtainBuffer ran here
@@ -5602,9 +5616,14 @@ void TexBlockReport() {
 int Rasterizer::TexBlockMode() {
     // sotc: SOTC_TEX_BLOCK, read once. 1: a stage's texture block is replayed from the memo when
     // it can be; 2: also runs the full bind on a would-be hit and compares the two (verify).
+    // sotc: SOTC_TEX_BIND_FAST=1 selects mode 1 when SOTC_TEX_BLOCK is not set at all (an explicit
+    // SOTC_TEX_BLOCK=0 or =2 still wins, so the verify mode can be run with the fast switch on).
     static const int mode = [] {
         const char* v = std::getenv("SOTC_TEX_BLOCK");
-        return v && v[0] == '1' ? 1 : v && v[0] == '2' ? 2 : 0;
+        if (!v) {
+            return VideoCore::TextureCache::TexBindFast() ? 1 : 0;
+        }
+        return v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
     }();
     return mode;
 }

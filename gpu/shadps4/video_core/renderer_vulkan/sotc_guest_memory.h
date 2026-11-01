@@ -7,8 +7,14 @@
 // the pages in RAM, so only the chunks in use are. Each chunk is a buffer the GPU can copy to and
 // from: what it writes there is the game's memory at once, with no staging buffer and no memcpy.
 // SOTC_PC_MEMORY=1 turns it on (the device extension is asked for only then).
+//
+// Ring import (SOTC_PC_RING=3 or 4, the extension is asked for then too): the caller imports the
+// guest ranges it copies from (ImportGuestRange) as transfer-source buffers, one per contiguous
+// backing run, and the GPU copies from them at each submit (LookupGuest gives buffer and offset).
 
 #pragma once
+
+#include <cstdint>
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -19,7 +25,8 @@ class Instance;
 
 namespace Vulkan::SotcGuestMemory {
 
-/// After the device exists (Rasterizer): on with the extension, the backing view found later.
+/// After the device exists (Rasterizer): reads SOTC_PC_MEMORY and SOTC_PC_RING; the extension
+/// (when enabled) and the backing view found later.
 void Init(const Instance& instance);
 
 /// At each submission: looks for the backing view until the game has mapped memory, then
@@ -36,5 +43,38 @@ struct Span {
 
 /// The imported chunk holding [host, host + size) of the backing view.
 Span Get(const u8* host, u64 size);
+
+/// Ring import (SOTC_PC_RING=3 or 4): true when the extension is enabled and the device reports
+/// a host-visible, coherent memory type for the view whose buffers can be transfer sources.
+/// Decided once, with one log line ("import" or "unavailable: <reason>"). False, undecided, while
+/// the game has not mapped memory yet: the caller asks again on the next submission.
+/// Thread-safe.
+bool Available();
+
+/// Ring import: imports the host pages behind the guest range [guest_addr, guest_addr + size) as
+/// transfer-source buffers, one per contiguous backing run, each starting at a host address
+/// aligned to minImportedHostPointerAlignment (the buffer may begin a little before the run;
+/// LookupGuest accounts for it). Idempotent: a range already imported with the same backing
+/// costs two backing lookups. Any thread may call it (under one mutex); false when the range
+/// cannot be imported, in which case the caller copies on the CPU. Verifies the backing of the
+/// range it is given, so a remapped range is imported again; LookupGuest does not re-verify.
+bool ImportGuestRange(uint64_t guest_addr, uint64_t size);
+
+/// Ring import: the imported buffer and the offset of guest_addr in it, when one run holds the
+/// whole span [guest_addr, guest_addr + size). False when not imported or when the span crosses
+/// runs (the caller then splits it at the run boundaries and looks each piece up).
+/// Thread-safe.
+bool LookupGuest(uint64_t guest_addr, uint64_t size, vk::Buffer* buffer, uint64_t* offset);
+
+/// sotc: SOTC_PC_RING=8. The imported run holding a bind, for BufferCache's host binds.
+struct GuestView {
+    vk::Buffer buffer{};   ///< the imported buffer (owned by this unit; never destroyed by callers)
+    u64 offset{};         ///< of the bind's first byte in buffer
+    u64 buffer_size{};    ///< size of buffer
+    u64 cpu_base{};       ///< guest address of byte 0 of buffer (guest_addr - offset)
+};
+
+/// sotc: SOTC_PC_RING=8. As LookupGuest, with the buffer's size and base. Thread-safe.
+bool LookupGuestView(uint64_t guest_addr, uint64_t size, GuestView* out);
 
 } // namespace Vulkan::SotcGuestMemory

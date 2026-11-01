@@ -40,6 +40,26 @@ typedef struct { uint64_t target, kind, value, addend; } Reloc;
 static char (*names)[128];
 static uint64_t import_count;
 static unsigned char *image;
+/* sotc: SOTC_ARENA_ATTRIB (gpu/sotc/arena_attrib.cpp): the guest image base, the offsets of the
+ * attribution log are relative to it. 0 before the image is mapped. */
+uintptr_t sotc_arena_image_base(void) { return (uintptr_t)image; }
+/* sotc: SOTC_RAM_REPORT (gpu/sotc/ram_report.cpp): mimalloc's committed bytes, the operator new
+ * heap of bb-probe (BB_MIMALLOC, CMake). 0 when the build does not use mimalloc. The prototype is
+ * local: mimalloc.h is not on the include path of this file. */
+#ifdef BB_MIMALLOC
+void mi_process_info(size_t *elapsed_msecs, size_t *user_msecs, size_t *system_msecs,
+                     size_t *current_rss, size_t *peak_rss, size_t *current_commit,
+                     size_t *peak_commit, size_t *page_faults);
+#endif
+uint64_t sotc_mimalloc_committed_bytes(void) {
+#ifdef BB_MIMALLOC
+    size_t elapsed, user_ms, sys_ms, rss, peak_rss, commit, peak_commit, faults;
+    mi_process_info(&elapsed, &user_ms, &sys_ms, &rss, &peak_rss, &commit, &peak_commit, &faults);
+    return (uint64_t)commit;
+#else
+    return 0;
+#endif
+}
 static size_t page_size;
 typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module; } LinkedModule;
 static LinkedModule modules[16];
@@ -83,6 +103,18 @@ static size_t round_page(size_t size) { return (size + page_size - 1) & ~(page_s
 #define EBOOT_LIMIT UINT64_C(0x80000000)
 #define EBOOT_RESERVATION (UINT64_C(256) << 20)
 static void *eboot_reservation;
+/* sotc: the last 64 KiB of the eboot reservation are the engine-command buffer (bb_low_block):
+ * the Lab's live commands and free camera need one block below 2 GiB, and a later top-down scan
+ * for a free one failed in about half the sessions (docs/sotc/LAB-FAILURE-REPORT.md). The image
+ * never reaches it (allocate_image refuses an image that would). */
+#define LOW_BLOCK_SIZE UINT64_C(0x10000)
+void *bb_low_block(void);
+void *bb_low_block(void) {
+    static void *block;
+    if (!block && eboot_reservation)
+        block=VirtualAlloc((char *)eboot_reservation+EBOOT_RESERVATION-LOW_BLOCK_SIZE,LOW_BLOCK_SIZE,MEM_COMMIT,PAGE_READWRITE);
+    return block;
+}
 static void reserve_eboot_range(void) {
     for (uintptr_t at=EBOOT_MIN; at+EBOOT_RESERVATION<=EBOOT_LIMIT;) {
         MEMORY_BASIC_INFORMATION m;
@@ -96,13 +128,22 @@ static void reserve_eboot_range(void) {
     }
 }
 /* The image (eboot, linked modules, patch trampolines) below 2 GiB. */
+static uint64_t image_committed_bytes; /* sotc: RAM report, bytes committed by allocate_image */
 static void *allocate_image(size_t size) {
     if (!eboot_reservation) fail("no free 256 MiB range below 2 GiB for the eboot");
-    if (size > EBOOT_RESERVATION) fail("the image does not fit the eboot reservation");
+    if (size > EBOOT_RESERVATION-LOW_BLOCK_SIZE) fail("the image does not fit the eboot reservation");
     void *p=VirtualAlloc(eboot_reservation, size, MEM_COMMIT, PAGE_READWRITE);
     if (!p) fail("cannot commit the eboot range");
+    image_committed_bytes=size;
     printf("Image at %p (below 2 GiB, as the game's 31-bit pointers need); loader at %p\n",p,(void *)GetModuleHandleA(NULL));
     return p;
+}
+/* sotc: RAM report: the eboot reservation (base, reserved size: 0 when none) and the image bytes
+ * committed in it. The sweep counts the committed private memory inside [base, base+reserved). */
+void sotc_eboot_range(uintptr_t *base, uint64_t *reserved, uint64_t *committed) {
+    *base=(uintptr_t)eboot_reservation;
+    *reserved=eboot_reservation ? EBOOT_RESERVATION : 0;
+    *committed=image_committed_bytes;
 }
 #endif
 #ifdef _WIN32
@@ -978,6 +1019,10 @@ static void fault_ring_open(const char *path) {
     HANDLE map=CreateFileMappingA(file,NULL,PAGE_READWRITE,0,8192*sizeof(struct fault_entry),NULL);
     if (map) fault_ring=MapViewOfFile(map,FILE_MAP_WRITE,0,0,0);
 }
+/* sotc: RAM report: bytes of the BB_FAULT_RING mapping (0 when the ring is not open). */
+uint64_t sotc_fault_ring_bytes(void) {
+    return fault_ring ? 8192*sizeof(struct fault_entry) : 0;
+}
 static struct fault_entry *fault_ring_add(const EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     struct fault_entry *e=&fault_ring[(InterlockedIncrement(&fault_ring_next)-1)&8191];
@@ -1021,6 +1066,8 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     return result;
 }
 int runtime_memory_carve_retry(uintptr_t address, int write); /* sotc: runtime_memory.c */
+int runtime_memory_lazy_fault(uintptr_t address, int write);  /* sotc: runtime_memory.c, SOTC_COMMIT_CHUNKS=2 */
+int runtime_memory_backing_fault(uintptr_t address, int write); /* sotc: runtime_memory.c, SOTC_COMMIT_CHUNKS=2 */
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
@@ -1039,6 +1086,19 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
         c->Rdx=1;
         c->Rip=(DWORD64)(uintptr_t)bb_longjmp;
         fault_path=13;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    /* sotc: SOTC_COMMIT_CHUNKS=2: a guest address in a chunk not open yet (or a host access to the backing
+     * of one) opens the chunk and the access runs again. After the copy guard (its fallback reads through
+     * the backing view) and before page tracking, which never sees these pages. */
+    if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 &&
+        runtime_memory_lazy_fault((uintptr_t)record->ExceptionInformation[1],(int)record->ExceptionInformation[0])) {
+        fault_path=14;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 &&
+        runtime_memory_backing_fault((uintptr_t)record->ExceptionInformation[1],(int)record->ExceptionInformation[0])) {
+        fault_path=15;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && gpu_enabled && helper_read_fault(info)) {

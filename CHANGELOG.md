@@ -72,6 +72,91 @@ com `=0` (ou na aba Ajustes experimentais do lançador).
   o menu diz isso. O pulo para colosso usa a automação de comandos da engine descoberta por tabnul na
   PR AjncSystem/ShadowOfTheColossus-PC#345 (ainda não mesclada). Guia: `docs/sotc/LAB.md`.
 
+**Modelo de memória do PC (experimental, tudo desligado por padrão)**
+Troca em andamento da memória unificada do PS4: a RAM passa a guardar o que a CPU escreve, e a VRAM
+guarda o que a GPU lê e escreve. Sem as chaves abaixo, nada muda. Como testar: `docs/sotc/MODELO-MEMORIA-PC-2.md`.
+
+Estado de cada chave, com o que foi medido em 1 de novembro (rota de testes do Lab; lotes de duas rodadas
+quando não diz outra coisa):
+
+- **Anel de upload** (`SOTC_PC_RING`): `=1` libera a memória de quadro da GPU para a escrita da CPU na
+  alocação, em vez de protegê-la até a primeira escrita. As faltas de escrita no código do jogo caíram
+  24–41% e as cópias de memória do host 40–60%, mas o FPS caiu cerca de 1–1,5 (matriz: 27,2 → 23,4 em média,
+  com a thread de desenho no limite). `=2` só confere e não muda nada. `=3`, `=4` e `=5` são o anel
+  completo: `=4` só confere (com queda forte de FPS: 16 e 23 nas medições), `=3` não confere, e `=5` não é seguro. Use `=1` ou `=2`.
+- **Classe estática** (`SOTC_STATIC_CLASS`): malhas e texturas que a GPU só lê deixam de ser protegidas na
+  alocação. `=1` aplica, `=2` só conta. Medido: 36–84 mil páginas ficam limpas por janela de 5 s; FPS dentro
+  da variação normal (28,3 contra 27,2 do padrão).
+- **Classe de render targets** (`SOTC_RT_CLASS`): os alvos de renderização (blocos RTAllocator) não são
+  copiados de volta nem rastreados. `=1` aplica, `=2` conta. Medido: cerca de 60 mil rastreamentos evitados
+  por janela de 5 s, nenhuma cópia de volta. FPS dentro da variação normal.
+- **Classe de leituras** (`SOTC_RB_CLASS`): `=1` avisa a cópia antes da leitura da CPU (máscaras de
+  visibilidade e estatísticas de partículas). Com `=1`, as leituras que esperam a GPU caíram cerca de 4%
+  (568 contra 593 por segundo no mesmo lote); FPS sem mudança. `=2` serve a leitura pela última cópia (527 por
+  segundo, contra 742 no padrão) e **produziu vértices estourados**:
+  não use. A correção está em andamento.
+- **Pool próprio, verificação** (`SOTC_PC_POOL=2`): confere a previsão do alocador de blocos com o que o jogo
+  faz, sem mudar nada. 6.022 de 6.173 alocações conferiram (cerca de 98%).
+- **Pool próprio, alocação nativa** (`SOTC_PC_POOL_NATIVE=1`): o port executa sozinho o caminho exato de
+  alocação. Na rota de testes: 27 alocações feitas pelo port, todas conferidas, nenhuma falha. O resto
+  continua com o jogo.
+- **Commit sob demanda** (`SOTC_COMMIT_ON_DEMAND=1`) e **commit por blocos** (`SOTC_COMMIT_CHUNKS`): a memória
+  do jogo só é comprometida quando usada. `=1` não economiza: o jogo mapeia o pool inteiro no boot (9,6 GB
+  comprometidos). `=2` compromete no primeiro acesso: 6,0–7,2 GB nas medições, sem travamento nem falha.
+  O FPS dessas chaves não foi separado.
+- **Detector de páginas velhas** (`SOTC_STALE_CHECK=N`): em uma de cada N ligações, confere se dados de
+  vértices e índices mudaram sem o port ter visto a escrita. Nas execuções válidas: 0 páginas velhas em até
+  cerca de 509 mil páginas comparadas por sessão. Só diagnóstico.
+- **Classes por heap, sombra** (`SOTC_CLASS_TRACK=2` com `SOTC_MEMTYPE_CLASSES=1`): conta, por heap, as páginas
+  que a GPU tocou dentro das faixas que a CPU considera só dela. Medido: 6.294 de 6.482 blocos de 64 KiB do
+  heap CPUMemory (405 MiB) parecem só da CPU, sem disparos. Nada é desprotegido ainda: o modo `=1` (aplicar)
+  não foi medido.
+- **Ferramentas**: `tools/pcmem_matrix.py` roda configurações lado a lado na rota de testes e gera
+  `user/pcmem/<data>/summary.md`. `tools/re/hooks_install_check.py` diz, sem abrir o jogo, se o carregador vai
+  recusar algum gancho (antes, essas recusas só apareciam no teste).
+- **Correção no SotC Lab**: um bloco de 64 KiB abaixo de 2 GiB é reservado no boot, antes do resto. A câmera livre não
+  falha mais (antes falhava em cerca de metade das sessões).
+
+**Problemas conhecidos**
+- Congelamento de 10 s visto uma vez com o anel ligado. Não se repetiu e ainda não foi explicado.
+- Vértices estourados com `SOTC_RB_CLASS=2`.
+- Queda antiga com `SOTC_DROP_FAST` (ver "Liberar memória sem espera" acima). Continua desligada por padrão.
+- Os lotes 035053 e 035215 (com `SOTC_STALE_CHECK=16`) não terminaram a rota em nenhuma tentativa, com quadros
+  de 600–800 ms; a causa não foi determinada. Os lotes 035657 e 035931 rodaram a cerca de 13 FPS (contra
+  27–28 nos demais), sem separação da causa. Não compare esses lotes com os outros.
+- Nenhuma chave muda o quadro hoje: a thread de desenho fica no limite (cerca de 34,5 ms de 33 ms).
+
+<details>
+<summary>Detalhes técnicos: modelo de memória do PC</summary>
+
+- Código: `gpu/sotc/pc_ring.cpp`, `rb_class.cpp`, `static_class.cpp`, `rt_class.cpp`, `pc_pool.cpp`,
+  `pc_pool_native.cpp`, `stale_check.cpp`, `mem_classes.cpp`, `probe_alloc.cpp`, `probe_memtype.cpp`,
+  `probe_xprmem.cpp`; `gpu/shadps4/video_core/buffer_cache/pc_ring_copy.cpp`; commit em `src/runtime_memory.c`.
+  Ganchos em `scripts/hooks.d/` (`alloc`, `memtype`, `pcring`, `xprmem`, `pcpool`, `staticclass`). Plano,
+  tabelas e chaves: `docs/re-stutters/PC-MEMORY-REWRITE.md` (seção 8).
+- Lotes citados (`user/pcmem/<data>/summary.md`): `20261101-014856` (base e probes), `-032958` (oito
+  configurações, duas rodadas), `-032443` (verify), `-032624` (safe: anel 1 + pool nativo + commit 2 + leituras 2
+  + classes), `-040243` (rbheur, rbclass1, rb2), `-035657` e `-035931` (cerca de 13 FPS), `-035053` e `-035215`
+  (sem rota).
+- Anel: a época é cada envio (`PerformSubmit` do gnmdriver e o doorbell de compute), não o quadro: o jogo envia
+  ~33 vezes por quadro. Custos: o gancho no despachante 0x12820 roda de 80 a 98 mil vezes por segundo nas
+  threads do jogo; as varreduras DMA sobem ~6 ms/s pelas páginas declaradas antes da escrita.
+- Modo 4 (verify), cobertura dos bytes ligados ao arena: 0,6% estão em alocações do último envio, 1,6% dos
+  últimos 4, 22,9% dos últimos 16 e 56,7% dos últimos 64; 43,3% não estão em nenhum dos 64 (dados reescritos
+  no lugar). Por isso `=4`/`=5` não são seguros como estão. A variante segura prevista é proteger e copiar a
+  cada envio.
+- Leituras (`SOTC_RB_CLASS=2`): a janela de máscaras precisa de 4 quadros de limite; com 2, quase todas as
+  leituras são recusadas como "antigas" (lote safe: 0 servidas).
+- Pool: o `POOL_FIX` (eboot 0x1a321) segue no port. O caminho nativo só age no acerto exato; os outros casos
+  voltam ao jogo ("fallbacks to the original"). Liberação: a VA liberada dos pools Onion/Garlic não volta à
+  lista livre (710 e 50 por janela), vazamento do próprio jogo confirmado pelo modelo.
+- Stale check: a rodada 035053 imprimiu linhas "stale page" (páginas com hash antigo, sem dono nomeado) durante
+  a execução travada. Não apareceu nas rodadas válidas; ainda não investigado.
+- Decisão do usuário (1 de novembro): o anel fica atrás de `SOTC_PC_RING=1` até a migração estar completa e o
+  teste do final do jogo passar; então os padrões mudam juntos.
+
+</details>
+
 ## 0.70.1 — 2026-10-29
 Correções e melhorias por cima da 0.70, que vem inteira (trocas de área, queda `0x49800`, DLSS no
 modo Pro, HUD com geração de quadros).

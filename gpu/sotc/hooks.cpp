@@ -21,6 +21,7 @@
 #include "hook_stats.h"
 #include "hooks.h"
 #include "video_core/sotc_trace.h" // sotc: time mode spans (Now, PushEvent, InternString)
+#include "arena_attrib.h" // sotc: SOTC_ARENA_ATTRIB shares the PC_RING_HEAP wrap
 
 namespace SotcHooks {
 namespace {
@@ -672,6 +673,11 @@ bool InstallHooks(const char* hooks_path, void* image, uint64_t module_size, Ins
         const bool timed = rec.mode == 4;
         rec.switch_value = timed ? ReadPresence(rec.switch_name.c_str())
                                  : ReadSwitch(rec.switch_name.c_str());
+        // sotc: SOTC_ARENA_ATTRIB runs the PC_RING_HEAP wrap (pc_ring.cpp HeapPre/HeapPost) without
+        // the ring: the wrap then only records the arena allocations (no declare, no protection).
+        if (rec.switch_value == 0 && rec.name == "PC_RING_HEAP" && SotcArenaAttrib::On()) {
+            rec.switch_value = 1;
+        }
         rec.enabled = !master_off && rec.switch_value != 0 && (!timed || SotcTrace::kOn);
         if (master_off) {
             rec.off_reason = "SOTC_HOOKS=0";

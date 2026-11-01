@@ -10,7 +10,9 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/sotc_stats.h"
 
 namespace Vulkan {
 
@@ -47,6 +49,9 @@ void Swapchain::Create(u32 width_, u32 height_) {
         instance.GetPresentQueueFamilyIndex(),
     };
 
+    // sotc: SOTC_PRESENT_UNLOCKED=1 (PresentPath::OtherFamily): the present family differs from the
+    // graphics family, so the images are CONCURRENT over both. Concurrent images need no queue
+    // family ownership transfer, and the present waits on the semaphore the graphics submit signals.
     const bool exclusive = queue_family_indices[0] == queue_family_indices[1];
     const u32 queue_family_indices_count = exclusive ? 1u : 2u;
     const vk::SharingMode sharing_mode =
@@ -150,7 +155,20 @@ bool Swapchain::Present(u64 present_id) {
         .pImageIndices = &image_index,
     };
 
+    // sotc: the time inside presentKHR alone (SOTC_FPS, or SOTC_PRESENT_UNLOCKED=2): a driver
+    // stall here is what held submit_mutex in the 10 s freeze (reports3/09-draw-freeze.md).
+    const bool time_present = SotcStats::kFpsLog || PresentUnlockedMode() == 2;
+    const u64 khr_start = time_present ? SotcStats::NowNs() : 0;
     auto result = instance.GetPresentQueue().presentKHR(present_info);
+    if (time_present) {
+        const u64 khr_ns = SotcStats::NowNs() - khr_start;
+        present_khr_ns.fetch_add(khr_ns, std::memory_order_relaxed);
+        present_khr_count.fetch_add(1, std::memory_order_relaxed);
+        u64 prev_max = present_khr_max_ns.load(std::memory_order_relaxed);
+        while (khr_ns > prev_max && !present_khr_max_ns.compare_exchange_weak(
+                                        prev_max, khr_ns, std::memory_order_relaxed)) {
+        }
+    }
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {
@@ -240,7 +258,7 @@ void Swapchain::FindPresentMode() {
     // sotc: SOTC_PRESENT_WAIT paces the flips on the display: FIFO queues each present for the
     // next vblank, in order, which is what vkWaitForPresentKHR reports on. The requested mode
     // is ignored then, Immediate (DLSS Frame Generation above) included.
-    if (instance.IsPresentWaitEnabled()) {
+    if (instance.IsPresentWaitPacingEnabled()) {
         present_mode = vk::PresentModeKHR::eFifo;
     }
 }

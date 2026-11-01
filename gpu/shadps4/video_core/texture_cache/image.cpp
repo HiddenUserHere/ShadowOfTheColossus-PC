@@ -105,7 +105,15 @@ UniqueImage::~UniqueImage() {
 
 void UniqueImage::Destroy() {
     if (image) {
-        vmaDestroyImage(allocator, image, allocation);
+        // sotc: SOTC_VK_POOL: the vkDestroyImage/vkFreeMemory run on the helper thread once the
+        // GPU is past the tick (the draw thread used to pay for the driver call).
+        auto destroy = [allocator_ = allocator, handle = static_cast<VkImage>(image),
+                        alloc = allocation]() { vmaDestroyImage(allocator_, handle, alloc); };
+        if (GpuDestroyDeferred()) {
+            DeferGpuDestroy(std::move(destroy));
+        } else {
+            destroy();
+        }
         image = vk::Image{};
         allocation = {};
         SotcStats::image_bytes.fetch_sub(size_bytes, std::memory_order_relaxed);
@@ -121,9 +129,13 @@ void UniqueImage::Destroy() {
 // that cannot use it, or larger than a block, is allocated as before.
 static VmaPool ImagePool(VmaAllocator allocator, const VkImageCreateInfo& image_ci,
                          const VmaAllocationCreateInfo& alloc_ci) {
+    // sotc: SOTC_VK_POOL=1 turns the pool on at 256 MiB unless SOTC_IMAGE_POOL_MB sets a size.
     static const u64 pool_mb = [] {
         const char* v = std::getenv("SOTC_IMAGE_POOL_MB");
-        return v ? std::strtoull(v, nullptr, 10) : 0ULL;
+        if (v) {
+            return std::strtoull(v, nullptr, 10);
+        }
+        return VkPoolEnabled() ? 256ULL : 0ULL;
     }();
     if (pool_mb == 0) {
         return VK_NULL_HANDLE;

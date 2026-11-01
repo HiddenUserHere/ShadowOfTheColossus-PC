@@ -32,6 +32,7 @@
 #include "video_core/sotc_adaptive.h"
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM (upload budget)
 #include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM (records and replay)
+#include "../../../sotc/rt_class.h" // sotc: SOTC_RT_CLASS (render targets in RTAllocator blocks)
 #include "video_core/texture_cache/host_compatibility.h"
 
 #include <vk_mem_alloc.h>
@@ -44,6 +45,159 @@
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
+
+// sotc: SOTC_TEX_PROTECT_BATCH=1 (off by default), see TexProtectScope in texture_cache.h.
+// A texture tracking protect (TrackImage*) made while a scope is open on this thread is collected
+// by the page manager's ProtectBatch (UpdatePageWatchers, deferrable: Track only, i.e. the pages
+// become read-only) and applied at the next flush. Ordering: a deferred Track must be in effect
+// before the guest pages are read by this cache. The reads are RefreshImage (the upload),
+// DownloadImageMemory and SotcGlyphHook; each calls FlushTexProtect first. The scope closes with a
+// flush too. Untracks (UntrackImage*) are never deferred: they only make pages writable, and a
+// page that is still read-only on the host costs a fault, which the tracker resolves.
+//
+// Residual window, closed by deferring only where the upload is certain: a Track is deferred only
+// for a Dirty, single-sample image (TexDeferOk). UpdateImage calls TrackImage and then
+// RefreshImage, which flushes first on every path (before the clean/CEILING returns), so the
+// protect is in effect before the upload reads the pages, and a guest write before the upload is
+// part of it. A clean image is tracked at once (not deferred): no guest write can slip between
+// its Track and a flush. The only Track outside UpdateImage is ExpandImage (after its own
+// RefreshImage, so the image is clean there and not deferred).
+namespace {
+
+const bool kTexProtectBatch = [] {
+    const char* v = std::getenv("SOTC_TEX_PROTECT_BATCH");
+    return v && v[0] == '1';
+}();
+// The counters run with SOTC_TEX_PROTECT_BATCH or SOTC_FPS and are printed every 5 s.
+const bool kTexProtectStats = kTexProtectBatch || SotcStats::kFpsLog;
+constexpr u64 kTexPageBits = 12; // PageManager::PM_PAGE_BITS
+
+std::atomic<u64> tp_track_calls{0}, tp_track_pages{0};
+std::atomic<u64> tp_untrack_calls{0}, tp_untrack_pages{0};
+std::atomic<u64> tp_deferred{0}, tp_flush_points{0};
+std::atomic<u64> tp_cycle_retrack{0}, tp_cycle_untrack{0};
+// The find memo (MemoLookup): lookups and perfect matches served. Counted under SOTC_FPS only.
+std::atomic<u64> memo_lookups{0}, memo_hits{0};
+
+// The innermost TexProtectScope open on this thread.
+thread_local TexProtectScope* tl_tex_scope = nullptr;
+
+// A Track may be deferred only when RefreshImage is certain to run for the image in the same
+// UpdateImage call and flush before it reads guest memory: a dirty, single-sample image.
+bool TexDeferOk(const Image& image) {
+    return True(image.flags & ImageFlagBits::Dirty) && image.info.num_samples <= 1;
+}
+
+// Every texture tracking protect goes through here (the six TrackImage* / UntrackImage* calls).
+// Deferred only for a Track inside an open scope, of an image that passes TexDeferOk, and only
+// while no fault is handled on this thread (PageManager::ProtectBatchOpen).
+void TexUpdateWatchers(PageManager& tracker, VAddr addr, u64 size, PageOp op,
+                       bool may_defer = false) {
+    if (size == 0) {
+        return;
+    }
+    const bool defer = kTexProtectBatch && op == PageOp::Track && may_defer &&
+                       tl_tex_scope != nullptr && PageManager::ProtectBatchOpen();
+    if (kTexProtectStats) {
+        const u64 pages = Common::DivCeil(addr + size, u64{1} << kTexPageBits) -
+                          (addr >> kTexPageBits);
+        if (op == PageOp::Track) {
+            tp_track_calls.fetch_add(1, std::memory_order_relaxed);
+            tp_track_pages.fetch_add(pages, std::memory_order_relaxed);
+        } else {
+            tp_untrack_calls.fetch_add(1, std::memory_order_relaxed);
+            tp_untrack_pages.fetch_add(pages, std::memory_order_relaxed);
+        }
+        if (defer) {
+            tp_deferred.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    tracker.UpdatePageWatchers(addr, size, op, defer);
+}
+
+// Applies the protects the open scope has collected before a guest read of this cache.
+void FlushTexProtect() {
+    if (tl_tex_scope == nullptr) {
+        return;
+    }
+    if (kTexProtectStats) {
+        tp_flush_points.fetch_add(1, std::memory_order_relaxed);
+    }
+    tl_tex_scope->Flush();
+}
+
+// SOTC_TEX_PROTECT_BATCH / SOTC_FPS: one line every 5 s from RunGarbageCollector (once per
+// submit, so gc_tick counts frames). Per-frame values divide by the ticks of the window.
+void ReportTexProtect(u64 tick) {
+    static auto last = std::chrono::steady_clock::now();
+    static u64 last_tick = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds{5}) {
+        return;
+    }
+    const double frames = std::max(1.0, double(tick - last_tick));
+    last = now;
+    last_tick = tick;
+    const u64 tc = tp_track_calls.exchange(0, std::memory_order_relaxed);
+    const u64 tg = tp_track_pages.exchange(0, std::memory_order_relaxed);
+    const u64 uc = tp_untrack_calls.exchange(0, std::memory_order_relaxed);
+    const u64 ug = tp_untrack_pages.exchange(0, std::memory_order_relaxed);
+    const u64 def = tp_deferred.exchange(0, std::memory_order_relaxed);
+    const u64 fl = tp_flush_points.exchange(0, std::memory_order_relaxed);
+    const u64 rt = tp_cycle_retrack.exchange(0, std::memory_order_relaxed);
+    const u64 ut = tp_cycle_untrack.exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "SOTC TEX PROTECT %.0f frames (5 s, batch %s): track %llu calls (%.1f/frame, "
+                 "%.1f pages/frame), untrack %llu calls (%.1f/frame, %.1f pages/frame), deferred "
+                 "%llu, flush points %llu, same-frame cycles: retrack after untrack %llu, untrack "
+                 "after track %llu\n",
+                 frames, kTexProtectBatch ? "on" : "off", static_cast<unsigned long long>(tc),
+                 double(tc) / frames, double(tg) / frames, static_cast<unsigned long long>(uc),
+                 double(uc) / frames, double(ug) / frames, static_cast<unsigned long long>(def),
+                 static_cast<unsigned long long>(fl), static_cast<unsigned long long>(rt),
+                 static_cast<unsigned long long>(ut));
+    if (SotcStats::kFpsLog) {
+        const u64 ml = memo_lookups.exchange(0, std::memory_order_relaxed);
+        const u64 mh = memo_hits.exchange(0, std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "SOTC FIND MEMO 5 s: lookups %llu (%.0f/frame), perfect hits %llu (%.1f%%), "
+                     "table %zu slots (SOTC_TEX_BIND_FAST %s)\n",
+                     static_cast<unsigned long long>(ml), double(ml) / frames,
+                     static_cast<unsigned long long>(mh),
+                     ml ? 100.0 * double(mh) / double(ml) : 0.0,
+                     TextureCache::TexBindFast() ? size_t{4096} : size_t{1024},
+                     TextureCache::TexBindFast() ? "on" : "off");
+    }
+}
+
+} // namespace
+
+struct TexProtectScope::Impl {
+    PageManager::ProtectBatch batch{true};
+};
+
+TexProtectScope::TexProtectScope() {
+    if (!kTexProtectBatch) {
+        return;
+    }
+    impl = std::make_unique<Impl>();
+    prev = tl_tex_scope;
+    tl_tex_scope = this;
+}
+
+TexProtectScope::~TexProtectScope() {
+    if (!impl) {
+        return;
+    }
+    impl.reset(); // ~ProtectBatch applies what this scope collected
+    tl_tex_scope = prev;
+}
+
+void TexProtectScope::Flush() {
+    if (impl) {
+        impl->batch.Flush();
+    }
+}
 
 void ReentrantMutex::AsymmetricBarrier() {
 #ifdef _WIN32
@@ -67,6 +221,20 @@ static void WriteBackSkippingStacks(VAddr guest_address, const u8* data, u64 siz
 
 // sotc: SOTC_AREA_PREWARM record check, defined with the replay below.
 static bool ReplayRecordKnown(const SotcAreaPrewarm::ImageRecord& rec);
+
+// sotc: SOTC_RT_CLASS. An image whose guest range lies in an RTAllocator block (render targets).
+static bool InRtBlock(const Image& image) {
+    return SotcRtClass::Mode() != 0 &&
+           SotcRtClass::Contains(image.info.guest_address, image.info.guest_size);
+}
+
+// sotc: SOTC_RT_CLASS=1: a render target, depth target or storage image in an RTAllocator block
+// that the CPU has not dirtied. Its pages are not CPU-tracked, and it is not written back.
+static bool RtClassSkipTrack(const Image& image) {
+    return SotcRtClass::Mode() == 1 && InRtBlock(image) &&
+           (image.usage.render_target || image.usage.depth_target || image.usage.storage) &&
+           False(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty));
+}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -152,6 +320,7 @@ void TextureCache::ProcessDownloadImages() {
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+    FlushTexProtect(); // sotc: SOTC_TEX_PROTECT_BATCH, before the guest pages are touched
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
@@ -166,6 +335,16 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (!sync && !gc_download) {
         SotcStats::gc_downloads_skipped.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
+    // sotc: SOTC_RT_CLASS: a render target inside an RTAllocator block is not written back to guest
+    // memory (the CPU never reads those pages; mode 2 only counts). Risk: a later sample of the same
+    // range starts from the guest memory, not from the lost VRAM contents.
+    if (InRtBlock(image)) {
+        if (SotcRtClass::Mode() == 1) {
+            SotcRtClass::NoteDownloadSkipped(image.info.guest_size);
+            return;
+        }
+        SotcRtClass::NoteDownload(image.info.guest_size);
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
@@ -278,6 +457,11 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
+        // sotc: SOTC_RT_CLASS: a CPU write reached a render target in an RTAllocator block (it should
+        // not). The normal path below runs; mode 1 counts it as a fallback.
+        if (InRtBlock(image)) {
+            SotcRtClass::NoteCpuInvalidate();
+        }
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
@@ -857,6 +1041,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 
     FreeImage(image_id, ImageLeave::Expand);
     TrackImage(new_image_id);
+    FlushTexProtect(); // sotc: SOTC_TEX_PROTECT_BATCH, a Track here is not followed by an upload
     return new_image_id;
 }
 
@@ -1502,6 +1687,9 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    // sotc: SOTC_TEX_PROTECT_BATCH: the deferred Tracks of this pass take effect first, on every
+    // path below (see the note above TexProtectScope's anon namespace).
+    FlushTexProtect();
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
@@ -1903,6 +2091,7 @@ void TextureCache::SotcGlyphHook(Image& image) {
     if (!dump && !replace) {
         return;
     }
+    FlushTexProtect(); // sotc: SOTC_TEX_PROTECT_BATCH, the guest pages are read below
     const auto& info = image.info;
     if (info.props.is_depth || True(image.flags & ImageFlagBits::GpuModified) ||
         info.size.width < 16 || info.size.height < 16 || info.size.width > 1024 ||
@@ -2161,12 +2350,29 @@ void TextureCache::TrackImage(ImageId image_id) {
     if (image_begin == image.track_addr && image_end == image.track_addr_end) {
         return;
     }
+    // sotc: SOTC_RT_CLASS: a render target in an RTAllocator block gets no CPU page tracking (mode
+    // 1): it is untracked instead, and the skip is counted. Anything CPU-dirty stays tracked.
+    if (InRtBlock(image)) {
+        if (RtClassSkipTrack(image)) {
+            SotcRtClass::NoteTrackSkipped();
+            UntrackImage(image_id);
+            return;
+        }
+        SotcRtClass::NoteTrack();
+    }
 
     if (!image.IsTracked()) {
         // Re-track the whole image
+        if (kTexProtectStats) { // sotc: a re-track of an image untracked earlier in this frame
+            if (image.tex_untrack_tick == gc_tick + 1) {
+                tp_cycle_retrack.fetch_add(1, std::memory_order_relaxed);
+            }
+            image.tex_track_tick = gc_tick + 1;
+        }
         image.track_addr = image_begin;
         image.track_addr_end = image_end;
-        tracker.UpdatePageWatchers(image_begin, image.info.guest_size, PageOp::Track);
+        TexUpdateWatchers(tracker, image_begin, image.info.guest_size, PageOp::Track,
+                          TexDeferOk(image));
     } else {
         if (image_begin < image.track_addr) {
             TrackImageHead(image_id);
@@ -2189,7 +2395,7 @@ void TextureCache::TrackImageHead(ImageId image_id) {
     ASSERT(image.track_addr != 0 && image_begin < image.track_addr);
     const auto size = image.track_addr - image_begin;
     image.track_addr = image_begin;
-    tracker.UpdatePageWatchers(image_begin, size, PageOp::Track);
+    TexUpdateWatchers(tracker, image_begin, size, PageOp::Track, TexDeferOk(image));
 }
 
 void TextureCache::TrackImageTail(ImageId image_id) {
@@ -2205,7 +2411,7 @@ void TextureCache::TrackImageTail(ImageId image_id) {
     const auto addr = image.track_addr_end;
     const auto size = image_end - image.track_addr_end;
     image.track_addr_end = image_end;
-    tracker.UpdatePageWatchers(addr, size, PageOp::Track);
+    TexUpdateWatchers(tracker, addr, size, PageOp::Track, TexDeferOk(image));
 }
 
 void TextureCache::UntrackImage(ImageId image_id) {
@@ -2215,10 +2421,16 @@ void TextureCache::UntrackImage(ImageId image_id) {
     }
     const auto addr = image.track_addr;
     const auto size = image.track_addr_end - image.track_addr;
+    if (kTexProtectStats) { // sotc: an untrack of an image tracked earlier in this frame
+        if (image.tex_track_tick == gc_tick + 1) {
+            tp_cycle_untrack.fetch_add(1, std::memory_order_relaxed);
+        }
+        image.tex_untrack_tick = gc_tick + 1;
+    }
     image.track_addr = 0;
     image.track_addr_end = 0;
     if (size != 0) {
-        tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
+        TexUpdateWatchers(tracker, addr, size, PageOp::Untrack);
     }
 }
 
@@ -2237,7 +2449,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
         // Cehck its hash later.
         MarkAsMaybeDirty(image_id, image);
     }
-    tracker.UpdatePageWatchers(image_begin, size, PageOp::Untrack);
+    TexUpdateWatchers(tracker, image_begin, size, PageOp::Untrack);
 }
 
 void TextureCache::UntrackImageTail(ImageId image_id) {
@@ -2256,7 +2468,7 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
         // Cehck its hash later.
         MarkAsMaybeDirty(image_id, image);
     }
-    tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
+    TexUpdateWatchers(tracker, addr, size, PageOp::Untrack);
 }
 
 bool TextureCache::TryEmergencyCollect(u32 level) {
@@ -2725,13 +2937,24 @@ bool TextureCache::IsSafeToDelete(const Image& image) const {
     return scheduler.CurrentTick() - image.tick_accessed_last > NumFramesBeforeRemoval;
 }
 
+bool TextureCache::TexBindFast() {
+    static const bool fast = [] {
+        const char* v = std::getenv("SOTC_TEX_BIND_FAST");
+        return v && v[0] == '1';
+    }();
+    return fast;
+}
+
 TextureCache::FindMemo& TextureCache::MemoSlot(const ImageInfo& info, bool exact_fmt,
                                                bool writer) {
     const u64 memo_hash = (info.guest_address * 0x9E3779B97F4A7C15ULL) ^
                           (u64{info.guest_size} * 0xC2B2AE3D27D4EB4FULL) ^
                           (u64(info.pixel_format) << 7) ^ (u64{info.size.width} << 23) ^
                           (u64{info.size.height} << 41) ^ u64{exact_fmt} ^ (u64{writer} << 1);
-    return find_memos[(memo_hash ^ (memo_hash >> 31)) % NumFindMemos];
+    // sotc: with SOTC_TEX_BIND_FAST the table is four times larger, so fewer distinct T#s evict
+    // each other's perfect matches (an evicted one takes the ForEachImageInRegion search again).
+    const size_t slots = TexBindFast() ? NumFindMemos : NumFindMemosDefault;
+    return (*find_memos)[(memo_hash ^ (memo_hash >> 31)) % slots];
 }
 
 // sotc: a memo is validated against the generation of its guest_address only: perfect matches
@@ -2752,6 +2975,9 @@ ImageId TextureCache::MemoLookup(const ImageInfo& info, bool exact_fmt, bool wri
         return !v || v[0] != '0';
     }();
     const FindMemo& memo = MemoSlot(info, exact_fmt, writer);
+    if (SotcStats::kFpsLog) { // sotc: SOTC FIND MEMO line (ReportTexProtect)
+        memo_lookups.fetch_add(1, std::memory_order_relaxed);
+    }
     if (!memo_enabled || memo.generation != MemoGeneration(info.guest_address) ||
         memo.guest_address != info.guest_address || memo.guest_size != info.guest_size ||
         !(memo.size == info.size) || memo.pixel_format != info.pixel_format ||
@@ -2771,6 +2997,9 @@ ImageId TextureCache::MemoLookup(const ImageInfo& info, bool exact_fmt, bool wri
         (image.info.sotc_first_mip &&
          memo.gpu_epoch != gpu_modified_epoch.load(std::memory_order_relaxed))) {
         return {};
+    }
+    if (SotcStats::kFpsLog) {
+        memo_hits.fetch_add(1, std::memory_order_relaxed);
     }
     return memo.image_id;
 }
@@ -2918,6 +3147,9 @@ void TextureCache::RunGarbageCollector() {
         ++gc_tick;
         SotcStats::gc_ticks.fetch_add(1, std::memory_order_relaxed);
     };
+    if (kTexProtectStats) { // sotc: SOTC_TEX_PROTECT_BATCH / SOTC_FPS, the TEX PROTECT line
+        ReportTexProtect(gc_tick);
+    }
 
     if (const u32 pending = pending_emergency.exchange(0, std::memory_order_relaxed)) {
         EmergencyCollect(pending - 1);

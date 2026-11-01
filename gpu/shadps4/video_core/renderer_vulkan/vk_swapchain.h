@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include "common/types.h"
@@ -34,6 +35,11 @@ public:
     /// Presents the current image and move to the next one. `present_id` (VK_KHR_present_id, used
     /// with SOTC_PRESENT_WAIT only) tags the present; 0 leaves it untagged.
     bool Present(u64 present_id = 0);
+
+    /// sotc: SOTC_FPS (or SOTC_PRESENT_UNLOCKED=2): time inside vkQueuePresentKHR alone, summed
+    /// over the presents since the last ReportFlipWait (vk_presenter.cpp), and the longest one.
+    static inline std::atomic<uint64_t> present_khr_ns{0}, present_khr_count{0};
+    static inline std::atomic<uint64_t> present_khr_max_ns{0};
 
     vk::SurfaceKHR GetSurface() const {
         return surface;

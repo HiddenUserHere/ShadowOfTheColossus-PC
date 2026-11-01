@@ -87,6 +87,16 @@ struct DrawIndirectParams {
 
 class PipelineCache {
 public:
+    /// sotc: SOTC_RAM_REPORT: counts of the programs and pipelines kept in host memory, and the size
+    /// of the last driver pipeline cache blob. The SPIR-V of a program is not kept (only the module
+    /// handles, which the driver holds).
+    void SotcCounts(u64& programs, u64& graphics, u64& compute, u64& driver_blob) const noexcept {
+        programs = program_cache.size();
+        graphics = graphics_pipelines.size();
+        compute = compute_pipelines.size();
+        driver_blob = saved_driver_cache_size;
+    }
+
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();

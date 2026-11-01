@@ -59,6 +59,7 @@ std::atomic<u64> flip_fence_ns{0}, flip_frames{0};   ///< GetRenderFrame: presen
 std::atomic<u64> ring_waits{0};                      ///< the same free-frame waits, for ReportPresent
 std::atomic<u64> present_lock_ns{0}, present_lock_count{0}; ///< present thread: submit_mutex wait
 std::atomic<u64> present_under_lock_ns{0};           ///< present thread: time under submit_mutex
+std::atomic<u64> depth_wait_ns{0}, depth_wait_count{0}, depth_wait_timeouts{0}; ///< WaitPresentDepth
 std::atomic<u32> present_ring{0};                    ///< C6: presentation frames in the ring
 } // namespace
 
@@ -545,6 +546,25 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       texture_cache{rasterizer->GetTextureCache()} {
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
+
+    // sotc: SOTC_PRESENT_UNLOCKED=1 takes effect with a present queue of its own (vk_instance.cpp)
+    // and without DLSS-G: Streamline submits on the game's queue while it works on a frame.
+    if (PresentUnlockedMode() == 1) {
+        const VkQueue graphics_queue = static_cast<VkQueue>(instance.GetGraphicsQueue());
+        const VkQueue present_queue = static_cast<VkQueue>(instance.GetPresentQueue());
+        present_unlocked = present_queue != graphics_queue && !Dlssg::Enabled();
+        if (present_unlocked) {
+            LOG_INFO(Render_Vulkan, "SOTC_PRESENT_UNLOCKED=1: presents do not hold submit_mutex");
+        } else {
+            LOG_WARNING(Render_Vulkan, "SOTC_PRESENT_UNLOCKED=1 not used: {}",
+                        Dlssg::Enabled() ? "DLSS Frame Generation is on"
+                                         : "the present queue is the graphics queue");
+        }
+    }
+
+    // sotc: PresentPath::SharedDepthWait: one queue, so the presents keep submit_mutex, and the
+    // presenter waits for the older presents before it takes the lock (WaitPresentDepth).
+    present_depth_wait = !present_unlocked && instance.IsPresentDepthWaitEnabled();
 
     // Create presentation frames.
     // sotc: with DLSS Frame Generation Streamline keeps 2 swapchain images, FSR 3 holds a frame
@@ -1236,7 +1256,34 @@ u64 Presenter::PresentDoneNs(u64 id) const {
     return record.id == id ? record.done_ns : 0;
 }
 
+// sotc: PresentPath::SharedDepthWait (vk_instance.cpp). The present keeps submit_mutex, but the
+// wait for the older presents runs before the lock is taken. After the wait, at most
+// image_count - 1 presents are queued and not yet on screen, which is the depth a swapchain's
+// presents can have without presentKHR blocking on a full queue. vkWaitForPresentKHR is not a
+// queue operation, so no queue or submit_mutex is held while waiting. A timeout is counted and
+// the present goes on: a slow display must not stop the flips.
+void Presenter::WaitPresentDepth() {
+    constexpr u64 kTimeoutNs = 100'000'000; // 100 ms
+    const u64 last = last_present_id.load(std::memory_order_acquire);
+    const u64 depth = std::max<u32>(1u, swapchain.GetImageCount() - 1u);
+    if (last <= depth) {
+        return;
+    }
+    const u64 target = last - depth;
+    const u64 start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+    if (!WaitPresented(target, kTimeoutNs)) {
+        depth_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (SotcStats::kFpsLog) {
+        depth_wait_ns.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
+        depth_wait_count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    // sotc: SOTC_FPS: the submits of this present (and of the frame generation before it) are
+    // counted under the present role (Scheduler::submit_lock_role_ns).
+    const Scheduler::SubmitRoleScope present_role{Scheduler::SubmitRole::Present};
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -1559,10 +1606,22 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         Dlssg::BeforePresent(frame->id,
                              FitImage(frame->width, frame->height, extent.width, extent.height),
                              extent);
+        // sotc: SOTC_PRESENT_UNLOCKED=1 on one queue: wait for the older presents before the lock.
+        if (present_depth_wait) {
+            WaitPresentDepth();
+        }
         // sotc: SOTC_FPS (B5, C6): how long this thread waited for submit_mutex, and the time under
         // it until the present returns. Clock reads only; the lock is taken as before.
+        // sotc: SOTC_PRESENT_UNLOCKED=1 (present_unlocked): the present holds present_queue_mutex
+        // only, and submit_mutex is free for the submits. Otherwise submit_mutex covers it as before.
         const u64 lock_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
+        std::unique_lock queue_lock{present_queue_mutex, std::defer_lock};
+        if (present_unlocked) {
+            queue_lock.lock();
+        } else {
+            submit_lock.lock();
+        }
         const u64 lock_taken = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
         if (SotcStats::kFpsLog) {
             present_lock_ns.fetch_add(lock_taken - lock_start, std::memory_order_relaxed);
@@ -1576,6 +1635,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             present_under_lock_ns.fetch_add(SotcStats::NowNs() - lock_taken,
                                             std::memory_order_relaxed);
         }
+        if (present_unlocked) {
+            queue_lock.unlock();
+        }
         low_latency.AfterPresent(frame->present_done);
         Dlssg::AfterPresent(frame->id);
         if (FrameGen::Current() == FrameGen::Mode::Fsr) {
@@ -1583,6 +1645,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
         if (!presented) {
             Dlssg::Suspend();
+            // sotc: the recreate waits for the device: under submit_mutex in both modes.
+            if (present_unlocked) {
+                submit_lock.lock();
+            }
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
@@ -1863,9 +1929,28 @@ bool Presenter::PresentGenerated(Frame* frame) {
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     submit();
-    std::scoped_lock submit_lock{Scheduler::submit_mutex};
-    if (!swapchain.Present()) {
+    // sotc: SOTC_PRESENT_UNLOCKED: the same locking as Present (present_queue_mutex alone when
+    // present_unlocked). The depth wait (PresentPath::SharedDepthWait) comes first, without a lock.
+    if (present_depth_wait) {
+        WaitPresentDepth();
+    }
+    const Scheduler::SubmitRoleScope present_role{Scheduler::SubmitRole::Present};
+    std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
+    std::unique_lock queue_lock{present_queue_mutex, std::defer_lock};
+    if (present_unlocked) {
+        queue_lock.lock();
+    } else {
+        submit_lock.lock();
+    }
+    const bool presented = swapchain.Present();
+    if (present_unlocked) {
+        queue_lock.unlock();
+    }
+    if (!presented) {
         Dlssg::Suspend();
+        if (present_unlocked) {
+            submit_lock.lock(); // sotc: the recreate waits for the device, as under the lock
+        }
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
     FsrFg::NotePresent();
@@ -1986,18 +2071,42 @@ void ReportFlipWait(std::string& out, double seconds) {
     const u64 draw_n = Scheduler::submit_lock_draw_count.exchange(0, std::memory_order_relaxed);
     const u64 other_ns = Scheduler::submit_lock_other_ns.exchange(0, std::memory_order_relaxed);
     const u64 other_n = Scheduler::submit_lock_other_count.exchange(0, std::memory_order_relaxed);
+    // sotc: submit_mutex waits by role (present, recorder, draw, other: LockSubmit), and the
+    // time inside vkQueuePresentKHR alone (Swapchain::Present). Both reset here.
+    constexpr size_t kRoles = static_cast<size_t>(Scheduler::SubmitRole::Count);
+    u64 role_ns[kRoles], role_n[kRoles];
+    for (size_t i = 0; i < kRoles; ++i) {
+        role_ns[i] = Scheduler::submit_lock_role_ns[i].exchange(0, std::memory_order_relaxed);
+        role_n[i] = Scheduler::submit_lock_role_count[i].exchange(0, std::memory_order_relaxed);
+    }
+    const u64 khr_ns = Swapchain::present_khr_ns.exchange(0, std::memory_order_relaxed);
+    const u64 khr_n = Swapchain::present_khr_count.exchange(0, std::memory_order_relaxed);
+    const u64 khr_max_ns = Swapchain::present_khr_max_ns.exchange(0, std::memory_order_relaxed);
     // Per frame: the GetRenderFrame calls of the window (one per flip).
     const auto per_frame = [frames](u64 ns) { return frames ? ns / 1e6 / frames : 0.0; };
-    char line[512];
+    const auto ms = [](u64 ns) { return ns / 1e6; };
+    char line[1024];
     std::snprintf(
         line, sizeof(line),
         "SOTC FLIP WAIT per frame (%llu frames in %.1f s): no free frame %.2f ms (%llu waits), "
         "present_done fence %.2f ms, submit_mutex on the draw thread %.2f ms (%llu submits), "
-        "other threads %.2f ms (%llu)\n",
+        "other threads %.2f ms (%llu); submit_mutex wait by role per frame: present %.2f ms "
+        "(%llu), recorder %.2f ms (%llu), draw %.2f ms (%llu), other %.2f ms (%llu); presentKHR "
+        "%.2f ms per present, max %.2f ms (%llu presents)\n",
         static_cast<unsigned long long>(frames), seconds, per_frame(free_ns),
         static_cast<unsigned long long>(free_n), per_frame(fence_ns), per_frame(draw_ns),
         static_cast<unsigned long long>(draw_n), per_frame(other_ns),
-        static_cast<unsigned long long>(other_n));
+        static_cast<unsigned long long>(other_n),
+        per_frame(role_ns[static_cast<size_t>(Scheduler::SubmitRole::Present)]),
+        static_cast<unsigned long long>(role_n[static_cast<size_t>(Scheduler::SubmitRole::Present)]),
+        per_frame(role_ns[static_cast<size_t>(Scheduler::SubmitRole::Recorder)]),
+        static_cast<unsigned long long>(role_n[static_cast<size_t>(Scheduler::SubmitRole::Recorder)]),
+        per_frame(role_ns[static_cast<size_t>(Scheduler::SubmitRole::Draw)]),
+        static_cast<unsigned long long>(role_n[static_cast<size_t>(Scheduler::SubmitRole::Draw)]),
+        per_frame(role_ns[static_cast<size_t>(Scheduler::SubmitRole::Other)]),
+        static_cast<unsigned long long>(role_n[static_cast<size_t>(Scheduler::SubmitRole::Other)]),
+        khr_n ? ms(khr_ns) / static_cast<double>(khr_n) : 0.0, ms(khr_max_ns),
+        static_cast<unsigned long long>(khr_n));
     out += line;
 }
 
@@ -2019,6 +2128,20 @@ void ReportPresent(std::string& out, double seconds) {
         static_cast<unsigned long long>(waits), static_cast<unsigned long long>(presents),
         per_present(lock_ns), per_present(under_ns));
     out += line;
+    // sotc: PresentPath::SharedDepthWait: the wait for the older presents before the lock.
+    const u64 depth_ns = depth_wait_ns.exchange(0, std::memory_order_relaxed);
+    const u64 depth_n = depth_wait_count.exchange(0, std::memory_order_relaxed);
+    const u64 depth_timeouts = depth_wait_timeouts.exchange(0, std::memory_order_relaxed);
+    if (depth_n) {
+        char depth_line[256];
+        std::snprintf(depth_line, sizeof(depth_line),
+                      "SOTC PRESENT DEPTH WAIT (%.1f s): %llu waits, %.2f ms per present, "
+                      "%llu timeouts\n",
+                      seconds, static_cast<unsigned long long>(depth_n),
+                      static_cast<double>(depth_ns) / 1e6 / static_cast<double>(depth_n),
+                      static_cast<unsigned long long>(depth_timeouts));
+        out += depth_line;
+    }
 }
 
 void Presenter::SetExpectedGameSize(s32 width, s32 height) {

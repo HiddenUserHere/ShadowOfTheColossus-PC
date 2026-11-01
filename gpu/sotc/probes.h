@@ -29,6 +29,9 @@ void RegisterLoader();
 void RegisterAlloc();
 void RegisterCvars();
 void RegisterArea();
+// sotc: PC memory model, wave B (docs/re-stutters/PC-MEMORY-REWRITE.md section 5).
+void RegisterMemtype(); // probe_memtype.cpp, switch SOTC_HOOK_MEMTYPE_PROBE
+void RegisterXprMem();  // probe_xprmem.cpp, switch SOTC_HOOK_XPRMEM_PROBE
 
 /// One report line each (or nothing when the probe is off or saw nothing in the window),
 /// appended to out by the driver.cpp 5 s report. seconds = window length. Resets the window.
@@ -37,5 +40,7 @@ void ReportLoader(std::string& out, double seconds);
 void ReportAlloc(std::string& out, double seconds);
 void ReportCvars(std::string& out, double seconds);
 void ReportArea(std::string& out, double seconds);
+void ReportMemtype(std::string& out, double seconds);
+void ReportXprMem(std::string& out, double seconds);
 
 } // namespace SotcProbes

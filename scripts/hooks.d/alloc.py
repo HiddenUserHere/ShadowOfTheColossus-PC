@@ -1,9 +1,14 @@
 """Allocator probes (gpu/sotc/probes.h, probe_alloc.cpp). They only observe.
 
 ALLOC_BLOCK  wrap at mem_allocator_alloc (0x479a0), the block allocator entry of both families.
-             rdi = family object: enabled byte +0x9, name (char *) +0x10, kind (int32) +0x18.
-             rsi = requested size (rounded up to 64 KiB by the callee). rdx and rcx are not read.
-             rax (post) = block node, or 0. Node: guest base +0x60, size +0x58, pool slot byte +0x68.
+             rdi = owner: the family object, enabled byte +0x9, name (char *) +0x10, kind (int32) +0x18.
+             rsi = requested size (rounded up to 64 KiB by the callee).
+             rdx = alignment and rcx = kind. Both are forwarded to the pool (0x19ae0 / 0x19e00 read
+             them). Call sites pass rdx = 0x10000 and rcx = [obj+0x18], except two that pass rcx = 1.
+             See docs/re-stutters/reports2/06-allocator-placement.md section 2.7 (the older
+             "not read" note was wrong) and reports3/06-pool-layer-spec.md.
+             rax (post) = block node, or 0. Node: guest base +0x60, size +0x58, pool slot byte +0x68
+             (0 flexible, 1 Onion, 2 Garlic).
 FREE_BLOCK   entry at pool_free_block (0x1b0e0). rdi = block node (the pointer ALLOC_BLOCK returns).
 BPE_HEAP_CODE  range over the BPE heap allocator code, 0x48a70-0x4a477: 20 functions with NOP
              padding between them, no code change.

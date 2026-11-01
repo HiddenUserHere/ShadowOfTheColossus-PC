@@ -86,7 +86,7 @@ public:
     void OnGpuUnmap(VAddr address, size_t size);
 
     /// Updates watches in the pages touching the specified region.
-    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const;
+    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op, bool deferrable = false) const;
 
     /// Updates watches in the pages touching the inclusive bounds using a mask.
     /// sotc: deferrable (SOTC_PROTECT_BATCH): the host protection change may be collected by
@@ -147,6 +147,29 @@ public:
     static bool MaybeWriteProtected(VAddr addr, u64 size);
     /// sotc: SOTC_WRITE_DECL=2 statistics: the write-protected pages of the span (lock-free).
     static u64 CountWriteProtectedPages(VAddr addr, u64 size);
+
+    /// sotc: SOTC_PC_RING fast declare. Same effect as DeclareCpuWrite(addr, size) (the pages a
+    /// guest write fault would invalidate without a readback are CPU-modified and unprotected, as
+    /// the fault does), but without the draw thread's invalidation work: the pages are marked on
+    /// the calling thread, one tracker update per run. A run that holds an image, or bytes owed to
+    /// guest memory, takes the full path (the same invalidation DeclareCpuWrite does for it). When
+    /// the calling thread is the command processor with the draw thread running, the draw queue is
+    /// drained first (the declare must not overtake queued work; see the comment at the definition).
+    /// Calls with no write-protected page return after a lock-free look. Static, as DeclareCpuWrite.
+    static void DeclareRingWrite(VAddr addr, u64 size);
+
+    /// sotc: SOTC_PC_RING statistics of DeclareRingWrite, since the last call when reset is true.
+    struct RingDeclareStats {
+        u64 calls{};         ///< DeclareRingWrite calls
+        u64 skipped{};       ///< calls that returned after the lock-free look (nothing protected)
+        u64 fast_runs{};     ///< runs marked on the calling thread
+        u64 fallback_runs{}; ///< runs given to the full path (image in the run, owed bytes, or
+                             ///< readbacks disabled for the call)
+        u64 drains{};        ///< draw-queue drains (command processor caller only)
+        u64 pages{};         ///< pages marked by the fast path
+        u64 ns{};            ///< time spent in DeclareRingWrite, all calls
+    };
+    static RingDeclareStats GetRingDeclareStats(bool reset);
 
     /// sotc: SOTC_PROTECT_COALESCE=1 (off by default). Opened by the guest write fault handler:
     /// while it is open on a thread, the tracker updates that thread makes which only REMOVE

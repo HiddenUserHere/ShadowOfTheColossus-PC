@@ -719,6 +719,12 @@ void AutoRouteTick() {
         const int64_t last = SotcEngineCmd::LastGameStartMs();
         if (starts > 0 && now - last >= static_cast<int64_t>(a.delay_s * 1000.0)) {
             a.phase = AutoPhase::StartCam;
+        } else if (starts == 0 && SotcEngineCmd::GameWaitExpired()) {
+            // sotc: SOTC_LAB_ROUTE_WAIT expired (engine_cmd.cpp printed why): end the run.
+            a.phase = AutoPhase::Closed;
+            SDL_Event quit{};
+            quit.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&quit);
         }
         break;
     }

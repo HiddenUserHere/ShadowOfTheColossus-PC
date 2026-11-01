@@ -21,6 +21,16 @@ class MultiLevelPageTable final {
     using L1Page = std::array<Entry, NUM_L1_ENTRIES>;
 
 public:
+    /// sotc: SOTC_RAM_REPORT: host bytes of the second-level pages allocated so far.
+    [[nodiscard]] size_t SotcAllocatedBytes() const noexcept {
+        size_t pages = 0;
+        for (const L1Page* page : top_level) {
+            pages += page != nullptr;
+        }
+        return pages * sizeof(L1Page);
+    }
+
+public:
     explicit MultiLevelPageTable(size_t chunk_size = 64)
         : top_level{1ULL << L1_BITS, nullptr}, top_locks{NULL_CHECK ? (1ULL << L1_BITS) : 0ULL},
           page_alloc{chunk_size} {}

@@ -12,6 +12,8 @@
 #include <cstring>
 #include <utility>
 #include <mutex>
+#include <source_location>
+#include <thread>
 #include <vector>
 
 #include "common/adaptive_mutex.h"
@@ -21,11 +23,29 @@
 #include "video_core/page_manager.h"
 #include "video_core/sotc_stats.h"
 #include "../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK=1 owns the untrack list (plan step 6)
+#include "../../../sotc/pc_ring.h"     // sotc: SotcPcRing::FullRingMode (stall guard in LockTimed)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 // sotc: SOTC_UNTRACK_MAX_MB (default 16 MiB), live (SotcLive): the cap of the untrack list.
 inline SotcLive::Int kUntrackMaxMb{"SOTC_UNTRACK_MAX_MB", 16};
 
 namespace VideoCore {
+
+/// sotc: SOTC_BUF_BIND_FAST=1 (off by default). BufferCache::SynchronizeMemory answers a range it
+/// found clean from its generation stamp, without walking the pages (see there). The stamps are
+/// the ones of SOTC_SYNC_FAST, so they are kept whenever either switch is on.
+namespace SotcBufBindFast {
+inline const bool kOn = [] {
+    const char* v = std::getenv("SOTC_BUF_BIND_FAST");
+    return v && v[0] == '1';
+}();
+/// True when UpdateStateAndProtection and ClearRingCpuBits bump the generation stamps. Its own
+/// environment reads (not SotcStats::kSyncFast) so the initialisation order does not matter.
+inline const bool kGenStamps = [] {
+    const char* f = std::getenv("SOTC_SYNC_FAST");
+    const char* b = std::getenv("SOTC_BUF_BIND_FAST");
+    return (f && f[0] == '1') || (b && b[0] == '1');
+}();
+} // namespace SotcBufBindFast
 
 /// sotc: repeat-fault grace. The GPU command thread clears a page's CPU bit and write-protects it
 /// again right after uploading it (every DMA draw syncs every resident range), so a guest writing
@@ -404,7 +424,28 @@ public:
     }
     explicit RegionManager() = default;
 
+    /// sotc: ring switch (SOTC_PC_RING in the plan). Off unless the integration code sets it, before
+    /// the first region is used. It must not be cleared while any ring bit is set: the protection
+    /// rule below is then no longer the one the watchers were counted with.
+    inline static std::atomic<bool> ring_enabled{false};
+
+    static bool RingOn() noexcept {
+        return ring_enabled.load(std::memory_order_relaxed);
+    }
+
+    /// sotc: SOTC_PC_RING stall guard. Set on the thread that runs the ring take (pc_ring_copy.cpp
+    /// OnSubmitStart); only that thread reports a stall.
+    inline static thread_local bool ring_take_thread = false;
+    /// sotc: the site that last took the region mutex (function name, set after the lock is taken).
+    inline static std::atomic<const char*> lock_taker{"none"};
+    inline static std::atomic<bool> ring_stall_reported{false};
+
     void SetCpuAddress(VAddr new_cpu_addr) {
+        // sotc: ring bits are relative to cpu_addr: a region that moves drops them first, under its
+        // old address (a fresh region has none, so this is a no-op then).
+        if (RingOn()) {
+            SetRingMask(RegionBits{});
+        }
         cpu_addr = new_cpu_addr;
         ComputeUntracked(); // sotc: SOTC_UNTRACK_RANGES
         sweep_words.store(~0ULL, std::memory_order_relaxed);
@@ -465,6 +506,154 @@ public:
                 std::popcount(untracked[index] & ~gpu[index] & ~cpu[index] & mask));
         });
         return bad;
+    }
+
+    /// sotc: SOTC_PC_RING. Replaces the ring mask of the whole region (draw thread, via
+    /// MemoryTracker::ApplyRing). A ring page is one the ring copy uploads at every submit, so its
+    /// guest writes need no fault: while it holds no GPU data it is never write-protected. The rule is
+    ///
+    ///   protected(p) <=> cpu(p) == 0 && !(ring(p) && gpu(p) == 0)
+    ///
+    /// for the write watchers. Read watchers (GPU readbacks, Precise) are separate and unchanged. With
+    /// the ring off, ring = 0 and this is the old rule (protected = cpu == 0).
+    ///
+    /// Invariant proof. Let P(c, g, r) = !c && (!r || g). The write watchers of a page are counted
+    /// with P (cpu = ~0 at the start: P = 0 everywhere, no watcher). Each entry point computes P
+    /// before and after its change and emits Track where P rose, Untrack where it fell. For each
+    /// combination (the changed pages of one call always move in one direction, so one watcher op
+    /// per call is exact; WriteWatcherOp):
+    ///  - <Set, None> (cpu 0 -> 1): P_after = 0. Only falls: Untrack where P_before = 1. A ring page
+    ///    without GPU data has P_before = 0: no call. Used by MarkRegionAsCpuModified, the
+    ///    InvalidateRegion write fault, MarkAhead*, MarkCpuModifiedUnlessGpu, the retrack
+    ///    (RetrackDownloadedLocked) and SetUntrackedMask.
+    ///  - <Clear, None> (cpu 1 -> 0, kept bits excepted): P_before = 0, P_after = !r || g. Only rises:
+    ///    Track where !r || g. A ring page without GPU data stays unprotected; a ring page with GPU
+    ///    data becomes protected again, as any page. Used by ClassifyFreshRange and the uploads.
+    ///  - <Clear, Set> (uploads of written bindings): the cpu-cleared pages get g = 1, so P_after = 1
+    ///    (Track); the kept pages keep cpu = 1, P 0 -> 0; a page whose cpu is 0 can only rise, where
+    ///    r && g was 0 (Track). Nothing falls.
+    ///  - <Set, Clear> (UnmarkRegionAsGpuModified with a write): P_after = 0 on every masked page. Only
+    ///    falls: Untrack.
+    ///  - <None, Set> (GPU bit rises): P changes only on c = 0, r = 1: 0 -> 1, Track.
+    ///  - <None, Clear> (GPU bit falls, after a download): P changes only on c = 0, r = 1: 1 -> 0,
+    ///    Untrack. With the ring off r = 0, P does not depend on g, and the call emits nothing.
+    ///  - SetRingMask (changes r only). A page with c = 1 keeps P = 0. A page with c = 0: entering the
+    ///    ring with g = 0 falls from 1 to 0 (Untrack); leaving it with g = 0 rises from 0 to 1 (Track);
+    ///    with g = 1, P = 1 both ways. Both directions can occur in one call, so the two masks are
+    ///    applied with two watcher calls.
+    ///  - ClearRingCpuBits (cpu 1 -> 0 on ring pages without GPU data): P is 0 before and after: no
+    ///    protection change, so no watcher call. The generation moves (the CPU bit fell).
+    ///
+    /// The bits and the watchers therefore agree after every call. The read watchers are untouched:
+    /// a ring page without GPU data has no GPU bit, so it has no read watcher (Precise readbacks),
+    /// and it is unprotected in the OS as the formula says.
+    void SetRingMask(RegionBits next) {
+        if (!RingOn()) { // sotc: the ring is off: the mask stays zero
+            return;
+        }
+        const Bounds full = GetBounds(0, HIGHER_PAGE_SIZE);
+        RegionBits to_track{};
+        RegionBits to_untrack{};
+        Lock(full);
+        for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
+            const u64 old_ring = ring[index];
+            const u64 new_ring = next[index];
+            if (old_ring == new_ring) {
+                continue;
+            }
+            const u64 c = cpu[index];
+            const u64 g = gpu[index];
+            const u64 before = ~c & (~old_ring | g);
+            const u64 after = ~c & (~new_ring | g);
+            to_track[index] = after & ~before;
+            to_untrack[index] = before & ~after;
+            ring[index] = new_ring;
+        }
+        RegionBits no_read{};
+        Bounds bounds{};
+        if (GetWatcherBounds<StateOp::Set, StateOp::None>(full, to_untrack, no_read, bounds)) {
+            tracker->UpdatePageWatchersForRegion(cpu_addr, bounds, to_untrack, no_read,
+                                                 PageOp::Untrack, PageOp::None);
+        }
+        if (GetWatcherBounds<StateOp::Set, StateOp::None>(full, to_track, no_read, bounds)) {
+            tracker->UpdatePageWatchersForRegion(cpu_addr, bounds, to_track, no_read,
+                                                 PageOp::Track, PageOp::None);
+        }
+        Unlock(full);
+    }
+
+    /// sotc: SOTC_PC_RING, incremental form of SetRingMask. Sets (on) or clears the ring bits of the
+    /// pages of [offset, offset + size) and applies the same transitions for those pages only: the
+    /// protection P of each page is computed before and after its ring bit changes, Track where it
+    /// rose and Untrack where it fell. The proof at SetRingMask is per page (P depends on the page's
+    /// own c, g and r), so it holds unchanged for any subset of pages. Pages outside the range are
+    /// not touched, and no whole-region rebuild happens. Draw thread (locks the region mutex).
+    void SetRingRange(u64 offset, u64 size, bool on) {
+        if (!RingOn() || size == 0) {
+            return;
+        }
+        const Bounds bounds_in = GetBounds(offset, size);
+        RegionBits to_track{};
+        RegionBits to_untrack{};
+        LockTimed();
+        IterateWords(bounds_in, [&](u64 index, u64 mask) {
+            const u64 old_ring = ring[index];
+            const u64 new_ring = on ? (old_ring | mask) : (old_ring & ~mask);
+            if (old_ring == new_ring) {
+                return;
+            }
+            const u64 c = cpu[index];
+            const u64 g = gpu[index];
+            const u64 before = ~c & (~old_ring | g);
+            const u64 after = ~c & (~new_ring | g);
+            to_track[index] = after & ~before;
+            to_untrack[index] = before & ~after;
+            ring[index] = new_ring;
+        });
+        RegionBits no_read{};
+        Bounds bounds{};
+        if (GetWatcherBounds<StateOp::Set, StateOp::None>(bounds_in, to_untrack, no_read, bounds)) {
+            tracker->UpdatePageWatchersForRegion(cpu_addr, bounds, to_untrack, no_read,
+                                                 PageOp::Untrack, PageOp::None);
+        }
+        if (GetWatcherBounds<StateOp::Set, StateOp::None>(bounds_in, to_track, no_read, bounds)) {
+            tracker->UpdatePageWatchersForRegion(cpu_addr, bounds, to_track, no_read,
+                                                 PageOp::Track, PageOp::None);
+        }
+        mutex.unlock();
+    }
+
+    /// sotc: SOTC_PC_RING self-check (region mutex held, from MemoryTracker::InvalidateRegion). Ring
+    /// pages of [offset, offset + size) without GPU data: a guest write fault on one of them means
+    /// the protection rule did not hold (such a page is never protected). Counts all of them in the
+    /// range, as CountUntrackedFaultsLocked does: the caller passes the faulting page.
+    u64 CountRingFaultsLocked(u64 offset, u64 size) noexcept {
+        u64 bad = 0;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            bad += static_cast<u64>(std::popcount(ring[index] & ~gpu[index] & mask));
+        });
+        return bad;
+    }
+
+    /// sotc: SOTC_PC_RING. Clears the CPU bits of the ring pages of [offset, offset + size) that hold
+    /// no GPU data (called after the ring copy put their current bytes in VRAM). Such a page has
+    /// P = 0 before and after (see the proof at SetRingMask), so no protection changes. The
+    /// generation moves, as a cached "clean" answer reads the bits. Other pages are not touched.
+    void ClearRingCpuBits(u64 offset, u64 size) noexcept {
+        if (!RingOn()) {
+            return;
+        }
+        LockTimed();
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            const u64 clean = cpu[index] & ring[index] & ~gpu[index] & mask;
+            if (clean) {
+                cpu[index] &= ~clean;
+                if (SotcBufBindFast::kGenStamps) {
+                    sync_gen[index / SYNC_GEN_WORDS].fetch_add(1, std::memory_order_release);
+                }
+            }
+        });
+        mutex.unlock();
     }
 
     /// sotc: a guest write fault on the page at offset (region mutex held, from
@@ -558,9 +747,12 @@ public:
         }
         [[maybe_unused]] u64 raised = 0;
         IterateWords(bounds, [&](u64 index, u64 mask) {
-            UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
+            [[maybe_unused]] const u64 rose =
+                UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
             if constexpr (cpu_op == StateOp::Set) {
-                if (write_prot[index]) { // CPU bits that went 0 -> 1
+                // sotc: CPU bits that went 0 -> 1 (write_prot is the protection change, which is
+                // not the same with the ring on: a ring page without GPU data is never protected).
+                if (rose) {
                     raised |= 1ULL << index;
                 }
             }
@@ -570,7 +762,7 @@ public:
                 sweep_words.fetch_or(raised, std::memory_order_release);
             }
         }
-        const auto write_op = GetPageOp<Type::CPU>(cpu_op);
+        const auto write_op = WriteWatcherOp<cpu_op, gpu_op>(); // sotc: SOTC_PC_RING
         const auto read_op = GetPageOp<Type::GPU>(gpu_op);
         const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
         if (update_watchers &&
@@ -696,7 +888,7 @@ public:
                 sweep_words.fetch_or(kept_words, std::memory_order_release);
             }
         }
-        const auto write_op = GetPageOp<Type::CPU>(cpu_op);
+        const auto write_op = WriteWatcherOp<cpu_op, gpu_op>(); // sotc: SOTC_PC_RING
         const auto read_op = GetPageOp<Type::GPU>(gpu_op);
         const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
         if (update_watchers &&
@@ -823,6 +1015,19 @@ public:
     static constexpr u64 SYNC_GEN_WORDS = 8;
     static constexpr u64 NUM_SYNC_GENS = NUM_REGION_WORDS / SYNC_GEN_WORDS;
 
+    /// sotc: SOTC_HLE_TABLE_GEN. Bumps the generation of every granule the span touches, for a
+    /// write that set no CPU bit (the bytes changed without a fault or a bit rise).
+    void BumpSyncGen(u64 offset, u64 size) noexcept {
+        if (!SotcBufBindFast::kGenStamps) {
+            return;
+        }
+        const auto bounds = GetBounds(offset, size);
+        for (u64 g = bounds.start_word / SYNC_GEN_WORDS; g <= bounds.end_word / SYNC_GEN_WORDS;
+             ++g) {
+            sync_gen[g].fetch_add(1, std::memory_order_release);
+        }
+    }
+
     /// sotc: SOTC_SYNC_FAST. Sum of the write generations of the granules over [offset,
     /// offset + size) (size > 0). Every generation only grows, so an unchanged sum means no
     /// granule moved. Acquire loads: see UpdateStateAndProtection for the ordering.
@@ -857,7 +1062,30 @@ public:
 
     /// sotc: locks the region mutex; with SOTC_FPS, a guest fault being handled on this thread
     /// (SotcStats::FaultStat) counts the wait.
-    void LockTimed() noexcept {
+    void LockTimed(std::source_location site = std::source_location::current()) noexcept {
+        // sotc: SOTC_PC_RING modes 6 and 7 only (other modes keep the plain lock below). The wait is
+        // polled, so a take that waits past 2 s on the ring take thread is reported once, with the
+        // site that last took the mutex. Those waits are the stall this guard is for.
+        if (SotcPcRing::FullRingMode() >= 6) {
+            if (!mutex.try_lock()) {
+                const auto start = std::chrono::steady_clock::now();
+                for (unsigned spins = 0; !mutex.try_lock(); ++spins) {
+                    if (spins < 1000) {
+                        std::this_thread::yield();
+                    } else {
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    }
+                    if (ring_take_thread && !ring_stall_reported.load(std::memory_order_relaxed) &&
+                        std::chrono::steady_clock::now() - start > std::chrono::seconds(2) &&
+                        !ring_stall_reported.exchange(true, std::memory_order_relaxed)) {
+                        std::fprintf(stderr, "SOTC PC RING stall: draw waits region lock held by %s\n",
+                                     lock_taker.load(std::memory_order_relaxed));
+                    }
+                }
+            }
+            lock_taker.store(site.function_name(), std::memory_order_relaxed);
+            return;
+        }
         if (SotcStats::kFpsLog && SotcStats::FaultStat::tl.active) {
             const SotcStats::FaultStat::Scope timed{&SotcStats::FaultStat::Tl::mutex_ns};
             mutex.lock();
@@ -1076,26 +1304,41 @@ private:
         grace_epoch = now;
     }
 
+    /// sotc: SOTC_PC_RING. Changes the bits of one word and their protection, and returns the CPU
+    /// bits that changed in mask (the CPU-bit change, not the protection change: the sweep and the
+    /// SOTC_SYNC_FAST generation follow it). write_prot[index] gets the protection change: with the
+    /// ring off it is the CPU-bit change (as before); with the ring on it is the change of
+    /// the protection rule of SetRingMask. read_prot[index] is the GPU-bit change.
+    /// Callers pick the watcher op with WriteWatcherOp and GetPageOp.
     template <StateOp cpu_op, StateOp gpu_op>
-    void UpdateStateAndProtection(RegionBits& write_prot, RegionBits& read_prot, u64 index,
-                                  u64 mask, u64 keep = 0) {
-        if constexpr (cpu_op != StateOp::None) {
-            const u64 prev = cpu[index];
-            if constexpr (cpu_op == StateOp::Clear) {
-                cpu[index] &= ~(mask & ~keep); // kept bits: no change, so no write Track
-            } else {
-                cpu[index] |= mask;
+    u64 UpdateStateAndProtection(RegionBits& write_prot, RegionBits& read_prot, u64 index,
+                                 u64 mask, u64 keep = 0) {
+        const u64 prev_cpu = cpu[index];
+        const u64 prev_gpu = gpu[index];
+        if constexpr (cpu_op == StateOp::Clear) {
+            cpu[index] &= ~(mask & ~keep); // kept bits: no change, so no write Track
+        } else if constexpr (cpu_op == StateOp::Set) {
+            cpu[index] |= mask;
+        }
+        if constexpr (gpu_op == StateOp::Clear) {
+            gpu[index] &= ~mask;
+        } else if constexpr (gpu_op == StateOp::Set) {
+            gpu[index] |= mask;
+        }
+        const u64 cpu_changed = (cpu[index] ^ prev_cpu) & mask;
+        if (!RingOn()) {
+            if constexpr (cpu_op != StateOp::None) {
+                write_prot[index] = cpu_changed;
             }
-            write_prot[index] = (cpu[index] ^ prev) & mask;
+        } else {
+            // sotc: SOTC_PC_RING. Write-protected <=> cpu == 0 && !(ring && gpu == 0).
+            const u64 ring_bits = ring[index];
+            const u64 before = ~prev_cpu & (~ring_bits | prev_gpu);
+            const u64 after = ~cpu[index] & (~ring_bits | gpu[index]);
+            write_prot[index] = (before ^ after) & mask;
         }
         if constexpr (gpu_op != StateOp::None) {
-            const u64 prev = gpu[index];
-            if constexpr (gpu_op == StateOp::Clear) {
-                gpu[index] &= ~mask;
-            } else {
-                gpu[index] |= mask;
-            }
-            read_prot[index] = (gpu[index] ^ prev) & mask;
+            read_prot[index] = (gpu[index] ^ prev_gpu) & mask;
         }
         // sotc: SOTC_SYNC_FAST. A CPU bit that rose or a GPU bit that fell is a change a cached
         // "range clean" answer must see (BufferCache::SynchronizeMemory): bump the granule's
@@ -1106,20 +1349,23 @@ private:
         // to the page always happens after it. Every bit transition goes through here: the region
         // mutex is held by every caller (ChangeRegionState, ForEachModifiedRange, or the
         // locked = false callers that took Lock()).
+        // sotc: SOTC_PC_RING. The generation follows the CPU-bit change (and the GPU-bit change of a
+        // clear), never the protection change: a cached "clean" answer reads the bits.
         if constexpr (cpu_op == StateOp::Set || gpu_op == StateOp::Clear) {
-            if (SotcStats::kSyncFast) {
+            if (SotcBufBindFast::kGenStamps) { // SOTC_SYNC_FAST or SOTC_BUF_BIND_FAST
                 u64 changed = 0;
                 if constexpr (cpu_op == StateOp::Set) {
-                    changed |= write_prot[index];
+                    changed |= cpu_changed;
                 }
                 if constexpr (gpu_op == StateOp::Clear) {
-                    changed |= read_prot[index];
+                    changed |= (gpu[index] ^ prev_gpu) & mask;
                 }
                 if (changed) {
                     sync_gen[index / SYNC_GEN_WORDS].fetch_add(1, std::memory_order_release);
                 }
             }
         }
+        return cpu_changed;
     }
 
     template <StateOp cpu_op, StateOp gpu_op>
@@ -1128,6 +1374,8 @@ private:
         const auto prot = [&](u64 index) {
             u64 word{};
             if constexpr (cpu_op != StateOp::None) {
+                word |= write_prot[index];
+            } else if (RingOn()) { // sotc: SOTC_PC_RING, a GPU-only op can move protection too
                 word |= write_prot[index];
             }
             if constexpr (gpu_op != StateOp::None) {
@@ -1155,6 +1403,26 @@ private:
             .end_page = PAGES_PER_WORD - std::countl_zero(end_prot) - 1,
         };
         return true;
+    }
+
+    /// sotc: SOTC_PC_RING. The op of the write watchers for one state op. A CPU op decides it as
+    /// before (GetPageOp). A GPU-only op moves protection only with the ring on (the GPU bit of a
+    /// ring page toggles its protection): GPU Set is Track, GPU Clear is Untrack. A combined op never
+    /// has opposite directions (<Set, Clear> and <Clear, Set> agree, <Set, Set> and <Clear, Clear>
+    /// are not used), so one op per call is exact. See the proof at SetRingMask.
+    template <StateOp cpu_op, StateOp gpu_op>
+    PageOp WriteWatcherOp() {
+        static_assert(!(cpu_op == StateOp::Set && gpu_op == StateOp::Set));
+        static_assert(!(cpu_op == StateOp::Clear && gpu_op == StateOp::Clear));
+        if constexpr (cpu_op != StateOp::None) {
+            return GetPageOp<Type::CPU>(cpu_op);
+        } else if constexpr (gpu_op == StateOp::Set) {
+            return RingOn() ? PageOp::Track : PageOp::None;
+        } else if constexpr (gpu_op == StateOp::Clear) {
+            return RingOn() ? PageOp::Untrack : PageOp::None;
+        } else {
+            return PageOp::None;
+        }
     }
 
     template <Type type>
@@ -1207,6 +1475,7 @@ private:
     u32 sticky_epoch{};
     bool sticky_any{false};
     RegionBits untracked{}; // sotc: SOTC_UNTRACK_RANGES (ComputeUntracked), zero when unset
+    RegionBits ring{};      // sotc: SOTC_PC_RING mask (SetRingMask), zero while the ring is off
     LockType mutex;
 };
 

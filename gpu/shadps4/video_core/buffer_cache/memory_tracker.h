@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic> // sotc: SOTC_STATIC_CLASS (Current)
 #include <deque>
 #include <vector>
 
@@ -22,8 +23,106 @@ public:
 
 public:
     explicit MemoryTracker(PageManager& tracker_)
-        : tracker{&tracker_}, readbacks_mode{EmulatorSettings.GetReadbacksMode()} {}
-    ~MemoryTracker() = default;
+        : tracker{&tracker_}, readbacks_mode{EmulatorSettings.GetReadbacksMode()} {
+        current_instance.store(this, std::memory_order_release); // sotc: SOTC_STATIC_CLASS
+    }
+
+    /// sotc: SOTC_RAM_REPORT: host bytes of the region manager pool (RegionManager objects, 32 per
+    /// pool block), the top-tier table and the manager lists. The containers inside a manager
+    /// are not counted.
+    [[nodiscard]] u64 SotcHostBytes() const noexcept {
+        return manager_pool.size() * MANAGER_POOL_SIZE * sizeof(RegionManager) +
+               sizeof(top_tier) + (live_managers.capacity() + free_managers.capacity()) *
+                                      sizeof(RegionManager*);
+    }
+    ~MemoryTracker() {
+        MemoryTracker* self = this; // sotc: SOTC_STATIC_CLASS
+        current_instance.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
+    }
+
+    /// sotc: SOTC_STATIC_CLASS. The live tracker (the buffer cache's), or null. Read by the
+    /// static-class hooks on guest threads; the tracker itself is only used through the methods
+    /// below and the locked region API.
+    static MemoryTracker* Current() noexcept {
+        return current_instance.load(std::memory_order_acquire);
+    }
+
+    /// sotc: SOTC_STATIC_CLASS. Counts of ClassifyFreshRange over one range or a window.
+    struct FreshRangeStats {
+        u64 pages{};           ///< whole pages inside the range
+        u64 pages_tracked{};   ///< of those, pages whose tracking region exists
+        u64 pages_gpu{};       ///< tracked pages with a GPU bit: left as they are
+        u64 pages_clean{};     ///< tracked pages made CPU-clean and protected (counted, not applied,
+                               ///< when apply is false)
+        u64 spans_missing{};   ///< 16 MiB spans of the range without a tracking region
+    };
+
+    /// sotc: SOTC_STATIC_CLASS. For a freshly allocated range [cpu_addr, cpu_addr + size) that the
+    /// game is about to fill: each whole page of it whose tracking region already exists and that
+    /// has no GPU bit is made CPU-clean and write-protected (ChangeRegionState<Clear, None>), so
+    /// the fill faults page by page and only the pages it writes become CPU-modified. Regions are
+    /// never created here (CreateRegion is draw-thread only); a span without one is only counted.
+    /// Partial pages at the two ends are left alone: they may hold a live neighbour. apply = false
+    /// changes no state (statistics only). Correct because the bytes of a fresh allocation are
+    /// garbage until the game writes them, and every later write to a protected page faults and
+    /// marks it CPU-modified. The caller must run before the fill (the copy of the allocation).
+    FreshRangeStats ClassifyFreshRange(VAddr cpu_addr, u64 size, bool apply) {
+        FreshRangeStats st{};
+        const VAddr limit = VAddr{1} << MAX_CPU_PAGE_BITS;
+        const VAddr first = (cpu_addr + BYTES_PER_PAGE - 1) & ~(BYTES_PER_PAGE - 1);
+        const VAddr end = std::min((cpu_addr + size) & ~(BYTES_PER_PAGE - 1), limit);
+        if (size == 0 || first >= end) {
+            return st;
+        }
+        VAddr addr = first;
+        while (addr < end) {
+            const u64 page_index = addr >> HIGHER_PAGE_BITS;
+            const VAddr span_end = std::min(end, (page_index + 1) << HIGHER_PAGE_BITS);
+            const u64 offset = addr & HIGHER_PAGE_MASK;
+            const u64 len = span_end - addr;
+            const u64 pages_here = len / BYTES_PER_PAGE;
+            st.pages += pages_here;
+            // sotc: SOTC_WRITE_DECL: lock-free reader, acquire (see CreateRegion).
+            RegionManager* region = __atomic_load_n(&top_tier[page_index], __ATOMIC_ACQUIRE);
+            if (!region) {
+                st.spans_missing++;
+            } else {
+                st.pages_tracked += pages_here;
+                const auto bounds = RegionManager::GetBounds(offset, len);
+                region->Lock(bounds);
+                u64 run_begin = 0;
+                u64 run_len = 0;
+                const auto flush = [&] {
+                    if (run_len != 0) {
+                        if (apply) {
+                            region->ChangeRegionState<StateOp::Clear, StateOp::None, false>(
+                                run_begin, run_len);
+                        }
+                        st.pages_clean += run_len / BYTES_PER_PAGE;
+                        run_len = 0;
+                    }
+                };
+                for (u64 off = offset; off < offset + len; off += BYTES_PER_PAGE) {
+                    if (region->IsRegionModified<Type::GPU>(off, BYTES_PER_PAGE)) {
+                        flush();
+                        st.pages_gpu++;
+                    } else {
+                        if (run_len == 0) {
+                            run_begin = off;
+                        }
+                        run_len += BYTES_PER_PAGE;
+                    }
+                }
+                flush();
+                region->Unlock(bounds);
+            }
+            addr = span_end;
+        }
+        if (apply && st.pages_clean != 0) {
+            SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds
+        }
+        return st;
+    }
 
     /// Returns true if a region has been modified from the GPU
     bool IsRegionGpuModified(VAddr cpu_addr, u64 size) noexcept {
@@ -377,6 +476,14 @@ public:
         return clean;
     }
 
+    /// sotc: SOTC_HLE_TABLE_GEN. Bumps the write generations of [cpu_addr, cpu_addr + size)
+    /// without touching any bit (a write that set no CPU bit). Called after the write.
+    void BumpSyncGeneration(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 len) {
+            manager->BumpSyncGen(offset, len);
+        });
+    }
+
     /// sotc: SOTC_SYNC_FAST. Sets gen to the sum of the write generations over [cpu_addr,
     /// cpu_addr + size) (RegionManager::SyncGenerationSum). False when the range is empty or a
     /// tracking region over it does not exist yet: ForEachUploadRange creates it with every page
@@ -523,6 +630,94 @@ public:
         }
     }
 
+    /// sotc: SOTC_PC_RING. Gives every live region its ring mask for `ranges`, built as the untracked
+    /// mask is (BuildUntrackedMask). GPU command (draw) thread only, as ApplyUntracked. A no-op while
+    /// the ring is off (RegionManager::ring_enabled: SetRingMask returns), and with readbacks
+    /// disabled no page is ringed.
+    void ApplyRing(const std::vector<SotcUntrack::Range>& ranges) {
+        const bool enabled = readbacks_mode != GpuReadbacksMode::Disabled;
+        for (size_t i = 0; i < live_managers.size(); ++i) {
+            RegionManager* manager = live_managers[i];
+            manager->SetRingMask(
+                enabled ? RegionManager::BuildUntrackedMask(manager->CpuAddress(), ranges)
+                        : RegionBits{});
+        }
+    }
+
+    /// sotc: SOTC_PC_RING. Call after the ring copy has put the current bytes of [cpu_addr, cpu_addr
+    /// + size) into VRAM. The CPU bits of its ring pages without GPU data are cleared: they are
+    /// clean and stay unprotected (no protection change, see RegionManager::SetRingMask). Other pages
+    /// are not touched. Draw thread only.
+    void MarkRingClean(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->ClearRingCpuBits(offset, size);
+        });
+    }
+
+    /// sotc: SOTC_PC_RING, incremental (mode 5). Sets the ring bits of the pages of [cpu_addr,
+    /// cpu_addr + size) and applies their protection change only (RegionManager::SetRingRange). A
+    /// page with no region is left alone. Draw thread only.
+    void AddRingRange(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->SetRingRange(offset, size, true);
+        });
+    }
+
+    /// sotc: SOTC_PC_RING, incremental (mode 5). Clears the ring bits of the pages of [cpu_addr,
+    /// cpu_addr + size) and applies their protection change only: a clean page leaving the ring is
+    /// protected again. Draw thread only.
+    void RemoveRingRange(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->SetRingRange(offset, size, false);
+        });
+    }
+
+    /// sotc: SOTC_PC_RING fast declare (PageManager::DeclareRingWrite). Marks CPU-modified and
+    /// unprotects the pages of [cpu_addr, cpu_addr + size) that are CPU-clean and hold no GPU data,
+    /// as InvalidateRegion does for a guest write fault on them (no readback is needed, since no
+    /// GPU bit is set). Each region's lock is held while its pages are checked and changed, so
+    /// the GPU bits are read under the same lock the GPU side writes them with; the bits are
+    /// checked per page, and each maximal run of pages that qualify is one ChangeRegionState (one
+    /// tracker update). A page that gained GPU data before its region was locked is left as it
+    /// is: its write fault does the readback. The guest-fault extras of InvalidateRegion (repeat
+    /// fault grace, untrack self-check) are not run: they feed statistics and heuristics only.
+    /// Returns false, changing nothing, when readbacks are disabled (InvalidateRegion then marks
+    /// every page without a GPU check, which the caller must do itself). Any thread.
+    bool DeclareCleanCpuWrite(VAddr cpu_addr, u64 size) noexcept {
+        if (readbacks_mode == GpuReadbacksMode::Disabled) {
+            return false;
+        }
+        SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            const auto bounds = manager->GetBounds(offset, size);
+            manager->Lock(bounds);
+            const u64 end = offset + size;
+            u64 run_begin = 0;
+            u64 run_len = 0;
+            for (u64 off = offset; off < end; off += BYTES_PER_PAGE) {
+                const bool qualifies =
+                    !manager->template IsRegionModified<Type::CPU>(off, BYTES_PER_PAGE) &&
+                    !manager->template IsRegionModified<Type::GPU>(off, BYTES_PER_PAGE);
+                if (qualifies) {
+                    if (run_len == 0) {
+                        run_begin = off;
+                    }
+                    run_len += BYTES_PER_PAGE;
+                } else if (run_len != 0) {
+                    manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(
+                        run_begin, run_len);
+                    run_len = 0;
+                }
+            }
+            if (run_len != 0) {
+                manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(run_begin,
+                                                                                       run_len);
+            }
+            manager->Unlock(bounds);
+        });
+        return true;
+    }
+
     /// sotc: SOTC_CLASS_TRACK=2 shadow. Total GPU-marked pages that fall in `ranges` across every
     /// live region, without changing state. Used to validate the allocator classification.
     u64 CountClassGpuPages(const std::vector<SotcUntrack::Range>& ranges) {
@@ -536,6 +731,9 @@ public:
 
 private:
     std::vector<RegionManager*> live_managers;
+
+    // sotc: SOTC_STATIC_CLASS. The live instance (set by the constructor, cleared by the destructor).
+    inline static std::atomic<MemoryTracker*> current_instance{nullptr};
 
     PageManager* tracker;
     const u32 readbacks_mode;

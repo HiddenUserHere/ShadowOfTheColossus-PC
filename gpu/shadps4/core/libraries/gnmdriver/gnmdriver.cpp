@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "../../../../sotc/pc_ring.h" // sotc: SOTC_PC_RING submit epoch
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -406,6 +407,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
 
     std::scoped_lock lk{m_submit_lock};
     GateWait(1); // sotc: SOTC_CP_AHEAD (WaitGpuIdle unless =2), SOTC_FPS accounting
+    SotcPcRing::OnSubmit(); // sotc: SOTC_PC_RING submit epoch (compute doorbell)
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
@@ -2290,6 +2292,7 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
 
 static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes,
                                 const u32* ccb_gpu_addrs[], u32* ccb_sizes_in_bytes) {
+    SotcPcRing::OnSubmit(); // sotc: SOTC_PC_RING submit epoch (before the CP sees the work)
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
     }

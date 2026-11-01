@@ -130,8 +130,29 @@ UniqueBuffer::~UniqueBuffer() {
 }
 
 void UniqueBuffer::Destroy() {
+    if (borrowed) { // sotc: SOTC_PC_RING=8, the handle belongs to sotc_guest_memory
+        buffer = VK_NULL_HANDLE;
+        bda_addr = 0;
+        allocation = VK_NULL_HANDLE;
+        borrowed = false;
+        return;
+    }
     if (allocation) {
-        vmaDestroyBuffer(allocator, buffer, allocation);
+        // sotc: SOTC_VK_POOL: destroyed on the helper thread once the GPU is past the tick. The
+        // ReBAR bytes come back with the memory.
+        auto destroy = [allocator_ = allocator, handle = static_cast<VkBuffer>(buffer),
+                        alloc = allocation, rebar = rebar_bytes]() {
+            vmaDestroyBuffer(allocator_, handle, alloc);
+            if (rebar) {
+                ReleaseRebarBytes(rebar);
+            }
+        };
+        rebar_bytes = 0;
+        if (Vulkan::GpuDestroyDeferred()) {
+            Vulkan::DeferGpuDestroy(std::move(destroy));
+        } else {
+            destroy();
+        }
     } else if (buffer) {
         device.destroyBuffer(buffer);
     }
@@ -148,8 +169,11 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
                           VmaAllocationInfo* out_alloc_info) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
     if (mem_type != MemoryType::Sparse) {
+        // sotc: SOTC_VK_POOL: BDA buffers are sub-allocated (the allocator already has
+        // VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT). A dedicated allocation is a driver
+        // vkAllocateMemory (win32u NtGdiDdDDICreateAllocation) on every buffer creation.
         const VmaAllocationCreateFlags bda_flag =
-            with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+            with_bda && !Vulkan::VkPoolEnabled() ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
         VmaAllocationCreateInfo alloc_ci = {
             .flags =
                 VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(mem_type),
@@ -216,6 +240,14 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         ASSERT_MSG(bda_result != 0, "Failed to get buffer device address");
         bda_addr = bda_result;
     }
+}
+
+// sotc: SOTC_PC_RING=8. The handle is not owned: UniqueBuffer::Destroy leaves it alone.
+Buffer::Buffer(VAddr cpu_addr_, u64 size_bytes_, vk::Buffer borrowed_buffer)
+    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{MemoryType::DeviceLocal},
+      buffer{vk::Device{}, VmaAllocator{}} {
+    buffer.buffer = borrowed_buffer;
+    buffer.borrowed = true;
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,

@@ -65,8 +65,21 @@ public:
         return queue_family_index;
     }
 
+    /// sotc: the family of the queue presents go to: the graphics family, except with
+    /// SOTC_PRESENT_UNLOCKED=1 when another family presents (PresentPath::OtherFamily).
     u32 GetPresentQueueFamilyIndex() const {
-        return queue_family_index;
+        return present_queue_family_index;
+    }
+
+    /// sotc: how presents reach the queue, decided by CreateDevice (SOTC_PRESENT_UNLOCKED).
+    enum class PresentPath : u8 {
+        SharedQueue,    ///< one queue, presents under Scheduler::submit_mutex (as before)
+        SecondQueue,    ///< second queue of the graphics family (NVIDIA)
+        OtherFamily,    ///< queue of another family that can present; swapchain CONCURRENT
+        SharedDepthWait ///< one queue; presents under submit_mutex, after a VK_KHR_present_wait bound
+    };
+    PresentPath GetPresentPath() const {
+        return present_path;
     }
 
     /// sotc: SOTC_XFER_QUEUE=1: true when a transfer-only queue family was found and its queue
@@ -407,10 +420,23 @@ public:
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
-    /// sotc: SOTC_PRESENT_WAIT=1 and VK_KHR_present_id / VK_KHR_present_wait are enabled. The
-    /// presenter then tags each present with an id and the vblank thread waits on them.
+    /// sotc: VK_KHR_present_id and VK_KHR_present_wait are enabled: by SOTC_PRESENT_WAIT=1, or by
+    /// SOTC_PRESENT_UNLOCKED=1 on a shared queue (PresentPath::SharedDepthWait). The presenter tags
+    /// each present with an id and can wait on them.
     bool IsPresentWaitEnabled() const {
         return present_wait_enabled;
+    }
+
+    /// sotc: SOTC_PRESENT_WAIT=1 itself: FIFO is forced and the vblank thread paces the flips on
+    /// the presents. False for the SharedDepthWait extensions alone.
+    bool IsPresentWaitPacingEnabled() const {
+        return present_wait_pacing;
+    }
+
+    /// sotc: PresentPath::SharedDepthWait: the presenter waits for older presents before it takes
+    /// submit_mutex (Presenter::WaitPresentDepth).
+    bool IsPresentDepthWaitEnabled() const {
+        return present_depth_wait;
     }
 
     /// sotc: VK_KHR_present_id is enabled (SOTC_PRESENT_WAIT or SOTC_REFLEX). Presents are then
@@ -698,7 +724,9 @@ public:
 
 private:
     /// Creates the logical device opportunistically enabling extensions
-    bool CreateDevice();
+    /// window: the surface of the swapchain is not created yet, so CreateDevice makes a probe
+    /// surface for the present family check and destroys it.
+    bool CreateDevice(Frontend::WindowSDL& window);
 
     /// Creates the VMA allocator handle
     void CreateAllocator();
@@ -747,6 +775,8 @@ private:
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    u32 present_queue_family_index{0}; // sotc: see GetPresentQueueFamilyIndex
+    PresentPath present_path{PresentPath::SharedQueue}; // sotc: see GetPresentPath
     static constexpr u32 NoXferQueueFamily = ~u32{0};
     u32 xfer_queue_family_index{NoXferQueueFamily}; // sotc: see HasXferQueue()
     vk::Queue xfer_queue;                           // sotc: see HasXferQueue()
@@ -792,7 +822,9 @@ private:
     bool device_fault_vendor_binary{};
     bool descriptor_buffer{}; // sotc: VK_EXT_descriptor_buffer enabled (SOTC_DESC_BUFFER=1)
     bool host_image_copy{};   // sotc: VK_EXT_host_image_copy enabled (SOTC_HOST_IMAGE_COPY=1)
-    bool present_wait_enabled{}; // sotc: SOTC_PRESENT_WAIT, see IsPresentWaitEnabled
+    bool present_wait_enabled{}; // sotc: VK_KHR_present_wait on, see IsPresentWaitEnabled
+    bool present_wait_pacing{};  // sotc: SOTC_PRESENT_WAIT, see IsPresentWaitPacingEnabled
+    bool present_depth_wait{};   // sotc: PresentPath::SharedDepthWait, see IsPresentDepthWaitEnabled
     bool present_id_enabled{};   // sotc: VK_KHR_present_id on, see IsPresentIdEnabled
     bool low_latency_requested{};    // sotc: SOTC_LOW_LATENCY / SOTC_REFLEX, see IsLowLatencyRequested
     bool nv_low_latency_enabled{};   // sotc: VK_NV_low_latency2 on, see IsNvLowLatencyEnabled

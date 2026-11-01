@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic> // sotc: RAM report counters
 #include <memory>
 #include <vector>
 
@@ -58,6 +59,12 @@ public:
     /// Releases idle memory.
     void TickFrame();
 
+    /// sotc: SOTC_RAM_REPORT: bytes held by the ring blocks and large buffers of one memory type
+    /// (VkBuffer memory, so it sits in the VMA blocks of the Vulkan lines). Relaxed read.
+    [[nodiscard]] u64 HeldBytes(VideoCore::MemoryType type) const noexcept {
+        return held_bytes[u32(type)].load(std::memory_order_relaxed);
+    }
+
 private:
     struct Block {
         std::unique_ptr<VideoCore::StreamBuffer> buffer;
@@ -94,6 +101,7 @@ private:
     std::array<Ring, NUM_TYPES> rings;
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
     u64 frame = 0;
+    std::array<std::atomic<u64>, NUM_TYPES> held_bytes{}; // sotc: RAM report, see HeldBytes
 };
 
 } // namespace Vulkan

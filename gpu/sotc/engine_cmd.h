@@ -31,6 +31,11 @@ std::vector<std::string> RecentOutput();
 uint64_t GameStarts();
 int64_t LastGameStartMs();
 
+/// True once the Lab route has waited longer than SOTC_LAB_ROUTE_WAIT seconds (default 180, 0 = no
+/// limit) for the first "starting game" line, counted from the first engine tick. The expiry prints
+/// one "gave up waiting" line with the tick count. Any thread.
+bool GameWaitExpired();
+
 // --- Colossi -----------------------------------------------------------------------------------
 struct Colossus {
     const char* name;  ///< English name (Valus, Quadratus, ...)

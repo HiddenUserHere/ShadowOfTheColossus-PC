@@ -26,6 +26,13 @@
 #include "video_core/sotc_trace.h" // sotc: SOTC_FPS readbacks by guest RIP (B6)
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "../../../sotc/mem_classes.h"  // sotc: SOTC_CLASS_TRACK (plan step 6)
+#include "../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE bind evidence
+#include "../../../sotc/pc_ring.h"      // sotc: SOTC_PC_RING shadow
+#include <xxhash.h>                     // sotc: SOTC_PC_RING=8 verify (XXH3, as stale_check.cpp)
+#include "video_core/buffer_cache/pc_ring_copy.h"      // sotc: SOTC_PC_RING=8 (HostMaintain)
+#include "video_core/renderer_vulkan/sotc_guest_memory.h" // sotc: SOTC_PC_RING=8 (LookupGuestView)
+#include "../../../sotc/rb_class.h"     // sotc: SOTC_RB_CLASS readback ranges
+#include "../../../sotc/hooks.h"        // sotc: IsInstalled (SOTC_RB_CLASS=2 needs the mask hook)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 // sotc: SOTC_RB_SPIN_US (default 150 us), live (SotcLive): see the readback wait below.
 SotcLive::Int kRbSpinUs{"SOTC_RB_SPIN_US", 150};
@@ -47,6 +54,7 @@ extern "C" uintptr_t runtime_sotc_heap_table(void);
 #include <vk_mem_alloc.h>
 
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM
+#include "../../../sotc/stale_check.h" // sotc: SOTC_STALE_CHECK
 
 namespace VideoCore {
 
@@ -270,6 +278,28 @@ const bool rb_pf_issue_env = [] {
     const char* mat = std::getenv("SOTC_RB_MATERIALIZE");
     return rb_prefetch_env && ((v && v[0] == '1') || (mat && mat[0] == '1') || rb_prev_env);
 }();
+/// sotc: SOTC_RB_CLASS=2 (off by default; the class-1 machinery plus the serve below). A guest
+/// read fault inside a registered mask-arena window (pf_mask_ranges) is served from the last applied
+/// copy by TryServePrevious instead of waiting for the GPU. Needs SOTC_RB_OWNER=1 and
+/// SOTC_RB_MATERIALIZE=1 or SOTC_RB_PREV=1, and not SOTC_RB_EXACT (its owed downloads would dirty
+/// each other, as for SOTC_RB_PREV). Inert while SotcRbClass::On() is false: the registry in
+/// rb_class.cpp accepts only SOTC_RB_CLASS=1 today.
+const bool rb_class2_env = [] {
+    const char* v = std::getenv("SOTC_RB_CLASS");
+    if (!v || v[0] != '2') {
+        return false;
+    }
+    const bool ok = rb_prefetch_env && !rb_exact_env && (rb_materialize_env || rb_prev_env);
+    std::fprintf(stderr, ok ? "SOTC RB class 2: on (serves mask-arena reads from the last applied "
+                              "copy, only the exact mask bytes; needs SOTC_HOOK_XPR_PROBE=1 for the "
+                              "mask spans, else every read is refused)\n"
+                            : "SOTC RB class 2: inactive (needs SOTC_RB_OWNER=1, "
+                              "SOTC_RB_MATERIALIZE=1 or SOTC_RB_PREV=1, no SOTC_RB_EXACT)\n");
+    return ok;
+}();
+/// The applied-copy bookkeeping (PrevNoteApplied, PrevErase, the pf_applied pruning) runs for
+/// SOTC_RB_PREV and for SOTC_RB_CLASS=2.
+const bool rb_prev_book = rb_prev_env || rb_class2_env;
 /// SOTC_RB_PREV_FRAMES (default 2, 1-4): the guest memory version served is at most this many
 /// frames old; an older one makes the read wait for the GPU as before (and refreshes it).
 const u64 rb_prev_frames = [] {
@@ -284,6 +314,114 @@ constexpr u64 RbPrevMaxNs = 150'000'000;
 constexpr u64 RbMatFreshMaxNs = 100'000'000;
 /// Fresh ranges kept per window (SOTC_RB_MATERIALIZE); more replace the oldest.
 constexpr size_t RbMatFreshMax = 8;
+
+/// sotc: SOTC_RB_CLASS counters (buffer_cache.cpp only; PrefetchClassReport prints and resets
+/// them every 5 s). Per-kind arrays: [0] the mask-arena copies (rb_class.h), [1] the stats request
+/// copies. "stale" counts the dropped dirty ones (a later write, an unmap or a freed block),
+/// "expired" the unused ones freed by the tick bound.
+/// sotc: SOTC_RB_CLASS=2 refusal reasons (TryServePrevious, mask-arena reads).
+enum C2Refuse : size_t {
+    kC2Write,      ///< a write fault needs the exact bytes
+    kC2NoCopy,     ///< no applied copy of the window within SOTC_RB_PREV_FRAMES frames
+    kC2NotCovered, ///< a GPU-modified byte of an asked page has no recent applied copy
+    kC2NotOnlyMasks, ///< sotc: a GPU-modified byte of an asked page lies outside every mask span
+    kC2Cpu,        ///< an asked page the guest also wrote
+    kC2Busy,       ///< an in-flight readback owns the pages
+    kC2Capped,     ///< prefetch count or staging budget for the owed download
+    kC2Other,      ///< other: no arena, no recurring entry, nothing to drop, spans two windows
+    kC2NoHook,     ///< SOTC_HOOK_XPR_PROBE not installed: no mask span is ever recorded
+    kC2Reasons
+};
+struct RbClassCounts {
+    std::atomic<u64> c2_served{};              ///< mask-arena reads served (class 2)
+    std::atomic<u64> c2_bytes{};               ///< bytes of the GPU-modified pages those served dropped
+    std::atomic<u64> c2_pages{};               ///< pages whose GPU-modified state class 2 dropped
+    std::atomic<u64> c2_refused[kC2Reasons]{}; ///< class-2 refusals by C2Refuse
+    std::atomic<u64> issued[2]{};
+    std::atomic<u64> applied[2]{};
+    std::atomic<u64> applied_bytes[2]{};
+    std::atomic<u64> consumed[2]{}; ///< applied by a guest read fault in its granule
+    std::atomic<u64> stale[2]{};
+    std::atomic<u64> expired[2]{};
+    std::atomic<u64> claimed[2]{}; ///< a guest readback waited for it
+    std::atomic<u64> block_gone[2]{};
+    std::atomic<u64> held{};       ///< mask windows held to the next cp frame (issue)
+    std::atomic<u64> empty{};      ///< nothing GPU-modified to copy (issue)
+    std::atomic<u64> capped{};     ///< prefetch count cap (issue)
+    std::atomic<u64> budget{};     ///< staging budget (issue)
+    std::atomic<u64> no_arena{};   ///< window outside every arena (issue)
+    std::atomic<u64> c2_owed_dirty{};    ///< sotc: class 2 owed downloads dropped dirty (a write, unmap or CPU write)
+    std::atomic<u64> c2_unasked_kept{};  ///< sotc: class 2 pages of the window not asked, GPU state kept
+};
+RbClassCounts rb_class_cnt;
+
+/// sotc: SOTC_RB_CLASS_AHEAD=1 (off by default). The class copies (mask-arena windows, stats request
+/// copies) are issued at the producer: the writers are flushed to the queue first, then the copy
+/// goes in an ahead command buffer submitted right after them (Scheduler::BeginAheadAsync and
+/// SubmitAheadAsync), and a guest read fault waits for that copy's timeline value only, not for the
+/// tick the copy was recorded in. Not SOTC_RB_AHEAD: that name is the DownloadMemory ahead copy
+/// (on by default on NVIDIA and AMD). Needs the prefetch issue path (rb_pf_issue_env) and
+/// SOTC_RB_CLASS=1, which is what names the windows.
+const bool rb_class_ahead_env = [] {
+    const char* v = std::getenv("SOTC_RB_CLASS_AHEAD");
+    if (!v || v[0] != '1') {
+        return false;
+    }
+    const bool ok = rb_pf_issue_env && SotcRbClass::On();
+    std::fprintf(stderr, ok ? "SOTC RB class ahead: on (class copies issued after their writers)\n"
+                            : "SOTC RB class ahead: inactive (needs SOTC_RB_PREFETCH=1 or "
+                              "SOTC_RB_MATERIALIZE=1 with SOTC_RB_OWNER=1, and SOTC_RB_CLASS=1)\n");
+    return ok;
+}();
+/// sotc: SOTC_RB_CLASS_AHEAD counters (RbAheadReport prints and resets them every 5 s). Per-kind
+/// arrays as in RbClassCounts: [0] mask-arena copies, [1] stats request copies.
+struct RbAheadCounts {
+    std::atomic<u64> issued[2]{};   ///< ahead copies submitted
+    std::atomic<u64> consumed[2]{}; ///< a guest read fault reached one (not dirty), counted once
+    std::atomic<u64> wasted[2]{};   ///< dropped unapplied and no fault ever reached it
+    std::atomic<u64> flushes{};     ///< submits made so the writers are on the queue before the copy
+    std::atomic<u64> fallback{};    ///< wanted an ahead copy, took the in-tick copy instead
+    std::atomic<u64> waited{};      ///< guest readbacks that waited for an ahead copy
+    std::atomic<u64> waited_ns{};   ///< time those waits took
+};
+RbAheadCounts rb_ahead_cnt;
+
+/// sotc: SOTC_RB_CLASS_AHEAD report, every 5 s (PrefetchIssue, draw thread).
+void RbAheadReport() {
+    static u64 last_ns = 0;
+    const u64 now = SotcStats::NowNs();
+    if (now - last_ns < 5'000'000'000ull) {
+        return;
+    }
+    last_ns = now;
+    const auto get = [](std::atomic<u64>& c) { return c.exchange(0, std::memory_order_relaxed); };
+    auto& c = rb_ahead_cnt;
+    // Each counter is read once (get resets it).
+    const u64 issued_mask = get(c.issued[0]);
+    const u64 issued_stats = get(c.issued[1]);
+    const u64 flushes = get(c.flushes);
+    const u64 fallback = get(c.fallback);
+    const u64 consumed_mask = get(c.consumed[0]);
+    const u64 consumed_stats = get(c.consumed[1]);
+    const u64 wasted_mask = get(c.wasted[0]);
+    const u64 wasted_stats = get(c.wasted[1]);
+    const u64 waits = get(c.waited);
+    const u64 wait_ns = get(c.waited_ns);
+    std::fprintf(stderr,
+                 "SOTC RB class ahead (5 s): copies issued %llu (mask %llu, stats %llu), writers "
+                 "flushed %llu, fallback %llu; consumed by a fault %llu (mask %llu, stats %llu), "
+                 "wasted %llu (mask %llu, stats %llu); guest waits %llu, %.1f us avg, %.2f ms "
+                 "total\n",
+                 (unsigned long long)(issued_mask + issued_stats),
+                 (unsigned long long)issued_mask, (unsigned long long)issued_stats,
+                 (unsigned long long)flushes, (unsigned long long)fallback,
+                 (unsigned long long)(consumed_mask + consumed_stats),
+                 (unsigned long long)consumed_mask, (unsigned long long)consumed_stats,
+                 (unsigned long long)(wasted_mask + wasted_stats),
+                 (unsigned long long)wasted_mask, (unsigned long long)wasted_stats,
+                 (unsigned long long)waits, waits ? wait_ns / 1000.0 / waits : 0.0,
+                 wait_ns / 1e6);
+}
 
 /// SOTC_RB_EXACT caps: owed downloads in flight, their staging, label-download staging, and the
 /// writer map entries kept before it is pruned (and, past the cap after pruning, forgotten).
@@ -547,6 +685,7 @@ void BufferCache::TickFrame() {
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks,
                                    bool guest_fault) {
     if (SotcStats::kCmdStats) SotcStats::inv_buffer.fetch_add(size, std::memory_order_relaxed);
+    SotcStale::Forget(device_addr, size); // sotc: SOTC_STALE_CHECK: guest or host write
     Core::MemoryManager::NoteHostWrite(device_addr, size, 9,
                                        reinterpret_cast<u64>(__builtin_return_address(0)));
     // sotc: SOTC_RB_EXACT: a guest write fault marks the whole 4 KiB page(s) CPU-modified, so
@@ -582,7 +721,7 @@ void BufferCache::RbxSettleWritePages(VAddr addr, u64 size, bool assume_locks) {
 }
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
-    if (rb_prev_env) {
+    if (rb_prev_book) {
         PrevErase(device_addr, size); // sotc: SOTC_RB_PREV: the memory may hold other data now
     }
     // sotc: SOTC_ASYNC_UPLOAD write fence: the range may be mapped again (the same memory at
@@ -600,7 +739,7 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
         const char* v = std::getenv("SOTC_DROP_ASYNC");
         return v && v[0] == '1';
     }();
-    // sotc: SOTC_DROP_FAST=1 (off by default). A range with no GPU-written page (the usual
+    // sotc: SOTC_DROP_FAST (on by default, =0 turns it off). A range with no GPU-written page (the usual
     // unmap: streamed data the GPU only read) has no GPU state to forget and no readback in
     // flight (those keep their pages GPU-modified until applied): marking it CPU-modified is all
     // the drop does, and a guest write fault does the same from any thread. The guest thread
@@ -648,11 +787,12 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
             std::unique_lock gpu_modified_lock{gpu_modified_mutex};
             gpu_modified_ranges.Subtract(device_addr, size);
         }
-        if (rb_prev_env) {
+        if (rb_prev_book) {
             // sotc: SOTC_RB_PREV: again here, ordered with the draw thread: a readback applied
             // between the erase at the top and this drop recorded the range again.
             PrevErase(device_addr, size);
         }
+        SotcStale::Forget(device_addr, size); // sotc: SOTC_STALE_CHECK: GPU bits cleared
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         MarkInflightReadbacksDirty(device_addr, size, StaleReason::Unmap);
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -1140,6 +1280,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (readback.tick != 0) {
         scheduler.WaitSubmitted(readback.tick, false);
     }
+    // sotc: SOTC_RB_CLASS_AHEAD: the wait for an ahead class copy is timed (RbAheadReport).
+    const u64 t_ahead0 = readback.wait_ahead_pf ? SotcStats::NowNs() : 0;
     if (readback.wait_ahead != 0) {
         scheduler.WaitAheadSubmitted(readback.wait_ahead);
     }
@@ -1150,6 +1292,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
     if (readback.wait_ahead != 0) {
         scheduler.WaitAhead(readback.wait_ahead);
+    }
+    if (readback.wait_ahead_pf) { // sotc: SOTC_RB_CLASS_AHEAD
+        rb_ahead_cnt.waited.fetch_add(1, std::memory_order_relaxed);
+        rb_ahead_cnt.waited_ns.fetch_add(SotcStats::NowNs() - t_ahead0,
+                                         std::memory_order_relaxed);
     }
     // sotc: SOTC_RB_TICK: the copy on the transfer queue (see BeginAsyncReadback). Polls the
     // timeline counter for SOTC_RB_SPIN_US (default 150) before blocking: the copy is short once
@@ -1225,6 +1372,7 @@ void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
             return;
         }
         SotcStats::write_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed);
+        SotcStale::Forget(lo, hi - lo); // sotc: SOTC_STALE_CHECK: GPU bits cleared
         memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
     }
     memory_tracker->MarkRegionAsCpuModified(addr, size);
@@ -1316,7 +1464,7 @@ void BufferCache::BeginAsyncReadbackImpl(AsyncReadback& readback) {
             PrefetchAtFault(readback.device_addr, readback.size);
         }
         // sotc: SOTC_RB_PREV: the last applied version instead of a wait (see TryServePrevious).
-        if (rb_prev_env && TryServePrevious(readback)) {
+        if ((rb_prev_env || rb_class2_env) && TryServePrevious(readback)) {
             readback.waiting = false;
             return;
         }
@@ -1391,17 +1539,27 @@ void BufferCache::BeginAsyncReadbackImpl(AsyncReadback& readback) {
     u64 owner_tick = 0;
     u64 owner_ahead = 0; // sotc: SOTC_RB_ASYNC_AHEAD: owners whose copies went ahead
     u64 owner_xfer = 0;  // sotc: SOTC_RB_TICK: owners whose copies went on the transfer queue
+    bool owner_pf = false; // sotc: SOTC_RB_CLASS_AHEAD: an owner is an ahead class copy
     if (rb_owner && !inflight_readbacks.empty() && !exact_used) {
         owned.clear();
         const VAddr ask_end = readback.device_addr + readback.size;
         for (const AsyncReadback* other : inflight_readbacks) {
+            // sotc: SOTC_RB_CLASS_AHEAD: an ahead class copy is waited for by its timeline value
+            // only; its tick (the one it was recorded in) is not.
+            const bool ahead_class = rb_class_ahead_env && other->prefetch && other->pf_class != 0 &&
+                                     other->ahead_value != 0;
             for (const auto& item : other->pending) {
                 for (const auto& [range_addr, range_size] : item.gpu_ranges) {
                     owned.emplace_back(range_addr, range_addr + range_size);
                     if (range_addr < ask_end && readback.device_addr < range_addr + range_size) {
-                        owner_tick = std::max(owner_tick, other->tick);
-                        owner_ahead = std::max(owner_ahead, other->ahead_value);
-                        owner_xfer = std::max(owner_xfer, other->xfer_value);
+                        if (ahead_class) {
+                            owner_ahead = std::max(owner_ahead, other->ahead_value);
+                            owner_pf = true;
+                        } else {
+                            owner_tick = std::max(owner_tick, other->tick);
+                            owner_ahead = std::max(owner_ahead, other->ahead_value);
+                            owner_xfer = std::max(owner_xfer, other->xfer_value);
+                        }
                     }
                 }
             }
@@ -1418,6 +1576,7 @@ void BufferCache::BeginAsyncReadbackImpl(AsyncReadback& readback) {
         owned.resize(merged);
         rb_owned = &owned;
     }
+    readback.wait_ahead_pf = owner_pf; // sotc: SOTC_RB_CLASS_AHEAD: the wait is timed (ReadMemory)
     const u64 total =
         exact_used ? exact_total
                    : GatherDownloads(arena, window_start, readback.window_size, readback.pending,
@@ -1483,9 +1642,13 @@ void BufferCache::BeginAsyncReadbackImpl(AsyncReadback& readback) {
         // Its bytes may belong to a readback still in flight (taken out of the GPU-modified set,
         // pages still protected): wait for that one and finish it if its thread has not yet.
         if (const AsyncReadback* other = FindInflightReadback(readback.device_addr, readback.size)) {
-            readback.tick = other->tick;
+            // sotc: SOTC_RB_CLASS_AHEAD: an ahead class copy is waited for by its value only.
+            const bool ahead_class = rb_class_ahead_env && other->prefetch && other->pf_class != 0 &&
+                                     other->ahead_value != 0;
+            readback.tick = ahead_class ? 0 : other->tick;
             readback.wait_ahead = other->ahead_value; // sotc: SOTC_RB_ASYNC_AHEAD
             readback.wait_xfer = other->xfer_value;   // sotc: SOTC_RB_TICK
+            readback.wait_ahead_pf = owner_pf || ahead_class;
             readback.waiting = true;
             readback.dependent = true;
             return;
@@ -2079,10 +2242,27 @@ void BufferCache::PrefetchRebuild(u64 frame) {
         }
         ++it;
     }
+    // sotc: SOTC_RB_CLASS (rb_class.h): the readback ranges the engine named (XPR mask arena,
+    // particle stats ring arrays) are recurring from the first frame, without read history.
+    if (SotcRbClass::On()) {
+        u64 class_version = 0;
+        const u64 granule = PfGranule();
+        pf_mask_ranges = SotcRbClass::Snapshot(class_version);
+        for (const auto& r : pf_mask_ranges) {
+            for (VAddr key = Common::AlignDown(r.addr, granule); key < r.addr + r.size;
+                 key += granule) {
+                pf_recurring.push_back({.key = key});
+            }
+        }
+    }
     std::ranges::sort(pf_recurring, {}, &PfWindow::key);
+    if (SotcRbClass::On()) { // sotc: a key from both the history and the class appears once
+        const auto dup = std::ranges::unique(pf_recurring, {}, &PfWindow::key);
+        pf_recurring.erase(dup.begin(), dup.end());
+    }
     // sotc: SOTC_RB_PREV: forget windows not written in the last 8 frames, and applied ranges
     // older than SOTC_RB_PREV_FRAMES.
-    if (rb_prev_env) {
+    if (rb_prev_book) { // sotc: pf_wmask is only filled by SOTC_RB_PREV (PrefetchNoteWrite)
         const u64 cpf = SotcStats::cp_frame.load(std::memory_order_relaxed);
         for (auto it = pf_wmask.begin(); it != pf_wmask.end();) {
             const u64 shift = cpf > it->second.frame ? cpf - it->second.frame : 0;
@@ -2137,6 +2317,8 @@ void BufferCache::PrefetchNoteWrite(VAddr addr, u64 size) {
             it->armed = true;
             pf_armed.push_back(static_cast<u32>(it - pf_recurring.begin()));
         }
+        // sotc: SOTC_RB_CLASS v2: a mask-arena window waits for a later cp frame (PrefetchIssue).
+        it->written_cp_frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
         if (rb_prev_env) {
             // sotc: SOTC_RB_PREV: the frames this window was written in.
             // Counted in command processor frames (cp_frame), the timeline the GPU writes follow:
@@ -2245,8 +2427,21 @@ void BufferCache::PrefetchMarkDirty(VAddr addr, u64 size) {
 void BufferCache::PrefetchDrop(size_t index) {
     AsyncReadback& p = *pf_live[index];
     if (!p.finished) {
+        // sotc: an owed download of class 2 holds GPU-newest bytes whose GPU state was already dropped
+        // (TryServePrevious). Dirty, it is never applied: those bytes never reach guest memory.
+        if (p.pf_owed && p.dirty) {
+            rb_class_cnt.c2_owed_dirty.fetch_add(1, std::memory_order_relaxed);
+        }
         // Not applied: its ranges stay in the GPU-modified set, its pages protected. The
         // staging is reused once the tick being recorded is done, after its copies.
+        if (p.pf_class) { // sotc: SOTC_RB_CLASS report: dirty ones are stale, the rest expired
+            (p.dirty ? rb_class_cnt.stale : rb_class_cnt.expired)[p.pf_class - 1]
+                .fetch_add(1, std::memory_order_relaxed);
+        }
+        // sotc: SOTC_RB_CLASS_AHEAD: an ahead copy no fault reached, dropped unapplied.
+        if (p.ahead_value != 0 && p.pf_class && !p.ahead_faulted) {
+            rb_ahead_cnt.wasted[p.pf_class - 1].fetch_add(1, std::memory_order_relaxed);
+        }
         p.finished = true;
         if (p.pf_label) { // sotc: SOTC_RB_EXACT: dropped dirty, expired or unused
             SotcStats::rb_ex_ld_dropped.fetch_add(1, std::memory_order_relaxed);
@@ -2301,6 +2496,12 @@ void BufferCache::PrefetchAtFault(VAddr addr, u64 size) {
             PrefetchDrop(i); // applied or dropped by a guest readback that waited for it
             continue;
         }
+        // sotc: SOTC_RB_CLASS: a mask-arena copy whose block was freed is dirty (never applied; its
+        // unclaimed drop is counted as stale). A claimed one is left to the guest that waits for it.
+        if (p.pf_class == 1 && !p.dirty && !p.pf_claimed && !PrefetchClassAlive(p)) {
+            rb_class_cnt.block_gone[0].fetch_add(1, std::memory_order_relaxed);
+            p.dirty = true;
+        }
         // sotc: a claimed one stays even when stale: the guest readback waiting for it finds it
         // in FinishReadyOwners and reads its window back (FinishAsyncReadback). Dropped here,
         // that guest got nothing and faulted again, possibly onto a newer prefetch that went
@@ -2317,6 +2518,11 @@ void BufferCache::PrefetchAtFault(VAddr addr, u64 size) {
             ++i;
             continue;
         }
+        // sotc: SOTC_RB_CLASS_AHEAD: the first clean fault that reaches an ahead class copy consumes it.
+        if (p.ahead_value != 0 && p.pf_class && !p.dirty && !p.ahead_faulted) {
+            p.ahead_faulted = true;
+            rb_ahead_cnt.consumed[p.pf_class - 1].fetch_add(1, std::memory_order_relaxed);
+        }
         if (!p.dirty && IsReadbackComplete(p)) {
             // The guest faulted in its granule and its copies are done: apply it now (not dirty,
             // see above), no GPU wait.
@@ -2331,6 +2537,9 @@ void BufferCache::PrefetchAtFault(VAddr addr, u64 size) {
             }
             SotcStats::rb_pf_consumed.fetch_add(1, std::memory_order_relaxed);
             SotcStats::rb_pf_consumed_all.fetch_add(1, std::memory_order_relaxed);
+            if (p.pf_class) { // sotc: SOTC_RB_CLASS report
+                rb_class_cnt.consumed[p.pf_class - 1].fetch_add(1, std::memory_order_relaxed);
+            }
             PrefetchDrop(i);
             continue;
         }
@@ -2347,8 +2556,12 @@ void BufferCache::PrefetchAtFault(VAddr addr, u64 size) {
             p.pf_claimed = true;
             ++inflight_version;
             SotcStats::rb_pf_waited.fetch_add(1, std::memory_order_relaxed);
+            if (p.pf_class) { // sotc: SOTC_RB_CLASS report
+                rb_class_cnt.claimed[p.pf_class - 1].fetch_add(1, std::memory_order_relaxed);
+            }
         }
-        unsent |= owner && p.tick >= scheduler.CurrentTick();
+        // sotc: SOTC_RB_CLASS_AHEAD: an ahead copy is waited for by its value, not its tick.
+        unsent |= owner && p.ahead_value == 0 && p.tick >= scheduler.CurrentTick();
         ++i;
     }
     PrefetchUpdateHull();
@@ -2365,6 +2578,12 @@ bool BufferCache::PrefetchIssue() {
     }
     if (!rb_prefetch_env) {
         return false;
+    }
+    if (SotcRbClass::On()) {
+        PrefetchClassReport(); // sotc: SOTC_RB_CLASS counters, every 5 s
+    }
+    if (rb_class_ahead_env) {
+        RbAheadReport(); // sotc: SOTC_RB_CLASS_AHEAD counters, every 5 s
     }
     RbxDepth rbx_depth_guard{rbx_depth}; // sotc: SOTC_RB_EXACT: pf_live is walked here
     if (RbxOn() && !rbx_live.empty()) {
@@ -2406,6 +2625,45 @@ bool BufferCache::PrefetchIssue() {
         }
         PrefetchUpdateHull();
     }
+    // sotc: SOTC_RB_CLASS v2: copies the engine asked for (the particle stats slot read next). Each
+    // window becomes recurring and armed now; one already armed keeps its place.
+    if (SotcRbClass::On() && rb_pf_issue_env) {
+        if (const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+            frame != pf_frame) {
+            PrefetchRebuild(frame);
+        }
+        thread_local std::vector<SotcRbClass::Range> requests;
+        SotcRbClass::TakeRequests(requests);
+        if (!requests.empty()) {
+            const u64 granule = PfGranule();
+            u64 added = 0;
+            for (const auto& r : requests) {
+                for (VAddr key = Common::AlignDown(r.addr, granule); key < r.addr + r.size;
+                     key += granule) {
+                    auto it = std::ranges::lower_bound(pf_recurring, key, {}, &PfWindow::key);
+                    if (it == pf_recurring.end() || it->key != key) {
+                        it = pf_recurring.insert(it, PfWindow{.key = key});
+                    }
+                    if (!it->armed) {
+                        it->armed = true;
+                        ++added;
+                    }
+                    it->written_cp_frame = 0; // a request is never held
+                    it->class_req = true;     // sotc: SOTC_RB_CLASS: pf_class 2 at issue
+                }
+            }
+            // Insertions moved indices: rebuild the armed list from the flags.
+            pf_armed.clear();
+            for (size_t i = 0; i < pf_recurring.size(); ++i) {
+                if (pf_recurring[i].armed) {
+                    pf_armed.push_back(static_cast<u32>(i));
+                }
+            }
+            pf_rec_lo = pf_recurring.empty() ? 0 : pf_recurring.front().key;
+            pf_rec_hi = pf_recurring.empty() ? 0 : pf_recurring.back().key + granule;
+            SotcRbClass::NoteRequestIssued(added);
+        }
+    }
     if (pf_armed.empty() || !rb_pf_issue_env) { // sotc: SOTC_RB_EXACT alone issues no prefetches
         return false;
     }
@@ -2413,6 +2671,8 @@ bool BufferCache::PrefetchIssue() {
         frame != pf_frame) {
         PrefetchRebuild(frame);
     }
+    const u64 cp_frame_now = SotcStats::cp_frame.load(std::memory_order_relaxed);
+    u64 class_held = 0;
     // The pages readbacks in flight (guest ones and prefetches) download are theirs.
     thread_local std::vector<std::pair<VAddr, VAddr>> owned;
     owned.clear();
@@ -2435,6 +2695,7 @@ bool BufferCache::PrefetchIssue() {
     owned.resize(merged);
     const u64 granule = PfGranule();
     bool issued = false;
+    bool ahead_flushed = false; // sotc: SOTC_RB_CLASS_AHEAD: the writers are on the queue (once)
     size_t kept = 0;
     for (size_t a = 0; a < pf_armed.size(); ++a) {
         PfWindow& window = pf_recurring[pf_armed[a]];
@@ -2444,14 +2705,32 @@ bool BufferCache::PrefetchIssue() {
             pf_armed[kept++] = pf_armed[a];
             continue;
         }
+        // sotc: SOTC_RB_CLASS v2: a mask-arena window written in this cp frame waits for the next
+        // one, after the frame's last cull (see rb_class.h).
+        const bool mask_window = !pf_mask_ranges.empty() &&
+                                 SotcRbClass::InRanges(pf_mask_ranges, window.key, granule);
+        if (mask_window && window.written_cp_frame >= cp_frame_now) {
+            pf_armed[kept++] = pf_armed[a];
+            ++class_held;
+            continue;
+        }
+        // sotc: SOTC_RB_CLASS: a stats request copy (class_req) is issued once, now.
+        const bool request_window = window.class_req;
+        window.class_req = false;
         window.armed = false;
         if (pf_live.size() >= rb_pf_max) {
             SotcStats::rb_pf_capped.fetch_add(1, std::memory_order_relaxed);
+            if (mask_window || request_window) {
+                rb_class_cnt.capped.fetch_add(1, std::memory_order_relaxed);
+            }
             continue;
         }
         // Never creates an arena: a window outside every arena holds no GPU data.
         const Buffer* arena = address_space[window.key >> ARENA_PAGE_BITS];
         if (!arena) {
+            if (mask_window || request_window) {
+                rb_class_cnt.no_arena.fetch_add(1, std::memory_order_relaxed);
+            }
             continue;
         }
         const VAddr start = std::max<VAddr>(window.key, arena->cpu_addr);
@@ -2468,28 +2747,101 @@ bool BufferCache::PrefetchIssue() {
         rb_owned = nullptr;
         rb_gather_no_hot = false;
         if (total == 0) {
+            if (mask_window || request_window) { // sotc: SOTC_RB_CLASS report
+                rb_class_cnt.empty.fetch_add(1, std::memory_order_relaxed);
+            }
             continue; // read back since, or owned by a readback in flight
         }
         // The pool hands deferred requests out in power-of-two size classes of at least 64 KiB.
         const u64 bytes = std::bit_ceil(std::max<u64>(total, 64_KB));
         if (pf_bytes_held + bytes > rb_pf_budget) {
             SotcStats::rb_pf_capped.fetch_add(1, std::memory_order_relaxed);
+            if (mask_window || request_window) {
+                rb_class_cnt.budget.fetch_add(1, std::memory_order_relaxed);
+            }
             continue;
         }
         // Held until it is applied or dropped.
         const auto download =
             staging_pool.Request(total, VideoCore::MemoryType::HostCached, 0, true);
+        // sotc: SOTC_RB_CLASS_AHEAD. A class copy is issued after its writers: they are flushed to
+        // the queue first (once per call), and the copy goes in an ahead command buffer submitted
+        // at once, so the guest that faults on it waits for that submit's timeline value only.
+        // Why the copy reads what the writers wrote and nothing later:
+        // - The flush submits every recorded tick, so the writers of the window (the mask build,
+        //   the stats ring) are earlier on the graphics queue than the ahead submit (SubmitAheadAsync
+        //   orders it after the flushed ticks, through the recorder's stream when there is one).
+        // - The first barrier (all commands, memory writes -> transfer read) orders the copy after
+        //   every submitted command; the last one (transfer -> all commands) makes the later submits
+        //   wait for it. Tick N+1 writes after the copy are seen by MarkInflightReadbacksDirty /
+        //   PrefetchNoteWrite, as for the in-tick copy.
+        // - Runtime::CopyBuffer's access bookkeeping is not needed: the barriers above cover the
+        //   copy, and it writes only the staging buffer, read by the host after the timeline wait.
+        // - A busy ahead slot, sparse binds not yet submitted, transfer-queue routing or a
+        //   ReadbackBatchScope fall back to the in-tick copy below (counted as fallback).
+        vk::CommandBuffer ahead_cmdbuf{};
+        if (rb_class_ahead_env && (mask_window || request_window)) {
+            if (ReadbackBatchScope::Defer(scheduler) || !pending_binds.empty() ||
+                instance.IsXferRoutingEnabled()) {
+                rb_ahead_cnt.fallback.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (!ahead_flushed) {
+                    scheduler.Flush();
+                    ahead_flushed = true;
+                    rb_ahead_cnt.flushes.fetch_add(1, std::memory_order_relaxed);
+                }
+                ahead_cmdbuf = scheduler.BeginAheadAsync();
+                if (ahead_cmdbuf) {
+                    const vk::MemoryBarrier2 pre_barrier = {
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                    };
+                    ahead_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                        .memoryBarrierCount = 1,
+                        .pMemoryBarriers = &pre_barrier,
+                    });
+                } else {
+                    rb_ahead_cnt.fallback.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
         VAddr lo = ~VAddr{0};
         VAddr hi = 0;
         for (auto& item : p.pending) {
             for (auto& copy : item.copies) {
                 copy.dstOffset += download.offset;
             }
-            runtime.CopyBuffer(item.arena, download.buffer, item.copies);
+            if (ahead_cmdbuf) {
+                ahead_cmdbuf.copyBuffer(item.arena->Handle(), download.buffer->Handle(),
+                                        item.copies);
+            } else {
+                runtime.CopyBuffer(item.arena, download.buffer, item.copies);
+            }
             for (const auto& [range_addr, range_size] : item.gpu_ranges) {
                 lo = std::min(lo, range_addr);
                 hi = std::max(hi, range_addr + range_size);
             }
+        }
+        if (ahead_cmdbuf) {
+            const std::array<vk::MemoryBarrier2, 2> post_barriers = {{
+                {
+                    .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                    .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+                },
+                {
+                    .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                },
+            }};
+            ahead_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .memoryBarrierCount = static_cast<u32>(post_barriers.size()),
+                .pMemoryBarriers = post_barriers.data(),
+            });
+            p.ahead_value = scheduler.SubmitAheadAsync();
         }
         p.device_addr = start;
         p.size = stop - start;
@@ -2502,7 +2854,17 @@ bool BufferCache::PrefetchIssue() {
         p.pf_lo = lo;
         p.pf_hi = hi;
         p.pf_bytes = bytes;
-        p.pf_fresh_ok = rb_materialize_env && PrefetchFreshCovers(window.key, p);
+        // sotc: SOTC_RB_CLASS: a mask-arena or stats request copy skips the freshness test (its
+        // rules are in the comment above PrefetchMaterialize); everything else is as before.
+        p.pf_class = mask_window ? 1 : (request_window ? 2 : 0);
+        if (p.pf_class) {
+            rb_class_cnt.issued[p.pf_class - 1].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (p.ahead_value != 0 && p.pf_class) { // sotc: SOTC_RB_CLASS_AHEAD
+            rb_ahead_cnt.issued[p.pf_class - 1].fetch_add(1, std::memory_order_relaxed);
+        }
+        p.pf_fresh_ok = rb_materialize_env &&
+                        (p.pf_class ? true : PrefetchFreshCovers(window.key, p));
         if (rb_materialize_env && !p.pf_fresh_ok) {
             SotcStats::rb_mat_not_fresh.fetch_add(1, std::memory_order_relaxed);
         }
@@ -2521,6 +2883,10 @@ bool BufferCache::PrefetchIssue() {
         pf_live.push_back(std::move(prefetch));
         SotcStats::rb_pf_issued.fetch_add(1, std::memory_order_relaxed);
         issued = true;
+    }
+    if (class_held) {
+        SotcRbClass::NoteHeld(class_held); // sotc: SOTC_RB_CLASS v2
+        rb_class_cnt.held.fetch_add(class_held, std::memory_order_relaxed);
     }
     pf_armed.resize(kept);
     return issued;
@@ -2604,23 +2970,78 @@ void BufferCache::PrevErase(VAddr addr, u64 size) {
 // Readbacks in flight that own the dropped pages go dirty (StaleReason::Unmap) and read again the
 // usual way when finished. Risk accepted with the switch: an object that just became visible may
 // be culled for a frame or two.
+// sotc: SOTC_RB_CLASS=2 needs the XPR consumer hook (probe_xpr.cpp, XPR_CONSUME_MASK, switch
+// SOTC_HOOK_XPR_PROBE=1): it records the mask spans. Without it no span exists and every class-2
+// read is refused (kC2NoHook). Read once, at the first class-2 read: the hooks are installed
+// before the game runs.
+bool MaskHookOn() {
+    static const bool on = SotcHooks::IsInstalled("XPR_CONSUME_MASK");
+    return on;
+}
+// sotc: SOTC_RB_CLASS=2 (rb_class2_env). A read fault in a registered mask-arena window is served
+// by this same path, with two differences. The window is registered by the engine (the XPR
+// visibility masks, pf_mask_ranges), so the producer test (written in two of the last three frames)
+// is skipped. And every refusal is counted by reason (rb_class_cnt.c2_refused). Nothing else
+// changes, and nothing is written into guest memory: the served bytes are the ones the guest already
+// holds, which by the covered test below are the last applied copy of each GPU-modified byte that
+// is dropped. Freshness is the same bound as SOTC_RB_PREV (applied at most SOTC_RB_PREV_FRAMES cp
+// frames and 150 ms ago). The owed download of the dropped GPU-newer bytes is applied later by
+// PrefetchMaterialize, so the guest gets the newest frame a little later. The newest complete clean
+// class copy is applied before this runs (PrefetchAtFault, at this same fault), so the last applied
+// copy here is the last complete one. A copy in flight that overlaps a dropped page goes dirty
+// (PrefetchMarkDirty) and is never applied over the served version.
 bool BufferCache::TryServePrevious(AsyncReadback& readback) {
-    if (readback.is_write) {
-        return false;
-    }
     const VAddr addr = readback.device_addr;
     const u64 size = readback.size;
     const u64 granule = PfGranule();
     const VAddr key = Common::AlignDown(addr, granule);
-    if (addr + size > key + granule) {
-        return false; // spans two windows: the usual path
-    }
-    const u64 frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
-    const auto wm = pf_wmask.find(key);
-    if (wm == pf_wmask.end()) {
+    const bool c2_win = rb_class2_env && !pf_mask_ranges.empty() &&
+                        SotcRbClass::InRanges(pf_mask_ranges, key, granule);
+    if (!rb_prev_env && !c2_win) {
         return false;
     }
-    {
+    // sotc: SOTC_RB_CLASS2_PARTS bisect: without kClass2Serve, class 2 never serves or drops anything.
+    const u32 c2_parts = c2_win ? SotcRbClass::Class2Parts() : 0;
+    if (c2_win && !(c2_parts & SotcRbClass::kClass2Serve)) {
+        return false;
+    }
+    const auto refuse = [&](size_t reason) {
+        if (c2_win) {
+            rb_class_cnt.c2_refused[reason].fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    };
+    if (readback.is_write) {
+        return refuse(kC2Write);
+    }
+    if (c2_win && !MaskHookOn()) {
+        return refuse(kC2NoHook);
+    }
+    if (addr + size > key + granule) {
+        return refuse(kC2Other); // spans two windows: the usual path
+    }
+    const u64 frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
+    // sotc: class 2, proof that only mask bytes lose their GPU-modified state.
+    // 1. A page is dropped only when ok holds, and ok needs every GPU-modified byte of the page
+    //    (ForEachInRange) inside one merged mask span (CoveredBy on masks): an allocation the XPR
+    //    consumer hook recorded (probe_xpr.cpp RecordMask) in the last 4 cp frames (rb_class.h).
+    // 2. A GPU-modified byte outside every span sets foreign, so ok is false: its page is not
+    //    dropped, and an asked page refuses the read (kC2NotOnlyMasks). A page that is not asked
+    //    is left as it is. Nothing else in the loop clears GPU-modified bits.
+    // 3. Subtract, UnmarkRegionAsGpuModified and the owed download (GatherDownloads) act on the
+    //    dropped pages only, and a page is dropped whole only when all its GPU-modified bytes
+    //    passed step 1, so no other GPU-written byte loses its state. In-flight readbacks or
+    //    prefetches that overlap a dropped page are marked dirty and read again: their state
+    //    changes, the GPU data they hold does not lose its GPU-modified state.
+    // Residual risk, not excluded here: a span names the allocation the consumer read, so a
+    // byte of it reused by another GPU writer within those 4 frames would pass step 1 (report).
+    const std::vector<SotcRbClass::Range> masks =
+        c2_win ? SotcRbClass::MaskSpansSince(frame) : std::vector<SotcRbClass::Range>{};
+    if (!c2_win) {
+        const auto wm = pf_wmask.find(key);
+        if (wm == pf_wmask.end()) {
+            return false;
+        }
         const u64 shift = frame > wm->second.frame ? frame - wm->second.frame : 0;
         const u32 mask = shift >= 32 ? 0 : wm->second.mask << shift;
         // Written in at least two of the frames frame-1 .. frame-3 (bits 1-3), whatever this frame
@@ -2632,11 +3053,11 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
     }
     const auto rec = std::ranges::lower_bound(pf_recurring, key, {}, &PfWindow::key);
     if (rec == pf_recurring.end() || rec->key != key) {
-        return false;
+        return refuse(kC2Other);
     }
     const Buffer* arena = address_space[addr >> ARENA_PAGE_BITS];
     if (!arena) {
-        return false;
+        return refuse(kC2Other);
     }
     boost::container::small_vector<std::pair<VAddr, VAddr>, RbMatFreshMax> spans;
     {
@@ -2645,7 +3066,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
         const auto found = pf_applied.find(key);
         if (found == pf_applied.end()) {
             SotcStats::rb_prev_too_old.fetch_add(1, std::memory_order_relaxed);
-            return false;
+            return refuse(kC2NoCopy);
         }
         for (const PfFresh& f : found->second) {
             if (f.frame + rb_prev_frames >= frame && now - f.ns <= RbPrevMaxNs) {
@@ -2665,7 +3086,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
     spans.resize(merged);
     if (spans.empty()) {
         SotcStats::rb_prev_too_old.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        return refuse(kC2NoCopy);
     }
     const auto covered = [&](VAddr lo, VAddr hi) {
         const auto it =
@@ -2684,16 +3105,34 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
         std::shared_lock lock{gpu_modified_mutex};
         for (VAddr page = Common::AlignDown(window_start, Page); page < window_end; page += Page) {
             bool any = false;
-            bool ok = true;
+            bool uncovered = false; // a GPU-modified byte without a recent applied copy
+            bool foreign = false;   // sotc: class 2: a GPU-modified byte outside every mask span
+            bool cpu_page = false;
             gpu_modified_ranges.ForEachInRange(page, Page, [&](VAddr lo, VAddr hi) {
                 any = true;
-                ok = ok && covered(lo, hi);
+                if (!covered(lo, hi)) {
+                    uncovered = true;
+                } else if (c2_win && !SotcRbClass::CoveredBy(masks, lo, hi)) {
+                    foreign = true;
+                }
             });
+            bool ok = !uncovered && !foreign;
             const bool asked = page >= ask_lo && page < ask_hi;
+            // sotc: class 2 drops only the pages the read asked for. The other pages of the window keep
+            // their GPU-modified state (as in class 1): dropping them gave the owed download and the
+            // later CPU uploads bytes nobody read (the bad run of 2026-11-01 04:27). The old scope is
+            // SOTC_RB_CLASS2_PARTS=3.
+            if (c2_win && !asked && !(c2_parts & SotcRbClass::kClass2WindowDrop)) {
+                if (any) {
+                    rb_class_cnt.c2_unasked_kept.fetch_add(1, std::memory_order_relaxed);
+                }
+                continue;
+            }
             // A page the guest also wrote (CPU and GPU bits) would upload the old guest bytes over
             // the arena's newer GPU bytes once released: the exact path (review of 2026-10-28).
             if (any && ok && memory_tracker->IsRegionCpuModified(page, Page)) {
                 ok = false;
+                cpu_page = true;
             }
             if (any && ok) {
                 if (!drop.empty() && drop.back().second == page) {
@@ -2705,12 +3144,16 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
                 // An asked page with GPU data older than the limit (or none: some other reason
                 // for the fault): the usual readback.
                 SotcStats::rb_prev_too_old.fetch_add(1, std::memory_order_relaxed);
-                return false;
+                // sotc: foreign (class 2) is reported only when every other byte is in order.
+                return refuse(!any        ? kC2Other
+                              : cpu_page  ? kC2Cpu
+                              : uncovered ? kC2NotCovered
+                                          : kC2NotOnlyMasks);
             }
         }
     }
     if (drop.empty()) {
-        return false;
+        return refuse(kC2Other);
     }
     // A guest readback in flight already downloads some of these pages: leave them to it (its
     // data would be thrown away as stale and the guest would get the old bytes).
@@ -2724,7 +3167,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
                 for (const auto& [lo, hi] : drop) {
                     if (range_addr < hi && lo < range_addr + range_size) {
                         SotcStats::rb_prev_busy.fetch_add(1, std::memory_order_relaxed);
-                        return false;
+                        return refuse(kC2Busy);
                     }
                 }
             }
@@ -2738,7 +3181,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
     // guest gets the newer version a little later instead of never.
     if (pf_live.size() >= rb_pf_max) {
         SotcStats::rb_pf_capped.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        return refuse(kC2Capped);
     }
     auto owed = std::make_unique<AsyncReadback>();
     u64 owed_total = 0;
@@ -2759,7 +3202,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
     const u64 owed_bytes = owed_total ? std::bit_ceil(std::max<u64>(owed_total, 64_KB)) : 0;
     if (owed_total != 0 && pf_bytes_held + owed_bytes > rb_pf_budget) {
         SotcStats::rb_pf_capped.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        return refuse(kC2Capped);
     }
     if (owed_total != 0) {
         AsyncReadback& o = *owed;
@@ -2803,6 +3246,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
             gpu_modified_ranges.Subtract(lo, hi - lo);
         }
         EraseGranuleSnapshots(lo, hi - lo);
+        SotcStale::Forget(lo, hi - lo); // sotc: SOTC_STALE_CHECK: GPU bits cleared
         memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
         MarkInflightReadbacksDirty(lo, hi - lo, StaleReason::Unmap);
         if (!pf_live.empty()) {
@@ -2821,6 +3265,11 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
         ++inflight_version;
         pf_live.push_back(std::move(owed));
         SotcStats::rb_prev_owed.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (c2_win) {
+        rb_class_cnt.c2_served.fetch_add(1, std::memory_order_relaxed);
+        rb_class_cnt.c2_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        rb_class_cnt.c2_pages.fetch_add(bytes / Page, std::memory_order_relaxed);
     }
     SotcStats::rb_prev_served.fetch_add(1, std::memory_order_relaxed);
     SotcStats::rb_prev_served_all.fetch_add(1, std::memory_order_relaxed);
@@ -2853,6 +3302,27 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
 //    a guest write in between wins.
 // A claimed one (a guest readback waits for it) is left to that readback. Checked at most every
 // SOTC_RB_MATERIALIZE_US (default 100 us), from PrefetchIssue (draw thread, like every readback).
+// sotc: SOTC_RB_CLASS (rb_class.h) relaxes the freshness test for the two ranges the engine names,
+// and only for them (pf_class: 1 mask-arena window, 2 stats request copy; both set only while the
+// registry is on). Why each relaxation is exact:
+// - The freshness test guards against applying GPU-modified bytes that belong to memory the game
+//   reused. The rest of the rules still hold for these copies: a copy is applied only when complete
+//   and clean (any later GPU write, CPU write, unmap, release or other readback dirties it, and a
+//   dirty copy is never applied); the apply is the usual one (same staging, ApplyDownloads with its
+//   heap guard, hot items so guest writes win). So the bytes written are the ones a guest readback
+//   at that moment would copy: all GPU-modified ranges of the window, after every command recorded
+//   before the copy. That is the exact content, whatever the age of its writes.
+// - A mask-arena copy additionally needs its block to be registered: freed blocks leave the
+//   registry (OnFreeBlock), and PrefetchClassAlive checks the current registry before any apply
+//   (materialize and the fault path). A registered block is the game's live memory, not reused.
+//   The hold rule (PrefetchNoteWrite / PrefetchIssue) already makes the copy follow the window's
+//   last write of its cp frame, so no freshness window is needed to order it.
+// - A stats request copy has no registry entry. Its memory is protected until the copy is applied,
+//   so a CPU write to it dirties the copy (TryReplaceFromCpu / CpuWrite) and a GPU write does too.
+//   Residual risk: memory freed and reused with neither a CPU nor a GPU write seen before the apply
+//   (the count of such cases is not known; the stats arrays are short-lived). Accepted for the
+//   class switch only.
+// The counters (rb_class_cnt) say how many copies each path applied, and why the others did not.
 void BufferCache::PrefetchMaterialize() {
     const u64 now = SotcStats::NowNs();
     if (now - pf_mat_last_ns < rb_mat_ns) {
@@ -2866,18 +3336,91 @@ void BufferCache::PrefetchMaterialize() {
             ++i;
             continue;
         }
+        if (p.pf_class == 1 && !PrefetchClassAlive(p)) {
+            // sotc: SOTC_RB_CLASS: the mask block was freed: never applied (PrefetchDrop counts it
+            // as stale, its pages stay GPU-modified).
+            rb_class_cnt.block_gone[0].fetch_add(1, std::memory_order_relaxed);
+            p.dirty = true;
+            PrefetchDrop(i);
+            changed = true;
+            continue;
+        }
         for (auto& item : p.pending) {
             item.hot = true; // guard 2: pages the guest wrote keep its bytes
         }
         FinishAsyncReadback(p); // erases it from inflight_readbacks, frees its staging
         SotcStats::rb_mat_applied.fetch_add(1, std::memory_order_relaxed);
         SotcStats::rb_mat_bytes.fetch_add(p.gathered_bytes, std::memory_order_relaxed);
+        if (p.pf_class) { // sotc: SOTC_RB_CLASS report
+            rb_class_cnt.applied[p.pf_class - 1].fetch_add(1, std::memory_order_relaxed);
+            rb_class_cnt.applied_bytes[p.pf_class - 1].fetch_add(p.gathered_bytes,
+                                                                 std::memory_order_relaxed);
+        }
         PrefetchDrop(i);
         changed = true;
     }
     if (changed) {
         PrefetchUpdateHull();
     }
+}
+
+bool BufferCache::PrefetchClassAlive(const AsyncReadback& p) {
+    if (p.pf_class != 1) {
+        return true;
+    }
+    const u64 version = SotcRbClass::Version();
+    if (version != pf_mat_version) {
+        pf_mat_ranges = SotcRbClass::Snapshot(pf_mat_version);
+    }
+    return SotcRbClass::InRanges(pf_mat_ranges, p.window_start, p.window_size);
+}
+
+void BufferCache::PrefetchClassReport() {
+    static u64 last_ns = 0; // draw thread only (PrefetchIssue)
+    const u64 now = SotcStats::NowNs();
+    if (now - last_ns < 5'000'000'000ull) {
+        return;
+    }
+    last_ns = now;
+    const auto get = [](std::atomic<u64>& c) {
+        return c.exchange(0, std::memory_order_relaxed);
+    };
+    auto& c = rb_class_cnt;
+    std::fprintf(
+        stderr,
+        "SOTC RB class (5 s): mask copies issued %llu, applied %llu (%.1f MiB), read by a fault "
+        "%llu, stale %llu (block gone %llu), expired %llu, claimed %llu; stats copies issued "
+        "%llu, applied %llu (%.1f MiB), read by a fault %llu, stale %llu, expired %llu, claimed "
+        "%llu; refused at issue: held %llu, empty %llu, capped %llu, budget %llu, no arena %llu; "
+        "class 2 served %llu reads (%llu pages, %.1f MiB), refused: write %llu, no copy %llu, not "
+        "covered %llu, not only masks %llu, cpu %llu, busy %llu, capped %llu, no mask hook %llu, "
+        "other %llu\n",
+        (unsigned long long)get(c.issued[0]), (unsigned long long)get(c.applied[0]),
+        get(c.applied_bytes[0]) / 1048576.0, (unsigned long long)get(c.consumed[0]),
+        (unsigned long long)get(c.stale[0]), (unsigned long long)get(c.block_gone[0]),
+        (unsigned long long)get(c.expired[0]), (unsigned long long)get(c.claimed[0]),
+        (unsigned long long)get(c.issued[1]), (unsigned long long)get(c.applied[1]),
+        get(c.applied_bytes[1]) / 1048576.0, (unsigned long long)get(c.consumed[1]),
+        (unsigned long long)get(c.stale[1]), (unsigned long long)get(c.expired[1]),
+        (unsigned long long)get(c.claimed[1]), (unsigned long long)get(c.held),
+        (unsigned long long)get(c.empty), (unsigned long long)get(c.capped),
+        (unsigned long long)get(c.budget), (unsigned long long)get(c.no_arena),
+        (unsigned long long)get(c.c2_served), (unsigned long long)get(c.c2_pages),
+        get(c.c2_bytes) / 1048576.0,
+        (unsigned long long)get(c.c2_refused[kC2Write]),
+        (unsigned long long)get(c.c2_refused[kC2NoCopy]),
+        (unsigned long long)get(c.c2_refused[kC2NotCovered]),
+        (unsigned long long)get(c.c2_refused[kC2NotOnlyMasks]),
+        (unsigned long long)get(c.c2_refused[kC2Cpu]), (unsigned long long)get(c.c2_refused[kC2Busy]),
+        (unsigned long long)get(c.c2_refused[kC2Capped]),
+        (unsigned long long)get(c.c2_refused[kC2NoHook]),
+        (unsigned long long)get(c.c2_refused[kC2Other]));
+    // sotc: class 2 owed downloads dropped dirty (their GPU-newest bytes never reach guest memory),
+    // and window pages of a served read that kept their GPU state (SOTC_RB_CLASS2_PARTS).
+    std::fprintf(stderr, "SOTC RB class 2 (5 s): owed downloads dropped dirty %llu, window pages not "
+                         "asked, GPU state kept %llu\n",
+                 (unsigned long long)get(c.c2_owed_dirty),
+                 (unsigned long long)get(c.c2_unasked_kept));
 }
 
 // sotc: SOTC_RB_EXACT=1 (off by default; needs SOTC_RB_OWNER=1 and the asynchronous readbacks;
@@ -3871,6 +4414,7 @@ BufferCache::ExactResult BufferCache::TryServeExact(AsyncReadback& readback, con
             gpu_modified_ranges.Subtract(lo, hi - lo);
         }
         EraseGranuleSnapshots(lo, hi - lo);
+        SotcStale::Forget(lo, hi - lo); // sotc: SOTC_STALE_CHECK: GPU bits cleared
         memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
         MarkInflightReadbacksDirty(lo, hi - lo, StaleReason::Unmap, true);
         if (!pf_live.empty()) {
@@ -5158,7 +5702,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 }
             };
             write_pages(dst_addr, copy.size, [&](VAddr part_addr, u64 part_size) {
-            if (rb_prev_env) {
+            if (rb_prev_book) {
                 // sotc: SOTC_RB_PREV: only the parts written (hot items skip guest-written pages)
                 PrevNoteApplied(part_addr, part_size);
             }
@@ -5291,6 +5835,17 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         std::ranges::sort(keep_all); // the loop below needs the keep ranges in ascending order
         keep = keep_all;
     }
+    // sotc: SOTC_PROTECT_BATCH, readback side. Every change the unmarks make is an Untrack (the
+    // protection falls: GPU bits cleared after the bytes reached guest memory above, and the
+    // retrack gives CPU bits to untracked pages), never a re-protect. Ordering: the bytes are
+    // already in guest memory when the scope opens, so the copy cannot be overtaken; a deferred
+    // Untrack leaves a page protected for a little longer (a guest write then faults, and the
+    // fault path makes an RW-state page writable on the host). The flush at scope end runs
+    // before this function returns, so the readback's caller never sees a page both unprotected
+    // in the tracker and protected by the host for longer than this call. Inert until
+    // RegionManager::ChangeRegionState and RetrackDownloadedLocked pass deferrable for these ops
+    // (region_manager.h, outside this change).
+    const PageManager::ProtectBatch unmark_batch{SotcStats::kProtectBatch};
     for (std::size_t i = 0; i < merged; ++i) {
         const auto [start, stop] = runs[i];
         // sotc: SOTC_RB_KEEP_LATER: pages a later GPU write covers keep their GPU state.
@@ -5332,6 +5887,22 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                                                         bool is_written, bool is_texel_buffer,
                                                         u32 mark_offset, u32 mark_size) {
     SotcLoadWarm::NoteBind(device_addr, size); // sotc: SOTC_LOAD_WARM (no-op when off)
+    // sotc: SOTC_CLASS_TRACK: a GPU-bound granule is never CPU_ONLY. Draw thread only (the lookup
+    // is rebuilt there); binds from other threads are rare and only delay the signal.
+    if (SotcMemClasses::On() && SotcStats::t_draw_thread) {
+        u64 hit_lo = 0, hit_hi = 0;
+        if (SotcMemClasses::NoteGpuBind(device_addr, size, 0, &hit_lo, &hit_hi) &&
+            SotcMemClasses::Mode() == 1) {
+            // sotc: a bind hit a published (untracked) block: its CPU writes since the publish
+            // were not seen. Mark the whole published span CPU-modified so this bind uploads it.
+            memory_tracker->MarkRegionAsCpuModified(hit_lo, hit_hi - hit_lo);
+        }
+    }
+    // sotc: SOTC_PC_PLACE bind evidence has its own gate (the glue is on), not SOTC_CLASS_TRACK. Any thread: the glue
+    // locks, and a bind can only take a block out of CPU_ONLY.
+    if (SotcPcPlaceGlue::On()) {
+        SotcPcPlaceGlue::Global().OnGpuBind(device_addr, size);
+    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     // sotc: SOTC_STREAM_THRESHOLD=<bytes> (default 16 KiB) for A/B: small read-only buffers are
     // copied into the stream buffer on every bind instead of using the synchronized arena.
@@ -5346,6 +5917,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
         return {&stream_buffer, offset};
+    }
+    // sotc: SOTC_PC_RING=8 (host arena binds): a range inside one imported arena run is read, and
+    // written, in the imported host memory. No sync and no GPU tracking for it (pc_ring.h, mode 8).
+    if (SotcPcRing::Mode() == 8) {
+        if (auto host = PcHostBind(device_addr, size, is_written)) {
+            return *host;
+        }
     }
     if (hrr && hrr->NoteBinding(device_addr, size, is_written)) { // sotc: SOTC_HRR dry run
         hrr->NoteImageOverlap(device_addr, size, texture_cache.HasImageInRange(device_addr, size));
@@ -5395,6 +5973,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 }
 
 u64 BufferCache::AddGpuModified(VAddr addr, u64 size) {
+    // sotc: SOTC_PC_RING=4/5 coverage input: every GPU write into the arena, before any early
+    // return below (the range may already be marked). Lock-free; no-op in the other modes.
+    if ((SotcPcRing::FullRingMode() == 4 || SotcPcRing::FullRingMode() == 5) &&
+        SotcPcRing::InArena(addr, size)) {
+        SotcPcRing::NoteGpuWrite(addr, size);
+    }
     // sotc: SOTC_RB_EXACT: a write into a hot window (a recurring readback granule) gets the next
     // hot sequence number; labels snapshot it (HotWriteSeq) to say which writes they announce.
     // The write is noted (with its seq_floor, which needs the owed and GPU-modified state as it
@@ -5701,6 +6285,7 @@ void BufferCache::EraseHashedUploads(VAddr addr, u64 size) {
 void BufferCache::RecordCurrentWrite(VAddr addr, u64 size, u64 seq, bool gpu_write,
                                      bool pf_marked) {
     const u32 wd_mode = WriteDietMode();
+    SotcStale::Forget(addr, size); // sotc: SOTC_STALE_CHECK: any arena write (GPU or upload)
     EraseHashedUploads(addr, size);
     // sotc: SOTC_RB_EXACT: any arena write over owed bytes takes them out of the owed downloads.
     if (RbxOn() && rbx_owed_count.load(std::memory_order_relaxed) != 0) {
@@ -5988,6 +6573,27 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionCpuModified(addr, size);
 }
 
+// sotc: SOTC_HLE_TABLE_GEN accessors (vk_shader_hle.cpp). The generations exist only with
+// SOTC_SYNC_FAST or SOTC_BUF_BIND_FAST; BumpSyncGeneration checks that itself.
+bool BufferCache::SyncGeneration(VAddr addr, u64 size, u64& gen) const {
+    return memory_tracker->SyncGeneration(addr, size, gen);
+}
+
+bool BufferCache::IsCpuClean(VAddr addr, u64 size) const {
+    return memory_tracker->IsSyncClean(addr, size, false);
+}
+
+bool BufferCache::OwedIntersects(VAddr addr, u64 size) const {
+    return rbx_owed_count.load(std::memory_order_relaxed) != 0 && RbxOwedIntersects(addr, size);
+}
+
+void BufferCache::BumpSyncGeneration(VAddr addr, u64 size) {
+    if (!SotcBufBindFast::kGenStamps) {
+        return;
+    }
+    memory_tracker->BumpSyncGeneration(addr, size);
+}
+
 bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
     if (size == 0) {
         return true;
@@ -6009,6 +6615,7 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
         std::unique_lock gpu_modified_lock{gpu_modified_mutex};
         gpu_modified_ranges.Subtract(addr, size);
     }
+    SotcStale::Forget(addr, size); // sotc: SOTC_STALE_CHECK: GPU bits cleared
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size, StaleReason::CpuWrite);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
@@ -6050,6 +6657,7 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
         std::unique_lock gpu_modified_lock{gpu_modified_mutex};
         gpu_modified_ranges.Subtract(addr, size);
     }
+    SotcStale::Forget(addr, size); // sotc: SOTC_STALE_CHECK: GPU bits cleared
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size, StaleReason::CpuWrite);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
@@ -6109,6 +6717,7 @@ bool BufferCache::TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, 
         std::unique_lock gpu_modified_lock{gpu_modified_mutex};
         gpu_modified_ranges.Subtract(addr, size);
     }
+    SotcStale::Forget(addr, size); // sotc: SOTC_STALE_CHECK: GPU bits cleared
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size, StaleReason::CpuWrite);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
@@ -6197,6 +6806,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    const SotcPcRing::SweepScope ring_sweep; // sotc: SOTC_PC_RING, uploads here are sweeps
     const SyncReason sync_reason{3}; // sotc: SOTC_TRACE reason 3 (DMA sweep)
     // sotc: SOTC_DMA_SYNC_SKIP=1, diagnostic only: no sweep, to weigh its share of the stalls when
     // a new area loads (shaders unchanged, unlike turning the DMA off; reflections may lag).
@@ -6216,12 +6826,35 @@ void BufferCache::SynchronizeDmaBuffers() {
     // untracked (RegionManager), and the self-check trips and releases everything on a bad fault.
     if (SotcMemClasses::On()) {
         SotcMemClasses::RefreshLookup(); // the write-fault lookup (both modes), cheap when unchanged
+        // sotc: memtype granules (per-heap classes): every 250 ms a rotating window of 512 granules
+        // gets its GPU-marked pages and texture overlap sampled, before ApplyRanges below reads the
+        // classes. A full pass over 32k granules takes ~16 s; a granule is published as CPU_ONLY only
+        // once sampled, so an unsampled one simply stays tracked.
+        static auto granule_next = std::chrono::steady_clock::time_point{};
+        static size_t granule_cursor = 0;
+        const auto granule_now = std::chrono::steady_clock::now();
+        if (granule_now >= granule_next) {
+            granule_next = granule_now + std::chrono::milliseconds(250);
+            u64 granule_version = 0;
+            const auto granules = SotcMemClasses::SnapshotGranules(granule_version);
+            const size_t count = std::min<size_t>(granules.size(), 512);
+            for (size_t k = 0; k < count; ++k) {
+                const auto& g = granules[(granule_cursor + k) % granules.size()];
+                SotcMemClasses::NoteGranuleGpuPages(
+                    g.index, memory_tracker->CountClassGpuPages(
+                                 {VideoCore::SotcUntrack::Range{g.addr, g.size}}));
+                SotcMemClasses::NoteGranuleImage(g.index,
+                                                 texture_cache.HasImageInRange(g.addr, g.size));
+            }
+            granule_cursor = granules.empty() ? 0 : (granule_cursor + count) % granules.size();
+        }
     }
     if (SotcMemClasses::Mode() == 1) {
         if (class_pub_wait < 30) {
             ++class_pub_wait;
         }
-        if (class_pub_wait >= 30 && SotcMemClasses::Version() != class_pub_version) {
+        if ((class_pub_wait >= 30 || SotcMemClasses::RetrackPending()) &&
+            SotcMemClasses::Version() != class_pub_version) {
             u64 version = 0;
             const auto cls = SotcMemClasses::ApplyRanges(version);
             std::vector<VideoCore::SotcUntrack::Range> list;
@@ -6242,6 +6875,13 @@ void BufferCache::SynchronizeDmaBuffers() {
             VideoCore::SotcUntrack::PublishClass(std::move(list));
             SotcMemClasses::NotePublish(VideoCore::SotcUntrack::AutoRanges(),
                                         VideoCore::SotcUntrack::AutoBytes());
+            // sotc: ranges this publish left out were untracked until now: mark them
+            // CPU-modified so their next bind uploads the CPU writes they missed.
+            std::vector<SotcMemClasses::Range> retracked;
+            SotcMemClasses::TakeRetracked(retracked);
+            for (const auto& r : retracked) {
+                memory_tracker->MarkRegionAsCpuModified(r.addr, r.size);
+            }
             class_pub_version = version;
             class_pub_wait = 0;
         }
@@ -6293,6 +6933,35 @@ void BufferCache::SynchronizeDmaBuffers() {
                 SotcMemClasses::NoteImageRanges(pool, images);
             }
             SotcMemClasses::NoteShadow(cls.size(), bytes, gpu_pages);
+        }
+        // sotc: SOTC_CLASS_TRACK=2 owners (PC memory model, wave B). The GPU-marked pages and the
+        // texture-image overlaps of every live block, grouped by allocator owner (not only CPU-only).
+        // Recounted at most every 250 ms: the table changes on almost every sync during loads, and
+        // the snapshot plus one page walk per owner would otherwise skew the timings being measured.
+        static auto owner_next = std::chrono::steady_clock::time_point{};
+        const auto owner_now = std::chrono::steady_clock::now();
+        if (owner_now >= owner_next) {
+            owner_next = owner_now + std::chrono::milliseconds(250);
+            u64 owner_version = 0;
+            const auto owners = SotcMemClasses::SnapshotOwners(owner_version);
+            std::vector<std::vector<VideoCore::SotcUntrack::Range>> by_owner(
+                SotcMemClasses::kMaxOwners);
+            for (const auto& r : owners) {
+                by_owner[std::min<u32>(r.owner, SotcMemClasses::kMaxOwners - 1)].push_back(
+                    VideoCore::SotcUntrack::Range{r.addr, r.size});
+            }
+            for (u32 owner = 0; owner < SotcMemClasses::kMaxOwners; ++owner) {
+                if (by_owner[owner].empty()) {
+                    continue;
+                }
+                SotcMemClasses::NoteShadowOwner(
+                    owner, memory_tracker->CountClassGpuPages(by_owner[owner]));
+                u64 images = 0;
+                for (const auto& r : by_owner[owner]) {
+                    images += texture_cache.HasImageInRange(r.addr, r.size) ? 1 : 0;
+                }
+                SotcMemClasses::NoteOwnerImageRanges(owner, images);
+            }
         }
     }
     const u64 uploads_before = SotcStats::uploads.load(std::memory_order_relaxed);
@@ -6512,6 +7181,12 @@ void BufferCache::NoteBindUse(VAddr device_addr, u64 size) noexcept {
 
 void BufferCache::SynchronizeBinding(const Buffer* arena, VAddr device_addr, u32 size,
                                      bool is_texel_buffer) {
+    // sotc: SOTC_PC_RING=8. A host view is the guest memory itself (imported): a bind memo or bind
+    // cache entry that holds one has nothing to upload into it, and an upload would copy the bytes
+    // onto themselves while the GPU may be writing them.
+    if (SotcPcRing::Mode() == 8 && PcHostIsView(arena)) {
+        return;
+    }
     // sotc: SOTC_BIND_CACHE_XTICK. ObtainBuffer's SynchronizeMemory for a read-only binding.
     const SyncReason sync_reason{4}; // sotc: SOTC_TRACE reason 4 (SynchronizeBinding)
     SynchronizeMemory(arena, device_addr, size, false, is_texel_buffer);
@@ -6673,7 +7348,9 @@ struct SyncFastSlot {
     u32 size{}; // 0: empty (a real sync has size > 0)
     bool is_written{};
 };
-constexpr u64 SyncFastSlotBits = 10;
+// 4096 slots (was 1024) to make collisions between live keys rarer; direct-mapped and
+// thread-local, so a collision only costs the full page walk. Not measured yet.
+constexpr u64 SyncFastSlotBits = 12;
 thread_local std::array<SyncFastSlot, 1ULL << SyncFastSlotBits> sync_fast_slots{};
 
 SyncFastSlot& SyncFastSlotFor(VAddr addr, u32 size, bool is_written) {
@@ -6682,12 +7359,378 @@ SyncFastSlot& SyncFastSlotFor(VAddr addr, u32 size, bool is_written) {
 }
 } // namespace
 
+// sotc: SOTC_PC_RING full ring (pc_ring_copy.cpp, draw thread). Forwarders to the tracker, which
+// is private here. Declared in buffer_cache.h (PcRingApply, PcRingMarkClean).
+void BufferCache::PcRingApply(const std::vector<SotcPcRing::RingExtent>& blocks) {
+    std::vector<SotcUntrack::Range> ranges;
+    ranges.reserve(blocks.size());
+    for (const auto& block : blocks) {
+        ranges.push_back(SotcUntrack::Range{block.addr, block.size});
+    }
+    memory_tracker->ApplyRing(ranges);
+}
+
+void BufferCache::PcRingDelta(VAddr addr, u64 size, bool on) { // sotc: SOTC_PC_RING=5
+    if (on) {
+        memory_tracker->AddRingRange(addr, size);
+    } else {
+        memory_tracker->RemoveRingRange(addr, size);
+    }
+}
+
+// sotc: SOTC_PC_RING=8 (host arena binds). See pc_ring.h (mode 8) and HostMaintain (pc_ring_copy.cpp).
+void BufferCache::PcHostApply(const std::vector<SotcPcRing::RingExtent>& blocks) {
+    // Pages that leave the ring go back to normal tracking, but their CPU writes while ringed were
+    // never seen (no fault, no ring copy in mode 8): the tracker would take a stale device copy for
+    // clean. They are marked CPU-modified once the ring bit is off, so the next bind uploads them
+    // (blocks leave during loads; suspected cause of the loading-screen glitch, 1 Nov).
+    std::vector<SotcPcRing::RingExtent> left;
+    {
+        std::scoped_lock lock{pc_host_mutex};
+        for (const auto& old : pc_host_blocks) {
+            VAddr cursor = old.addr;
+            const VAddr end = old.addr + old.size;
+            auto sorted = blocks;
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& a, const auto& b) { return a.addr < b.addr; });
+            for (const auto& now : sorted) {
+                const VAddr lo = std::max<VAddr>(now.addr, cursor);
+                const VAddr hi = std::min<VAddr>(now.addr + now.size, end);
+                if (lo >= hi) {
+                    continue;
+                }
+                if (lo > cursor) {
+                    left.push_back({cursor, lo - cursor});
+                }
+                cursor = hi;
+            }
+            if (cursor < end) {
+                left.push_back({cursor, end - cursor});
+            }
+        }
+        pc_host_blocks = blocks;
+    }
+    PcRingApply(blocks);
+    for (const auto& range : left) {
+        memory_tracker->MarkRegionAsCpuModified(range.addr, range.size);
+    }
+    static int logged = 0;
+    for (const auto& range : left) {
+        if (logged++ < 64) {
+            std::fprintf(stderr, "SOTC PC RING8 left the ring: %#llx +%llu KiB (marked CPU-modified)\n",
+                         static_cast<unsigned long long>(range.addr),
+                         static_cast<unsigned long long>(range.size >> 10));
+        }
+    }
+}
+
+bool BufferCache::PcHostIsView(const Buffer* buffer) {
+    std::scoped_lock lock{pc_host_mutex};
+    for (const auto& [key, view] : pc_host_views) {
+        if (view.get() == buffer) {
+            return true;
+        }
+    }
+    return false;
+}
+
+u64 BufferCache::PcHostMarkCpu(VAddr addr, u64 size) {
+    // Ranges to mark: the part of [addr, addr + size) in each imported block (the rest of the bind
+    // is normal tracked memory and is not touched here), minus the parts already marked by an
+    // earlier bind of the same draw-side submit. That bind's upload holds the bytes of this submit
+    // unless the game wrote them since, so the dedupe is only kept inside one submit (pc_host_marked
+    // is reset at PcHostSubmitStart). SOTC_PC_RING8_DEDUPE=0 turns the dedupe off.
+    static const bool dedupe = [] {
+        const char* v = std::getenv("SOTC_PC_RING8_DEDUPE");
+        return !(v && v[0] == '0');
+    }();
+    std::vector<std::pair<VAddr, u64>> todo;
+    u64 skipped = 0;
+    {
+        std::scoped_lock lock{pc_host_mutex};
+        if (pc_host_submit_seq != pc_host_mark_seq) {
+            pc_host_mark_seq = pc_host_submit_seq;
+            pc_host_marked.clear();
+        }
+        for (const auto& block : pc_host_blocks) {
+            const VAddr lo = std::max<VAddr>(addr, block.addr);
+            const VAddr hi = std::min<VAddr>(addr + size, block.addr + block.size);
+            if (lo >= hi) {
+                continue;
+            }
+            bool covered = false;
+            for (const auto& [m_addr, m_size] : pc_host_marked) {
+                if (m_addr <= lo && hi <= m_addr + m_size) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (dedupe && covered) {
+                skipped += hi - lo;
+                continue;
+            }
+            if (pc_host_marked.size() >= 4096) {
+                pc_host_marked.clear(); // a re-mark is only an extra upload
+            }
+            pc_host_marked.emplace_back(lo, hi - lo);
+            todo.emplace_back(lo, hi - lo);
+        }
+    }
+    u64 marked = 0;
+    for (const auto& [lo, len] : todo) {
+        memory_tracker->MarkRegionAsCpuModified(lo, len);
+        marked += len;
+    }
+    SotcPcRing::NoteHostMark(marked, skipped);
+    return marked;
+}
+
+void BufferCache::PcHostLogStraddle(VAddr addr, u32 size, int relation, u64 marked) {
+    static std::atomic<u32> logged{0};
+    if (relation != 2 || logged.load(std::memory_order_relaxed) >= 32) {
+        return; // straddling binds only, first 32 per run
+    }
+    logged.fetch_add(1, std::memory_order_relaxed);
+    std::vector<SotcPcRing::RingExtent> imported;
+    {
+        std::scoped_lock lock{pc_host_mutex};
+        imported = pc_host_blocks;
+    }
+    u64 version = 0;
+    const auto blocks = SotcPcRing::ArenaBlocks(version);
+    std::fprintf(stderr,
+                 "SOTC PC RING8 bind #%u: %#llx +%u relation %d, marked %llu bytes, epoch %u\n",
+                 logged.load(std::memory_order_relaxed), static_cast<unsigned long long>(addr), size,
+                 relation, static_cast<unsigned long long>(marked), SotcPcRing::SubmitEpoch());
+    for (const auto& block : blocks) {
+        const bool overlaps = block.addr < addr + size && addr < block.addr + block.size;
+        bool is_imported = false;
+        for (const auto& imp : imported) {
+            is_imported = is_imported || (imp.addr <= block.addr && block.addr + block.size <= imp.addr + imp.size);
+        }
+        std::fprintf(stderr, "  block %#llx +%llu KiB overlaps %d imported %d\n",
+                     static_cast<unsigned long long>(block.addr),
+                     static_cast<unsigned long long>(block.size >> 10), overlaps ? 1 : 0,
+                     is_imported ? 1 : 0);
+    }
+}
+
+namespace {
+// sotc: SOTC_PC_RING=8 verify and unique-bytes helpers. Hashes at most 1 MiB of a range (the
+// guest bytes now, through the copy of TryCopySparseMemory). 0 when the range is not readable.
+constexpr u64 kPcHostHashMax = u64{1} << 20;
+u64 PcHostHash(Core::MemoryManager* memory, VAddr addr, u64 size) {
+    const u64 n = std::min(size, kPcHostHashMax);
+    thread_local std::vector<u8> buf;
+    buf.resize(n);
+    if (!memory->TryCopySparseMemory(addr, buf.data(), n)) {
+        return 0;
+    }
+    return XXH3_64bits(buf.data(), n);
+}
+
+// Sorts the spans by address, merges the overlapping ones in place and returns their total size.
+u64 PcHostMergeSpans(std::vector<std::pair<VAddr, u64>>& spans) {
+    std::sort(spans.begin(), spans.end());
+    std::vector<std::pair<VAddr, u64>> merged;
+    merged.reserve(spans.size());
+    for (const auto& [addr, size] : spans) {
+        if (!merged.empty() && addr <= merged.back().first + merged.back().second) {
+            const u64 end = std::max(merged.back().first + merged.back().second, addr + size);
+            merged.back().second = end - merged.back().first;
+        } else {
+            merged.emplace_back(addr, size);
+        }
+    }
+    u64 total = 0;
+    for (const auto& span : merged) {
+        total += span.second;
+    }
+    spans = std::move(merged);
+    return total;
+}
+constexpr size_t kPcHostSpansCompact = 4096; // merge the span list when it grows past this
+} // namespace
+
+void BufferCache::PcHostRecordBind(VAddr addr, u32 size, bool is_written) {
+    // sotc: the span records (unique bytes per frame) and samples cost the draw thread on every served bind
+    // (FPS 27 -> 10 in game, 1 Nov): kept only under SOTC_PC_RING8_VERIFY=1.
+    if (!SotcPcRing::Ring8Verify()) {
+        return;
+    }
+    auto& spans = is_written ? pc_host_write_spans : pc_host_read_spans;
+    spans.emplace_back(addr, size);
+    if (spans.size() % kPcHostSpansCompact == 0) {
+        PcHostMergeSpans(spans); // amortized: merged again after every kPcHostSpansCompact appends
+    }
+    if (SotcPcRing::Ring8Verify() && pc_host_bind_seq++ % SotcPcRing::Ring8VerifySample() == 0 &&
+        pc_host_verify.size() < kPcHostSpansCompact) {
+        pc_host_verify.push_back(
+            PcHostVerifyRec{addr, size, PcHostHash(memory, addr, size), is_written});
+    }
+}
+
+void BufferCache::PcHostSubmitStart() {
+    std::scoped_lock lock{pc_host_mutex};
+    ++pc_host_submit_seq; // sotc: the dedupe of PcHostMarkCpu is per draw-side submit
+    // Unique bytes of the submit that ended: the GPU reads each byte once per submit.
+    const u64 read_bytes = PcHostMergeSpans(pc_host_read_spans);
+    const u64 write_bytes = PcHostMergeSpans(pc_host_write_spans);
+    SotcPcRing::NoteHostUnique(read_bytes, write_bytes);
+    pc_host_read_spans.clear();
+    pc_host_write_spans.clear();
+    // Verify: the bytes of each sampled bind now against the hash taken at the bind.
+    for (const auto& rec : pc_host_verify) {
+        const u64 bytes = std::min(rec.size, kPcHostHashMax);
+        const bool changed = PcHostHash(memory, rec.addr, rec.size) != rec.hash;
+        SotcPcRing::NoteHostVerify(rec.written, bytes, changed);
+    }
+    pc_host_verify.clear();
+}
+
+// sotc: SOTC_PC_RING=8 flip wait. The game reuses a heap half two frames after it was current: the
+// draw thread bound its served ranges while the game was building the frame before the last one.
+// Deadlock argument: the calls below only wait for the command processor, the draw thread and the
+// GPU. None of them waits for the game thread, which is the only thread that calls this (the frame
+// boundary). WaitGpuIdle is the wait SubmitDone already does on that thread in the default gate.
+void BufferCache::PcHostFlipWait() {
+    if (!SotcPcRing::Ring8FlipWaitOn()) {
+        return;
+    }
+    const u64 t0 = SotcStats::NowNs();
+    // 1. The command processor parsed every submitted buffer and the draw thread ran it: every
+    //    served bind of the submits so far is recorded in a scheduler tick.
+    if (liverpool) {
+        liverpool->WaitGpuIdle();
+    }
+    // 2. The half the game makes current now was current before the previous flip. The tick sampled
+    //    at that flip covers all of its work (served binds included): the GPU must finish it first.
+    const u64 half = pc_host_flip_count & 1;
+    const u64 wait_tick = pc_host_half_tick[half];
+    if (wait_tick != 0) {
+        scheduler.Wait(wait_tick);
+        scheduler.PopPendingOperations();
+    }
+    // 3. The half that stops being current now: its last use ends with everything recorded so far.
+    pc_host_half_tick[half ^ 1] = scheduler.CurrentTick();
+    ++pc_host_flip_count;
+    const unsigned halves = (pc_host_half_tick[0] != 0 ? 1u : 0u) + (pc_host_half_tick[1] != 0 ? 1u : 0u);
+    const u64 ns = SotcStats::NowNs() - t0;
+    static std::atomic<bool> slow_logged{false};
+    if (ns > 2'000'000'000ull && !slow_logged.exchange(true)) {
+        std::fprintf(stderr, "SOTC PC RING8 flip wait took %llu ms (GPU behind by more than a frame)\n",
+                     static_cast<unsigned long long>(ns / 1'000'000ull));
+    }
+    SotcPcRing::NoteFlipWait(ns, wait_tick != 0, halves);
+}
+
+// sotc: SOTC_PC_RING=8 clip. The 64 MiB binds that start inside a 32 MiB arena block are unbounded
+// V#s cut to the rasterizer's window, not game sizes. Taking the normal path, their arena part was a
+// device copy uploaded once per submit (about 3 GiB/s of marks, FPS 28 -> 22) and a memoized hit
+// skipped the marks, while the served binds of the same bytes read the live host memory (1 Nov).
+u64 BufferCache::PcHostClipLimited(VAddr addr, u64 size) {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_PC_RING8_CLIP");
+        return !(v && v[0] == '0');
+    }();
+    if (!on || SotcPcRing::ArenaRelation(addr, size) != 2) {
+        return size;
+    }
+    Vulkan::SotcGuestMemory::GuestView view{};
+    if (!Vulkan::SotcGuestMemory::LookupGuestView(addr, 1, &view)) {
+        return size; // starts outside an imported run
+    }
+    const u64 run_end = view.cpu_base + view.buffer_size;
+    if (addr + size <= run_end) {
+        return size;
+    }
+    SotcPcRing::NoteHostClip();
+    return run_end - addr;
+}
+
+std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostBind(VAddr device_addr, u32 size,
+                                                                      bool is_written) {
+    const int relation = SotcPcRing::ArenaRelation(device_addr, size);
+    if (relation == 0) {
+        return std::nullopt; // not in the arena
+    }
+    if (SotcStats::t_draw_thread) {
+        VideoCore::PcRingCopy::HostMaintain(*this); // imports and ring, once per submit
+    }
+    if (relation == 2 && !SotcPcRing::Ring8Group()) {
+        // Crosses a block edge: the normal path, after the ringed bytes it covers are marked for
+        // upload (the ring does not fault their CPU writes). Exactly the pre-group behaviour.
+        SotcPcRing::NoteHostStraddle(false);
+        const u64 marked = PcHostMarkCpu(device_addr, size);
+        PcHostLogStraddle(device_addr, size, relation, marked);
+        return std::nullopt;
+    }
+    Vulkan::SotcGuestMemory::GuestView view{};
+    // With SOTC_PC_RING8_GROUP=1 a bind across two arena blocks is served when they were imported
+    // as one run; LookupGuestView fails when the bytes are not one run.
+    if (!Vulkan::SotcGuestMemory::LookupGuestView(device_addr, size, &view)) {
+        // The block is not imported (or the bind spans two runs): the normal path.
+        if (relation == 2) {
+            SotcPcRing::NoteHostStraddle(false);
+        } else {
+            SotcPcRing::NoteHostFallback();
+        }
+        const u64 marked = PcHostMarkCpu(device_addr, size);
+        PcHostLogStraddle(device_addr, size, relation, marked);
+        return std::nullopt;
+    }
+    if (relation == 2) {
+        SotcPcRing::NoteHostStraddle(true);
+    }
+    std::scoped_lock lock{pc_host_mutex};
+    std::unique_ptr<Buffer>& slot = pc_host_views[view.cpu_base];
+    if (!slot || slot->Handle() != view.buffer) {
+        if (slot) {
+            pc_host_retired.push_back(std::move(slot)); // a bind may still hold the old view
+        }
+        slot = std::make_unique<Buffer>(view.cpu_base, view.buffer_size, view.buffer);
+    }
+    SotcPcRing::NoteHostBind(size, is_written);
+    PcHostRecordBind(device_addr, size, is_written);
+    return std::pair<const Buffer*, u64>{slot.get(), view.offset};
+}
+
+void BufferCache::PcRingMarkClean(VAddr addr, u64 size) {
+    SotcStale::Forget(addr, size); // sotc: SOTC_STALE_CHECK: clean bits lifted without an upload
+    memory_tracker->MarkRingClean(addr, size);
+}
+
+// sotc: SOTC_STALE_CHECK: the tracker queries of stale_check.h, over this buffer cache's tracker.
+static SotcStale::Oracle StaleOracle(MemoryTracker* tracker) {
+    return SotcStale::Oracle{
+        tracker,
+        [](void* ctx, uint64_t addr, uint64_t size) {
+            return static_cast<MemoryTracker*>(ctx)->IsRegionCpuModified(addr, size);
+        },
+        [](void* ctx, uint64_t addr, uint64_t size) {
+            return static_cast<MemoryTracker*>(ctx)->IsRegionGpuModified(addr, size);
+        }};
+}
+
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
     if (SotcStats::kCeiling & SotcStats::CeilingSync) {
         return false; // sotc: SOTC_CEILING=sync, measurement only (see sotc_stats.h)
     }
-    if (!SotcStats::kSyncFast) {
+    // sotc: SOTC_STALE_CHECK: one bind in N compares the CPU- and GPU-clean pages of this range
+    // with the hashes stored at their last upload (stale_check.h). Before any sync below.
+    if (SotcStale::On() && SotcStale::SampleBind()) {
+        SotcStale::CheckBind(device_addr, size, StaleOracle(memory_tracker.get()));
+    }
+    // sotc: SOTC_PC_RING=4/5/7 (verify): the arena ranges a bind reads are checked against the
+    // submit's extents. Records only; the upload below is unchanged.
+    if ((SotcPcRing::FullRingMode() == 4 || SotcPcRing::FullRingMode() == 5 ||
+         SotcPcRing::FullRingMode() == 7) && // sotc: verify
+        SotcPcRing::InArena(device_addr, size)) {
+        SotcPcRing::CheckBind(device_addr, size);
+    }
+    // sotc: SOTC_BUF_BIND_FAST=1 also takes this path (its stamps are kept by region_manager.h).
+    if (!SotcBufBindFast::kGenStamps) {
         return SynchronizeMemoryFull(arena, device_addr, size, is_written, is_texel_buffer);
     }
     // sotc: SOTC_SYNC_FAST. Skip the page scan (and its locks) when the range was found clean
@@ -6778,16 +7821,31 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         // re-protects are flushed. a = ranges found.
         SotcTrace::ScopeMin trace_protect{"sync protect"};
         const PageManager::ProtectBatch protect_batch{SotcStats::kProtectBatch};
+        const u64 bind_size = size; // sotc: SOTC_PC_RING (the lambda's size is the range's)
         clean = memory_tracker->ForEachUploadRange(device_addr, size, is_written,
                                                    [&](u64 addr, u64 size) {
                                                        copies.emplace_back(total_size_bytes, addr,
                                                                            size);
                                                        total_size_bytes += size;
+                                                       // sotc: SOTC_PC_RING=2 divergence check
+                                                       if (SotcPcRing::On()) {
+                                                           SotcPcRing::NoteUpload(addr, size,
+                                                                                  device_addr,
+                                                                                  bind_size);
+                                                       }
                                                    });
         trace_protect.a = copies.size();
     }
     if (scan_clean) { // sotc: SOTC_SYNC_PIPE, see SynchronizeMemory
         *scan_clean = clean;
+    }
+    // sotc: SOTC_STALE_CHECK: the pages of this upload lose their stored hashes here, so a path
+    // below that copies them without recording (host import, async, granule drop) leaves none.
+    // The record after the CPU copy stores new ones.
+    if (SotcStale::On()) {
+        for (const auto& copy : copies) { // dstOffset: guest address here
+            SotcStale::Forget(copy.dstOffset, copy.size);
+        }
     }
     // sotc: SOTC_FAULT_GRANULE: pages a granule marked dirty that the guest never wrote stay as
     // the arena holds them. Only runs when such pages are pending (otherwise one atomic load).
@@ -7002,6 +8060,15 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
             }
             for (const auto& copy : copies) {
                 RecordCurrentWrite(arena->cpu_addr + copy.dstOffset, copy.size);
+            }
+        }
+        // sotc: SOTC_STALE_CHECK: hash the bytes copied from guest memory above (backing view),
+        // after RecordCurrentWrite, which dropped the entries of these runs. dstOffset is the arena
+        // offset here, so the guest address is arena->cpu_addr + dstOffset.
+        if (SotcStale::On()) {
+            const auto oracle = StaleOracle(memory_tracker.get());
+            for (const auto& copy : copies) {
+                SotcStale::RecordUpload(arena->cpu_addr + copy.dstOffset, copy.size, oracle);
             }
         }
         // The hashes go in after RecordCurrentWrite, which drops the older ones of these runs.
@@ -7623,7 +8690,7 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     }
     // sotc: SOTC_RB_PREFETCH: the range loses its GPU-modified state below without a readback;
     // a prefetch of it must never land afterwards (the guest may map other data there).
-    if (rb_prev_env) {
+    if (rb_prev_book) {
         PrevErase(first_block << block_shift, (end_block - first_block) << block_shift);
     }
     if (rb_prefetch_env && !pf_live.empty()) {
@@ -8232,6 +9299,11 @@ bool ReadbackBatchScope::Defer(Vulkan::Scheduler& scheduler) {
     }
     rb_batch.pending = &scheduler;
     return true;
+}
+
+// sotc: SOTC_RAM_REPORT (declared in buffer_cache.h): the memory tracker's region managers.
+u64 BufferCache::SotcHostBytes() const noexcept {
+    return memory_tracker ? memory_tracker->SotcHostBytes() : 0;
 }
 
 } // namespace VideoCore

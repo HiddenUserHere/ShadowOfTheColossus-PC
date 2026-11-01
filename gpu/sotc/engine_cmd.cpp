@@ -15,9 +15,14 @@
 
 #include "engine_cmd.h"
 
+#ifdef _WIN32
+extern "C" void* bb_low_block(void) __attribute__((weak)); // src/probe.c
+#endif
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -72,11 +77,16 @@ struct LowBlock {
     char text[kMaxLine + 16];
 };
 
-// Commits one 64 KiB block at the highest free address below 2 GiB (top-down scan, outside what the
-// loader already reserved). nullptr when none is free: live commands then stay off.
+// One 64 KiB block below 2 GiB. sotc: first the block the loader keeps for this at the end of
+// the eboot reservation (bb_low_block, src/probe.c): the top-down scan below found nothing in about
+// half the sessions, and the free camera then stayed off without a visible error. The scan remains
+// the fallback. nullptr when neither works: live commands then stay off.
 LowBlock* LowBuffer() {
     static LowBlock* const block = []() -> LowBlock* {
 #ifdef _WIN32
+        if (void* reserved = bb_low_block ? bb_low_block() : nullptr) {
+            return static_cast<LowBlock*>(reserved);
+        }
         for (uintptr_t a = 0x7fff0000u; a >= 0x01000000u; a -= 0x10000u) {
             void* p = VirtualAlloc(reinterpret_cast<void*>(a), 0x10000, MEM_RESERVE | MEM_COMMIT,
                                    PAGE_READWRITE);
@@ -112,12 +122,20 @@ void AddOutputLocked(std::string text) {
     }
 }
 
+void CheckGameWait(uint64_t frame); // defined after the stdout reader below
+
 // Tick handler (ENGINE_CMD_TICK, entry, update thread). rdi is the console (first integer argument;
 // xmm0 holds the frame dt).
 SotcHooks::HookAction OnTick(SotcHooks::GuestRegs& regs, void*) {
     g_console.store(regs.rdi, std::memory_order_relaxed);
     const uint64_t frame = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
+    CheckGameWait(frame);
 
+    // sotc: without the low block nothing can run; checked before the free camera takes its line,
+    // so its state machine does not advance on a line that is then dropped.
+    if (!LowBuffer()) {
+        return SotcHooks::HookAction::Continue;
+    }
     std::string line;
     bool quiet = false; // free-cam lines: one per frame, not logged
     {
@@ -193,6 +211,55 @@ SotcHooks::HookAction OnPrint(SotcHooks::GuestRegs& regs, void*) {
 // Set..." from printPlayerPos / PrintCameraPos), so the rest of the log costs one short scan.
 std::atomic<uint64_t> g_game_starts{0};
 std::atomic<int64_t> g_game_start_ms{0};
+
+// sotc: Lab route give-up. lab_commands.cpp (WaitGame) waits for "starting game" with no limit, so a
+// run that never gets there looks like an endless loading screen and nothing is printed. This bounds
+// the wait (SOTC_LAB_ROUTE_WAIT seconds, default 180, 0 = no limit), counted from the first tick, and
+// prints one line with the tick count: ticks still advancing means the update thread runs and the
+// text never reached stdout; ticks flat means the update thread itself is stuck.
+std::atomic<bool> g_wait_expired{false};
+std::atomic<int64_t> g_wait_first_ms{0};
+
+void CheckGameWait(uint64_t frame) {
+    static const double limit_s = [] {
+        const char* route = std::getenv("SOTC_LAB_ROUTE");
+        if (!route || !*route) {
+            return 0.0;
+        }
+        double s = 180.0;
+        if (const char* v = std::getenv("SOTC_LAB_ROUTE_WAIT"); v && *v) {
+            char* end = nullptr;
+            const double d = std::strtod(v, &end);
+            if (end != v && std::isfinite(d)) {
+                s = d;
+            }
+        }
+        return s > 0.0 ? s : 0.0;
+    }();
+    if (limit_s <= 0.0 || g_wait_expired.load(std::memory_order_relaxed) ||
+        g_game_starts.load(std::memory_order_relaxed) > 0) {
+        return;
+    }
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    int64_t first = g_wait_first_ms.load(std::memory_order_relaxed);
+    if (first == 0) {
+        g_wait_first_ms.store(now, std::memory_order_relaxed);
+        return;
+    }
+    if (static_cast<double>(now - first) < limit_s * 1000.0) {
+        return;
+    }
+    g_wait_expired.store(true, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "SOTC LAB ROUTE gave up waiting for gameplay after %.0f s: no \"st_gameflow() "
+                 "starting game\" on stdout; engine ticks %llu, console %s, command block %s\n",
+                 limit_s, static_cast<unsigned long long>(frame),
+                 g_console.load(std::memory_order_relaxed) ? "seen" : "never seen",
+                 LowBuffer() ? "ok" : "missing");
+    std::fflush(stderr);
+}
 
 bool Contains(const char* text, size_t size, const char* key) {
     const size_t n = std::strlen(key);
@@ -301,6 +368,10 @@ uint64_t GameStarts() {
 
 int64_t LastGameStartMs() {
     return g_game_start_ms.load(std::memory_order_relaxed);
+}
+
+bool GameWaitExpired() {
+    return g_wait_expired.load(std::memory_order_relaxed);
 }
 
 std::vector<std::string> RecentOutput() {

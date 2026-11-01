@@ -1,0 +1,254 @@
+== 24772  rip ntdll.dll+0x1628a4
+    EngineFrameLine freecam.cpp:381:1
+    ?? ??:0:0
+    evf_wait_common runtime_sotc.c:410:62
+    evf_wait runtime_sotc.c:434:15
+== bb:kernel_service  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    SetCurrentThreadName thread.cpp:0:5
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    ~__intrusive_shared_ptr intrusive_shared_ptr.h:83:9
+== 15844  rip ntdll.dll+0x1623d4
+    ?? ??:0:0
+    Report bbgpu.cpp:174:18
+== sotc:window  rip ntdll.dll+0x161dd4
+    ?? ??:0:0
+    operator() bbgpu.cpp:446:13
+== shadPS4:GpuDraw  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    operator() atomic_sync.h:0:9
+    SynchronizeMemoryFull buffer_cache.cpp:7252:0
+    __atomic_wait_unless<std::__1::atomic<long long>, (lambda at C:/msys64 atomic_sync.h:0:3
+    ObtainBuffer buffer_cache.cpp:0:9
+    BindSamplers vk_rasterizer.cpp:6563:47
+    Mode mem_classes.cpp:687:5
+    BindTexturesFull vk_rasterizer.cpp:6028:9
+    ~Scope sotc_stats.h:867:13
+    LockCounted texture_cache.h:522:20
+    Copy<const unsigned int *> buffer.h:174:9
+    BindResources vk_rasterizer.cpp:3259:1
+== shadPS4:GpuCommandProcessor  rip ntdll.dll+0x59870
+    ?? ??:0:0
+    wait_for<long long, std::__1::ratio<1LL, 1000000000LL> > condition_variable.h:166:12
+    wait_until<std::__1::chrono::steady_clock, std::__1::chrono::duration< condition_variable.h:136:33
+    ProcessCommands id.h:0:10
+    operator[] span:521:12
+    __cxx_atomic_fetch_add<unsigned long long> c11.h:181:10
+    WriteRegsMarked liverpool.cpp:0:9
+    LookupComputePipeline vk_rasterizer.cpp:7692:12
+    operator() liverpool.cpp:3646:47
+    ProcessCompute<false> liverpool.cpp:4365:17
+== shadPS4:GpuRecorder  rip ntdll.dll+0x59870
+    ?? ??:0:0
+    wait_for<long long, std::__1::ratio<1LL, 1000000000LL> > condition_variable.h:166:12
+    wait_until<std::__1::chrono::steady_clock, std::__1::chrono::duration< condition_variable.h:136:33
+== shadPS4:GpuSchedPriorityPendingOpsRunner  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    SetCurrentThreadName thread.cpp:202:5
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    ~__intrusive_shared_ptr intrusive_shared_ptr.h:83:9
+== shadPS4:GpuSchedPriorityPendingOpsRunner  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    SetCurrentThreadName thread.cpp:202:5
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    ~__intrusive_shared_ptr intrusive_shared_ptr.h:83:9
+== shadPS4:GpuSchedPriorityPendingOpsRunner  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    SetCurrentThreadName thread.cpp:202:5
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    ~__intrusive_shared_ptr intrusive_shared_ptr.h:83:9
+== 13240  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    wait_for<long long, std::__1::ratio<1LL, 1000000000LL> > condition_variable.h:166:12
+    wait_until<std::__1::unique_lock<std::__1::mutex>, std::__1::chrono::s condition_variable:0:0
+    __invoke stop_callback.h:80:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineWorker  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    __thread_proxy<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread thread.h:174:0
+== shadPS4:PipelineCacheIO  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    SetCurrentThreadName thread.cpp:202:5
+    ~unique_lock unique_lock.h:66:9
+    __invoke stop_callback.h:80:0
+    ~__intrusive_shared_ptr intrusive_shared_ptr.h:83:9
+== shadPS4:PresentThread  rip ntdll.dll+0x161dd4
+    AccurateSleep thread.cpp:142:22
+    Start thread.cpp:264:18
+== sotc:ctl  rip ntdll.dll+0x162474
+    ?? ??:0:0
+    ServerMain ctl_server.cpp:123:32
+    ServerMain ctl_server.cpp:107:0
+    __thread_execute<std::__1::unique_ptr<std::__1::__thread_struct, std:: thread.h:170:0
+    OnTick engine_cmd.cpp:125:0
+== 25436  rip ntdll.dll+0x1623d4
+    __cxx_atomic_load<unsigned long long> c11.h:81:10
+    ?? ??:0:0
+== 21176  rip ntdll.dll+0x1623d4
+    __cxx_atomic_load<unsigned long long> c11.h:81:10
+== SceFiosCallback  rip ntdll.dll+0x1628a4
+    mutex_unlock runtime_mutex.c:198:9
+    cond_wait runtime_mutex.c:271:19
+    ?? ??:0:0
+    thread_self runtime_thread.c:190:45
+== SceFiosIO  rip ntdll.dll+0x1628a4
+    mutex_unlock runtime_mutex.c:198:9
+    cond_wait runtime_mutex.c:271:19
+    ?? ??:0:0
+    thread_self runtime_thread.c:190:45
+== SceFiosZlib0  rip ntdll.dll+0x1628a4
+    cond_wait runtime_mutex.c:271:19
+    thread_self runtime_thread.c:190:45
+    vectored_fault probe.c:1021:13
+    ?? ??:0:0
+    host_start runtime_thread.c:462:35
+== BPE JobWorkerTh  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    operator() atomic_sync.h:0:9
+    __atomic_wait_unless<std::__1::atomic<long long>, (lambda at C:/msys64 atomic_sync.h:0:3
+    cached_region_q runtime_memory.c:1814:17
+    operator() page_manager.cpp:0:17
+    cached_region_q runtime_memory.c:1807:17
+    UpdatePageWatchersForRegion page_manager.cpp:0:23
+    UpdatePageWatchersForRegion page_manager.cpp:0:11
+    operator() page_manager.cpp:567:21
+== BPE JobWorkerTh  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    operator() atomic_sync.h:0:9
+    __atomic_wait_unless<std::__1::atomic<long long>, (lambda at C:/msys64 atomic_sync.h:0:3
+    cached_region_q runtime_memory.c:1814:17
+    operator() page_manager.cpp:0:17
+    UpdatePageWatchersForRegion page_manager.cpp:0:23
+    UpdatePageWatchersForRegion page_manager.cpp:0:11
+== Resource Loadin  rip ntdll.dll+0x1628a4
+    ?? ??:0:0
+    evf_wait_common runtime_sotc.c:410:62
+    evf_set runtime_sotc.c:0:5
+    mutex_unlock runtime_mutex.c:198:9
+    evf_wait runtime_sotc.c:434:15
+    host_start runtime_thread.c:462:35
+== RenderFlip  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    operator() equeue.cpp:194:17
+    sceKernelWaitEqueue equeue.cpp:498:14
+    host_start runtime_thread.c:462:35
+== Game Render  rip ntdll.dll+0x1628a4
+    ?? ??:0:0
+    evf_wait_common runtime_sotc.c:410:62
+    evf_set runtime_sotc.c:0:5
+    mutex_unlock runtime_mutex.c:198:9
+    evf_wait runtime_sotc.c:434:15
+== Save Task Threa  rip ntdll.dll+0x1628a4
+    ?? ??:0:0
+    evf_wait_common runtime_sotc.c:410:62
+    evf_wait runtime_sotc.c:434:15
+    host_start runtime_thread.c:462:35
+== Trophy Task Thr  rip ntdll.dll+0x1628a4
+    ?? ??:0:0
+    evf_wait_common runtime_sotc.c:410:62
+    evf_wait runtime_sotc.c:434:15
+    mutex_unlock runtime_mutex.c:198:9
+    trophy_handle runtime_services.c:649:96
+    host_start runtime_thread.c:462:35
+== sndx_loader_thr  rip ntdll.dll+0x1628a4
+    ?? ??:0:0
+    evf_wait_common runtime_sotc.c:410:62
+    evf_wait runtime_sotc.c:434:15
+    host_start runtime_thread.c:462:35
+== sndx_out_thread  rip ntdll.dll+0x161dd4
+    ?? ??:0:0
+    compat_sleep_ns compat_win.c:124:9
+    clock_gettime pthread_time.h:117:10
+== sndx_stream_sch  rip ntdll.dll+0x1628a4
+    ?? ??:0:0
+    evf_wait_common runtime_sotc.c:410:62
+    evf_wait runtime_sotc.c:434:15
+    host_start runtime_thread.c:462:35
+== SoundSystemSndx  rip ntdll.dll+0x1628a4
+    ?? ??:0:0
+    evf_wait_common runtime_sotc.c:410:62
+    evf_wait runtime_sotc.c:434:15
+    evf_set runtime_sotc.c:0:5
+    host_start runtime_thread.c:462:35
+== Shadow Game Upd  rip ntdll.dll+0x1628a4
+    ?? ??:0:0
+    evf_wait_common runtime_sotc.c:410:62
+    evf_wait runtime_sotc.c:434:15
+    fiber_switch_impl runtime_fiber.c:324:12
+    evf_set runtime_sotc.c:0:5
+== bb:Copy0  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    __cxx_atomic_fetch_add<unsigned long long> c11.h:181:10
+    operator() bbport_copy.cpp:254:29
+== bb:Copy1  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    __cxx_atomic_fetch_add<unsigned long long> c11.h:181:10
+    operator() bbport_copy.cpp:254:29
+== bb:Copy2  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    __cxx_atomic_fetch_add<unsigned long long> c11.h:181:10
+    operator() bbport_copy.cpp:254:29
+== bb:Copy3  rip ntdll.dll+0x1659c4
+    ?? ??:0:0
+    __cxx_atomic_fetch_add<unsigned long long> c11.h:181:10
+    operator() bbport_copy.cpp:254:29

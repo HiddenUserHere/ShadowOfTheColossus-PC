@@ -614,6 +614,16 @@ inline std::atomic<uint64_t> drop_fast_overflows{0};
 /// sotc: SOTC_DROP_FAST guard: nested indirect buffers the walk skipped because their memory is
 /// not mapped (Liverpool::CollectNestedIbs).
 inline std::atomic<uint64_t> drop_fast_unmapped_ibs{0};
+/// sotc: SOTC_DROP_FAST guard: the nested indirect buffer walk stopped before the end of a command
+/// buffer (a non-packet or type 0/1 dword, a packet running past the span) or skipped an unmapped
+/// indirect buffer. Those submits are marked overflowed, so unmaps wait while they are in flight.
+inline std::atomic<uint64_t> drop_fast_walk_gaps{0};
+/// sotc: SOTC_DROP_FAST guard: indirect buffers the parser registered while it ran (CmdRangeGuard)
+/// that the submit-time walk had not registered. A non-zero value means the walk missed a buffer.
+inline std::atomic<uint64_t> drop_fast_late_ibs{0};
+/// sotc: submits accepted by the GPU command path (SubmitGfx and SubmitAsc), a running count. The
+/// drop ring stores it per fast drop, so a bad packet can say how many submits ago the drop was.
+inline std::atomic<uint64_t> submit_tick{0};
 /// sotc: SOTC_DROP_FAST diagnostics: the last kDropRing fast-dropped ranges, so a bad PM4 packet
 /// can tell whether it was read from memory the guest had already unmapped (FastDropAge).
 /// Each slot is a seqlock, so a reader never mixes the bounds of two drops.
@@ -622,11 +632,13 @@ struct DropSlot {
     std::atomic<uint32_t> seq{0}; ///< odd while NoteFastDrop writes the slot
     std::atomic<uint64_t> lo{0};
     std::atomic<uint64_t> hi{0};
+    std::atomic<uint64_t> tick{0}; ///< submit_tick when the range was dropped
 };
 inline DropSlot drop_ring[kDropRing]{};
 inline std::atomic<uint32_t> drop_ring_head{0};
 inline void NoteFastDrop(uint64_t addr, uint64_t size) noexcept {
     const uint64_t end = size > ~uint64_t{0} - addr ? ~uint64_t{0} : addr + size; // saturates
+    const uint64_t tick = submit_tick.load(std::memory_order_relaxed);
     const uint32_t i = drop_ring_head.fetch_add(1, std::memory_order_relaxed) % kDropRing;
     DropSlot& s = drop_ring[i];
     const uint32_t q = s.seq.load(std::memory_order_relaxed);
@@ -634,11 +646,13 @@ inline void NoteFastDrop(uint64_t addr, uint64_t size) noexcept {
     std::atomic_thread_fence(std::memory_order_release);
     s.lo.store(addr, std::memory_order_relaxed);
     s.hi.store(end, std::memory_order_relaxed);
+    s.tick.store(tick, std::memory_order_relaxed);
     s.seq.store(q + 2, std::memory_order_release);
 }
 /// How many fast drops ago `addr` was inside a dropped range (1 = the newest); 0 when it is not in
-/// any of the last kDropRing.
-inline uint32_t FastDropAge(uint64_t addr) noexcept {
+/// any of the last kDropRing. When found and tick_out is set, *tick_out is the submit_tick of that
+/// drop.
+inline uint32_t FastDropAge(uint64_t addr, uint64_t* tick_out = nullptr) noexcept {
     const uint32_t head = drop_ring_head.load(std::memory_order_relaxed);
     for (uint32_t k = 1; k <= kDropRing && k <= head; ++k) {
         const DropSlot& s = drop_ring[(head - k) % kDropRing];
@@ -649,11 +663,15 @@ inline uint32_t FastDropAge(uint64_t addr) noexcept {
             }
             const uint64_t lo = s.lo.load(std::memory_order_relaxed);
             const uint64_t hi = s.hi.load(std::memory_order_relaxed);
+            const uint64_t tick = s.tick.load(std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_acquire);
             if (s.seq.load(std::memory_order_relaxed) != s1) {
                 continue; // overwritten while read
             }
             if (addr >= lo && addr < hi) {
+                if (tick_out) {
+                    *tick_out = tick;
+                }
                 return k;
             }
             break;

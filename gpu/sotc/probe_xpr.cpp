@@ -21,6 +21,8 @@
 
 #include "hooks.h"
 #include "probes.h"
+#include "rb_class.h"            // sotc: SOTC_RB_CLASS=2 mask spans (RecordMaskSpan)
+#include "video_core/sotc_stats.h" // sotc: cp_frame, the frame a mask span is recorded in
 
 extern "C" {
 // runtime_memory.c: the unprotected backing view of a guest address (null when unmapped).
@@ -96,10 +98,30 @@ HookAction OnLabel(GuestRegs& regs, void*) {
     return HookAction::Continue;
 }
 
-// XPR_CONSUME_MASK (entry, 0x1a6d20). rsi = the visibility bitset (qwords), rcx = the frame
-// context. The bitset itself is not read: the label state is the probe's question.
+// sotc: records the visibility mask span of one consumer call for SOTC_RB_CLASS=2 (the span
+// rules are in rb_class.h). set = the draw set object (rdi at entry, count u16 at [set+0x64]),
+// bits = the bitset the consumer reads. The mask is 4 * ceil(n / 32) bytes (the allocator size,
+// reports 02 and 07). Nothing is written. The record happens at entry, before the consumer's
+// first read of the bitset, so a read fault on those bytes finds the span.
+void RecordMask(uintptr_t set, uintptr_t bits) {
+    if (!set || !bits) {
+        return;
+    }
+    uint16_t count = 0;
+    if (!ReadGuest(set + 0x64, &count, sizeof count) || count == 0) {
+        return;
+    }
+    const uint64_t bytes = 4ull * ((static_cast<uint64_t>(count) + 31) / 32);
+    SotcRbClass::RecordMaskSpan(static_cast<uint64_t>(bits), bytes,
+                                SotcStats::cp_frame.load(std::memory_order_relaxed));
+}
+
+// XPR_CONSUME_MASK (entry, 0x1a6d20). rdi = the draw set object, rsi = the visibility bitset
+// (qwords), rcx = the frame context. The bitset itself is not read: the label state is the
+// probe's question. The mask span is recorded for SOTC_RB_CLASS=2 (RecordMask).
 HookAction OnConsume(GuestRegs& regs, void*) {
     g_consumes.fetch_add(1, std::memory_order_relaxed);
+    RecordMask(static_cast<uintptr_t>(regs.rdi), static_cast<uintptr_t>(regs.rsi));
 
     const uintptr_t ctx = static_cast<uintptr_t>(regs.rcx);
     uint64_t slot = 0;
@@ -123,6 +145,14 @@ HookAction OnConsume(GuestRegs& regs, void*) {
     return HookAction::Continue;
 }
 
+// sotc: XPR_CONSUME_MASK_INDIRECT (entry, 0x1a7290), the second consumer. rdi = the draw set
+// object (count at [rdi+0x64]), rdx = the bitset (qwords), rcx = the frame context. Records the
+// mask span for SOTC_RB_CLASS=2 only; it has no label probe.
+HookAction OnConsumeIndirect(GuestRegs& regs, void*) {
+    RecordMask(static_cast<uintptr_t>(regs.rdi), static_cast<uintptr_t>(regs.rdx));
+    return HookAction::Continue;
+}
+
 } // namespace
 
 namespace SotcProbes {
@@ -137,6 +167,10 @@ void RegisterXpr() {
     SotcHooks::Handler consume;
     consume.pre = &OnConsume;
     SotcHooks::RegisterHandler("XPR_CONSUME_MASK", consume);
+
+    SotcHooks::Handler indirect;
+    indirect.pre = &OnConsumeIndirect;
+    SotcHooks::RegisterHandler("XPR_CONSUME_MASK_INDIRECT", indirect);
 }
 
 void ReportXpr(std::string& out, double seconds) {

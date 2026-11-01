@@ -171,6 +171,10 @@ public:
     ImageFlagBits flags = ImageFlagBits::Dirty;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+    /// sotc: SOTC_TEX_PROTECT_BATCH / SOTC_FPS: gc_tick + 1 of the last full track / untrack
+    /// (0: never). Counts track-untrack cycles of one image within one frame.
+    u64 tex_track_tick{};
+    u64 tex_untrack_tick{};
     ImageId depth_id{};
     /// sotc: the depth/colour twin parked by ResolveDepthOverlap (unregistered, untracked, kept
     /// for the next conversion back); deleted together with this image.

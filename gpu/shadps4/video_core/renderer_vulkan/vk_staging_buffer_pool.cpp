@@ -176,6 +176,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
                 .last_used_frame = frame,
             });
             ring.current = ring.blocks.size() - 1;
+            held_bytes[u32(type)].fetch_add(BlockSize(), std::memory_order_relaxed); // sotc: RAM report
             best_offset = *best->buffer->Reserve(size, alignment, false);
         }
     }
@@ -235,6 +236,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
             .last_used_frame = frame,
             .held = false,
         });
+        held_bytes[u32(type)].fetch_add(alloc_size, std::memory_order_relaxed); // sotc: RAM report
     }
 
     best->tick = scheduler.CurrentTick();
@@ -291,6 +293,8 @@ void StagingBufferPool::TrimRing(Ring& ring, size_t keep_blocks) {
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }
+        held_bytes[static_cast<size_t>(&ring - rings.data())].fetch_sub(
+            block.buffer->SizeBytes(), std::memory_order_relaxed); // sotc: RAM report
         blocks.erase(blocks.begin() + i);
         if (i < ring.current) {
             --ring.current;
@@ -304,6 +308,7 @@ void StagingBufferPool::TrimRing(Ring& ring, size_t keep_blocks) {
 }
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
+    const size_t index = static_cast<size_t>(&cache - large_caches.data()); // sotc: RAM report
     // sotc: SOTC_STAGING_LARGE_POW2: idle buffers are kept up to SOTC_STAGING_LARGE_KEEP_MB,
     // the most recently used first.
     u64 keep = StagingLargePow2() ? StagingLargeKeepBytes() : 0;
@@ -312,7 +317,7 @@ void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
             return a.last_used_frame > b.last_used_frame;
         });
     }
-    std::erase_if(cache, [this, &keep](const LargeBuffer& entry) {
+    std::erase_if(cache, [this, &keep, index](const LargeBuffer& entry) {
         if (entry.held || frame - entry.last_used_frame < LARGE_IDLE_FRAMES ||
             !scheduler.IsFree(entry.tick)) {
             return false;
@@ -322,6 +327,7 @@ void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
             keep -= bytes;
             return false;
         }
+        held_bytes[index].fetch_sub(bytes, std::memory_order_relaxed); // sotc: RAM report
         return true;
     });
 }

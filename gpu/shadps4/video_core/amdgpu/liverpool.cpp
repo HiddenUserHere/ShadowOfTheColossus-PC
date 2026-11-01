@@ -8,6 +8,7 @@
 #include <deque>
 #include <mutex>
 #include <new>
+#include <unordered_set> // sotc: SOTC_PC_RING=8 CP wait keys
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -33,6 +34,8 @@
 #include "video_core/sotc_lod_stats.h"
 #include "video_core/sotc_stats.h"
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
+#include "../../../sotc/pc_ring.h"                   // sotc: SOTC_PC_RING full ring (mode)
+#include "video_core/buffer_cache/pc_ring_copy.h"    // sotc: SOTC_PC_RING full ring (copy)
 #include "bbport_threads.h"
 #include "video_core/amdgpu/draw_prep.h"
 #include "video_core/amdgpu/op_footprint.h" // sotc: SOTC_CULL_EXPRESS
@@ -126,6 +129,94 @@ static u8 CpLabelSkipMode() {
 // thread adds to them, the report thread takes them).
 static std::atomic<u64> g_lbl_waits{}, g_lbl_skippable{}, g_lbl_skipped{}, g_lbl_gpu_waits{};
 
+// sotc: SOTC_PC_RING full ring. ProcessGraphics nesting depth (command processor thread only).
+static u32 pc_ring_gfx_depth = 0;
+static u32 pc_ring_asc_depth = 0; // sotc: SOTC_PC_RING full ring, compute submits
+// sotc: SOTC_PC_RING=8. HostWriteSeq at the previous gfx EOP label (only the back thread reads it).
+static u64 g_ring8_label_seq = 0;
+// sotc: SOTC_PC_RING=8. 8-byte keys of the addresses the command processor waits on (WAIT_REG_MEM,
+// both queues), learned while the stream is parsed. A label the CP waits on is never deferred:
+// a CP wait on a deferred label hung the boot (1 Nov). Learned, so the first wait of an address may
+// come after its label was already deferred (the set is checked when the label runs).
+static std::mutex g_ring8_wait_mutex;
+static std::unordered_set<VAddr> g_ring8_wait_keys;
+static void Ring8NoteCpWait(VAddr addr) {
+    std::scoped_lock lk{g_ring8_wait_mutex};
+    if (g_ring8_wait_keys.size() < 4096) {
+        g_ring8_wait_keys.insert(addr & ~VAddr{7});
+    }
+}
+static bool Ring8CpWaits(VAddr addr) {
+    std::scoped_lock lk{g_ring8_wait_mutex};
+    return g_ring8_wait_keys.contains(addr & ~VAddr{7});
+}
+
+// sotc: SOTC_PC_RING8_LABELS (default on, 0 disables). Lookahead (command processor thread): before the
+// outermost gfx submit is parsed, every WAIT_REG_MEM of its DCB, CCB and the IBs they call (walked
+// as CollectNestedIbs does, IB by IB) gives an 8-byte key. An EOP label whose key is in the set is
+// never deferred: the submit itself waits on it, and a deferred label the submit waits on is the
+// stall the switch is for. g_ring8_wait_unknown: the walk met a buffer it cannot read or step over,
+// so the set may be incomplete and no label of that submit is deferred.
+static std::unordered_set<VAddr> g_ring8_submit_waits;
+static bool g_ring8_wait_unknown = false;
+static bool Ring8LabelsEnv() {
+    // sotc: on by default in mode 8 since 1 Nov (no hang, vertices clean with it); 0 disables.
+    const char* v = std::getenv("SOTC_PC_RING8_LABELS");
+    return !(v && v[0] == '0');
+}
+static void Ring8CollectWaits(std::span<const u32> cb, u32 depth, size_t& packets) {
+    constexpr u32 kMaxDepth = 4;
+    constexpr size_t kMaxPackets = size_t{1} << 20;
+    while (!cb.empty()) {
+        if (packets++ >= kMaxPackets) {
+            g_ring8_wait_unknown = true;
+            return;
+        }
+        const auto* header = reinterpret_cast<const PM4Header*>(cb.data());
+        size_t words = 0;
+        if (header->type == 2) {
+            words = 1;
+        } else if (header->type == 3) {
+            const PM4ItOpcode opcode = header->type3.opcode;
+            if (opcode == PM4ItOpcode::WaitRegMem) {
+                const auto* wait = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+                g_ring8_submit_waits.insert(wait->Address<VAddr>() & ~VAddr{7});
+            } else if (opcode == PM4ItOpcode::IndirectBuffer ||
+                       opcode == PM4ItOpcode::IndirectBufferConst) {
+                const auto* ib = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                const u32* data = ib->Address<const u32>();
+                const u64 bytes = u64{ib->ib_size} * sizeof(u32);
+                if (data != nullptr && bytes != 0) {
+                    if (depth + 1 >= kMaxDepth ||
+                        !Core::Memory::Instance()->IsValidMapping(reinterpret_cast<VAddr>(data),
+                                                                  bytes)) {
+                        g_ring8_wait_unknown = true; // not readable here: its waits are unknown
+                    } else {
+                        Ring8CollectWaits({data, ib->ib_size}, depth + 1, packets);
+                    }
+                }
+            }
+            words = header->type3.NumWords() + 1;
+        } else {
+            g_ring8_wait_unknown = true; // type 0 and 1: not a packet the walk can step over
+            return;
+        }
+        if (words > cb.size()) {
+            g_ring8_wait_unknown = true;
+            return;
+        }
+        cb = NextPacket(cb, words);
+    }
+}
+// Called once per outermost gfx submit (ProcessGraphics), before its first packet is parsed.
+static void Ring8ScanSubmit(std::span<const u32> dcb, std::span<const u32> ccb) {
+    g_ring8_submit_waits.clear();
+    g_ring8_wait_unknown = false;
+    size_t packets = 0;
+    Ring8CollectWaits(dcb, 0, packets);
+    Ring8CollectWaits(ccb, 0, packets);
+}
+
 void ReportCpLabelSkip(std::string& out, double seconds) {
     const u8 mode = CpLabelSkipMode();
     if (mode == 0) {
@@ -211,6 +302,8 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     // the same reason as SOTC_EOP_TICK (BackLoop polls the deferred labels).
     rbx = back_threaded && VideoCore::BufferCache::RbExactEnabled();
     eop_poll = eop_tick || rbx;
+    // sotc: SOTC_PC_RING8_LABELS (default on, 0 disables). Used with SOTC_PC_RING=8 only (checked at use).
+    ring8_labels = Ring8LabelsEnv();
     VideoCore::BufferCache::SetLabelSideActive(rbx); // sotc: SOTC_RB_EXACT (cache side agrees)
     if (rbx) {
         g_rbx_self.store(this, std::memory_order_release);
@@ -486,6 +579,12 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         if (eop_poll && eop_outstanding.load(std::memory_order_acquire) != 0) {
             EopService();
         }
+        // sotc: SOTC_PC_RING8_LABELS: the deferred ring8 labels are polled too. Without this poll
+        // nothing lands a label while the command processor waits (PopPendingOperations runs only
+        // from draw, dispatch and flush), and the watchdog (Ring8Watchdog) needs it.
+        if (ring8_labels && eop_outstanding.load(std::memory_order_acquire) != 0) {
+            Ring8Service();
+        }
         // sotc: SOTC_BACK_HEAD_CACHE=1 (off by default). Proof: back_head only grows, and every op
         // below it is published (BackPublish stores the head after the op's writes, seq_cst). An
         // older head therefore only delays the draw thread's view of new ops, and the acquire load
@@ -497,7 +596,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             draw_known_head = head_seen;
         }
         if (head_seen == tail) {
-            if (eop_poll && eop_outstanding.load(std::memory_order_acquire) != 0) {
+            if ((eop_poll || ring8_labels) && eop_outstanding.load(std::memory_order_acquire) != 0) {
                 // sotc: SOTC_EOP_TICK: a label is waiting for the GPU, so poll instead of
                 // blocking on back_cv or back_wake, which nothing signals when the GPU finishes.
                 // sotc: SOTC_RB_EXACT: a spin-waited label should not wait 200 us for the poll.
@@ -1123,7 +1222,18 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         rt.user_data = stage.num_user_data == ~0u
                            ? std::span<const u32>{}
                            : std::span<const u32>{stage.user_data.data(), stage.num_user_data};
-        rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+        // sotc: SOTC_UD_SWAP=1 (off by default): with no prep workers the draw thread is the
+        // only reader of stage.flat and an op runs once, so the flattened user data is moved
+        // into the runtime slot instead of copied (the front thread refills stage.flat on reuse).
+        static const bool ud_swap = [] {
+            const char* v = std::getenv("SOTC_UD_SWAP");
+            return v && v[0] == '1';
+        }();
+        if (ud_swap && prep_workers == 0) {
+            rt.flattened_ud_buf.swap(stage.flat);
+        } else {
+            rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+        }
         rt.pgm_base = stage.pgm_base;
     }
     const u64 ob_t1 = opstat ? SotcStats::NowNs() : 0; // sotc: SOTC_OPSTAT
@@ -2225,10 +2335,102 @@ std::shared_ptr<Liverpool::RbxJob> Liverpool::QueueDeferredLabel(
             job->ready.store(true, std::memory_order_release);
             RbxDrain();
         } else {
-            LandLabel(*job);
+            LandOnce(*job);
         }
     });
     return job;
+}
+
+// sotc: SOTC_PC_RING8_LABELS. Draw thread. Lands the job unless it already landed (the watchdog
+// may have forced it; the scheduler op and RbxDrain then find it claimed).
+void Liverpool::LandOnce(RbxJob& job) {
+    if (!job.claimed.exchange(true, std::memory_order_acq_rel)) {
+        LandLabel(job);
+    }
+}
+
+// sotc: SOTC_PC_RING8_LABELS. The draw thread records a ring8 label it deferred.
+void Liverpool::Ring8Track(const std::shared_ptr<RbxJob>& job) {
+    std::scoped_lock lk{ring8_mutex};
+    ring8_jobs.push_back(job);
+}
+
+bool Liverpool::Ring8PendingFor(VAddr addr) {
+    const VAddr key = addr & ~VAddr{7};
+    std::scoped_lock lk{ring8_mutex};
+    for (const auto& job : ring8_jobs) {
+        if (job->key == key && !job->claimed.load(std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// sotc: SOTC_PC_RING8_LABELS. Command processor, inside a WAIT_REG_MEM spin that is not satisfied.
+// If the wait is on a deferred ring8 label that has not landed, the open command buffer is
+// submitted once for this wait (the GPU then runs everything before the label), and Ring8Service
+// is queued on the draw thread, which lands the labels the GPU has finished. Only one service
+// request is outstanding at a time (the same pattern as EopWaitGuard). The spin itself is
+// unchanged; the watchdog bounds how long a label can stay pending.
+void Liverpool::Ring8CpWaitStep(VAddr addr, bool& flushed) {
+    if (!Ring8PendingFor(addr)) {
+        return;
+    }
+    if (!flushed) {
+        flushed = true;
+        ring8_want_flush.store(true, std::memory_order_release);
+        SotcPcRing::NoteHostCpWaitFlush();
+    }
+    if (!ring8_service_requested.exchange(true, std::memory_order_acq_rel)) {
+        QueueBackFunc(Common::UniqueFunction<void>{[this] { Ring8Service(); }}, false);
+    }
+}
+
+// Draw thread. Runs the queued ring8 service: the requested flush, the watchdog, then the
+// scheduler's pending labels (landing those whose tick the GPU has finished).
+void Liverpool::Ring8Service() {
+    ring8_service_requested.store(false, std::memory_order_release);
+    if (!rasterizer) {
+        return;
+    }
+    if (ring8_want_flush.exchange(false, std::memory_order_acq_rel)) {
+        rasterizer->Flush();
+    }
+    Ring8Watchdog();
+    rasterizer->GetScheduler().PopPendingOperations();
+    if (rbx) {
+        RbxDrain();
+    }
+}
+
+// Draw thread. A ring8 label that has not landed 500 ms after it was queued is written now, even
+// if the GPU has not finished the work before it (so the guest never waits on it forever). Counted
+// as forced. With SOTC_RB_EXACT on the job stays in rbx_jobs and RbxDrain skips it (claimed). That
+// path skips the owed-download rule (ApplyOwedBeforeLabel), so a forced label may announce data the
+// guest has not been given yet; that is the price of never hanging, and it is counted.
+void Liverpool::Ring8Watchdog() {
+    constexpr u64 kForceNs = 500'000'000ULL;
+    const u64 now = SotcStats::NowNs();
+    std::vector<std::shared_ptr<RbxJob>> due;
+    {
+        std::scoped_lock lk{ring8_mutex};
+        std::erase_if(ring8_jobs, [&](const std::shared_ptr<RbxJob>& job) {
+            if (job->claimed.load(std::memory_order_acquire)) {
+                return true;
+            }
+            if (now - job->queued_ns >= kForceNs) {
+                due.push_back(job);
+                return true;
+            }
+            return false;
+        });
+    }
+    for (const auto& job : due) {
+        if (!job->claimed.load(std::memory_order_acquire)) {
+            SotcPcRing::NoteHostLabelForced();
+            LandOnce(*job);
+        }
+    }
 }
 
 // Queue time (ns) of the oldest deferred label whose tick is still the open one or later, that
@@ -2346,6 +2548,11 @@ void Liverpool::RbxDrain() {
             }
             job = rbx_jobs.front();
         }
+        if (job->claimed.load(std::memory_order_acquire)) { // sotc: landed by the ring8 watchdog
+            std::scoped_lock lk{rbx_mutex};
+            rbx_jobs.pop_front();
+            continue;
+        }
         // Ready when the scheduler op ran (an optimisation) or the GPU has finished the job's
         // tick: the drain does not depend on any scheduler operation having run.
         if (!job->ready.load(std::memory_order_acquire)) {
@@ -2369,7 +2576,7 @@ void Liverpool::RbxDrain() {
             std::scoped_lock lk{rbx_mutex};
             rbx_jobs.pop_front();
         }
-        LandLabel(*job);
+        LandOnce(*job);
     }
 }
 
@@ -2964,7 +3171,7 @@ void Liverpool::Process(std::stop_token stoken) {
                     if (CmdRanges::Enabled() && !queue.submit_ranges.empty()) {
                         const SubmitRanges& done = queue.submit_ranges.front();
                         for (const auto& [data, bytes] : done.list) {
-                            cmd_ranges.Remove(data, bytes);
+                            cmd_ranges.RemoveSubmitted(data, bytes);
                         }
                         if (done.overflowed) {
                             cmd_overflow_live.fetch_sub(1, std::memory_order_release);
@@ -3100,9 +3307,14 @@ void Liverpool::FreeTaskFrame(std::coroutine_handle<> frame) {
 // ring of SotcStats). "no" with SOTC_DROP_FAST on means the cause is elsewhere.
 static void NoteBadPacket(const void* at) {
     const auto addr = reinterpret_cast<uintptr_t>(at);
-    const u32 age = SotcStats::FastDropAge(addr);
-    LOG_CRITICAL(Render, "sotc: bad PM4 packet at {:#x}; in a fast-dropped range: {}", addr,
-                 age ? fmt::format("yes, {} drop(s) ago", age) : std::string{"no"});
+    uint64_t drop_tick = 0;
+    const u32 age = SotcStats::FastDropAge(addr, &drop_tick);
+    LOG_CRITICAL(Render,
+                 "sotc: bad PM4 packet at {:#x}; in a fast-dropped range: {}; submit tick {} now",
+                 addr,
+                 age ? fmt::format("yes, {} drop(s) ago at submit tick {}", age, drop_tick)
+                     : std::string{"no"},
+                 SotcStats::submit_tick.load(std::memory_order_relaxed));
 }
 
 Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
@@ -3189,6 +3401,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // (indirect buffers re-enter this function: only the outermost call counts).
     if (xp_on && xp_gfx_depth++ == 0) {
         xp_seg_start = back_head.load(std::memory_order_relaxed);
+    }
+
+    // sotc: SOTC_PC_RING full ring. The outermost gfx submit (nested IBs re-enter here) queues the
+    // ring copy on the draw thread before anything below queues an op, so the copy precedes every
+    // op of the submit. The copy runs in the draw thread's order (BackOrRun).
+    const bool pc_ring_top = pc_ring_gfx_depth++ == 0;
+    // sotc: SOTC_PC_RING8_LABELS lookahead: the waits of the whole submit, before any of it is parsed.
+    if (pc_ring_top && ring8_labels && SotcPcRing::Mode() == 8) {
+        Ring8ScanSubmit(dcb, ccb);
+    }
+    // sotc: mode 8 also runs OnSubmitStart (import and ring at the submit start, PcHostSubmitStart).
+    // sotc: mode 8 always runs it (PcHostSubmitStart counts the draw-side submits: the dedupe key).
+    if (pc_ring_top && rasterizer && (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8)) {
+        BackOrRun([r = rasterizer] { VideoCore::PcRingCopy::OnSubmitStart(*r); });
     }
 
     // TODO: potentially, ASCs also can depend on CE and in this case the
@@ -3770,7 +3996,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                      ? SotcStats::NowNs()
                                      : 0;
                 const u64 lb_prev = LabelPrevBarrier(GfxQueueId); // sotc: CP_LABEL_SKIP
-                BackOrRun([this, eop_packet, t_cp] {
+                // sotc: SOTC_PC_RING8_LABELS lookahead, decided on the command processor thread:
+                // the submit waits on this label (or its waits could not all be seen), so it is
+                // never deferred. See Ring8ScanSubmit.
+                const bool ring8_waited =
+                    ring8_labels && SotcPcRing::Mode() == 8 &&
+                    (g_ring8_wait_unknown ||
+                     g_ring8_submit_waits.contains(reinterpret_cast<VAddr>(
+                                                       eop_packet.Address<void>()) &
+                                                   ~VAddr{7}));
+                BackOrRun([this, eop_packet, t_cp, ring8_waited] {
                 const auto* event_eop = &eop_packet;
                 if (rasterizer) {
                     rasterizer->OnFence();
@@ -3816,7 +4051,26 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     rbx_defer = RbxDecide(0, reinterpret_cast<VAddr>(event_eop->Address<void>()),
                                           rbx_snap, &rbx_hot);
                 }
-                if ((eop_tick || rbx_defer) && rasterizer) {
+                // sotc: SOTC_PC_RING=8. The CPU reads a served range (no fault, no GPU tracking), so
+                // a label must not announce a served write before the GPU has run it: the label is
+                // deferred when a served write came since the previous label, or when an earlier
+                // deferred label is still outstanding (the labels land in order). See pc_ring.h.
+                bool ring8_defer = false;
+                // sotc: opt-in (SOTC_PC_RING8_LABELS=1, member ring8_labels): without the lookahead
+                // it hung the boot (1 Nov). A label the CP waits on is written early, as before.
+                if (rasterizer && ring8_labels && SotcPcRing::Mode() == 8) {
+                    const u64 seq = SotcPcRing::HostWriteSeq();
+                    const bool pending = seq != g_ring8_label_seq ||
+                                         eop_outstanding.load(std::memory_order_acquire) != 0;
+                    g_ring8_label_seq = seq;
+                    if (pending && ring8_waited) {
+                        SotcPcRing::NoteHostLabelExcluded();
+                    }
+                    ring8_defer = pending && !ring8_waited &&
+                                  !Ring8CpWaits(reinterpret_cast<VAddr>(event_eop->Address<void>()));
+                    SotcPcRing::NoteHostLabel(ring8_defer);
+                }
+                if ((eop_tick || rbx_defer || ring8_defer) && rasterizer) {
                     const PM4CmdEventWriteEop eop = *event_eop;
                     const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
                     // As in the SOTC_EOP_DEFER path: the GPU copy of the label's page must not
@@ -3842,7 +4096,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 });
                         }},
                         rbp_cand ? t_cp : 0, t_draw);
-                    if (rbx_defer && rbx_hot) {
+                    if (ring8_defer) {
+                        Ring8Track(job); // sotc: SOTC_PC_RING8_LABELS: pending until it lands
+                    }
+                    if ((rbx_defer && rbx_hot) || ring8_defer) {
                         // The game spins on this label: submit now, so its latency is the GPU
                         // execution only (not the next periodic flush). A label deferred only by
                         // queue order is submitted by EopService after RbxMaxWaitNs.
@@ -4066,6 +4323,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
+                if (SotcPcRing::Mode() == 8) { // sotc: SOTC_PC_RING=8, label side (see Ring8NoteCpWait)
+                    Ring8NoteCpWait(reinterpret_cast<VAddr>(wait_addr));
+                }
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
@@ -4078,7 +4338,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     ++cp_wait_exits; // sotc: progress marker (Process)
                     break;
                 }
+                bool ring8_flushed = false; // sotc: SOTC_PC_RING8_LABELS, this wait
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+                    // sotc: SOTC_PC_RING8_LABELS: a wait on a deferred label that has not landed
+                    // submits the open buffer and makes the draw thread land what the GPU finished.
+                    if (ring8_labels && eop_outstanding.load(std::memory_order_acquire) != 0) {
+                        Ring8CpWaitStep(reinterpret_cast<VAddr>(wait_addr), ring8_flushed);
+                    }
                     // sotc: SOTC_EOP_TICK: a label queued for the GPU satisfies the stream's own
                     // wait at once (the host queue keeps the order).
                     if (eop_poll && EopShadowSatisfies(*wait_reg_mem)) {
@@ -4220,6 +4486,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (xp_on) {
         --xp_gfx_depth; // sotc: SOTC_CULL_EXPRESS
     }
+    --pc_ring_gfx_depth; // sotc: SOTC_PC_RING full ring
 
     FIBER_EXIT;
 }
@@ -4234,6 +4501,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         VAddr indirect_addr;
     };
     boost::container::small_vector<IndirectPatch, 4> indirect_patches;
+
+    // sotc: SOTC_PC_RING full ring. A compute submit may read arena data the game wrote after the
+    // last gfx submit, so it gets the same copy before its first op (outermost call only).
+    struct PcRingAscDepth {
+        bool top;
+        PcRingAscDepth() : top(pc_ring_asc_depth++ == 0) {}
+        ~PcRingAscDepth() { --pc_ring_asc_depth; }
+    } const pc_ring_asc;
+    if (pc_ring_asc.top && rasterizer && (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8)) {
+        BackOrRun([r = rasterizer] { VideoCore::PcRingCopy::OnSubmitStart(*r); });
+    }
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
@@ -4519,6 +4797,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            if (SotcPcRing::Mode() == 8) { // sotc: SOTC_PC_RING=8, label side (see Ring8NoteCpWait)
+                Ring8NoteCpWait(reinterpret_cast<VAddr>(wait_reg_mem->Address<u64*>()));
+            }
             // sotc: SOTC_CP_LABEL_SKIP: as in the graphics wait (queue of the compute ring).
             if (label_skip && !wait_reg_mem->Test(regs.reg_array) &&
                 LabelWaitSkip(LabelQueueOf(vqid), *wait_reg_mem,
@@ -4686,6 +4967,13 @@ void Liverpool::CollectNestedIbs(std::span<const u32> cb, SubmitRanges& out, u32
     constexpr u32 kMaxDepth = 4;
     constexpr size_t kMaxRanges = 1024;
     constexpr size_t kMaxPackets = size_t{1} << 20;
+    // sotc: a walk that stops early, or skips a buffer, cannot prove that every nested buffer is in
+    // the list. The submit is marked overflowed (its unmaps wait while it is in flight), and the
+    // gap is counted.
+    const auto walk_gap = [&out] {
+        out.overflowed = true;
+        SotcStats::drop_fast_walk_gaps.fetch_add(1, std::memory_order_relaxed);
+    };
     size_t packets = 0;
     while (!cb.empty()) {
         if (packets++ >= kMaxPackets || out.list.size() >= kMaxRanges) {
@@ -4697,8 +4985,6 @@ void Liverpool::CollectNestedIbs(std::span<const u32> cb, SubmitRanges& out, u32
         size_t words = 0;
         if (type == 2) {
             words = 1;
-        } else if (type == 0) {
-            words = header->type0.NumWords() + 1;
         } else if (type == 3) {
             const PM4ItOpcode opcode = header->type3.opcode;
             if (opcode == PM4ItOpcode::IndirectBuffer ||
@@ -4715,8 +5001,11 @@ void Liverpool::CollectNestedIbs(std::span<const u32> cb, SubmitRanges& out, u32
                     if (!known) {
                         if (!Core::Memory::Instance()->IsValidMapping(
                                 reinterpret_cast<VAddr>(data), bytes)) {
+                            // It may be mapped and called later, so the parser's registration
+                            // (CmdRangeGuard) would be the only guard.
                             SotcStats::drop_fast_unmapped_ibs.fetch_add(
                                 1, std::memory_order_relaxed);
+                            walk_gap();
                         } else {
                             out.list.emplace_back(data, bytes);
                             if (depth + 1 < kMaxDepth) {
@@ -4730,9 +5019,13 @@ void Liverpool::CollectNestedIbs(std::span<const u32> cb, SubmitRanges& out, u32
             }
             words = header->type3.NumWords() + 1;
         } else {
-            return; // not a packet: the parser would stop here too
+            // Type 0 and 1 dwords: the parser never accepts them ("Wrong PM4 type"), and a zeroed
+            // or reused area reads as type 0. Not a packet: the walk cannot step over it.
+            walk_gap();
+            return;
         }
         if (words > cb.size()) {
+            walk_gap(); // a packet that runs past the end of its buffer
             return;
         }
         cb = NextPacket(cb, words);
@@ -4747,6 +5040,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     auto task = ProcessGraphics(dcb, ccb);
+    SotcStats::submit_tick.fetch_add(1, std::memory_order_relaxed); // sotc: drop ring tick
     // sotc: SOTC_DROP_FAST guard: the command processor reads these, and the indirect buffers
     // they call, until the task finishes.
     SubmitRanges ranges;
@@ -4756,7 +5050,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         CollectNestedIbs(dcb, ranges, 0);
         CollectNestedIbs(ccb, ranges, 0);
         for (const auto& [data, bytes] : ranges.list) {
-            cmd_ranges.Add(data, bytes);
+            cmd_ranges.AddSubmitted(data, bytes);
         }
         if (ranges.overflowed) { // counted before the submit is queued, undone at its pop
             cmd_overflow_live.fetch_add(1, std::memory_order_release);
@@ -4794,12 +5088,13 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
         acb = std::span<const u32>{ring_copy.data(), ring_copy.size()};
     }
     const auto& task = ProcessCompute(acb, vqid);
+    SotcStats::submit_tick.fetch_add(1, std::memory_order_relaxed); // sotc: drop ring tick
     SubmitRanges ranges; // sotc: SOTC_DROP_FAST guard (see SubmitGfx)
     if (CmdRanges::Enabled()) {
         ranges.list.emplace_back(acb.data(), acb.size_bytes());
         CollectNestedIbs(acb, ranges, 0);
         for (const auto& [data, bytes] : ranges.list) {
-            cmd_ranges.Add(data, bytes);
+            cmd_ranges.AddSubmitted(data, bytes);
         }
         if (ranges.overflowed) {
             cmd_overflow_live.fetch_add(1, std::memory_order_release);

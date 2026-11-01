@@ -64,7 +64,8 @@ struct UniqueBuffer {
           bda_addr{std::exchange(other.bda_addr, 0)},
           allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          rebar_bytes{std::exchange(other.rebar_bytes, 0)} {}
+          rebar_bytes{std::exchange(other.rebar_bytes, 0)},
+          borrowed{std::exchange(other.borrowed, false)} {}
 
     UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
         if (this != &other) {
@@ -75,6 +76,7 @@ struct UniqueBuffer {
             allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
             allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
             rebar_bytes = std::exchange(other.rebar_bytes, 0);
+            borrowed = std::exchange(other.borrowed, false);
         }
         return *this;
     }
@@ -90,11 +92,16 @@ struct UniqueBuffer {
     VmaAllocator allocator;
     VmaAllocation allocation{};
     u64 rebar_bytes{}; // sotc: ReBAR bytes reserved by this allocation, released in Destroy()
+    /// sotc: SOTC_PC_RING=8: the handle is owned by another unit (sotc_guest_memory.cpp); never
+    /// destroyed here.
+    bool borrowed{};
 };
 
 struct Buffer {
     explicit Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
                     MemoryType mem_type, std::string_view debug_name = "");
+    /// sotc: SOTC_PC_RING=8: a view of an imported buffer owned elsewhere (not created, not destroyed).
+    explicit Buffer(VAddr cpu_addr_, u64 size_bytes_, vk::Buffer borrowed_buffer);
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;

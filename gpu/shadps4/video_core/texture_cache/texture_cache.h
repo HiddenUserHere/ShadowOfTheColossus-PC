@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 #include <deque>
+#include <memory>
 #include <queue>
 #include <string>
 #include <tsl/robin_map.h>
@@ -26,6 +27,8 @@
 #include "video_core/texture_cache/image_prefetch.h"
 #include "video_core/texture_cache/image_view.h"
 #include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM replay records
+#include "../../../sotc/mem_classes.h"   // sotc: SOTC_CLASS_TRACK bind signal
+#include "../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE bind evidence
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -288,6 +291,28 @@ inline bool TextureLockBatching() {
     return on;
 }
 
+/// sotc: SOTC_TEX_PROTECT_BATCH=1 (off by default). Opens a PageManager::ProtectBatch on the
+/// calling thread for the texture tracking protects made inside it (TrackImage of a dirty image
+/// only, see TexDeferOk; untracks are applied at once). Every guest read of the texture cache
+/// (RefreshImage upload, DownloadImageMemory, SotcGlyphHook) flushes the pending protects first,
+/// and so does the close of the scope. Unset: the scope does nothing. Used around each draw and
+/// dispatch of the rasterizer (the ordering note is above the helpers in texture_cache.cpp).
+class TexProtectScope {
+public:
+    TexProtectScope();
+    ~TexProtectScope();
+    TexProtectScope(const TexProtectScope&) = delete;
+    TexProtectScope& operator=(const TexProtectScope&) = delete;
+
+    /// Applies the protects collected so far by this scope (the scope stays open).
+    void Flush();
+
+private:
+    struct Impl; // holds the PageManager::ProtectBatch (texture_cache.cpp)
+    std::unique_ptr<Impl> impl;
+    TexProtectScope* prev = nullptr;
+};
+
 class TextureCache {
     // Default values for garbage collection
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
@@ -346,6 +371,14 @@ public:
     };
 
 public:
+    /// sotc: SOTC_RAM_REPORT: host bytes of the image and view slots (Image and ImageView objects,
+    /// by count), the page table's second-level pages and the page_images index. The slot counts
+    /// are read without the lock (diagnostic only).
+    [[nodiscard]] u64 SotcHostBytes() const noexcept {
+        return slot_images.size() * sizeof(Image) + slot_image_views.size() * sizeof(ImageView) +
+               page_table.SotcAllocatedBytes() + NumImagePages * sizeof(u32);
+    }
+
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                  Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache,
                  PageManager& tracker);
@@ -420,6 +453,9 @@ public:
     [[nodiscard]] u64 ImageAddrGeneration(VAddr address) const {
         return MemoGeneration(address);
     }
+    /// sotc: SOTC_TEX_BIND_FAST=1 (read once, off by default): the wider find memo table here, and
+    /// the texture block memo in Rasterizer::TexBlockMode (vk_rasterizer.cpp).
+    static bool TexBindFast();
     /// sotc: SOTC_TEX_BLOCK. True when `id` is what FindImage returns for `info` through a perfect
     /// match (same address, size and format, not a smaller chain): the result then depends only on
     /// the images registered at info.guest_address.
@@ -544,6 +580,14 @@ public:
         TrackImage(image_id);
         TouchImage(image);
         RefreshImage(image);
+        // sotc: SOTC_CLASS_TRACK: a bound image's guest range is GPU-bound (never CPU_ONLY).
+        if (SotcMemClasses::On() && SotcStats::t_draw_thread) {
+            SotcMemClasses::NoteGpuBind(image.info.guest_address, image.info.guest_size);
+        }
+        // sotc: SOTC_PC_PLACE bind evidence, its own gate (the glue is on).
+        if (SotcPcPlaceGlue::On()) {
+            SotcPcPlaceGlue::Global().OnGpuBind(image.info.guest_address, image.info.guest_size);
+        }
     }
 
     /// Resolves overlap between existing cache image and pending merged image
@@ -907,8 +951,12 @@ private:
         u64 gpu_epoch{};
         u64 image_uid{}; ///< sotc: the image the slot held when memoized (slots are reused)
     };
-    static constexpr size_t NumFindMemos = 1024;
-    std::array<FindMemo, NumFindMemos> find_memos{};
+    /// sotc: SOTC_TEX_BIND_FAST=1 uses all NumFindMemos slots; otherwise the first 1024 (the
+    /// slots the table had before). Direct-mapped: a second key on a slot evicts the first.
+    static constexpr size_t NumFindMemos = 4096;
+    static constexpr size_t NumFindMemosDefault = 1024;
+    std::unique_ptr<std::array<FindMemo, NumFindMemos>> find_memos =
+        std::make_unique<std::array<FindMemo, NumFindMemos>>();
     FindMemo& MemoSlot(const ImageInfo& info, bool exact_fmt, bool writer);
     /// The memoized perfect match for a lookup, or none (SOTC_FIND_MEMO=0: always none).
     ImageId MemoLookup(const ImageInfo& info, bool exact_fmt, bool writer);

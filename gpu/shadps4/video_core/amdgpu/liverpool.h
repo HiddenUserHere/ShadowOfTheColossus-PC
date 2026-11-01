@@ -28,6 +28,7 @@
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/op_footprint.h" // sotc: SOTC_OP_OVERLAP
 #include "video_core/amdgpu/regs.h"
+#include "video_core/sotc_stats.h" // sotc: SOTC_DROP_FAST counters (CmdRanges::AddNested)
 
 namespace Vulkan {
 class Rasterizer;
@@ -369,12 +370,46 @@ private:
             }();
             return on;
         }
-        void Add(const void* data, u64 bytes) {
+        /// A range of a submit (its DCB, CCB or ACB slice, or a nested buffer its walk found). It is
+        /// also recorded in `submitted`, so a parser registration that is not in it can be counted.
+        void AddSubmitted(const void* data, u64 bytes) {
             if (!Enabled() || data == nullptr || bytes == 0) {
                 return;
             }
+            const VAddr addr = reinterpret_cast<VAddr>(data);
             std::scoped_lock lock{mutex};
-            ranges.emplace_back(reinterpret_cast<VAddr>(data), bytes);
+            ranges.emplace_back(addr, bytes);
+            submitted.emplace_back(addr, bytes);
+        }
+        /// Removes one submit range (the pop in Liverpool::Process).
+        void RemoveSubmitted(const void* data, u64 bytes) {
+            if (!Enabled() || data == nullptr || bytes == 0) {
+                return;
+            }
+            const VAddr addr = reinterpret_cast<VAddr>(data);
+            std::scoped_lock lock{mutex};
+            EraseOne(ranges, addr, bytes);
+            EraseOne(submitted, addr, bytes);
+        }
+        /// A nested indirect buffer the parser is about to read (CmdRangeGuard). Counted as late
+        /// when the submit-time walk did not register it.
+        void AddNested(const void* data, u64 bytes) {
+            if (!Enabled() || data == nullptr || bytes == 0) {
+                return;
+            }
+            const VAddr addr = reinterpret_cast<VAddr>(data);
+            std::scoped_lock lock{mutex};
+            bool in_submit = false;
+            for (const auto& [lo, n] : submitted) {
+                if (lo == addr && n == bytes) {
+                    in_submit = true;
+                    break;
+                }
+            }
+            if (!in_submit) {
+                SotcStats::drop_fast_late_ibs.fetch_add(1, std::memory_order_relaxed);
+            }
+            ranges.emplace_back(addr, bytes);
         }
         void Remove(const void* data, u64 bytes) {
             if (!Enabled() || data == nullptr || bytes == 0) {
@@ -382,13 +417,7 @@ private:
             }
             const VAddr addr = reinterpret_cast<VAddr>(data);
             std::scoped_lock lock{mutex};
-            for (auto it = ranges.begin(); it != ranges.end(); ++it) {
-                if (it->first == addr && it->second == bytes) {
-                    *it = ranges.back();
-                    ranges.pop_back();
-                    return;
-                }
-            }
+            EraseOne(ranges, addr, bytes);
         }
         bool Intersects(VAddr addr, u64 size) const {
             // Ends saturate at the top of the address space, so a wrapping range overlaps
@@ -407,15 +436,27 @@ private:
         }
 
     private:
+        /// Erases one entry equal to (addr, bytes), if there is one. Caller holds `mutex`.
+        static void EraseOne(std::vector<std::pair<VAddr, u64>>& v, VAddr addr, u64 bytes) {
+            for (auto it = v.begin(); it != v.end(); ++it) {
+                if (it->first == addr && it->second == bytes) {
+                    *it = v.back();
+                    v.pop_back();
+                    return;
+                }
+            }
+        }
         mutable std::mutex mutex;
         std::vector<std::pair<VAddr, u64>> ranges;
+        /// The submit-time entries of `ranges` (AddSubmitted), for the late-IB diagnostic only.
+        std::vector<std::pair<VAddr, u64>> submitted;
     };
     /// sotc: holds a nested indirect buffer in CmdRanges while its task is parsed (a local of the
     /// parent coroutine, so it lives across the parent's yields).
     struct CmdRangeGuard {
         CmdRangeGuard(CmdRanges& ranges_, const void* data_, u64 bytes_)
             : ranges{ranges_}, data{data_}, bytes{bytes_} {
-            ranges.Add(data, bytes);
+            ranges.AddNested(data, bytes);
         }
         ~CmdRangeGuard() {
             ranges.Remove(data, bytes);
@@ -920,6 +961,9 @@ private:
         u32 lo{}, hi{}, queue{};
         u64 snap{}, queued_ns{}, tick{};
         std::atomic<bool> ready{false};
+        // sotc: SOTC_PC_RING8_LABELS: set when the job lands (LandOnce), so it lands only once even
+        // when the watchdog forces it first.
+        std::atomic<bool> claimed{false};
         Common::UniqueFunction<void> write;
         // sotc: SOTC_RB_EXACT=publish latency stamps (stat: a CS_DONE label, see EventWriteEop).
         bool stat{};
@@ -962,6 +1006,28 @@ private:
     void RbxFoldLanding(VAddr key, u64 latency_ns);
     static void RbxWaitObserver(u64 writer_seq, u64 wait_ns);
     u64 rbx_flush_tick{}; ///< tick of the last EopService flush (draw thread)
+
+    // sotc: SOTC_PC_RING8_LABELS (default on, 0 disables; liverpool.cpp has the design). ring8_labels: the
+    // switch is on (read in the constructor). ring8_jobs: deferred ring8 labels not landed yet,
+    // under ring8_mutex; the command processor reads it, the draw thread writes it. A CP wait on
+    // such a label queues Ring8Service (ring8_service_requested), which submits the open buffer
+    // once when ring8_want_flush is set, lands what the GPU finished, and runs the watchdog.
+    bool ring8_labels{};
+    std::mutex ring8_mutex;
+    std::vector<std::shared_ptr<RbxJob>> ring8_jobs;
+    std::atomic<bool> ring8_service_requested{false};
+    std::atomic<bool> ring8_want_flush{false};
+    void Ring8Track(const std::shared_ptr<RbxJob>& job);
+    /// Command processor: true while a deferred ring8 label with this 8-byte key has not landed.
+    bool Ring8PendingFor(VAddr addr);
+    /// Command processor, inside a WAIT_REG_MEM spin: flushes once per wait (flushed) and queues
+    /// Ring8Service while the wait is on a pending ring8 label.
+    void Ring8CpWaitStep(VAddr addr, bool& flushed);
+    void Ring8Service(); ///< draw thread
+    /// Draw thread: lands a ring8 label that has been pending for 500 ms (counted as forced).
+    void Ring8Watchdog();
+    /// Draw thread: LandLabel unless the job has already landed (scheduler op, RbxDrain, watchdog).
+    void LandOnce(RbxJob& job);
 
     // sotc: SOTC_CULL_EXPRESS=1 (default off). The "express lane" (liverpool.cpp has the long
     // comment with the exactness argument). The command processor recognises the XPR occlusion

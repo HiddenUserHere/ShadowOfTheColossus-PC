@@ -272,3 +272,26 @@ uint64_t compat_qpc_tsc_frequency(void) {
     return (uint64_t)f.QuadPart * qpc_scale();
 }
 #endif
+
+#ifdef _WIN32
+/* sotc: RAM report (gpu/sotc/ram_report.cpp): allocated and committed bytes of the process heaps
+ * (the ucrt malloc heap and any other heap of the process), summed with HeapSummary, which reads
+ * each heap's segments rather than walking its blocks. At most 64 heaps are counted. */
+void sotc_heap_summary(uint64_t *allocated, uint64_t *committed) {
+    HANDLE heaps[64];
+    DWORD count = GetProcessHeaps(64, heaps);
+    uint64_t in_use = 0, commit = 0;
+    if (count > 64) count = 64;
+    for (DWORD i = 0; i < count; ++i) {
+        HEAP_SUMMARY summary;
+        memset(&summary, 0, sizeof summary);
+        summary.cb = sizeof summary;
+        if (HeapSummary(heaps[i], 0, &summary)) {
+            in_use += summary.cbAllocated;
+            commit += summary.cbCommitted;
+        }
+    }
+    *allocated = in_use;
+    *committed = commit;
+}
+#endif

@@ -49,6 +49,24 @@
 #include "../../../../sotc/write_decl.h" // sotc: SotcWriteDecl::Report
 #include "../../../../sotc/probes.h"     // sotc: engine probe report lines
 #include "../../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK report (plan step 6)
+#include "../../../../sotc/pc_ring.h"     // sotc: SOTC_PC_RING report
+#include "../../../../sotc/rb_class.h"    // sotc: SOTC_RB_CLASS report
+#include "../../../../sotc/stale_check.h" // sotc: SOTC_STALE_CHECK report
+#include "../../../../sotc/static_class.h" // sotc: SOTC_STATIC_CLASS report
+#include "../../../../sotc/rt_class.h"     // sotc: SOTC_RT_CLASS report
+extern "C" { // sotc: SOTC_COMMIT_ON_DEMAND (src/runtime_memory.c)
+uint64_t runtime_memory_committed_bytes(void);
+uint64_t runtime_memory_commit_count(void);
+int runtime_memory_commit_on_demand(void);
+int runtime_memory_commit_chunks(void);
+uint64_t runtime_memory_lazy_ns(void); // sotc: SOTC_COMMIT_CHUNKS=2 handler cost
+uint64_t runtime_memory_lazy_max_ns(void);
+uint64_t runtime_memory_lazy_calls(void);
+uint64_t runtime_memory_chunk_open_ns(void);
+uint64_t runtime_memory_chunk_open_max_ns(void);
+uint64_t runtime_memory_chunk_opens_locked(void);
+}
+#include "../../../../sotc/pc_pool.h"      // sotc: SOTC_PC_POOL report
 #include "../../../../sotc/lab_commands.h" // sotc: SotC Lab frame-time window
 #include "../../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM report (plan step 5d)
 #include "../../../../sotc/probe_buildsync.h" // sotc: Wave D report lines
@@ -56,6 +74,8 @@
 #include "../../../../sotc/probe_drawtag.h"
 #include "../../../../sotc/probe_scopes.h" // sotc: trace v2 engine scopes report
 #include "../../../../sotc/particle_prev.h"
+#include "../../../../sotc/ram_report.h" // sotc: SOTC_RAM_REPORT
+#include "../../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE report
 #include "../../../../sotc/decommit_budget.h"
 #include "../../../../sotc/mip_budget.h"
 #include "video_core/buffer_cache/buffer_cache.h"     // sotc: VideoCore::ReportReadbackRips (B6)
@@ -1842,7 +1862,8 @@ void VideoOutDriver::Flip(const Request& req) {
             if (const uint64_t fast = SotcStats::drop_fast.load(std::memory_order_relaxed)) {
                 ReportPrintf(report,
                              "SOTC drop fast %llu, waited %llu (%llu of them over a command "
-                             "buffer in use); IB walk overflows %llu, unmapped IBs skipped %llu\n",
+                             "buffer in use); IB walk overflows %llu, unmapped IBs skipped %llu, "
+                             "walk gaps %llu, late IBs %llu\n",
                              static_cast<unsigned long long>(fast),
                              static_cast<unsigned long long>(
                                  SotcStats::drop_slow.load(std::memory_order_relaxed)),
@@ -1851,7 +1872,11 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::drop_fast_overflows.load(std::memory_order_relaxed)),
                              static_cast<unsigned long long>(
-                                 SotcStats::drop_fast_unmapped_ibs.load(std::memory_order_relaxed)));
+                                 SotcStats::drop_fast_unmapped_ibs.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::drop_fast_walk_gaps.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::drop_fast_late_ibs.load(std::memory_order_relaxed)));
             }
             {
                 // sotc: SOTC_EOP_TICK labels: written, mean/max time from queue to write, flushes.
@@ -1959,7 +1984,38 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcProbes::ReportAlloc(report, seconds);
             SotcProbes::ReportCvars(report, seconds);
             SotcProbes::ReportArea(report, seconds);
+            SotcProbes::ReportMemtype(report, seconds); // sotc: PC memory model, wave B
+            SotcProbes::ReportXprMem(report, seconds);
+            SotcPcRing::Report(report, seconds); // sotc: SOTC_PC_RING
+            SotcRbClass::Report(report, seconds); // sotc: SOTC_RB_CLASS
+            SotcStale::Report(report, seconds);   // sotc: SOTC_STALE_CHECK
+            SotcStaticClass::Report(report, seconds); // sotc: SOTC_STATIC_CLASS
+            SotcRtClass::Report(report, seconds);     // sotc: SOTC_RT_CLASS
+            SotcPcPool::Report(report, seconds);      // sotc: SOTC_PC_POOL
+            SotcRamReport::Report(report, presenter.get()); // sotc: SOTC_RAM_REPORT
+            // sotc: SOTC_COMMIT_ON_DEMAND / SOTC_COMMIT_CHUNKS
+            if (runtime_memory_commit_on_demand() || runtime_memory_commit_chunks()) {
+                char commit_line[256];
+                std::snprintf(commit_line, sizeof commit_line,
+                              "SOTC COMMIT (%s): %.1f MiB of guest memory committed, %llu commits\n",
+                              runtime_memory_commit_chunks() ? "chunks" : "on demand",
+                              runtime_memory_committed_bytes() / 1048576.0,
+                              static_cast<unsigned long long>(runtime_memory_commit_count()));
+                report += commit_line;
+                if (runtime_memory_commit_chunks() == 2) {
+                    std::snprintf(commit_line, sizeof commit_line,
+                                  "SOTC COMMIT lazy: faults %llu (%.1f ms, max %.2f ms), chunk opens %.1f ms "
+                                  "(max %.2f ms), opened under table lock %llu\n",
+                                  static_cast<unsigned long long>(runtime_memory_lazy_calls()),
+                                  runtime_memory_lazy_ns() / 1e6, runtime_memory_lazy_max_ns() / 1e6,
+                                  runtime_memory_chunk_open_ns() / 1e6,
+                                  runtime_memory_chunk_open_max_ns() / 1e6,
+                                  static_cast<unsigned long long>(runtime_memory_chunk_opens_locked()));
+                    report += commit_line;
+                }
+            }
             SotcMemClasses::Report(report, seconds);
+            SotcPcPlaceGlue::Global().Report(report, seconds); // sotc: SOTC_PC_PLACE / SOTC_PC_RECYCLE
             // sotc: Wave C optimizations, each prints only while its switch is on.
             SotcAreaPrewarm::ReportAreaPrewarm(report, seconds); // SOTC_AREA_PREWARM >= 2
             Vulkan::ReportPipeMemo(report, seconds);              // SOTC_PIPE_MEMO

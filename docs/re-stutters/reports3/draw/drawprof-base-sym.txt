@@ -1,0 +1,133 @@
+11446 samples; self time by function:
+    5.2%  AmdGpu::Liverpool::BackLoop
+    1.5%  std::__1::__tree_iterator std::__1::__tree::__lower_bound_multi[abi:nqe230103]
+    1.3%  VideoCore::TextureCache::MemoLookup
+    1.2%  bool VideoCore::RegionManager::ForEachModifiedRange::'lambda'::operator const
+    1.2%  tsl::detail_robin_hash::robin_hash::robin_iterator tsl::detail_robin_hash::robin_hash::find_impl const
+    1.1%  cached_region_q
+    1.0%  Vulkan::Rasterizer::BindBuffers
+    1.0%  AmdGpu::Liverpool::ExecuteBackOp
+    0.9%  Vulkan::Rasterizer::CaptureTextures
+    0.9%  VideoCore::Image::FindView
+    0.9%  boost::container::operator!=
+    0.8%  Vulkan::Rasterizer::BindTexturesFull
+    0.8%  void VideoCore::TextureCache::ForEachImageInRegion::'lambda'::operator const
+    0.8%  VideoCore::BufferCache::ObtainBuffer
+    0.7%  VideoCore::TextureCache::LockCounted
+    0.7%  Vulkan::::ArrayOf
+    0.7%  Vulkan::Rasterizer::BindResources
+    0.7%  std::__1::__wrap_iter std::__1::__lower_bound_bisecting[abi:nqe230103]
+    0.6%  VideoCore::::TsharpInfoSlot
+    0.6%  T0 std::__1::__lower_bound_bisecting[abi:nqe230103]
+    0.6%  VideoCore::ImageViewInfo::ImageViewInfo
+    0.5%  VideoCore::TextureCache::MemoGeneration const
+    0.5%  unsigned long long std::__1::__cxx_atomic_load[abi:nqe230103]
+    0.5%  Common::LeastRecentlyUsedCache::Touch
+    0.5%  Vulkan::Rasterizer::BeginRendering
+    0.5%  bool Shader::SharpFetch::Fetch const
+    0.5%  VideoCore::BufferCache::SynchronizeMemoryFull
+    0.5%  bool VideoCore::MemoryTracker::ForEachUploadRange::'lambda'::operator const
+    0.4%  VideoCore::ImageInfo::ImageInfo
+    0.4%  void boost::container::dtl::construct_type
+    0.4%  IntervalList::AddUnion requires std::is_same_v
+    0.4%  AmdGpu::Liverpool::OnBackThread const
+    0.4%  Vulkan::Rasterizer::PrepareRenderState
+    0.4%  ___chkstk_ms
+    0.4%  VideoCore::ImageViewInfo::operator== const
+    0.3%  VideoCore::BufferCache::EnsureResident
+    0.3%  unsigned long long Common::AlignDown
+    0.3%  void Vulkan::::CmdPushDescriptorSet
+    0.3%  SotcLoadWarm::NoteBind
+    0.3%  VideoCore::BufferCache::RecordCurrentWrite
+outside the loader (by module):
+   19.7%  ntdll.dll
+   13.8%  ucrtbase.dll
+    5.0%  win32u.dll
+    0.9%  nvoglv64.dll
+    0.1%  KERNELBASE.dll
+    0.0%  KERNEL32.DLL
+    0.0%  graphics-hook64.dll
+    0.0%  vulkan-1.dll
+    0.0%  0000000000001808
+    0.0%  dxcore.dll
+inclusive (callees) by function:
+  101.2%  std::__1::__invoke_result_impl::type std::__1::__invoke[abi:nqe230103]
+   99.4%  std::__1::__invoke_result_impl::type std::__1::invoke[abi:nqe230103]
+   99.4%  std::__1::__intrusive_shared_ptr::~__intrusive_shared_ptr[abi:nqe230103]
+   99.4%  std::__1::stop_token::~stop_token[abi:nqe230103]
+   99.4%  decltype std::__1::__bind_front_op::operator[abi:nqe230103] const
+   99.4%  decltype std::__1::__perfect_forward_impl::operator[abi:nqe230103] &&
+   99.4%  void std::__1::__thread_execute[abi:nqe230103]
+   99.4%  void* std::__1::__thread_proxy[abi:nqe230103]
+   94.8%  AmdGpu::Liverpool::BackLoop
+   94.7%  SotcStats::SplitTimer::~SplitTimer
+   82.0%  AmdGpu::Liverpool::ExecuteBackOp
+   46.7%  Vulkan::Rasterizer::BindResources
+   32.1%  Vulkan::Rasterizer::DispatchDirect
+   25.5%  Vulkan::Rasterizer::DrawIndirect
+   19.2%  Vulkan::Rasterizer::BindBuffers
+   17.8%  Vulkan::Rasterizer::BindTextures
+   16.5%  Vulkan::Rasterizer::BindTexturesFull
+   15.5%  VideoCore::BufferCache::ObtainBuffer
+   14.6%  std::__1::pair::operator=[abi:nqe230103]
+   13.4%  VideoCore::BufferCache::SynchronizeMemory
+   13.0%  Vulkan::Rasterizer::Draw
+   12.9%  VideoCore::BufferCache::SynchronizeMemoryFull
+    9.7%  SotcTrace::ScopeMin::~ScopeMin
+    9.6%  Common::UniqueFunction::Callable::operator
+    9.5%  VideoCore::TextureCache::FindImage
+    9.3%  VideoCore::SyncReason::~SyncReason
+    8.4%  bool VideoCore::MemoryTracker::IteratePages
+    7.6%  bool VideoCore::MemoryTracker::ForEachUploadRange
+    7.4%  AmdGpu::Liverpool::ProcessCommands
+    7.0%  bool VideoCore::RegionManager::ForEachModifiedRange
+    6.9%  bool VideoCore::MemoryTracker::ForEachUploadRange::'lambda'::operator const
+    6.8%  VideoCore::SignalImpl::Protect
+    6.6%  runtime_memory_gpu_protect
+    6.6%  BbStats::Timer::~Timer
+    6.6%  Core::AddressSpace::Protect
+    6.5%  protect_fast
+    6.5%  void AmdGpu::Liverpool::SendCommand::'lambda'::operator const
+    6.3%  Common::SlotId::operator bool const
+    6.0%  Core::CopySparseSerial
+    5.8%  Vulkan::Rasterizer::DispatchIndirect
+    5.8%  VideoCore::PageManager::Impl::UpdatePageWatchersForRegion
+    5.7%  VideoCore::BufferCache::ReadMemory::$_5::operator const
+    5.7%  VideoCore::BufferCache::FinishAsyncReadback
+    5.5%  Core::GuardedGuestCopy
+    5.2%  SotcOpPhases::Scope::~Scope
+    5.1%  SotcOpPhases::Charge
+    5.1%  VideoCore::PageManager::Impl::UpdatePageWatchersForRegion::'lambda'::operator const
+    4.8%  std::__1::__function::__value_func::~__value_func[abi:nqe230103]
+    4.8%  std::__1::function::~function[abi:nqe230103]
+    4.7%  BbCopy::::Pool::Run
+    4.7%  BbCopy::ParallelFor
+    4.7%  Vulkan::Rasterizer::BeginRendering
+    4.6%  std::__1::__atomic_base::fetch_add[abi:nqe230103]
+    4.6%  unsigned long long std::__1::__cxx_atomic_fetch_add[abi:nqe230103]
+    4.5%  VideoCore::BufferCache::SynchronizeDmaBuffers
+    4.3%  VideoCore::TextureCache::UpdateImage
+    4.2%  Vulkan::Rasterizer::PrepareRenderState
+    3.9%  VideoCore::TextureCache::ResolveOverlap
+    3.9%  bool std::__1::condition_variable::wait_for[abi:nqe230103]
+    3.9%  std::__1::cv_status std::__1::condition_variable::wait_until[abi:nqe230103]
+    3.9%  bool std::__1::condition_variable::wait_until[abi:nqe230103]
+    3.8%  std::__1::cv_status std::__1::condition_variable::wait_for[abi:nqe230103]
+    3.8%  void std::__1::condition_variable::__do_timed_wait[abi:nqe230103]
+    3.8%  Core::MemoryManager::CopySparseMemory
+    3.8%  SotcStats::DrawWait::DrawWait
+    3.8%  VideoCore::TextureCache::RefreshImage
+    3.7%  BbCopy::::Pool::Work
+    3.7%  std::__1::condition_variable::__do_timed_wait
+    3.7%  std::__1::__libcpp_condvar_timedwait
+    3.6%  VideoCore::TextureCache::FindTexture
+    3.6%  VideoCore::BufferCache::ObtainBufferForImage
+    3.6%  Vulkan::StagingBufferRef::Flush const
+    3.5%  Common::InlineFunction::operator
+    3.4%  std::__1::span::span[abi:nqe230103]
+    3.4%  boost::container::vector_alloc_holder::start const
+    3.4%  boost::container::vector::priv_raw_begin const
+    3.4%  boost::container::vector::data
+    3.4%  auto std::__1::ranges::__data::__fn::operator[abi:nqe230103] const
+    3.3%  VideoCore::BufferCache::ApplyDownloads
+    3.3%  Vulkan::ExecuteShaderHLE

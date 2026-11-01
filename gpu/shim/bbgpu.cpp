@@ -10,6 +10,7 @@
 #include "bbport_toggles.h"
 #include "sotc_backing_warm.h" // sotc: SOTC_BACKING_WARM
 #include "../sotc/load_warm.h"   // sotc: SOTC_LOAD_WARM
+#include "../sotc/pc_ring.h"     // sotc: SOTC_PC_RING=8 flip wait (SetFlipWait)
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/page_manager.h" // sotc: bbgpu_declare_cpu_write (SOTC_WRITE_DECL)
@@ -119,6 +120,12 @@ static void TraceMapEvent(const char* name, uintptr_t address, uint64_t size) {
 }
 void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
     rasterizer = rasterizer_;
+    // sotc: SOTC_PC_RING=8 flip wait: the frame boundary (MEMTYPE_FLIP_SITE) calls the buffer cache.
+    if (rasterizer_) {
+        SotcPcRing::SetFlipWait(
+            [](void* ctx) { static_cast<VideoCore::BufferCache*>(ctx)->PcHostFlipWait(); },
+            &rasterizer_->GetBufferCache());
+    }
     // Existing guest mappings are replayed by the runtime when hooks are installed.
     runtime_memory_set_gpu_hooks(
         [](uintptr_t address, uint64_t size) {
@@ -311,7 +318,13 @@ const u8* MemoryManager::GetBackingPointer(VAddr address) const {
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size, u32 source) {
     BbWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size,
                      static_cast<BbWriteLog::Source>(10 + source));
-    return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
+    const bool ok = runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
+    // sotc: SOTC_HLE_TABLE_GEN. A backing write sets no CPU bit (write-through, EOP labels, decoded
+    // data), so the write generations move here, after the bytes landed.
+    if (ok && rasterizer) {
+        rasterizer->GetBufferCache().BumpSyncGeneration(reinterpret_cast<uintptr_t>(address), size);
+    }
+    return ok;
 }
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
     BbStats::Timer timer{BbStats::t_protect};

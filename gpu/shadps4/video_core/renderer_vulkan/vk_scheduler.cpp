@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <limits>
 #include "common/assert.h"
 #include "common/debug.h"
@@ -21,8 +22,36 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
+namespace {
+// sotc: SOTC_VK_POOL: the scheduler DeferGpuDestroy queues on. The first scheduler constructed
+// while the switch is on (the draw scheduler: presenter members are built in that order).
+std::atomic<Scheduler*> pool_destroy_scheduler{};
+} // namespace
+
+bool VkPoolEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_VK_POOL");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+bool GpuDestroyDeferred() {
+    return VkPoolEnabled() && pool_destroy_scheduler.load(std::memory_order_acquire) != nullptr;
+}
+
+void DeferGpuDestroy(Common::UniqueFunction<void>&& func) {
+    Scheduler* scheduler = pool_destroy_scheduler.load(std::memory_order_acquire);
+    if (!scheduler) {
+        func();
+        return;
+    }
+    scheduler->DeferPriorityOperation(std::move(func));
+}
+
 // sotc: SOTC_FPS (B5). Takes submit_mutex; with SOTC_FPS on, the wait is timed and counted (see
-// Scheduler::submit_lock_draw_ns). With SOTC_FPS off it is the plain lock.
+// Scheduler::submit_lock_draw_ns, and by role in Scheduler::submit_lock_role_ns). With SOTC_FPS
+// off it is the plain lock.
 static void LockSubmit(std::unique_lock<std::mutex>& lk) {
     if (!SotcStats::kFpsLog) {
         lk.lock();
@@ -31,6 +60,11 @@ static void LockSubmit(std::unique_lock<std::mutex>& lk) {
     const uint64_t start = SotcStats::NowNs();
     lk.lock();
     const uint64_t waited = SotcStats::NowNs() - start;
+    const auto role = Scheduler::CurrentSubmitRole(SotcStats::t_draw_thread);
+    Scheduler::submit_lock_role_ns[static_cast<size_t>(role)].fetch_add(
+        waited, std::memory_order_relaxed);
+    Scheduler::submit_lock_role_count[static_cast<size_t>(role)].fetch_add(
+        1, std::memory_order_relaxed);
     if (SotcStats::t_draw_thread) {
         Scheduler::submit_lock_draw_ns.fetch_add(waited, std::memory_order_relaxed);
         Scheduler::submit_lock_draw_count.fetch_add(1, std::memory_order_relaxed);
@@ -65,6 +99,11 @@ static void RecordHostVisibility(vk::CommandBuffer cmdbuf) {
 
 Scheduler::Scheduler(const Instance& instance, bool record_thread)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+    // sotc: SOTC_VK_POOL: the first scheduler is the one deferred destruction waits on.
+    if (VkPoolEnabled()) {
+        Scheduler* none = nullptr;
+        pool_destroy_scheduler.compare_exchange_strong(none, this, std::memory_order_acq_rel);
+    }
     if (record_thread) {
         recorder = std::make_unique<CommandRecorder>(instance, &work_semaphore);
         LOG_INFO(Render_Vulkan, "Vulkan commands are recorded on their own thread");
@@ -126,6 +165,8 @@ void Scheduler::TraceWatchThread(std::stop_token stoken) {
 }
 
 Scheduler::~Scheduler() {
+    Scheduler* self = this;
+    pool_destroy_scheduler.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
@@ -477,6 +518,8 @@ u64 Scheduler::SubmitAheadAsync() {
     const vk::Semaphore xfer_sem = xfer ? xfer->Handle() : vk::Semaphore{};
     const vk::Semaphore signal_sem = *ahead_timeline;
     auto submit = [this, cmdbuf, value, xfer_wait, xfer_sem, signal_sem] {
+        // sotc: SOTC_FPS: the recording thread's submit when it runs there (inline otherwise).
+        const SubmitRoleScope role_scope{recorder ? SubmitRole::Recorder : SubmitRole::Other};
         const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
         const vk::TimelineSemaphoreSubmitInfo timeline_si = {
             .waitSemaphoreValueCount = xfer_wait != 0 ? 1u : 0u,
@@ -1144,6 +1187,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         // The submit runs on the recording thread after the commands of these command buffers.
         recorder->Run(CommandRecorder::BlockCategory::Other,
                       [this, info, fakes = std::move(cmd_buffers), signal_value, gpu_pair] {
+            // sotc: SOTC_FPS: this queue submit is the recording thread's (LockSubmit by role).
+            const SubmitRoleScope role_scope{SubmitRole::Recorder};
             boost::container::small_vector<vk::CommandBuffer, 8> real;
             for (const vk::CommandBuffer fake : fakes) {
                 real.push_back(recorder->Real(fake));

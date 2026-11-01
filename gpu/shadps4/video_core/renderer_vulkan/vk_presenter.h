@@ -60,6 +60,20 @@ public:
     Presenter(Frontend::WindowSDL& window, AmdGpu::Liverpool* liverpool);
     ~Presenter();
 
+    /// sotc: SOTC_RAM_REPORT (gpu/sotc/ram_report.cpp) reads the VMA allocator through this.
+    const Instance& GetInstance() const {
+        return instance;
+    }
+
+    /// sotc: SOTC_RAM_REPORT: the rasterizer (null before it is created) and the runtime, which holds
+    /// the staging pool. Read-only telemetry.
+    Rasterizer* SotcRasterizer() {
+        return rasterizer.get();
+    }
+    Runtime& SotcRuntime() {
+        return runtime;
+    }
+
     HostPasses::PostProcessingPass::Settings& GetPPSettingsRef() {
         return pp_settings;
     }
@@ -163,8 +177,14 @@ private:
         u64 done_ns{};
     };
 
-    /// sotc: takes the id of the present about to be queued (call under Scheduler::submit_mutex).
+    /// sotc: takes the id of the present about to be queued. Call under the present queue lock:
+    /// Scheduler::submit_mutex, or present_queue_mutex with present_unlocked.
     u64 TagPresent();
+
+    /// sotc: SOTC_PRESENT_UNLOCKED=1, PresentPath::SharedDepthWait only. Waits (no lock held) until
+    /// the presents at most image_count - 1 behind the last one are on screen, so that the
+    /// present under submit_mutex does not block on a full queue. A timeout is counted and returns.
+    void WaitPresentDepth();
 
     /// sotc: false when a frame past ring_default_frames cannot be allocated (the caller drops it).
     bool RecreateFrame(Frame* frame, u32 width, u32 height);
@@ -214,6 +234,13 @@ private:
     std::atomic<u64> last_present_id{0};         ///< sotc: SOTC_PRESENT_WAIT, see LastPresentId
     mutable std::mutex present_records_mutex;    ///< sotc: guards present_records
     std::array<PresentRecord, 64> present_records{}; ///< sotc: indexed by id % 64
+    /// sotc: SOTC_PRESENT_UNLOCKED=1 with a present queue of its own and no DLSS-G: the present
+    /// holds present_queue_mutex (the lock of that VkQueue) instead of Scheduler::submit_mutex.
+    bool present_unlocked{false};
+    /// sotc: PresentPath::SharedDepthWait (SOTC_PRESENT_UNLOCKED=1 on one queue): the presents wait
+    /// for the older ones before they take submit_mutex, see WaitPresentDepth.
+    bool present_depth_wait{false};
+    std::mutex present_queue_mutex; ///< sotc: serializes the presents on the present queue
 };
 
 /// sotc: SOTC_FPS (B5). Appends one line per window: the draw thread's flip wait split by cause

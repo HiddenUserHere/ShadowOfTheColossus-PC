@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "../../../sotc/pc_ring.h" // sotc: SOTC_PC_RING (RingExtent)
+#include "../../../sotc/rb_class.h" // sotc: SOTC_RB_CLASS (PfWindow mask ranges)
 #include <array>
 #include <atomic>
 #include <thread>
@@ -78,6 +80,10 @@ public:
         return &gds_buffer;
     }
 
+    /// sotc: SOTC_RAM_REPORT: host bytes of the memory tracker's region managers (defined in
+    /// buffer_cache.cpp, where MemoryTracker is complete).
+    [[nodiscard]] u64 SotcHostBytes() const noexcept;
+
     /// Retrieves the device local DBA page table buffer.
     [[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept {
         return bda_pagetable_buffer.get();
@@ -134,6 +140,28 @@ public:
     void TickFrame();
 
     /// Invalidates any buffer in the logical page range.
+    // sotc: SOTC_PC_RING=3 full ring (pc_ring_copy.cpp, draw thread). PcRingApply gives every live
+    // region its ring mask for the arena blocks; PcRingMarkClean clears the CPU bits of ring pages
+    // the submit copy just brought up to date in VRAM.
+    void PcRingApply(const std::vector<SotcPcRing::RingExtent>& blocks);
+    void PcRingMarkClean(VAddr addr, u64 size);
+    // sotc: SOTC_PC_RING=5 incremental mask: ring bits on (enter) or off (leave) for a range.
+    void PcRingDelta(VAddr addr, u64 size, bool on);
+    // sotc: SOTC_PC_RING=8 (host arena binds). Draw thread. Rings the imported arena blocks (never
+    // protected) and remembers them; PcHostBind serves the binds inside them from host memory.
+    void PcHostApply(const std::vector<SotcPcRing::RingExtent>& blocks);
+    // sotc: SOTC_PC_RING=8. Draw thread, at each submit start (OnSubmitStart): reports the unique
+    // bytes of the previous submit's served binds and rechecks its verify samples.
+    void PcHostSubmitStart();
+    // sotc: SOTC_PC_RING=8 flip wait (SOTC_PC_RING8_FLIPWAIT=1, default off). Game render thread, once
+    // per frame at the frame boundary (SotcPcRing::SetFlipWait). Waits until the GPU has completed
+    // the work that used the heap half the game is about to reuse (pc_host_half_tick).
+    void PcHostFlipWait();
+    // sotc: SOTC_PC_RING=8 clip (SOTC_PC_RING8_CLIP, default on; 0 disables). A read-only bind whose
+    // size the rasterizer limited (unbounded V#, SHADPS4_UNBOUNDED_BUFFER_MB window) and that starts
+    // in an imported arena run but runs past its end: returns the size clipped to the run end, so
+    // PcHostBind serves it from host memory. Otherwise size unchanged.
+    [[nodiscard]] u64 PcHostClipLimited(VAddr addr, u64 size);
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false,
                           bool guest_fault = false);
 
@@ -175,6 +203,16 @@ public:
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+
+    /// sotc: SOTC_HLE_TABLE_GEN (vk_shader_hle.cpp). Sum of the write generations over the span;
+    /// false when a tracking region over it does not exist.
+    [[nodiscard]] bool SyncGeneration(VAddr addr, u64 size, u64& gen) const;
+    /// sotc: SOTC_HLE_TABLE_GEN. True when no page of the span has its CPU bit set.
+    [[nodiscard]] bool IsCpuClean(VAddr addr, u64 size) const;
+    /// sotc: SOTC_HLE_TABLE_GEN. True when readback data owed to guest memory intersects the span.
+    [[nodiscard]] bool OwedIntersects(VAddr addr, u64 size) const;
+    /// sotc: SOTC_HLE_TABLE_GEN. Moves the write generations of the span (a write without a CPU bit).
+    void BumpSyncGeneration(VAddr addr, u64 size);
 
     /// sotc: SOTC_WRITE_DECL (page_manager.cpp DeclareCpuWrite): lock-free check whether any page
     /// of the span may be write-protected, and how many are.
@@ -440,6 +478,16 @@ private:
         /// sotc: SOTC_RB_MATERIALIZE: every range it copied was written by the GPU in this frame or
         /// the previous one (pf_fresh), so PrefetchMaterialize may apply it without a guest fault.
         bool pf_fresh_ok{};
+        /// sotc: SOTC_RB_CLASS_AHEAD: a class copy issued after its writers were flushed, in an ahead
+        /// command buffer of its own (ahead_value is its timeline value; tick is kept only for the
+        /// reaping bound and is never waited for). ahead_faulted: a guest read fault reached it
+        /// (counted once). wait_ahead_pf: the guest readback waits for such a copy (timed).
+        bool ahead_faulted{};
+        bool wait_ahead_pf{};
+        /// sotc: SOTC_RB_CLASS: the class range the copy serves: 1 a mask-arena window (applied only
+        /// while its block is registered, PrefetchClassAlive), 2 a stats request copy, 0 none. Class
+        /// copies skip the freshness test (pf_fresh_ok is set at issue; see PrefetchMaterialize).
+        u8 pf_class{};
         /// sotc: SOTC_RB_PREV: the download of what TryServePrevious released without a readback
         /// (the GPU's newer bytes, still owed to guest memory). Applied by PrefetchMaterialize when
         /// done and clean; never expires by age.
@@ -523,7 +571,10 @@ private:
         VAddr key{};
         u64 issued_tick{};
         bool armed{};
+        u64 written_cp_frame{}; ///< sotc: SOTC_RB_CLASS v2, the cp frame of its last GPU write
+        bool class_req{};       ///< sotc: SOTC_RB_CLASS: a stats request not issued yet
     };
+    std::vector<SotcRbClass::Range> pf_mask_ranges; ///< sotc: SOTC_RB_CLASS, snapshot per rebuild
     std::vector<PfWindow> pf_recurring;
     std::vector<u32> pf_armed; ///< indices into pf_recurring
     VAddr pf_rec_lo{};
@@ -563,9 +614,20 @@ private:
     /// sotc: SOTC_RB_PREV: serves a guest read fault from the bytes already in guest memory (the
     /// last applied version, at most SOTC_RB_PREV_FRAMES frames old) instead of waiting for the
     /// GPU. True when it did (the readback then has nothing to wait for).
+    /// sotc: SOTC_RB_CLASS=2 uses the same path for the registered mask-arena windows (no producer
+    /// test, refusals counted by reason); see the comment above it in buffer_cache.cpp.
     bool TryServePrevious(AsyncReadback& readback);
     /// sotc: SOTC_RB_MATERIALIZE: steady-clock ns of the last PrefetchMaterialize pass.
     u64 pf_mat_last_ns{};
+    /// sotc: SOTC_RB_CLASS: registry snapshot for PrefetchClassAlive, refreshed when
+    /// SotcRbClass::Version changes (draw thread).
+    std::vector<SotcRbClass::Range> pf_mat_ranges;
+    u64 pf_mat_version{};
+    /// sotc: SOTC_RB_CLASS: false when p serves a mask-arena block that was freed since it was
+    /// issued (its bytes may belong to memory the game reused).
+    bool PrefetchClassAlive(const AsyncReadback& p);
+    /// sotc: SOTC_RB_CLASS: the report line, every 5 s (PrefetchIssue, draw thread).
+    void PrefetchClassReport();
     /// sotc: SOTC_RB_MATERIALIZE: true when every gpu_range of p lies inside one fresh range
     /// (this frame or the previous one) of window key.
     bool PrefetchFreshCovers(VAddr key, const AsyncReadback& p) const;
@@ -772,6 +834,52 @@ private:
     bool fault_process_pending{};
 
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
+    // sotc: SOTC_PC_RING=8. A bind inside one imported arena run is served from the imported buffer
+    // (no sync, no GPU tracking): the optional carries the buffer and the offset. Otherwise nullopt,
+    // after PcHostMarkCpu for the ringed bytes the bind covers. Draw thread (the maintenance).
+    [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> PcHostBind(VAddr device_addr,
+                                                                          u32 size, bool is_written);
+    /// sotc: SOTC_PC_RING=8. Marks CPU-modified the part of [addr, addr + size) that lies in an
+    /// imported (ringed) block, so the normal path uploads its current guest bytes.
+    /// Returns the bytes marked. A range already marked by an earlier bind of the same draw-side
+    /// submit is not marked again (pc_host_marked, reset at each PcHostSubmitStart). The key is the
+    /// draw-side submit sequence, not the game's SubmitEpoch: one game epoch can span several draw
+    /// submits, and a later submit must upload the bytes the game wrote in between. Off with
+    /// SOTC_PC_RING8_DEDUPE=0 (every straddling bind uploads its arena part).
+    u64 PcHostMarkCpu(VAddr addr, u64 size);
+    /// sotc: SOTC_PC_RING=8. One-shot log (first 32 straddling binds per run): the bind, the arena
+    /// blocks it touches and whether they are imported, and the bytes marked for it.
+    void PcHostLogStraddle(VAddr addr, u32 size, int relation, u64 marked);
+    u64 pc_host_submit_seq{};                                 ///< sotc: draw-side submit count (PcHostSubmitStart)
+    u64 pc_host_mark_seq{};                                   ///< sotc: submit_seq of pc_host_marked
+    std::vector<std::pair<VAddr, u64>> pc_host_marked;        ///< sotc: ranges marked this submit
+    /// sotc: flip wait state, game render thread only. pc_host_flip_count counts the frame flips;
+    /// pc_host_half_tick[h] is the scheduler tick that covers everything recorded while half h was
+    /// the current one, sampled at the flip that ended its use. The half the game reuses at a flip
+    /// is the one that was current before the previous flip, so its tick is the one to wait for.
+    u64 pc_host_flip_count{};
+    u64 pc_host_half_tick[2]{};
+    /// sotc: SOTC_PC_RING=8. True when buffer is one of the host views (pc_host_views).
+    [[nodiscard]] bool PcHostIsView(const Buffer* buffer);
+    /// sotc: SOTC_PC_RING=8. Caller holds pc_host_mutex. Records a served bind: its span for the
+    /// per-submit unique bytes, and every SOTC_PC_RING8_VERIFY_SAMPLE-th one a hash (verify).
+    void PcHostRecordBind(VAddr addr, u32 size, bool is_written);
+    std::vector<std::pair<VAddr, u64>> pc_host_read_spans; ///< sotc: served read binds this submit
+    std::vector<std::pair<VAddr, u64>> pc_host_write_spans; ///< sotc: served written binds this submit
+    struct PcHostVerifyRec {
+        VAddr addr;
+        u64 size;
+        u64 hash;
+        bool written;
+    };
+    std::vector<PcHostVerifyRec> pc_host_verify; ///< sotc: verify samples of this submit
+    u64 pc_host_bind_seq{};                      ///< sotc: served binds, for the verify sampling
+    std::mutex pc_host_mutex;                                 ///< sotc: pc_host_* (binds may come from other threads)
+    std::vector<SotcPcRing::RingExtent> pc_host_blocks;      ///< sotc: imported, ringed arena blocks
+    /// sotc: the host views by guest base (cpu_base). A replaced run's view is kept in pc_host_retired.
+    std::unordered_map<u64, std::unique_ptr<Buffer>> pc_host_views;
+    std::vector<std::unique_ptr<Buffer>> pc_host_retired;
+
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;
