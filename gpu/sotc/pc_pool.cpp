@@ -1871,8 +1871,11 @@ constexpr uint64_t kNodeOwnerList = 0x18;
 
 thread_local int64_t t_heap_key = kNoHeapKey;
 
+// The host side of a block: imported at its commit (the writer has backed it), dropped when the pool frees it.
 SotcPcPoolWindows::Table& WindowTable() {
-    static SotcPcPoolWindows::Table table;
+    static SotcPcPoolWindows::Table table(
+        [](uint64_t va, uint64_t bytes) { return SotcNativeWindows::ImportBlock(va, bytes); },
+        [](uint64_t va, uint64_t bytes) { SotcNativeWindows::DropBlock(va, bytes); });
     return table;
 }
 
@@ -2262,7 +2265,10 @@ bool WindowRelease(uint64_t owner, uint64_t node) {
         return false;
     }
     if (!WindowTable().Release(node, va, size)) {
-        return false; // an ordinary free: the original runs 0x476f0 with its VA return
+        // An ordinary free: the original runs 0x476f0 with its VA return, and the pool unmaps the block. A window block
+        // is then no longer backed by the game, so its import goes too (Table::Forget; a no-op outside the windows).
+        WindowTable().Forget(va);
+        return false;
     }
     // The stores of 0x476f0 before its call to 0x1b0e0 (the unlink, the count and the bytes), and then the return
     // without that call. The VA stays in use in the pool (the parked node) and its phys stays mapped.

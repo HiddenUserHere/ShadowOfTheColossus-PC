@@ -298,6 +298,69 @@ void TestGiveVa() {
     CHECK(t.stats().take_failed[0] == 1);
 }
 
+// ---- import and drop of committed blocks -------------------------------------------------------------------------
+
+void TestImportDrop() {
+    std::vector<uint64_t> imports; // every block the host was asked to import (refused ones too)
+    std::vector<uint64_t> drops;
+    bool refuse = false;
+    W::Table t([&](uint64_t va, uint64_t) {
+        imports.push_back(va);
+        return !refuse;
+    }, [&](uint64_t va, uint64_t) { drops.push_back(va); });
+    FakeHost host(kBase);
+    CHECK(ReserveAll(t, host, nullptr) == 3);
+    CHECK(t.Bind(0, kObjA, W::kAnyKey));
+    const uint64_t va1 = t.TakeVa(0, 32 * kMiB, kMiB);
+    const uint64_t va2 = t.TakeVa(0, 32 * kMiB, kMiB);
+    const uint64_t va3 = t.TakeVa(0, 32 * kMiB, kMiB);
+    const uint64_t n1 = 0x90000000ull;
+    const uint64_t n2 = 0x90001000ull;
+    const uint64_t n3 = 0x90002000ull;
+    CHECK(imports.empty()); // nothing is imported before the commit
+
+    // A commit imports the block (the writer has backed it).
+    t.Commit(0, va1, 32 * kMiB, n1);
+    CHECK(imports.size() == 1 && imports[0] == va1);
+    CHECK(t.imported(0).count(va1) == 1 && t.stats().imported[0] == 1);
+
+    // A refused import is counted: the block stays committed and bound, and is not imported.
+    refuse = true;
+    t.Commit(0, va2, 32 * kMiB, n2);
+    CHECK(imports.size() == 2 && t.stats().import_refused[0] == 1);
+    CHECK(t.imported(0).count(va2) == 0 && t.stats().committed[0] == 2);
+
+    // An ordinary free of a block that is not imported drops nothing.
+    t.Forget(va2);
+    CHECK(drops.empty() && t.stats().dropped[0] == 0);
+
+    // A parked block keeps its import: the park is not an unmap, and a second Forget of a parked block drops nothing.
+    CHECK(t.Release(n1, va1, 32 * kMiB));
+    t.Forget(va1);
+    CHECK(drops.empty() && t.imported(0).count(va1) == 1);
+
+    // An ordinary free of an imported block (not parked) drops its import; the window keeps its VA live.
+    refuse = false;
+    t.Commit(0, va3, 32 * kMiB, n3);
+    CHECK(imports.size() == 3 && t.imported(0).count(va3) == 1 && t.stats().imported[0] == 2);
+    t.Forget(va3);
+    CHECK(drops.size() == 1 && drops[0] == va3 && t.stats().dropped[0] == 1);
+    CHECK(t.imported(0).count(va3) == 0 && t.imported(0).count(va1) == 1);
+    t.Forget(va3); // already dropped: nothing more
+    CHECK(drops.size() == 1 && t.stats().dropped[0] == 1);
+    CHECK(t.window(0).live_blocks() == 3); // the VA stays live in the window (the pool may take it back)
+    t.Forget(0x123000); // outside every window: nothing of the windows
+
+    // A table without the host callbacks commits without importing (the default constructor).
+    W::Table plain;
+    FakeHost host2(kBaseB);
+    CHECK(ReserveAll(plain, host2, nullptr) == 3);
+    CHECK(plain.Bind(0, kObjA, W::kAnyKey));
+    const uint64_t pva = plain.TakeVa(0, 32 * kMiB, kMiB);
+    plain.Commit(0, pva, 32 * kMiB, n1);
+    CHECK(plain.stats().committed[0] == 1 && plain.stats().imported[0] == 0 && plain.stats().import_refused[0] == 0);
+}
+
 // ---- WindowFreshHost -------------------------------------------------------------------------------------------
 
 void TestWindowFreshHost() {
@@ -406,6 +469,7 @@ int main() {
     TestFullWindowFallsBack();
     TestCommitReleaseReuse();
     TestGiveVa();
+    TestImportDrop();
     TestWindowFreshHost();
     TestForcedFreshPredict();
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);

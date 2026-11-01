@@ -72,6 +72,13 @@ void bbgpu_register_guest_thread(void);
  * =2: only counted (the would-be declared pages per caller, SOTC WRITE DECL report line).
  * Unset/0: returns at once. Returns the number of tracked pages found in the span. */
 uint64_t bbgpu_declare_cpu_write(void *address, uint64_t size, uint64_t return_address);
+/* sotc: PC-native write announces for the runtime's copies (SOTC_NATIVE, gpu/sotc/native/native_hooks.cpp).
+ * A code is 0 for nothing to announce, else 1 + SotcNative::Kind (1 Persistent, 2 PerFrame).
+ * bbgpu_native_guest_write_kind(return_address): the code for a guest memcpy/memset/memmove whose caller is
+ * return_address (the table of GPU-read destinations); lock-free. bbgpu_native_announce_write(dst, size, code)
+ * announces [dst, dst+size) once the bytes landed; it takes a mutex (call it on the host stack). */
+uint32_t bbgpu_native_guest_write_kind(uint64_t return_address);
+void bbgpu_native_announce_write(void *dst, uint64_t size, uint32_t code);
 #ifdef __cplusplus
 }
 #endif

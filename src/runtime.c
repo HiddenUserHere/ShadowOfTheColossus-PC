@@ -203,20 +203,48 @@ static inline void declare_guest_write(void *dst, size_t size, void *caller) {
         dst, (uint64_t)size, (uint64_t)(uintptr_t)caller };
     runtime_call_on_host_stack(declare_on_host_stack, &call);
 }
+/* sotc: PC-native announces (SOTC_NATIVE; gpu/bbgpu.h, gpu/sotc/native/native_hooks.cpp). A guest copy whose
+ * destination the GPU reads is announced after its bytes landed (impl-writes7 gap 2): the GPU library
+ * decides by the caller's return address (code 0 = nothing to do). File reads are not announced: the
+ * GPU resources they fill are announced by their creator (NATIVE_RES_COPY), and announcing every read
+ * buffer would upload CPU-only data. Off costs one call and a flag test. The announce takes a mutex,
+ * so it runs on the host stack. */
+uint32_t bbgpu_native_guest_write_kind(uint64_t return_address) __attribute__((weak));
+void bbgpu_native_announce_write(void *dst, uint64_t size, uint32_t code) __attribute__((weak));
+static void announce_on_host_stack(void *arg) {
+    const struct { void *dst; uint64_t size; uint32_t code; } *call = arg;
+    bbgpu_native_announce_write(call->dst, call->size, call->code);
+}
+static inline void announce_guest_write(void *dst, size_t size, void *caller) {
+    if (!size || !bbgpu_native_guest_write_kind) return;
+    uint32_t code = bbgpu_native_guest_write_kind((uint64_t)(uintptr_t)caller);
+    if (!code) return;
+    struct { void *dst; uint64_t size; uint32_t code; } call = { dst, (uint64_t)size, code };
+    runtime_call_on_host_stack(announce_on_host_stack, &call);
+}
 static ABI void *guest_memset(void *dst, int value, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    declare_guest_write(dst, size, (void *)(uintptr_t)GUEST_CALLER());
-    return memset(dst, value, size);
+    void *caller = (void *)(uintptr_t)GUEST_CALLER();
+    declare_guest_write(dst, size, caller);
+    void *result = memset(dst, value, size);
+    announce_guest_write(dst, size, caller);
+    return result;
 }
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    declare_guest_write(dst, size, (void *)(uintptr_t)GUEST_CALLER());
-    return memcpy(dst, src, size);
+    void *caller = (void *)(uintptr_t)GUEST_CALLER();
+    declare_guest_write(dst, size, caller);
+    void *result = memcpy(dst, src, size);
+    announce_guest_write(dst, size, caller);
+    return result;
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    declare_guest_write(dst, size, (void *)(uintptr_t)GUEST_CALLER());
-    return memmove(dst, src, size);
+    void *caller = (void *)(uintptr_t)GUEST_CALLER();
+    declare_guest_write(dst, size, caller);
+    void *result = memmove(dst, src, size);
+    announce_guest_write(dst, size, caller);
+    return result;
 }
 static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcmp(a, b, size);

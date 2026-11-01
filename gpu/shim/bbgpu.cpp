@@ -315,6 +315,11 @@ const u8* MemoryManager::GetBackingRun(VAddr address, VAddr* run_start, u64* run
 const u8* MemoryManager::GetBackingPointer(VAddr address) const {
     return runtime_memory_backing_pointer(address);
 }
+// sotc: no PC-native announce here (impl-writes7 gap 2). The writes go through the backing view, so the fault
+// oracle cannot see them. The sources are GPU-produced bytes written back to the guest (2: EOP fence labels, 1: GPU
+// heap copy, 3: texture download) or CPU bytes mirrored into a buffer-cache range (10: TryReplaceFromCpu and the
+// write-through paths). None is a copy the GPU reads from guest memory as its own input that a guest writer
+// announces; source 10 is the one to re-check if a native verify run shows a GPU read of a backing-only write.
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size, u32 source) {
     BbWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size,
                      static_cast<BbWriteLog::Source>(10 + source));

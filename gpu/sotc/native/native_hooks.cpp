@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "../../bbgpu.h"
 #include "../hooks.h"
 #include "native.h"
 
@@ -182,6 +183,7 @@ struct Window {
     std::atomic<uint64_t> mip_releases{0}, mip_release_bytes{0};
     std::atomic<uint64_t> skipped{0};
     Counter dcb, ccb, chunk, zc, mat, blk, inst, part, view, strm, cull;
+    Counter gmem; // sotc: guest copies (runtime memcpy/memset/memmove) announced
     std::atomic<uint64_t> desc{0};
     std::atomic<uint64_t> chunk_dropped{0};
 };
@@ -657,6 +659,61 @@ HookAction MipRelease(GuestRegs& regs, void*) {
     return HookAction::Continue;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// impl-writes7 gap 2: guest memset/memcpy/memmove (src/runtime.c) and file reads (src/runtime_file.c) announce the
+// bytes they put into guest memory when the GPU reads them. The runtime calls these after the copy has landed, so
+// the announce is post-write, as the Site hooks are. The table holds exact return addresses (image offsets, EU 1.01)
+// of the eboot calls whose destination is GPU data:
+//   0xf6eac9  sub_f711a0 (a tail-called memset) inside 0xf6ea60: clears the 16-byte V# pool slots that 0xf6e000 and
+//             0xf6e3b0 then fill with descriptors. PerFrame (the pool is rebuilt every frame).
+//   0xf9d7d   0xf9cf0: copies a parameter block into [obj+0x4b0]+offset and sets the object's dirty bit
+//             (table 0x2edf140). PerFrame: material and constant parameters.
+//   0xfce45   RenderThread_Kick (0xfc470): copies up to 128 bytes of per-slot state into the slot object +0xd8.
+//             PerFrame; probably GPU user data, not confirmed by a bind (the gmem counter shows the volume).
+// Not in the table, on purpose:
+//   0x8bf50   resource initial data: ResCopy (Site, after the memcpy) already announces it as Persistent.
+//   0x918e7   CRenderContext zeroing: a CPU object; the GPU reads the command buffers it points to, which submit announces.
+//   0x8df2e   generic stream copy: the destination belongs to the caller, so the copy cannot say whether it is GPU data.
+//   0xca18d   resource table: the stores after the copy build it, so a copy announce would be early; needs a Site hook
+//             after the last store.
+//   0x85e558, 0x19a328, 0xb0d1db: CPU object zeroing and container moves (few pages in the write-decl counts).
+struct GuestWriteCaller {
+    uint32_t ret;
+    SotcNative::Kind kind;
+};
+constexpr GuestWriteCaller kGuestWriteCallers[] = {
+    {0xf6eac9, SotcNative::Kind::PerFrame},
+    {0xf9d7d, SotcNative::Kind::PerFrame},
+    {0xfce45, SotcNative::Kind::PerFrame},
+};
+
+// The code of the announce a guest copy from return_address needs: 0 = none, else 1 + SotcNative::Kind.
+// Lock-free and cheap: it runs on every guest memcpy/memset/memmove while SOTC_NATIVE is on.
+uint32_t GuestWriteCode(uint64_t return_address) {
+    if (!SotcNative::On() || return_address == 0) {
+        return 0;
+    }
+    const uint64_t base = static_cast<uint64_t>(SotcHooks::ImageBase());
+    if (base == 0 || return_address < base) {
+        return 0;
+    }
+    const uint64_t offset = return_address - base;
+    for (const GuestWriteCaller& c : kGuestWriteCallers) {
+        if (offset == c.ret) {
+            return 1u + static_cast<uint32_t>(c.kind);
+        }
+    }
+    return 0;
+}
+
+// Announces [dst, dst + size) for a guest copy that has landed.
+void AnnounceWrite(uint64_t dst, uint64_t size, uint32_t code) {
+    if (code == 0 || size == 0 || dst > UINT64_MAX - size) {
+        return;
+    }
+    AnnounceRange(dst, dst + size, static_cast<SotcNative::Kind>(code - 1), g_window.gmem);
+}
+
 } // namespace
 
 // Report lines for the 5 s window (SotcNative::Report prints the rest). Resets the counters.
@@ -696,6 +753,7 @@ void Report(std::string& out, double seconds) {
     out += cls("view", g_window.view);
     out += cls("strm", g_window.strm);
     out += cls("cull", g_window.cull);
+    out += cls("gmem", g_window.gmem);
     std::snprintf(line, sizeof(line), " desc %llu dropped %llu\n",
                   static_cast<unsigned long long>(take(g_window.desc)),
                   static_cast<unsigned long long>(take(g_window.chunk_dropped)));
@@ -742,4 +800,17 @@ void NoteFrameBlock(uint64_t addr, uint64_t size) {
 }
 
 } // namespace SotcNativeHooks
+
+// C entry points for the runtime (src/runtime.c), declared in gpu/bbgpu.h. Lookups are
+// lock-free; bbgpu_native_announce_write takes the SotcNative mutex, so the runtime calls it on the host stack.
+extern "C" uint32_t bbgpu_native_guest_write_kind(uint64_t return_address) {
+    return SotcNativeHooks::GuestWriteCode(return_address);
+}
+
+extern "C" void bbgpu_native_announce_write(void* dst, uint64_t size, uint32_t code) {
+    if (!SotcNative::On()) {
+        return;
+    }
+    SotcNativeHooks::AnnounceWrite(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst)), size, code);
+}
 

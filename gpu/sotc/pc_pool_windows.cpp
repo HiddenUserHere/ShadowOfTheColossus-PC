@@ -278,6 +278,39 @@ void Table::Commit(int slot, uint64_t va, uint64_t bytes, uint64_t node) {
     }
     s.node_of[va] = node;
     ++stats_.committed[slot];
+    // The writer has backed the block (its batch map ran before this call), so the host can import it now.
+    if (import_ && s.imported.count(va) == 0) {
+        if (import_(va, bytes)) {
+            s.imported[va] = bytes;
+            ++stats_.imported[slot];
+        } else {
+            ++stats_.import_refused[slot];
+        }
+    }
+}
+
+void Table::Forget(uint64_t va) {
+    const int slot = SlotOf(va);
+    if (slot < 0) {
+        return; // not a window block: nothing of the window's
+    }
+    SlotState& s = slots_[slot];
+    for (const Parked& p : s.parked) {
+        if (p.va == va) {
+            return; // parked: the pool still holds it (a second release), its import stays
+        }
+    }
+    s.node_of.erase(va);
+    const auto it = s.imported.find(va);
+    if (it == s.imported.end()) {
+        return;
+    }
+    const uint64_t bytes = it->second;
+    s.imported.erase(it);
+    if (drop_) {
+        drop_(va, bytes);
+    }
+    ++stats_.dropped[slot];
 }
 
 int Table::SlotOf(uint64_t va) const {
@@ -388,6 +421,18 @@ void ReportTable(const Table& table, std::string& out) {
                       static_cast<unsigned long long>(s.take_failed[i]), static_cast<unsigned long long>(s.parked[i]),
                       static_cast<unsigned long long>(s.park_refused[i]), static_cast<unsigned long long>(s.reused[i]),
                       static_cast<unsigned long long>(s.reuse_miss[i]));
+        out += line;
+        uint64_t imported_bytes = 0;
+        for (const auto& [va, bytes] : table.imported(i)) {
+            imported_bytes += bytes;
+        }
+        std::snprintf(line, sizeof line,
+                      "SOTC PC POOL WINDOWS %s imports: imported %llu, refused %llu, dropped %llu; "
+                      "imported blocks %zu (%llu MiB)\n",
+                      Spec(i).name, static_cast<unsigned long long>(s.imported[i]),
+                      static_cast<unsigned long long>(s.import_refused[i]),
+                      static_cast<unsigned long long>(s.dropped[i]), table.imported(i).size(),
+                      static_cast<unsigned long long>(imported_bytes / kMiB));
         out += line;
     }
 }

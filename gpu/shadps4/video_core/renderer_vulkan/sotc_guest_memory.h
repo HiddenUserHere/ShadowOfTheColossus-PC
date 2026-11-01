@@ -60,6 +60,12 @@ bool Available();
 /// range it is given, so a remapped range is imported again; LookupGuest does not re-verify.
 bool ImportGuestRange(uint64_t guest_addr, uint64_t size);
 
+/// sotc: SOTC_NATIVE window blocks. Drops the imported runs that lie inside [guest_addr, guest_addr + size)
+/// (a block given back or decommitted). A dropped run is no longer found by the lookups at once; its buffer
+/// and memory are destroyed once the GPU has finished the frame after the drop (SotcNative frame ticket), so
+/// the memory it pins is released without a read in flight. Thread-safe.
+void DropGuestRange(uint64_t guest_addr, uint64_t size);
+
 /// Ring import: the imported buffer and the offset of guest_addr in it, when one run holds the
 /// whole span [guest_addr, guest_addr + size). False when not imported or when the span crosses
 /// runs (the caller then splits it at the run boundaries and looks each piece up).

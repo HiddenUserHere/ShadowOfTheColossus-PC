@@ -79,6 +79,12 @@ bool g_ring_decided{};
 bool g_ring_ok{};
 std::map<uint64_t, Run> g_runs;  ///< by guest_begin
 std::vector<Run> g_retired;      ///< replaced runs: kept, the GPU may still read them
+/// sotc: runs dropped by DropGuestRange, destroyed by ReapDropped once the GPU has finished frame `frame`.
+struct Dropped {
+    Run run;
+    uint64_t frame;
+};
+std::vector<Dropped> g_dropped;
 u64 g_ring_bytes{};
 bool g_ring_refusal_logged{};
 
@@ -425,6 +431,24 @@ bool ImportRun(uint64_t guest_begin, uint64_t guest_end, const u8* host_begin) {
     return true;
 }
 
+/// Under g_mutex. Destroys the dropped runs whose frame the GPU has finished. The ticket is FrameCompleted
+/// (the newest frame whose GPU work is done): it must reach the frame after the drop.
+void ReapDropped() {
+    if (g_dropped.empty()) {
+        return;
+    }
+    const uint64_t done = SotcNative::FrameCompleted();
+    const vk::Device device = g_instance->GetDevice();
+    std::erase_if(g_dropped, [&](const Dropped& d) {
+        if (d.frame > done) {
+            return false;
+        }
+        device.destroyBuffer(d.run.buffer);
+        device.freeMemory(d.run.memory);
+        return true;
+    });
+}
+
 } // namespace
 
 void Init(const Instance& instance) {
@@ -487,6 +511,28 @@ bool Available() {
     return RingDecide();
 }
 
+void DropGuestRange(uint64_t guest_addr, uint64_t size) {
+    if (!g_ring || size == 0 || guest_addr + size < guest_addr) {
+        return;
+    }
+    std::scoped_lock lock{g_mutex};
+    ReapDropped();
+    const uint64_t end = guest_addr + size;
+    // The frame after the one in flight: a submission that bound the run before the drop is in that frame.
+    const uint64_t frame = SotcNative::FrameSubmitted() + 1;
+    // The runs that start in the range. A run that reaches past its end belongs to a larger import: kept.
+    auto it = g_runs.lower_bound(guest_addr);
+    while (it != g_runs.end() && it->first < end) {
+        if (it->second.guest_end > end) {
+            ++it;
+            continue;
+        }
+        g_ring_bytes -= it->second.buffer_size;
+        g_dropped.push_back(Dropped{it->second, frame});
+        it = g_runs.erase(it);
+    }
+}
+
 bool ImportGuestRange(uint64_t guest_addr, uint64_t size) {
     if (!g_ring || size == 0) {
         return false;
@@ -495,6 +541,7 @@ bool ImportGuestRange(uint64_t guest_addr, uint64_t size) {
     if (!RingDecide()) {
         return false;
     }
+    ReapDropped();
     // Already imported, and the backing is still the one imported: the common case, per submit.
     if (const Run* run = FindRun(guest_addr);
         run && guest_addr + size <= run->guest_end && RunMatches(*run)) {

@@ -5857,7 +5857,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         return {&stream_buffer, offset};
     }
     // sotc: SOTC_NATIVE: a range inside a registered window is served from its imported run, as the
-    // ring8 host binds below (no sync, no tracking).
+    // ring8 host binds below (no sync, no tracking). A block not imported yet makes NativeBind refuse
+    // (counted, the normal path with the bytes marked CPU-modified).
     if (SotcNative::On() && SotcNative::InWindow(device_addr, size)) {
         if (auto host = NativeBind(device_addr, size, is_written)) {
             return *host;

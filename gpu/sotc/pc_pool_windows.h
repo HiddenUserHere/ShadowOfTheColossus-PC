@@ -11,6 +11,10 @@
 // so its VA is fixed for the session. Its release is parked (0x476f0 skips the VA return 0x1b0e0; the pool keeps the
 // block in use), and the next block of that owner and size takes the parked node back (0x479a0), with no pool call.
 //
+// Host memory: a window is registered (its range only) at boot. A committed block is imported when the writer has
+// backed it (Table::Commit), and its import is dropped when the pool frees it outside the window (Table::Forget). A
+// block is never imported before it is committed, so the memory pinned by the windows is the live blocks only.
+//
 // Limits, checked when a window is reserved:
 //  - base + size <= kWindowLimit. The owner-tag table at root+0x111908 (one byte per MiB, index VA >> 20) is modelled
 //    only up to root+0x20d918 (pc_pool_native_dispatch.cpp InModelled): a window above 0xfc010 MiB writes outside it.
@@ -114,6 +118,9 @@ struct Stats {
     uint64_t park_refused[kSlotCount] = {}; ///< releases in a window that were not a live block of its node
     uint64_t reused[kSlotCount] = {};       ///< allocations served by a parked node
     uint64_t reuse_miss[kSlotCount] = {};   ///< allocations of a bound owner with no parked node of that size
+    uint64_t imported[kSlotCount] = {};     ///< committed blocks imported with the host
+    uint64_t import_refused[kSlotCount] = {}; ///< committed blocks the host refused to import (normal binds)
+    uint64_t dropped[kSlotCount] = {};      ///< imports dropped when the block was freed outside the window
     uint64_t reserve_ok = 0;
     uint64_t reserve_failed = 0;            ///< the host gave no VA, or an unaligned one (leaked at boot)
     uint64_t reserve_limit = 0;             ///< the reserved range ends above kWindowLimit (leaked at boot)
@@ -122,11 +129,18 @@ struct Stats {
 
 /// Registers a reserved range with the host (SotcNative::RegisterWindow). Null: not registered.
 using RegisterFn = std::function<bool(uint64_t base, uint64_t size, const char* name)>;
+/// Imports a committed block with the host (SotcNative::ImportWindowBlock). Null: no import.
+using ImportFn = std::function<bool(uint64_t va, uint64_t bytes)>;
+/// Drops the import of a block with the host (SotcNative::DropWindowBlock). Null: no drop.
+using DropFn = std::function<void(uint64_t va, uint64_t bytes)>;
 
 /// The three windows, their bindings and their parked nodes. The owner of a binding is the object the pool wrapper
 /// receives as rdi (the arena or the render-target allocator, the family object of the block, node+0x40).
 class Table {
 public:
+    Table() = default;
+    Table(ImportFn import, DropFn drop) : import_(std::move(import)), drop_(std::move(drop)) {}
+
     /// Reserves the window's VA (host.ReserveVirtual, 1 MiB aligned) and registers it. A window already active is kept.
     /// Returns false when the window stays inactive (why says which).
     bool Reserve(int slot, SotcPcPoolNativeFresh::FreshHost& host, const RegisterFn& reg, std::string* why);
@@ -140,8 +154,13 @@ public:
     uint64_t TakeVa(int slot, uint64_t bytes, uint64_t align);
     /// Returns the VA of a refused fresh call (nothing was committed) to the window.
     void GiveVa(int slot, uint64_t va, uint64_t bytes);
-    /// Binds the window's block at va to its node after a verified call (node is the rax the call returned).
+    /// Binds the window's block at va to its node after a verified call (node is the rax the call returned), and
+    /// imports it (the writer has backed it). An import the host refuses is counted; the block stays bound.
     void Commit(int slot, uint64_t va, uint64_t bytes, uint64_t node);
+    /// The ordinary free of [va, va + bytes) (not parked): the pool unmaps the block, so the block is no longer
+    /// bound to its node and its import is dropped. The window keeps the VA live: the pool's free list may take it,
+    /// so the window must never hand it out again. A parked block is left alone.
+    void Forget(uint64_t va);
 
     /// The release of a block (0x476f0): true when [va, va+bytes) is the live block of node in a window and is now
     /// parked (the caller skips the VA return). False: a normal free; the caller runs the original.
@@ -156,6 +175,8 @@ public:
     bool bound(int slot) const { return slots_[slot].bound; }
     uint64_t obj(int slot) const { return slots_[slot].obj; }
     const std::vector<Parked>& parked(int slot) const { return slots_[slot].parked; }
+    /// The imported blocks of a slot (block start -> bytes).
+    const std::map<uint64_t, uint64_t>& imported(int slot) const { return slots_[slot].imported; }
     const Stats& stats() const { return stats_; }
     /// Clears the counters (the windows, bindings and parked nodes stay).
     void ResetCounters() { stats_ = Stats(); }
@@ -167,12 +188,15 @@ private:
         int64_t key = kAnyKey;
         Window window;
         std::map<uint64_t, uint64_t> node_of; ///< live block start -> node (set by Commit)
+        std::map<uint64_t, uint64_t> imported; ///< imported block start -> bytes (set by Commit, dropped by Forget)
         std::vector<Parked> parked;
     };
     /// The bound slot for an owner, kind, key and size, or -1. Does not count.
     int Match(uint64_t obj, int32_t kind, int64_t key, uint64_t bytes) const;
     SlotState slots_[kSlotCount];
     Stats stats_;
+    ImportFn import_;
+    DropFn drop_;
 };
 
 /// The VA source of the fresh writers for the windowed calls: a window Take when a slot is selected, else the normal
