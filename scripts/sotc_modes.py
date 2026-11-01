@@ -87,6 +87,16 @@ CVAR_MODES = {
 PSTATS_STORE = (0x501ae4, bytes.fromhex('890c98'), bytes.fromhex('0f1f00'))
 POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
             bytes.fromhex('41c7467400000000' '31c0' 'e9c1feffff'))
+# sotc: PC-native GPU-result consumers (docs/re-stutters/native/impl-results.md). The XPR label spins: each skip
+# branch jumps to the continuation (2-byte short jumps). SOTC_NATIVE_MASKS=all only (the masks are all visible then).
+NATIVE_SPINS = [
+    (BASE + 0x11e1e2, bytes.fromhex('742c'), bytes.fromhex('eb35')),  # RenderXPRDecals: je 0x11e210 -> jmp 0x11e219
+    (BASE + 0x11dc49, bytes.fromhex('7425'), bytes.fromhex('eb2e')),  # IndexCullXPRObjects: je 0x11dc70 -> jmp 0x11dc79
+    (BASE + 0x11d80f, bytes.fromhex('741f'), bytes.fromhex('eb28')),  # BPXPR_RecordMaskedDraws: je 0x11d830 -> jmp 0x11d839
+    (BASE + 0x11daeb, bytes.fromhex('7423'), bytes.fromhex('eb2c')),  # BPXPR_RecordMaskedDraws: je 0x11db10 -> jmp 0x11db19
+]
+# WaterRendering::ReadQueries: jb 0xe493a -> jmp (the ring read is skipped). SOTC_NATIVE=1 only (mode 2 keeps it).
+NATIVE_WATER = (BASE + 0xe491a, bytes.fromhex('721e'), bytes.fromhex('eb1e'))
 # Above this many rendered pixels the larger render target pool pushes the game's free system
 # memory figure under texturePoolReserveSystemMemMiBs (220), and the texture streamer drops every
 # texture to mip 3 every second or so (fine textures flicker). Reserve 0 there; it needs POOL_FIX.
@@ -237,6 +247,28 @@ def render_patches(elf, ph, size, log=print):
     return writes
 
 
+def native_result_patches(elf, ph, supported, log=print):
+    """Groups for SOTC_NATIVE (each group applied only when all its bytes match). Empty when SOTC_NATIVE is unset,
+    so mode 0 gets no patch."""
+    native = os.environ.get('SOTC_NATIVE', '0')
+    groups = []
+    if not supported or native in ('', '0'):
+        return groups
+    if os.environ.get('SOTC_NATIVE_MASKS') == 'all':
+        if all(holds(elf, ph, address, expected) for address, expected, _ in NATIVE_SPINS):
+            groups.append([patch_entry(*entry) for entry in NATIVE_SPINS])
+            log('Native: XPR label spins removed (masks all visible)')
+        else:
+            log('Native: spin bytes differ, not applied')
+    if native == '1':
+        if holds(elf, ph, NATIVE_WATER[0], NATIVE_WATER[1]):
+            groups.append([patch_entry(*NATIVE_WATER)])
+            log('Native: water ring read skipped')
+        else:
+            log('Native: water bytes differ, not applied')
+    return groups
+
+
 def build_patches(elf, ph, modes, render='', pstats=False, log=print):
     """The patch groups (one per family, see patches_blob) and the cvars of the modes and the render
     size that apply to this eboot. A family whose expected bytes differ from the eboot's is left out
@@ -294,6 +326,7 @@ def build_patches(elf, ph, modes, render='', pstats=False, log=print):
         reserve_off = False
     if reserve_off:
         log('Texture pool reserve: 0 (page allocator fix on)')
+    groups += native_result_patches(elf, ph, supported, log)
     return groups, cvars
 
 

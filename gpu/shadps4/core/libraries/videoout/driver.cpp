@@ -56,6 +56,7 @@
 #include "../../../../sotc/native/native.h" // sotc: SOTC_NATIVE report
 #include "../../../../sotc/native/native_sync.h" // sotc: SOTC_NATIVE frame ticket report
 #include "../../../../sotc/native/verify.h" // sotc: SOTC_VERIFY report
+#include "../../../../sotc/native/native_results.h" // sotc: SOTC_NATIVE results report
 namespace SotcNativeHooks { void Report(std::string& out, double seconds); } // sotc: native_hooks.cpp
 #include "../../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST report
 #include "../../../../sotc/rb_class.h"    // sotc: SOTC_RB_CLASS report
@@ -2023,6 +2024,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcNativeHooks::Report(report, seconds); // sotc: SOTC_NATIVE write hooks
             SotcNativeSync::Report(report, seconds);  // sotc: SOTC_NATIVE frame ticket
             SotcVerify::Report(report, seconds);      // sotc: SOTC_VERIFY
+            SotcNativeResults::Report(report, seconds); // sotc: SOTC_NATIVE GPU-result consumers
             SotcRbClass::Report(report, seconds); // sotc: SOTC_RB_CLASS
             SotcRbHost::Report(report, seconds);  // sotc: SOTC_RB_HOST
             SotcStale::Report(report, seconds);   // sotc: SOTC_STALE_CHECK
