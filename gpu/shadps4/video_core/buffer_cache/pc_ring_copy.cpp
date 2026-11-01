@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <span>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "../../../sotc/mem_classes.h" // sotc: SOTC_PC_RING8_HEAPS (heap granule runs)
@@ -368,22 +369,26 @@ void HostMaintain(BufferCache& cache) {
     static uint64_t seen_version = 0;
     static std::vector<SotcPcRing::RingExtent> applied; // the blocks the ring was applied to
     const uint32_t epoch = SotcPcRing::SubmitEpoch();
-    if (epoch == seen_epoch && SotcPcRing::BlockVersion() == seen_version) {
+    // sotc: with heap runs (hundreds of blocks) the per-submit recheck below cost the draw thread
+    // ~5 ms a frame (1 Nov): it then runs when the set changes, or every 64 submits otherwise.
+    static size_t seen_count = 0;
+    const uint32_t every = seen_count > 32 ? 64u : 1u;
+    if (epoch - seen_epoch < every && SotcPcRing::BlockVersion() == seen_version) {
         return;
     }
     seen_epoch = epoch;
     uint64_t version = 0;
     const auto blocks = SotcPcRing::ArenaBlocks(version);
     seen_version = version;
+    seen_count = blocks.size();
 
     // A block that is not imported (refused, or not yet possible) keeps normal tracking: it is not
     // ringed, and its binds take the normal path.
-    static std::vector<u64> held;
+    static std::unordered_set<u64> held;
     for (const auto& block : blocks) {
         // sotc: SOTC_COMMIT_CHUNKS: the imported pages stay committed while the GPU may read them.
-        if (std::find(held.begin(), held.end(), block.addr) == held.end() &&
-            runtime_memory_hold_range(block.addr, block.size) == 0) {
-            held.push_back(block.addr);
+        if (!held.contains(block.addr) && runtime_memory_hold_range(block.addr, block.size) == 0) {
+            held.insert(block.addr);
         }
     }
     // Blocks that are adjacent in guest address space are imported as one range (one import call,
@@ -411,13 +416,23 @@ void HostMaintain(BufferCache& cache) {
             bytes += group.size;
         } else {
             for (size_t k = i; k <= j; ++k) {
+                // sotc: a refused range is not retried (heap runs, 1 Nov: 5364 retries and log lines in
+                // one route, each a backing walk); it stays on the normal path.
+                static std::vector<std::pair<u64, u64>> refused;
+                const std::pair<u64, u64> key{sorted[k].addr, sorted[k].size};
+                if (std::find(refused.begin(), refused.end(), key) != refused.end()) {
+                    continue;
+                }
                 if (Vulkan::SotcGuestMemory::ImportGuestRange(sorted[k].addr, sorted[k].size)) {
                     imported.push_back(sorted[k]);
                     bytes += sorted[k].size;
                 } else {
-                    std::fprintf(stderr, "SOTC PC RING8 import refused: block %#llx +%llu KiB\n",
-                                 static_cast<unsigned long long>(sorted[k].addr),
-                                 static_cast<unsigned long long>(sorted[k].size >> 10));
+                    refused.push_back(key);
+                    if (refused.size() <= 16) {
+                        std::fprintf(stderr, "SOTC PC RING8 import refused: block %#llx +%llu KiB\n",
+                                     static_cast<unsigned long long>(sorted[k].addr),
+                                     static_cast<unsigned long long>(sorted[k].size >> 10));
+                    }
                 }
             }
         }

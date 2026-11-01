@@ -126,6 +126,14 @@ max 84 vs 176 ms, flip wait ~1 us avg. Verify run 074212: ~0.1% of sampled read 
 submit (inflated by clipped binds that reach the block end). Vertices with this build: waiting for the user.
 Heap serving (SOTC_PC_RING8_HEAPS=CPUMemory, off by default; mem_classes CollectHostServe, pc_ring
 SetHostExtras, pc_ring_copy CollectHeapRuns): written and built, not yet run.
+Heap serving measured (074556, 074852, 075018): CPUMemory faults -27..-31% (2122-2288 -> 1471-1678/s), host
+-35%, but FPS 21.6-23.0 vs ring8probe 25-26 vs ring8 28.6 (draw busy 44-48 ms). The probes alone (memtype +
+classes + class track 2) cost 2.6-3.6 FPS. Fixed on the way: refused imports were retried every maintain (5364
+log lines), HostMaintain rechecked ~320 runs per submit with an O(n^2) held list. Remaining cost: the run set grows
+by 1-3 granules about once a second and every change re-applies the whole ring (ApplyRing over all region
+managers, 300+ ranges) plus the full re-import walk; and the binds of the new runs. To make it pay: incremental
+ring add (AddRingRange, as mode 5), whole heap regions instead of 64 KiB granules (few imports, no class track),
+and a cheaper heap source than the memtype probe. Parked: off by default.
 
 ## Next
 Fix ring8 vertices, combined matrix (several rounds), long play test, AMD/Intel, enable proven switches by default,
