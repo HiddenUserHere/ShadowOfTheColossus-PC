@@ -270,12 +270,12 @@ void NoteMipTailWrite(const Image& image);
 void ImageChurnReport();
 
 inline void MarkGpuModified(Image& image, bool bump_epoch = true) {
-    // sotc: SOTC_GEN_BIND / SOTC_GEN_TEX: every GPU write into the image (copies, clears, render)
-    // moves the generation of its guest range, not only the first one (the GPU-modified epoch).
-    if (SotcGen::On()) {
-        SotcGen::Bump(image.info.guest_address, image.info.guest_size);
-    }
     if (False(image.flags & ImageFlagBits::GpuModified)) {
+        // sotc: SOTC_GEN_BIND / SOTC_GEN_TEX: the image's range becomes GPU-written: its generation
+        // moves once (a bump on every write cost ~12 ms of draw work per frame, 1 Nov).
+        if (SotcGen::On()) {
+            SotcGen::Bump(image.info.guest_address, image.info.guest_size);
+        }
         if (bump_epoch) {
             gpu_modified_epoch.fetch_add(1, std::memory_order_relaxed);
         }

@@ -3513,7 +3513,12 @@ void TextureCache::FreeRebased(ImageId image_id, std::atomic<std::uint64_t>& cou
 }
 
 void TextureCache::MarkWritten(Image& image) {
-    GenBumpImage(image); // sotc: SOTC_GEN_TEX, the GPU writes this image (every write, not the first)
+    // sotc: SOTC_GEN_TEX: the bump marks the image's range as GPU-written once, on its first write. A bump on
+    // every write (each draw into a render target: hundreds of granules) cost ~12 ms of draw work per
+    // frame (profile, 1 Nov); the texture memo validates by image state, which later writes do not change.
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        GenBumpImage(image);
+    }
     // sotc: the writer's FindImage freed the mip tails it overlapped, but another binding of the
     // same draw can create one after it. On an image's first GPU write over a tail, memoized
     // tail decisions are made again (they refuse GPU-written overlaps). Writes found otherwise

@@ -29,8 +29,16 @@ constexpr u64 kChunkCount = u64{1} << (kAddrBits - kShift - kChunkBits); // 4096
 constexpr u64 kGranulesPerWord = 4;                      // 256 KiB word / 64 KiB granule
 constexpr u64 kPagesPerGranule = 16;                     // 4 KiB pages / 64 KiB granule
 
+// sotc: a 2 MiB block level (32 granules): Sum reads one block counter for every whole block of
+// the range instead of 32 granule counters (a 32 MiB ring8 bind: 16 loads instead of 512; with
+// granule loads only, SOTC_GEN_BIND cost ~11 ms of draw work per frame, 1 Nov). A block counter
+// is bumped with each of its granules, so it always equals the sum of its granules: Sum returns
+// the same value either way.
+constexpr u64 kBlockBits = 5; // granules per block: 32 (2 MiB)
+
 struct Chunk {
     std::atomic<u64> count[u64{1} << kChunkBits];
+    std::atomic<u64> block[u64{1} << (kChunkBits - kBlockBits)];
 };
 
 // Zero-initialized static storage: every chunk pointer starts null.
@@ -57,7 +65,9 @@ Chunk* ChunkOf(u64 granule, bool create) {
 
 void BumpGranule(u64 granule, u64 n) {
     Chunk* chunk = ChunkOf(granule, true);
-    chunk->count[granule & ((u64{1} << kChunkBits) - 1)].fetch_add(n, std::memory_order_release);
+    const u64 local = granule & ((u64{1} << kChunkBits) - 1);
+    chunk->count[local].fetch_add(n, std::memory_order_release);
+    chunk->block[local >> kBlockBits].fetch_add(n, std::memory_order_release);
 }
 
 } // namespace
@@ -95,15 +105,26 @@ u64 Sum(u64 addr, u64 size) {
     u64 sum = 0;
     Chunk* chunk = nullptr;
     u64 chunk_index = ~0ULL;
-    for (u64 g = first; g <= last; ++g) {
+    constexpr u64 kBlockGranules = u64{1} << kBlockBits;
+    for (u64 g = first; g <= last;) {
         const u64 index = g >> kChunkBits;
         if (index != chunk_index) {
             chunk_index = index;
             chunk = ChunkOf(g, false); // a missing chunk has no bumps: contributes 0
         }
-        if (chunk) {
-            sum += chunk->count[g & ((u64{1} << kChunkBits) - 1)].load(std::memory_order_acquire);
+        const u64 local = g & ((u64{1} << kChunkBits) - 1);
+        // A whole block inside the range (blocks never cross a chunk): its block counter.
+        if ((local & (kBlockGranules - 1)) == 0 && last - g + 1 >= kBlockGranules) {
+            if (chunk) {
+                sum += chunk->block[local >> kBlockBits].load(std::memory_order_acquire);
+            }
+            g += kBlockGranules;
+            continue;
         }
+        if (chunk) {
+            sum += chunk->count[local].load(std::memory_order_acquire);
+        }
+        ++g;
     }
     return sum;
 }

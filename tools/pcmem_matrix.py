@@ -83,6 +83,18 @@ SWITCHES = {
     'base': {'SOTC_RAM_REPORT': '1', 'SOTC_PC_RING': '0'},
     # The current defaults (sotc.py: ring8 and its hooks), nothing else set.
     'default': {'SOTC_RAM_REPORT': '1'},
+    # drawphases bisect (1 Nov): one group each, on top of the defaults.
+    'dp_gen': {'SOTC_GEN_BIND': '1', 'SOTC_GEN_DMA': '1', 'SOTC_GEN_TEX': '1'},
+    'dp_pr': {'SOTC_PARALLEL_RECORD': '1', 'SOTC_GEN_BIND': '1', 'SOTC_PR_GEN': '1'},
+    'dp_pipe': {'SOTC_PIPE_DIRTY': '1', 'SOTC_PIPE_GPL': '1'},
+    'dp_img': {'SOTC_IMG_POOLED': '1', 'SOTC_IMG_CREATE_AHEAD': '1', 'SOTC_RT_MAXEXTENT': '1'},
+    'dp_class': {'SOTC_STATIC_CLASS': '3', 'SOTC_RT_CLASS': '1', 'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1',
+                 'SOTC_RB_MATERIALIZE': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_FLIP_OFFTHREAD': '1'},
+    # The groups that cost nothing in the bisect (1 Nov), together; no resolve workers (dp_pr cost ~3 ms).
+    'drawbest': {'SOTC_GEN_BIND': '1', 'SOTC_GEN_DMA': '1', 'SOTC_GEN_TEX': '1', 'SOTC_PIPE_DIRTY': '1',
+                 'SOTC_PIPE_GPL': '1', 'SOTC_IMG_POOLED': '1', 'SOTC_IMG_CREATE_AHEAD': '1', 'SOTC_RT_MAXEXTENT': '1',
+                 'SOTC_STATIC_CLASS': '3', 'SOTC_RT_CLASS': '1', 'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1',
+                 'SOTC_RB_MATERIALIZE': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_FLIP_OFFTHREAD': '1'},
     # The draw-thread phases that ran clean on 1 Nov, on top of the defaults (no honest labels and what
     # needs them: SOTC_FRAME_AHEAD, SOTC_RB_HOST, heap serving; no SOTC_BDA, unsafe with ring8).
     'drawphases': {'SOTC_RAM_REPORT': '1', 'SOTC_FLIP_OFFTHREAD': '1', 'SOTC_GEN_BIND': '1', 'SOTC_GEN_DMA': '1',
