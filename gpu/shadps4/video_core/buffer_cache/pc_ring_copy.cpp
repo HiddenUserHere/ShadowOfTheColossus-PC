@@ -13,7 +13,6 @@
 
 #include "../../../sotc/mem_classes.h" // sotc: SOTC_PC_RING8_HEAPS (heap granule runs)
 #include "../../../sotc/pc_ring.h"
-#include "../../../sotc/rb_host.h" // sotc: SOTC_RB_HOST (R1) result runs
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE drain at submit start
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
@@ -312,8 +311,6 @@ void ProtectThenCopy(Vulkan::Rasterizer& rasterizer, BufferCache& cache, int mod
 // the unbound clean granules between them included, unless the tracker holds a GPU bit in that gap (then
 // the run is cut there). A run with a GPU bit is left out, as in mode 1. At most kCoarseRuns runs are
 // served (the largest by bytes); the others keep the normal path. Fewer runs: fewer imports and ring ranges.
-// sotc: SOTC_RB_HOST (rb_host.h, R1): the heap runs last published, kept for the merge in HostMaintain.
-static std::vector<SotcPcRing::RingExtent> g_heap_runs;
 
 static void CollectCoarseRuns(BufferCache& cache, const std::vector<std::string>& heaps,
                               uint64_t& last_version) {
@@ -400,7 +397,6 @@ static void CollectCoarseRuns(BufferCache& cache, const std::vector<std::string>
                      static_cast<unsigned long long>(gpu_left));
     }
     last_version = version;
-    g_heap_runs = runs; // sotc: SOTC_RB_HOST merges the result runs with these (HostMaintain)
     SotcPcRing::SetHostExtras(std::move(runs));
 }
 
@@ -459,7 +455,6 @@ static void CollectHeapRuns(BufferCache& cache, uint32_t epoch) {
                      runs.size(), static_cast<unsigned long long>(bytes >> 20),
                      static_cast<unsigned long long>(gpu_modified));
     }
-    g_heap_runs = runs; // sotc: SOTC_RB_HOST merges the result runs with these (HostMaintain)
     SotcPcRing::SetHostExtras(std::move(runs));
 }
 
@@ -536,29 +531,6 @@ void HostMaintain(BufferCache& cache) {
         return;
     }
     CollectHeapRuns(cache, SotcPcRing::SubmitEpoch());
-    // sotc: SOTC_RB_HOST (R1): the GPU-to-CPU result runs (stats arrays) as host runs, every submit. Merged
-    // with the heap runs: SetHostExtras needs them sorted and disjoint. Granules with GPU-modified pages
-    // are left out, as for heap runs (their newest bytes are in the device copy).
-    if (SotcRbHost::On()) {
-        std::vector<SotcPcRing::RingExtent> all = g_heap_runs;
-        for (const SotcRbClass::Range& r : SotcRbHost::Runs()) {
-            if (!cache.IsRegionGpuModified(r.addr, r.size)) {
-                all.push_back({r.addr, r.size});
-            }
-        }
-        std::sort(all.begin(), all.end(), [](const SotcPcRing::RingExtent& a, const SotcPcRing::RingExtent& b) {
-            return a.addr < b.addr;
-        });
-        std::vector<SotcPcRing::RingExtent> merged;
-        for (const SotcPcRing::RingExtent& e : all) {
-            if (!merged.empty() && e.addr <= merged.back().addr + merged.back().size) {
-                merged.back().size = std::max(merged.back().size, e.addr + e.size - merged.back().addr);
-            } else {
-                merged.push_back(e);
-            }
-        }
-        SotcPcRing::SetHostExtras(std::move(merged));
-    }
     // Once per submit epoch, and whenever the arena block set changed. The epoch is read first: a
     // block that appears after it is seen at the next submit.
     static uint32_t seen_epoch = 0;

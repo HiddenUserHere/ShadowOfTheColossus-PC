@@ -769,11 +769,10 @@ def build_report(eboot_path, hooks_dir, include_examples, ctx_flags):
 
 
 def run_validation(ctx):
-    """The known outcomes: four refusals the loader logged, and eleven hooks that installed in real
+    """The known outcomes: three refusals the loader logged, and eleven hooks that installed in real
     runs. The refusals with a mode the declarations do not use (0x19b760 as wrap) are checked directly."""
     cases = [
         ('refusal', 'PC_POOL_ALLOC', 0x19e00, 'wrap', 'function has an unresolved indirect branch'),
-        ('refusal', 'STATIC_CLASS_BUFFER_ALLOC', 0x8bf0e, 'site', 'branch target inside the displaced span'),
         ('refusal', 'XPRMEM_BUILD_MASKS@wrap', 0x19b760, 'wrap', 'Wrap: stack operand at an unknown stack depth'),
         ('refusal', 'entry@0x136f0', 0x136f0, 'entry', 'function has an unresolved indirect branch'),
     ]

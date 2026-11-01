@@ -22,9 +22,6 @@
 // machinery it feeds), SOTC_HOOK_ALLOC_PROBE=1 (the arena blocks) and SOTC_PARTICLE_PREV=1 (the
 // stats ring hook).
 //
-// sotc: SOTC_RB_HOST (rb_host.h, R1) uses the same registry and stats requests: the mask arena blocks
-// are its "covered" arena ranges, and particle_prev.cpp hands the stats arrays to it as host runs. It
-// works without SOTC_RB_CLASS for the stats arrays; the registry needs SOTC_RB_CLASS=1 for the masks.
 #pragma once
 
 #include <cstdint>

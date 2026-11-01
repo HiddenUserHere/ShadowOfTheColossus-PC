@@ -107,14 +107,13 @@ class BuildTests(Clean):
         self.assertIn('Mode fps60: this eboot is not EU 1.01 / US 1.00, not applied', log)
 
     def test_each_family_is_its_own_group(self):
-        families = [(m.POOL_FIX[0], m.POOL_FIX[1]), (m.PSTATS_STORE[0], m.PSTATS_STORE[1])]
+        families = [(m.POOL_FIX[0], m.POOL_FIX[1])]
         elf, ph = fake_eboot(spots_for(modes=['grassbuf'], families=families))
-        groups, _ = m.build_patches(elf, ph, 'grassbuf', pstats=True, log=[].append)
+        groups, _ = m.build_patches(elf, ph, 'grassbuf', log=[].append)
         self.assertEqual(groups[0], [entry(*m.POOL_FIX)])
-        self.assertEqual(groups[1], [entry(*m.PSTATS_STORE)])
-        self.assertEqual(len(groups[2]), len(m.MODES['grassbuf']))
+        self.assertEqual(len(groups[1]), len(m.MODES['grassbuf']))
         numbers = {g for g, *_ in parse_bbpatch3(m.patches_blob(groups))[1]}
-        self.assertEqual(numbers, {1, 2, 3})
+        self.assertEqual(numbers, {1, 2})
 
     def test_mismatched_pool_fix_not_written(self):
         families = [(m.POOL_FIX[0], m.POOL_FIX[1][:-1] + b'\x01')]

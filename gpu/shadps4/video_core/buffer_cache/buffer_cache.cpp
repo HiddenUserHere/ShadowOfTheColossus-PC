@@ -32,8 +32,7 @@
 #include "../../../sotc/native/native_draw.h" // sotc: SOTC_NATIVE draw-thread side
 #include "../../../sotc/native/verify.h"      // sotc: SOTC_VERIFY (NoteGpuConsume)
 #include "../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST (L1)
-#include "../../../sotc/rb_host.h"      // sotc: SOTC_RB_HOST (R1)
-#include <xxhash.h>                     // sotc: SOTC_PC_RING=8 verify (XXH3, as stale_check.cpp)
+#include <xxhash.h>                     // sotc: SOTC_PC_RING=8 verify (XXH3)
 #include "video_core/buffer_cache/pc_ring_copy.h"      // sotc: SOTC_PC_RING=8 (HostMaintain)
 #include "video_core/renderer_vulkan/sotc_guest_memory.h" // sotc: SOTC_PC_RING=8 (LookupGuestView)
 #include "../../../sotc/rb_class.h"     // sotc: SOTC_RB_CLASS readback ranges
@@ -58,8 +57,6 @@ extern "C" uintptr_t runtime_sotc_heap_table(void);
 #include <vk_mem_alloc.h>
 
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM
-#include "../../../sotc/stale_check.h" // sotc: SOTC_STALE_CHECK
-#include "../../../sotc/static_class.h" // sotc: SOTC_STATIC_CLASS=3 (TrySkip / NoteClean)
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH
 
@@ -674,7 +671,6 @@ void BufferCache::TickFrame() {
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks,
                                    bool guest_fault) {
     if (SotcStats::kCmdStats) SotcStats::inv_buffer.fetch_add(size, std::memory_order_relaxed);
-    SotcStale::Forget(device_addr, size); // sotc: SOTC_STALE_CHECK: guest or host write
     Core::MemoryManager::NoteHostWrite(device_addr, size, 9,
                                        reinterpret_cast<u64>(__builtin_return_address(0)));
     // sotc: SOTC_RB_EXACT: a guest write fault marks the whole 4 KiB page(s) CPU-modified, so
@@ -782,7 +778,6 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
             // between the erase at the top and this drop recorded the range again.
             PrevErase(device_addr, size);
         }
-        SotcStale::Forget(device_addr, size); // sotc: SOTC_STALE_CHECK: GPU bits cleared
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         MarkInflightReadbacksDirty(device_addr, size, StaleReason::Unmap);
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -1362,7 +1357,6 @@ void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
             return;
         }
         SotcStats::write_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed);
-        SotcStale::Forget(lo, hi - lo); // sotc: SOTC_STALE_CHECK: GPU bits cleared
         memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
     }
     memory_tracker->MarkRegionAsCpuModified(addr, size);
@@ -3158,7 +3152,6 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
             gpu_modified_ranges.Subtract(lo, hi - lo);
         }
         EraseGranuleSnapshots(lo, hi - lo);
-        SotcStale::Forget(lo, hi - lo); // sotc: SOTC_STALE_CHECK: GPU bits cleared
         memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
         MarkInflightReadbacksDirty(lo, hi - lo, StaleReason::Unmap);
         if (!pf_live.empty()) {
@@ -4302,7 +4295,6 @@ BufferCache::ExactResult BufferCache::TryServeExact(AsyncReadback& readback, con
             gpu_modified_ranges.Subtract(lo, hi - lo);
         }
         EraseGranuleSnapshots(lo, hi - lo);
-        SotcStale::Forget(lo, hi - lo); // sotc: SOTC_STALE_CHECK: GPU bits cleared
         memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
         MarkInflightReadbacksDirty(lo, hi - lo, StaleReason::Unmap, true);
         if (!pf_live.empty()) {
@@ -5572,14 +5564,6 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             // region lock, so a write fault in between waits instead of being overwritten (the
             // game's resource loader crashed asking for 59 GiB once, 24 Oct: a size it had just
             // read from a file, replaced by stale GPU bytes).
-            // sotc: SOTC_RB_HOST=2 (rb_host.h, R1): the bytes the guest pages hold before this readback
-            // applies them (the GPU mirror) against the bytes the readback brings.
-            if (SotcRbHost::Mode() == 2) {
-                std::vector<u8> before;
-                if (SotcRbHost::SnapshotBefore(dst_addr, copy.size, before)) {
-                    SotcRbHost::CompareApplied(dst_addr, before, src);
-                }
-            }
             const auto write_pages = [&](VAddr start, u64 size, auto&& write) {
                 if (!item.hot) {
                     write(start, size);
@@ -6278,7 +6262,6 @@ void BufferCache::EraseHashedUploads(VAddr addr, u64 size) {
 void BufferCache::RecordCurrentWrite(VAddr addr, u64 size, u64 seq, bool gpu_write,
                                      bool pf_marked) {
     const u32 wd_mode = WriteDietMode();
-    SotcStale::Forget(addr, size); // sotc: SOTC_STALE_CHECK: any arena write (GPU or upload)
     EraseHashedUploads(addr, size);
     // sotc: SOTC_RB_EXACT: any arena write over owed bytes takes them out of the owed downloads.
     if (RbxOn() && rbx_owed_count.load(std::memory_order_relaxed) != 0) {
@@ -6601,7 +6584,6 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
         std::unique_lock gpu_modified_lock{gpu_modified_mutex};
         gpu_modified_ranges.Subtract(addr, size);
     }
-    SotcStale::Forget(addr, size); // sotc: SOTC_STALE_CHECK: GPU bits cleared
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size, StaleReason::CpuWrite);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
@@ -6643,7 +6625,6 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
         std::unique_lock gpu_modified_lock{gpu_modified_mutex};
         gpu_modified_ranges.Subtract(addr, size);
     }
-    SotcStale::Forget(addr, size); // sotc: SOTC_STALE_CHECK: GPU bits cleared
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size, StaleReason::CpuWrite);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
@@ -6703,7 +6684,6 @@ bool BufferCache::TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, 
         std::unique_lock gpu_modified_lock{gpu_modified_mutex};
         gpu_modified_ranges.Subtract(addr, size);
     }
-    SotcStale::Forget(addr, size); // sotc: SOTC_STALE_CHECK: GPU bits cleared
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size, StaleReason::CpuWrite);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
@@ -7789,9 +7769,6 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostServe(
     SotcPcRing::NoteHostBind(size, is_written);
     SotcLabels::NoteSharedTouch(); // sotc: SOTC_LABELS_HONEST: GPU work on host-served memory (L1)
     PcHostRecordBind(device_addr, size, is_written);
-    if (is_written) {
-        SotcRbHost::NoteServedWrite(device_addr, size); // sotc: SOTC_RB_HOST (R1): labels wait for it (mode 1)
-    }
     return std::pair<const Buffer*, u64>{slot.get(), view.offset};
 }
 
@@ -7864,26 +7841,13 @@ u64 BufferCache::NativeFrameCompleted(void* ctx) {
 }
 
 void BufferCache::PcRingMarkClean(VAddr addr, u64 size) {
-    SotcStale::Forget(addr, size); // sotc: SOTC_STALE_CHECK: clean bits lifted without an upload
     memory_tracker->MarkRingClean(addr, size);
-}
-
-// sotc: SOTC_STALE_CHECK: the tracker queries of stale_check.h, over this buffer cache's tracker.
-static SotcStale::Oracle StaleOracle(MemoryTracker* tracker) {
-    return SotcStale::Oracle{
-        tracker,
-        [](void* ctx, uint64_t addr, uint64_t size) {
-            return static_cast<MemoryTracker*>(ctx)->IsRegionCpuModified(addr, size);
-        },
-        [](void* ctx, uint64_t addr, uint64_t size) {
-            return static_cast<MemoryTracker*>(ctx)->IsRegionGpuModified(addr, size);
-        }};
 }
 
 // sotc: SOTC_GEN_BIND. Whether the bind memo may answer this range. The memo skips the per-bind
 // diagnostics of SynchronizeMemory (stale check, ring verify), so those modes keep the full path.
 bool BufferCache::BindMemoEligible(VAddr device_addr, u32 size) const {
-    if (!SotcGen::On() || !SotcGen::Covered(device_addr, size) || SotcStale::On()) {
+    if (!SotcGen::On() || !SotcGen::Covered(device_addr, size)) {
         return false;
     }
     const int ring = SotcPcRing::FullRingMode();
@@ -7892,11 +7856,6 @@ bool BufferCache::BindMemoEligible(VAddr device_addr, u32 size) const {
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
-    // sotc: SOTC_STALE_CHECK: one bind in N compares the CPU- and GPU-clean pages of this range
-    // with the hashes stored at their last upload (stale_check.h). Before any sync below.
-    if (SotcStale::On() && SotcStale::SampleBind()) {
-        SotcStale::CheckBind(device_addr, size, StaleOracle(memory_tracker.get()));
-    }
     // sotc: SOTC_PC_RING=4/5/7 (verify): the arena ranges a bind reads are checked against the
     // submit's extents. Records only; the upload below is unchanged.
     if ((SotcPcRing::FullRingMode() == 4 || SotcPcRing::FullRingMode() == 5 ||
@@ -7943,15 +7902,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                    ? SynchronizeMemoryFromImage(arena, device_addr, size)
                    : false;
     }
-    // sotc: SOTC_STATIC_CLASS=3 (static_class.h). A read of a static mesh range that a clean sync
-    // armed, and whose region generation sum is unchanged, needs no scan. Behind the slot above:
-    // with SOTC_GEN_BIND the bind memo answers first, so this only adds the static ranges whose
-    // slot was evicted. Stores the slot like the clean branches below.
-    if (!is_written && SotcStaticClass::TrySkip(device_addr, size, gen0)) {
-        slot = {device_addr, gen0, size, is_written};
-        return is_texel_buffer && !is_written ? SynchronizeMemoryFromImage(arena, device_addr, size)
-                                              : false;
-    }
     // sotc: SOTC_SYNC_PRECHECK=1 (off by default). On a slot miss, a range that is already clean
     // (IsSyncClean: no CPU bit, and for a written binding every GPU bit set) needs no upload: the
     // full path below would find no copies, and its tail is the same texel branch. So the slot is
@@ -7976,9 +7926,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     // the look as before. =2 always takes the look and counts the disagreements.
     if (SotcStats::kSyncPipe && scan_clean && !SotcStats::kSyncPipeVerify) {
         slot = {device_addr, gen0, size, is_written};
-        if (!is_written) { // sotc: SOTC_STATIC_CLASS=3 arm (no-op otherwise)
-            SotcStaticClass::NoteClean(device_addr, size, gen0);
-        }
         return result;
     }
     const bool clean_after = memory_tracker->IsSyncClean(device_addr, size, is_written);
@@ -7988,9 +7935,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     // A slot left stale (range not clean now) cannot match again: its sum only grows.
     if (clean_after) {
         slot = {device_addr, gen0, size, is_written};
-        if (!is_written) { // sotc: SOTC_STATIC_CLASS=3 arm (no-op otherwise)
-            SotcStaticClass::NoteClean(device_addr, size, gen0);
-        }
     }
     return result;
 }
@@ -8027,14 +7971,6 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
     }
     if (scan_clean) { // sotc: SOTC_SYNC_PIPE, see SynchronizeMemory
         *scan_clean = clean;
-    }
-    // sotc: SOTC_STALE_CHECK: the pages of this upload lose their stored hashes here, so a path
-    // below that copies them without recording (host import, async, granule drop) leaves none.
-    // The record after the CPU copy stores new ones.
-    if (SotcStale::On()) {
-        for (const auto& copy : copies) { // dstOffset: guest address here
-            SotcStale::Forget(copy.dstOffset, copy.size);
-        }
     }
     // sotc: SOTC_FAULT_GRANULE: pages a granule marked dirty that the guest never wrote stay as
     // the arena holds them. Only runs when such pages are pending (otherwise one atomic load).
@@ -8264,15 +8200,6 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
             }
             for (const auto& copy : copies) {
                 RecordCurrentWrite(arena->cpu_addr + copy.dstOffset, copy.size);
-            }
-        }
-        // sotc: SOTC_STALE_CHECK: hash the bytes copied from guest memory above (backing view),
-        // after RecordCurrentWrite, which dropped the entries of these runs. dstOffset is the arena
-        // offset here, so the guest address is arena->cpu_addr + dstOffset.
-        if (SotcStale::On()) {
-            const auto oracle = StaleOracle(memory_tracker.get());
-            for (const auto& copy : copies) {
-                SotcStale::RecordUpload(arena->cpu_addr + copy.dstOffset, copy.size, oracle);
             }
         }
         // The hashes go in after RecordCurrentWrite, which drops the older ones of these runs.

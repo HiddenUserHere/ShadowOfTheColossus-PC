@@ -7,9 +7,10 @@ WaterRendering::ReadQueries (call at 0xe492b) and ParticleSystemPool::ProcessSta
 Entry registers: rdi = the descriptor (pool + 0xf8 + slot * 0x28); the caller keeps the pool object
 in r13 (ProcessStats: mov r13, rdi at 0x1018db, never written again before the call).
 
-Mode is the value of SOTC_PARTICLE_PREV. 1 and 2 only observe: the hook always continues. 3 is the
-PC-native serving (SOTC_NATIVE_PARTICLES=prev, sotc.py sets it): the accessor may return a completed
-copy of the counts instead (gpu/sotc/native/native_particles.cpp). Off when the switch is unset: the
+Mode is the value of SOTC_PARTICLE_PREV. Only 3 is used: the PC-native serving
+(SOTC_NATIVE_PARTICLES=prev, sotc.py sets it), where the accessor may return a completed copy of the
+counts instead (gpu/sotc/native/native_particles.cpp). Any other value installs the detour, which then
+continues without effect (the observe modes 1 and 2 were removed). Off when the switch is unset: the
 detour is not installed.
 
 NATIVE_PARTICLE_VERIFY: the site after the count load mov r15d,[r12+rbx*4] at 0x101a98 in

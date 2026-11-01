@@ -82,9 +82,6 @@ CVAR_MODES = {
 # 0, and the tally drifts above the bitmap's real free count. With the bitmap empty and the tally
 # not 0, the scan found no bit and read bitmap[-1] (crash at 0x41a371). On a failed scan: tally 0,
 # then carve a chunk (0x41a1f1, needs eax 0) and scan again.
-# ParticleSystemPool::ProcessStats: `movl %ecx,(%rax,%rbx,4)` (time stored to pool+0x188[slot])
-# -> 3-byte nop (SOTC_HOOK_PSTATS, see main).
-PSTATS_STORE = (0x501ae4, bytes.fromhex('890c98'), bytes.fromhex('0f1f00'))
 POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
             bytes.fromhex('41c7467400000000' '31c0' 'e9c1feffff'))
 # sotc: PC-native GPU-result consumers (docs/re-stutters/native/impl-results.md). The XPR label spins: each skip
@@ -271,7 +268,7 @@ def native_result_patches(elf, ph, supported, log=print):
     return groups
 
 
-def build_patches(elf, ph, modes, render='', pstats=False, log=print):
+def build_patches(elf, ph, modes, render='', log=print):
     """The patch groups (one per family, see patches_blob) and the cvars of the modes and the render
     size that apply to this eboot. A family whose expected bytes differ from the eboot's is left out
     as a whole; a mode with a differing entry is logged and skipped, its cvars too."""
@@ -280,16 +277,6 @@ def build_patches(elf, ph, modes, render='', pstats=False, log=print):
     pool_fix = supported and holds(elf, ph, POOL_FIX[0], POOL_FIX[1])
     if pool_fix:
         groups.append([patch_entry(*POOL_FIX)])
-    # sotc: SOTC_HOOK_PSTATS=1 (off by default): skip the per-frame "last alive" store in
-    # ParticleSystemPool::ProcessStats (eboot 0x1018c0). That u32 array (pool+0x188, default heap)
-    # is written at spawn and here, and no reader was found; its pages share 64 KiB fault granules
-    # with GPU data, so this one store was 53% of all guest write faults.
-    if pstats:
-        if supported and holds(elf, ph, PSTATS_STORE[0], PSTATS_STORE[1]):
-            groups.append([patch_entry(*PSTATS_STORE)])
-            log('Hook ProcessStats: on')
-        else:
-            log('Hook ProcessStats: original bytes not found, not applied')
     for mode in filter(None, (m.strip().lower() for m in modes.split(','))):
         if mode not in MODES and mode not in CVAR_MODES:
             raise SystemExit(f'unknown mode {mode!r} (known: {", ".join([*MODES, *CVAR_MODES])})')
@@ -356,8 +343,7 @@ def main():
     parser.add_argument('--render', default='', help='render size WxH instead of 1920x1080, e.g. 3840x1600')
     args = parser.parse_args()
     elf, _, ph, _, _ = parse_self((args.game / 'eboot.bin').read_bytes())
-    groups, cvars = build_patches(elf, ph, args.modes, args.render,
-                                  pstats=os.environ.get('SOTC_HOOK_PSTATS') == '1')
+    groups, cvars = build_patches(elf, ph, args.modes, args.render)
     for item in args.cvars.split():
         item = item.lstrip('+')
         if not CVAR.match(item):

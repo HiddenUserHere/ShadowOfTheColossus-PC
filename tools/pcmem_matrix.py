@@ -30,7 +30,7 @@ Warnings (a column, not a crash): "SOTC CLASS TRIP" and "disabled native" lines.
 
 Parsed report lines (the last line of each kind per run; the pool block is the last complete
 "SOTC PC POOL:" report): ring full / coverage / hot mask / apply, CLASS heap, COMMIT, RB class, RB CLASS,
-STATIC CLASS, RT CLASS, PC POOL. Ring divergence is read from the "verify divergent N of M pages" form
+RT CLASS, PC POOL. Ring divergence is read from the "verify divergent N of M pages" form
 (older builds) or the "divergent N bytes in M binds" form (current builds).
 """
 import argparse
@@ -88,17 +88,17 @@ SWITCHES = {
     'dp_pr': {'SOTC_PARALLEL_RECORD': '1', 'SOTC_GEN_BIND': '1', 'SOTC_PR_GEN': '1'},
     'dp_pipe': {'SOTC_PIPE_DIRTY': '1', 'SOTC_PIPE_GPL': '1'},
     'dp_img': {'SOTC_IMG_POOLED': '1', 'SOTC_IMG_CREATE_AHEAD': '1', 'SOTC_RT_MAXEXTENT': '1'},
-    'dp_class': {'SOTC_STATIC_CLASS': '3', 'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1',
+    'dp_class': {'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1',
                  'SOTC_RB_MATERIALIZE': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_FLIP_OFFTHREAD': '1'},
     # The groups that cost nothing in the bisect (1 Nov), together; no resolve workers (dp_pr cost ~3 ms).
     'drawbest': {'SOTC_GEN_BIND': '1', 'SOTC_GEN_DMA': '1', 'SOTC_GEN_TEX': '1', 'SOTC_PIPE_DIRTY': '1',
                  'SOTC_PIPE_GPL': '1', 'SOTC_IMG_POOLED': '1', 'SOTC_IMG_CREATE_AHEAD': '1', 'SOTC_RT_MAXEXTENT': '1',
-                 'SOTC_STATIC_CLASS': '3', 'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1',
+                 'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1',
                  'SOTC_RB_MATERIALIZE': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_FLIP_OFFTHREAD': '1'},
     # The draw-thread phases that ran clean on 1 Nov, on top of the defaults (no honest labels and what
-    # needs them: SOTC_FRAME_AHEAD, SOTC_RB_HOST, heap serving; no SOTC_BDA, unsafe with ring8).
+    # needs them: SOTC_FRAME_AHEAD, heap serving; no SOTC_BDA, unsafe with ring8).
     'drawphases': {'SOTC_RAM_REPORT': '1', 'SOTC_FLIP_OFFTHREAD': '1', 'SOTC_GEN_BIND': '1', 'SOTC_GEN_DMA': '1',
-                   'SOTC_GEN_TEX': '1', 'SOTC_PARALLEL_RECORD': '1', 'SOTC_PR_GEN': '1', 'SOTC_STATIC_CLASS': '3',
+                   'SOTC_GEN_TEX': '1', 'SOTC_PARALLEL_RECORD': '1', 'SOTC_PR_GEN': '1',
                    'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1', 'SOTC_RB_MATERIALIZE': '1',
                    'SOTC_PARTICLE_PREV': '1', 'SOTC_IMG_POOLED': '1', 'SOTC_IMG_CREATE_AHEAD': '1',
                    'SOTC_RT_MAXEXTENT': '1', 'SOTC_PIPE_DIRTY': '1', 'SOTC_PIPE_GPL': '1'},
@@ -106,7 +106,7 @@ SWITCHES = {
     'verify': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_FRAME_FLIP': '1', 'SOTC_PC_RING': '4',
                'SOTC_PC_POOL': '2', 'SOTC_CLASS_TRACK': '2', 'SOTC_HOOK_MEMTYPE_PROBE': '1',
                'SOTC_MEMTYPE_CLASSES': '1', 'SOTC_RB_OWNER': '1', 'SOTC_RB_MATERIALIZE': '1',
-               'SOTC_RB_CLASS': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_STATIC_CLASS': '2',
+               'SOTC_RB_CLASS': '1', 'SOTC_PARTICLE_PREV': '1',
                'SOTC_COMMIT_CHUNKS': '2'},
     'ring5': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_FRAME_FLIP': '1', 'SOTC_PC_RING': '5'},
     'chunks2': {'SOTC_COMMIT_CHUNKS': '2'},
@@ -180,17 +180,15 @@ SWITCHES = {
     'drawall': {'SOTC_PROTECT_BATCH': '1', 'SOTC_RAM_REPORT': '1'},
     # Old configurations, kept under their names.
     'ring': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PC_RING': '1'},
-    'static': {'SOTC_STATIC_CLASS': '1'},
     'rb': {'SOTC_RB_OWNER': '1', 'SOTC_RB_MATERIALIZE': '1', 'SOTC_RB_CLASS': '1',
            'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PARTICLE_PREV': '1'},
     'pool2': {'SOTC_PC_POOL': '2', 'SOTC_HOOK_ALLOC_PROBE': '1'},
     'commit': {'SOTC_COMMIT_ON_DEMAND': '1'},
 }
-# "safe": ring5, chunks2 and rbclass1 with the static class (the probes they need are in the parts).
-SWITCHES['safe'] = merge_switches('safe', SWITCHES['ring5'], SWITCHES['chunks2'], SWITCHES['rbclass1'],
-                                  {'SOTC_STATIC_CLASS': '1'})
-# "all" (old): the union of ring, static, rb and commit (not pool2).
-SWITCHES['all'] = merge_switches('all', SWITCHES['ring'], SWITCHES['static'], SWITCHES['rb'],
+# "safe": ring5, chunks2 and rbclass1 (the probes they need are in the parts).
+SWITCHES['safe'] = merge_switches('safe', SWITCHES['ring5'], SWITCHES['chunks2'], SWITCHES['rbclass1'])
+# "all" (old): the union of ring, rb and commit (not pool2).
+SWITCHES['all'] = merge_switches('all', SWITCHES['ring'], SWITCHES['rb'],
                                  SWITCHES['commit'])
 DEFAULT_CONFIGS = ['base', 'verify', 'ring5', 'chunks2', 'heaps', 'poolnative', 'safe']
 
@@ -214,7 +212,6 @@ CONFIG_LINES = [
     ('RB class', re.compile(r'SOTC RB class \(')),
     ('RB CLASS mask', re.compile(r'SOTC RB CLASS: \d+ mask arena blocks')),
     ('RB CLASS stats', re.compile(r'SOTC RB CLASS: stats reads checked')),
-    ('STATIC CLASS', re.compile(r'SOTC STATIC CLASS: ')),
     ('RT CLASS', re.compile(r'SOTC RT CLASS: ')),
 ]
 CONFIG_LINE_KEYS = [key for key, _ in CONFIG_LINES] + ['PC POOL']

@@ -15,7 +15,6 @@
 #include "engine_cmd.h"
 #include "pc_ring.h"
 #include "pc_pool.h"
-#include "static_class.h"
 #include "freecam.h"
 
 #include "native/native_particles.h"
@@ -38,7 +37,6 @@ void RegisterAllHandlers() {
     SotcProbes::RegisterMemtype(); // sotc: PC memory model, wave B
     SotcProbes::RegisterXprMem();
     SotcPcRing::Register(); // sotc: SOTC_PC_RING (PC memory model)
-    SotcStaticClass::Register(); // sotc: SOTC_STATIC_CLASS
     SotcPcPool::Register();      // sotc: SOTC_PC_POOL=2
     // sotc: Wave D probes and optimizations (docs/re-stutters/reports2/00-PLAN.md).
     SotcBuildSync::RegisterBuildSyncProbe();

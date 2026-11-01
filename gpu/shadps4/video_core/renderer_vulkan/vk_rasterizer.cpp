@@ -39,7 +39,6 @@
 #include "video_core/sotc_live.h"
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_write_extent.h"
-#include "../../../sotc/rb_host.h" // sotc: SOTC_RB_HOST mirror copies
 #include "../../../sotc/native/native_copies.h" // sotc: PC-native GPU result copies
 #include "video_core/sotc_generation.h" // sotc: SOTC_PR_GEN (per-64 KiB generation sums)
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
@@ -2348,8 +2347,6 @@ struct DirectDispatchGuard {
 } // namespace
 
 void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
-    rb_mirrors.clear(); // sotc: SOTC_RB_HOST=2: collect this dispatch's written result binds
-    rb_mirror_collect = SotcRbHost::Mode() == 2;
     RENDERER_TRACE;
     const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     MdiBreak(); // sotc: SOTC_MDI_STATS
@@ -2514,7 +2511,6 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
-    FlushRbMirrors(cmdbuf); // sotc: SOTC_RB_HOST=2
     CopyGpuResults(cmdbuf); // sotc: PC-native GPU result copies (native_copies.h)
     DebugState.IncDispatch();
     MaybeDumpImages(cs.pgm_hash);
@@ -2528,8 +2524,6 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved,
                                   bool use_resolved) {
-    rb_mirrors.clear(); // sotc: SOTC_RB_HOST=2: collect this dispatch's written result binds
-    rb_mirror_collect = SotcRbHost::Mode() == 2;
     RENDERER_TRACE;
     const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDispatchIndirect}; // sotc: SOTC_OP_PHASES
@@ -2600,7 +2594,6 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
-    FlushRbMirrors(cmdbuf); // sotc: SOTC_RB_HOST=2
     CopyGpuResults(cmdbuf); // sotc: PC-native GPU result copies (native_copies.h)
     DebugState.IncDispatch();
     runtime.AccessBuffer(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
@@ -5774,9 +5767,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 }
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
-                if (rb_mirror_collect && desc.is_written && SotcRbHost::Covers(vbase, size)) {
-                    rb_mirrors.push_back({buffer->Handle(), offset, vbase, size}); // sotc: SOTC_RB_HOST=2
-                }
                 if (bind_cache_recording) { // sotc: SOTC_BIND_CACHE checks it is still clean
                     bind_cache_ranges_rec.emplace_back(vbase, size);
                     if (SotcStats::kBindCacheFrame && desc.is_formatted) {
@@ -7460,16 +7450,6 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 
     Common::RecursiveSharedLock lock{mapped_ranges_mutex};
     return boost::icl::contains(mapped_ranges, range);
-}
-
-// sotc: SOTC_RB_HOST=2: the GPU copies of this dispatch's written result ranges into their imported guest
-// runs, recorded right after the dispatch; collection stops until the next dispatch binds.
-void Rasterizer::FlushRbMirrors(vk::CommandBuffer cmdbuf) {
-    for (const RbMirror& m : rb_mirrors) {
-        SotcRbHost::RecordMirrorCopy(cmdbuf, m.src, m.src_offset, m.addr, m.size);
-    }
-    rb_mirrors.clear();
-    rb_mirror_collect = false;
 }
 
 // sotc: PC-native GPU result copies: the dispatch's written buffers go to native_copies.h, which copies the

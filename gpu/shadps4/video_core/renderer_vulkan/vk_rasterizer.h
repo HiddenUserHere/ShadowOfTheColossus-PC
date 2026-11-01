@@ -421,18 +421,6 @@ private:
     std::array<VideoCore::ImageId, Shader::NUM_IMAGES> image_info_images{};
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     BdaTable bda_table; ///< sotc: SOTC_BDA, the per-stage block table (vk_bda_table.h)
-    /// sotc: SOTC_RB_HOST=2 (rb_host.h): the written result binds of the dispatch being recorded, copied into
-    /// their imported guest run right after the dispatch (RecordMirrorCopy). Collected only while a dispatch
-    /// binds (rb_mirror_collect).
-    struct RbMirror {
-        vk::Buffer src;
-        u64 src_offset;
-        VAddr addr;
-        u64 size;
-    };
-    std::vector<RbMirror> rb_mirrors;
-    bool rb_mirror_collect{};
-    void FlushRbMirrors(vk::CommandBuffer cmdbuf);
     /// sotc: hands the dispatch's written binds to the GPU result copies (native_copies.h).
     void CopyGpuResults(vk::CommandBuffer cmdbuf);
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
