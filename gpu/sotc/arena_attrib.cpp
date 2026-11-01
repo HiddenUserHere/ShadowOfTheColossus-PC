@@ -473,6 +473,15 @@ void NoteAlloc(uint64_t addr, uint64_t size) {
     }
 }
 
+bool ImageOffset(uint64_t addr, uint64_t* offset) {
+    const uint64_t img = ImageBase();
+    if (img == 0 || addr < img || addr - img >= 0x20000000) {
+        return false;
+    }
+    *offset = addr - img;
+    return true;
+}
+
 uint32_t CurrentThread() {
 #ifdef _WIN32
     return static_cast<uint32_t>(GetCurrentThreadId());

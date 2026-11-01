@@ -18,6 +18,7 @@
 #include "static_class.h"
 #include "freecam.h"
 
+#include "native/native_sync.h"
 namespace SotcNativeHooks { // sotc: SOTC_NATIVE write hooks (gpu/sotc/native/native_hooks.cpp)
 void Register();
 } // namespace SotcNativeHooks
@@ -53,6 +54,7 @@ void RegisterAllHandlers() {
     SotcFreecam::Register();
     SotcCtl::StartIfEnabled();
     SotcNativeHooks::Register(); // sotc: SOTC_NATIVE write hooks
+    SotcNativeSync::Register();  // sotc: SOTC_NATIVE frame ticket hooks (native_sync.py)
 }
 
 } // namespace SotcHooks

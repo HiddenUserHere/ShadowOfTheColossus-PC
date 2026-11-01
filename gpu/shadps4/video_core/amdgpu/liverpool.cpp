@@ -34,6 +34,7 @@
 #include "video_core/sotc_lod_stats.h"
 #include "video_core/sotc_stats.h"
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
+#include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (AscRptrMode below)
 #include "../../../sotc/pc_ring.h"                   // sotc: SOTC_PC_RING full ring (mode)
 #include "video_core/buffer_cache/pc_ring_copy.h"    // sotc: SOTC_PC_RING full ring (copy)
 #include "bbport_threads.h"
@@ -5284,6 +5285,11 @@ int Liverpool::CpAheadMode() noexcept {
 
 // sotc: SOTC_ASC_RPTR (0, 1 or 2; anything else is 0).
 int Liverpool::AscRptrMode() noexcept {
+    // sotc: SOTC_NATIVE forces the read pointer hand-back (mode 2): the guest's ring-full retry
+    // (gnmx submit loops, sync.md section 6, R3) never starts, so no CPU wait on the GPU remains.
+    if (SotcNative::On()) {
+        return 2;
+    }
     static const int mode = [] {
         const char* v = std::getenv("SOTC_ASC_RPTR");
         const int n = v ? std::atoi(v) : 0;

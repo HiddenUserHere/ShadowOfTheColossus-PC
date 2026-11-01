@@ -61,6 +61,11 @@ void NoteAlloc(uint64_t addr, uint64_t size);
 /// Thread id of the calling thread (0 when unavailable).
 uint32_t CurrentThread();
 
+/// Eboot offset of addr (a guest RIP or address) when it lies inside the image (the same offsets the
+/// SOTC ARENA ATTRIB lines print). False when the image is not mapped or addr is outside it. Used by
+/// the verify reports (verify.cpp), which print offsets the same way.
+bool ImageOffset(uint64_t addr, uint64_t* offset);
+
 /// Scope set by the page manager around a fault that it forwards to the draw thread: the write
 /// fault is recorded for the faulting guest thread (thread id taken before the forward), not for
 /// the thread that runs the handler. Zero means "the calling thread".

@@ -5,6 +5,7 @@
 // draw thread (BufferCache::NativeDrain); the frame ticket is a backend supplied by BufferCache.
 #include "native.h"
 #include "native_draw.h"
+#include "verify.h" // sotc: coverage oracle (SOTC_VERIFY)
 
 #include <algorithm>
 #include <atomic>
@@ -148,6 +149,7 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
     if (g_mode == 0 || size == 0) {
         return;
     }
+    SotcVerify::NoteAnnounce(addr, size); // sotc: clears the coverage oracle's pending faults
     if (kind == Kind::GpuWritten) {
         g_c.announce_gpu_written.fetch_add(1, std::memory_order_relaxed);
         return; // the GPU writes it: nothing to upload
@@ -185,6 +187,7 @@ void Release(uint64_t addr, uint64_t size) {
     if (g_mode == 0 || size == 0) {
         return;
     }
+    SotcVerify::NoteAnnounce(addr, size); // sotc: a released range is not an unannounced write
     std::scoped_lock lock{g_mutex};
     // Drops the queued parts inside [addr, addr + size); the parts outside it stay queued.
     std::deque<PendingUpload> kept;
@@ -303,6 +306,7 @@ void NoteDescriptor(uint64_t desc_addr, uint64_t base, uint64_t size, uint32_t f
 void VerifyUnannouncedWrite(uint64_t addr, uint64_t size, uint64_t rip) {
     if (g_verify) {
         VerifyCount("unannounced write", addr, size, rip, g_c.verify_unannounced);
+        SotcVerify::AggregateUnannounced(addr, size, rip); // sotc: per-RIP table (verify.cpp)
     }
 }
 

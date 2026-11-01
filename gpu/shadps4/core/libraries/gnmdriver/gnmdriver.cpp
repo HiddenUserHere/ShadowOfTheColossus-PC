@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "../../../../sotc/label_honest.h" // sotc: SOTC_FRAME_AHEAD requires honest labels
+#include "../../../../sotc/native/native.h"      // sotc: SOTC_NATIVE (frame ticket API)
+#include "../../../../sotc/native/native_sync.h" // sotc: SOTC_NATIVE submit gates
 #include "../../../../sotc/pc_ring.h"       // sotc: SOTC_PC_RING submit epoch
 #include "gnm_error.h"
 #include "gnmdriver.h"
@@ -248,6 +250,11 @@ static void WaitSubmitGate() {
 // doorbell, 2 SubmitDone). Modes 0 and 1 run exactly what each site ran before; mode 2 waits on
 // the frame tickets. Called under m_submit_lock.
 static void GateWait(int site) {
+    // sotc: SOTC_NATIVE: no GPU-idle or submit-lock wait; the frame ring reuse is one frame ticket.
+    if (SotcNative::On()) {
+        SotcNativeSync::WaitReuse();
+        return;
+    }
     const u64 start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
     if (GateMode() == 2) {
         const u64 marked = liverpool->FramesMarked();
@@ -397,6 +404,9 @@ s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
 
 int PS4_SYSV_ABI sceGnmAreSubmitsAllowed() {
     LOG_TRACE(Lib_GnmDriver, "called");
+    if (SotcNative::On()) {
+        return SotcNativeSync::SubmitsAllowed(); // sotc: SOTC_NATIVE: frame ticket predicate
+    }
     return submission_lock == 0;
 }
 
@@ -2610,26 +2620,33 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
                                       SOTC_GUEST_CALLER()}; // sotc: guest caller (SOTC_TRACE_IMPORTS)
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
-    GateWait(2); // sotc: SOTC_CP_AHEAD (WaitGpuIdle unless =2), SOTC_FPS accounting
-    if (GateMode() != 2) {
-        if (!liverpool->IsGpuIdle()) {
-            submission_lock = true;
-        }
-    } else {
-        // sotc: SOTC_CP_AHEAD=2: the frame tickets replace submission_lock. Liverpool::SubmitDone
-        // reuses the command buffer copies from their start, so with BB_COPY_GPU_BUFFERS every
-        // copy must be parsed first (the old lock made the next submit wait for that).
-        if (EmulatorSettings.IsCopyGpuBuffers()) {
-            liverpool->WaitCommandsConsumed();
-        }
-        if (SotcStats::kFpsLog) {
-            const u64 lag = liverpool->FramesMarked() - liverpool->FramesRecorded();
-            SotcStats::gate_lag_sum.fetch_add(lag, std::memory_order_relaxed);
-            SotcStats::gate_lag_samples.fetch_add(1, std::memory_order_relaxed);
-            SotcStats::GateStoreMax(SotcStats::gate_lag_max, lag);
+    // sotc: SOTC_NATIVE: the frame closes with a ticket only (no gate: the frame ring reuse waits in
+    // WaitReuse before the next frame builds).
+    if (!SotcNative::On()) {
+        GateWait(2); // sotc: SOTC_CP_AHEAD (WaitGpuIdle unless =2), SOTC_FPS accounting
+        if (GateMode() != 2) {
+            if (!liverpool->IsGpuIdle()) {
+                submission_lock = true;
+            }
+        } else {
+            // sotc: SOTC_CP_AHEAD=2: the frame tickets replace submission_lock. Liverpool::SubmitDone
+            // reuses the command buffer copies from their start, so with BB_COPY_GPU_BUFFERS every
+            // copy must be parsed first (the old lock made the next submit wait for that).
+            if (EmulatorSettings.IsCopyGpuBuffers()) {
+                liverpool->WaitCommandsConsumed();
+            }
+            if (SotcStats::kFpsLog) {
+                const u64 lag = liverpool->FramesMarked() - liverpool->FramesRecorded();
+                SotcStats::gate_lag_sum.fetch_add(lag, std::memory_order_relaxed);
+                SotcStats::gate_lag_samples.fetch_add(1, std::memory_order_relaxed);
+                SotcStats::GateStoreMax(SotcStats::gate_lag_max, lag);
+            }
         }
     }
     liverpool->SubmitDone();
+    if (SotcNative::On()) {
+        SotcNativeSync::OnSubmitDone(); // sotc: SOTC_NATIVE: this frame's ticket (SotcNative::FrameSubmitted)
+    }
     fa_frame_start = true; // sotc: SOTC_FRAME_AHEAD: the next gate call starts a frame
     send_init_packet = true;
     ++frames_submitted;

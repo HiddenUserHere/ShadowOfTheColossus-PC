@@ -45,6 +45,8 @@
 #include "../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK write faults per pool (plan step 6)
 #include "../../sotc/pc_ring.h"     // sotc: SOTC_PC_RING shadow
 #include "../../sotc/arena_attrib.h" // sotc: SOTC_ARENA_ATTRIB (write faults on the arena by RIP)
+#include "../../sotc/native/native.h" // sotc: SotcNative::Verify (the PC-native verify oracle)
+#include "../../sotc/native/verify.h" // sotc: SOTC_VERIFY coverage oracle and per-range log
 
 // src/runtime_memory.c: the runtime's view of a page next to the host protection (diagnostics).
 extern "C" void runtime_memory_describe(uintptr_t address, char* out, size_t capacity);
@@ -1499,6 +1501,13 @@ struct SignalImpl : public PageManager::Impl {
             if (SotcArenaAttrib::On()) {
                 SotcArenaAttrib::NoteWriteFault(reinterpret_cast<uint64_t>(Common::GetRip(context)),
                                                 context, addr);
+            }
+            // sotc: SOTC_VERIFY (verify.h). The native coverage oracle: a write fault outside every
+            // host-shared window is pending until the next submit (an announce clears it). Also the
+            // last-write record of the range log. Off unless the native verify mode or SOTC_VERIFY is on.
+            if (SotcNative::Verify() || SotcVerify::VerifyAll()) {
+                SotcVerify::NoteWriteFault(addr, size,
+                                           reinterpret_cast<uint64_t>(Common::GetRip(context)));
             }
             // sotc: read only by the SOTC_CMD_STATS printer; every guest thread faults here, and
             // the counter shared a cache line with command-processor counters.
