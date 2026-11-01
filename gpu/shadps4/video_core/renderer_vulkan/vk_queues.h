@@ -9,6 +9,9 @@
 // over {graphics, transfer} (buffer.cpp), so no release/acquire barriers are needed for them.
 // Image uploads are not routed (exclusive images would need ownership transfers): see the report.
 // The async compute family is only probed here; no dispatch is moved to it yet.
+// sotc: N5 async compute (docs/re-stutters/native/impl-n5-asynccomp.md). SOTC_N5_ASYNC_COMPUTE, with
+// SOTC_NATIVE on: 0 off; 1 the device creates one compute queue (PickAsyncQueue) and logs the pick;
+// 2 verify: 1 + the classifier in vk_frame_graph.cpp ("N5 async" line). Mode 1 moves NO dispatch yet.
 //
 // Thread safety: Mode() is read once. Counters are atomics; Report resets its window.
 #pragma once
@@ -56,8 +59,31 @@ void LogProbe(uint32_t vendor_id, std::span<const FamilyInfo> families, const Pr
 enum class Fallback : uint8_t {
     NoTransferFamily,     ///< N5 on but no transfer-only family: uploads stay on graphics
     TransferQueueRefused, ///< device creation refused the transfer queue: graphics only
+    NoAsyncFamily,        ///< N5 async on but no compute-only family: compute stays on graphics
+    AsyncQueueRefused,    ///< device creation refused the async compute queue: graphics only
 };
 void NoteFallback(Fallback reason);
+
+/// SOTC_N5_ASYNC_COMPUTE: 0 off, 1 queue created (plumbing), 2 verify (classifier). Needs SOTC_NATIVE.
+int AsyncMode();
+inline bool AsyncOn() {
+    return AsyncMode() != 0;
+}
+
+/// The queue the device creates for async compute. family == NoFamily: none (graphics queue).
+struct AsyncPick {
+    uint32_t family{NoFamily};
+    uint32_t queue_index{}; ///< index inside the family (1 when shares_xfer)
+    bool shares_xfer{};     ///< the family is the upload family: its queue 0 is the upload queue
+};
+
+/// Picks the async compute queue: the first family with COMPUTE, no GRAPHICS, >= 1 queue, other
+/// than the upload family (xfer_family, NoFamily when none). Only when no other family exists, the
+/// upload family's queue 1 is used, and only if that family has >= 2 queues. Pure.
+AsyncPick PickAsyncQueue(std::span<const FamilyInfo> families, uint32_t xfer_family);
+
+/// Logs the pick once (SOTC N5 ASYNC line). A NoFamily pick notes the NoAsyncFamily fallback.
+void LogAsyncPick(const AsyncPick& pick, uint32_t family_count);
 
 /// Counters of routed uploads (vk_runtime.cpp TryCopyBufferXfer, snippet in the report).
 void NoteUploadRouted(uint64_t bytes);

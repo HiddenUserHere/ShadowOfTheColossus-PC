@@ -8,6 +8,7 @@
 #include <mutex>
 
 #include "video_core/renderer_vulkan/vk_queues.h"
+#include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE mode (AsyncMode)
 
 namespace SotcQueues {
 
@@ -34,6 +35,55 @@ int Mode() {
         return env[0] == '2' ? 2 : 1;
     }();
     return mode;
+}
+
+int AsyncMode() {
+    static const int mode = [] {
+        if (!SotcNative::On()) {
+            return 0;
+        }
+        const char* env = std::getenv("SOTC_N5_ASYNC_COMPUTE");
+        if (!env || env[0] == '\0' || env[0] == '0') {
+            return 0;
+        }
+        return env[0] == '2' ? 2 : 1;
+    }();
+    return mode;
+}
+
+AsyncPick PickAsyncQueue(std::span<const FamilyInfo> families, uint32_t xfer_family) {
+    for (uint32_t i = 0; i < families.size(); i++) {
+        const FamilyInfo& f = families[i];
+        if (i != xfer_family && f.compute && !f.graphics && f.queue_count >= 1) {
+            return AsyncPick{.family = i, .queue_index = 0, .shares_xfer = false};
+        }
+    }
+    // No other compute-only family: the upload family's second queue, when it has one. Many
+    // drivers expose one C+T family, which the upload path would otherwise also use.
+    if (xfer_family < families.size()) {
+        const FamilyInfo& f = families[xfer_family];
+        if (f.compute && !f.graphics && f.queue_count >= 2) {
+            return AsyncPick{.family = xfer_family, .queue_index = 1, .shares_xfer = true};
+        }
+    }
+    return AsyncPick{};
+}
+
+void LogAsyncPick(const AsyncPick& pick, uint32_t family_count) {
+    static std::atomic<bool> logged{false};
+    if (AsyncMode() == 0 || logged.exchange(true)) {
+        return;
+    }
+    if (pick.family == NoFamily) {
+        std::fprintf(stderr, "SOTC N5 ASYNC: no compute-only queue family (of %u); compute stays on "
+                             "the graphics queue\n", family_count);
+        NoteFallback(Fallback::NoAsyncFamily);
+        return;
+    }
+    std::fprintf(stderr, "SOTC N5 ASYNC: mode %d, async compute queue family %u index %u%s "
+                         "(move of dispatches: not implemented, see impl-n5-asynccomp.md)\n",
+                 AsyncMode(), pick.family, pick.queue_index,
+                 pick.shares_xfer ? " (shared with the upload family)" : "");
 }
 
 Probe ProbeFamilies(std::span<const FamilyInfo> families) {
@@ -98,7 +148,7 @@ void LogProbe(uint32_t vendor_id, std::span<const FamilyInfo> families, const Pr
 }
 
 void NoteFallback(Fallback reason) {
-    if (Mode() == 0) {
+    if (Mode() == 0 && AsyncMode() == 0) {
         return;
     }
     const uint32_t bit = uint32_t{1} << static_cast<uint32_t>(reason);
@@ -113,6 +163,13 @@ void NoteFallback(Fallback reason) {
     case Fallback::TransferQueueRefused:
         std::fprintf(stderr, "SOTC N5 QUEUES: device refused the transfer queue; uploads stay on "
                              "the graphics queue\n");
+        break;
+    case Fallback::NoAsyncFamily:
+        // Logged by LogAsyncPick with the family count; nothing more to add here.
+        break;
+    case Fallback::AsyncQueueRefused:
+        std::fprintf(stderr, "SOTC N5 ASYNC: device refused the async compute queue; compute "
+                             "stays on the graphics queue\n");
         break;
     }
 }

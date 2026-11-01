@@ -70,4 +70,12 @@ void Record(Sample& s);
 /// Appends one 5 s report line (the caller's window). Resets the window counters.
 void Report(std::string& out, double seconds);
 
+// sotc: N5 async compute classifier (SOTC_N5_ASYNC_COMPUTE=2, with SOTC_NATIVE on). It runs inside
+// Record on sampled frames (SOTC_N5_ASYNC_EVERY, default 8) and only counts: which compute passes
+// would run on the async queue, and what each would wait for. Rule and gaps: impl-n5-asynccomp.md.
+// Needs Liverpool's n5_on (the graph's hook) on as well: see the report's snippet.
+bool AsyncVerify();
+/// Appends one "N5 async ..." line and resets its counters. Empty when AsyncVerify is off.
+void ReportAsync(std::string& out, double seconds);
+
 } // namespace Vulkan::FrameGraph

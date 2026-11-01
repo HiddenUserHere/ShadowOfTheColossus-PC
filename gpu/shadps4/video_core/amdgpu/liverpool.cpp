@@ -341,7 +341,8 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     }
     // sotc: SOTC_N5_GRAPH (observe/verify; footprints come from the prep threads, see N5Begin).
     // The draw thread is the only one that runs ExecuteBackOp; its per-op state needs it.
-    n5_on = Vulkan::FrameGraph::Enabled() && back_threaded;
+    // sotc: SOTC_N5_ASYNC_COMPUTE=2 classifies compute passes from the same samples.
+    n5_on = (Vulkan::FrameGraph::Enabled() || Vulkan::FrameGraph::AsyncVerify()) && back_threaded;
     if (n5_on) {
         LOG_INFO(Render, "SOTC_N5_GRAPH: on (footprints need SOTC_PARALLEL_RECORD=1; without it "
                          "every op is a barrier point)");

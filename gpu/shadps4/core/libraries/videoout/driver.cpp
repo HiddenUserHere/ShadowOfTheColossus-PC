@@ -2028,6 +2028,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcNativeResults::Report(report, seconds); // sotc: SOTC_NATIVE GPU-result consumers
             SotcQueues::Report(report, seconds);        // sotc: SOTC_N5_QUEUES
             Vulkan::FrameGraph::Report(report, seconds); // sotc: SOTC_N5_GRAPH
+            Vulkan::FrameGraph::ReportAsync(report, seconds); // sotc: SOTC_N5_ASYNC_COMPUTE=2
             Vulkan::ParallelRecord::Report(report, seconds); // sotc: SOTC_N5_PARALLEL (passes, waits)
             if (VideoCore::BindlessImages* heap = VideoCore::BindlessImages::Active()) { // sotc: SOTC_N5_BINDLESS
                 char n5_line[256];

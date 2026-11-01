@@ -7,9 +7,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
+#include <vector>
 
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_frame_graph.h"
+#include "video_core/renderer_vulkan/vk_queues.h"
 #include "video_core/sotc_stats.h"
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE mode
 
@@ -74,6 +77,220 @@ int SwitchValue() {
 
 u64 Take(std::atomic<u64>& a) {
     return a.exchange(0, std::memory_order_relaxed);
+}
+
+// sotc: N5 async compute classifier (SOTC_N5_ASYNC_COMPUTE=2). Observe only; see
+// impl-n5-asynccomp.md for the rule. A compute pass is a maximal run of Class::Compute ops of one
+// frame. It is INDEPENDENT (would move to the async queue) when its footprint is known and no
+// earlier op of the frame that stayed on graphics conflicts with it (AmdGpu::Conflicts, the
+// pass's writes against any earlier access, its reads against earlier writes). Moved passes
+// before it are ordered on the same in-order queue, so they need no wait. Other passes stay on
+// graphics and would need one submit split first (counted, not moved). An independent pass joins
+// at the first later op that conflicts with it, or that is Other or unknown; an unmoved compute
+// pass that conflicts with it is a join too. Passes without a join run to the frame end.
+
+/// Sampled frames: 1 in SOTC_N5_ASYNC_EVERY (default 8). Classification is O(ops x pending).
+u32 AsyncEvery() {
+    static const u32 every = [] {
+        const char* v = std::getenv("SOTC_N5_ASYNC_EVERY");
+        const long x = v ? std::strtol(v, nullptr, 10) : 0;
+        return x >= 1 ? static_cast<u32>(x) : 8u;
+    }();
+    return every;
+}
+
+struct AsyncAccess {
+    AmdGpu::OpRange range;
+    bool write;
+};
+
+struct AsyncPass {
+    AmdGpu::OpFootprint fp{};
+    u64 window_ops{};  ///< ops after the pass ended (compute ops included), up to its join
+    u64 window_gfx{};  ///< of those, graphics ops that do not conflict with the pass
+};
+
+enum class AsyncJoin : u8 { Graphics, UnmovedCompute, OtherOrUnknown, FrameEnd };
+
+struct AsyncState {
+    u64 frame{~u64{0}};
+    bool sampled{};
+    bool in_pass{};
+    bool barrier_seen{};             ///< an unknown op of this frame stayed on graphics
+    AsyncPass cur{};                 ///< the open compute pass
+    std::vector<AsyncAccess> accesses; ///< accesses of this frame that stayed on graphics
+    std::vector<AsyncPass> pending;  ///< independent passes not joined yet
+};
+AsyncState as;
+
+struct AsyncCounters {
+    std::atomic<u64> frames{};            ///< sampled frames
+    std::atomic<u64> passes{};            ///< compute passes
+    std::atomic<u64> independent{};       ///< would move (known footprint, no earlier conflict)
+    std::atomic<u64> needs_split{};       ///< would move after one submit split (earlier conflict)
+    std::atomic<u64> unknown{};           ///< unknown footprint: stays on graphics, blocks later
+    std::atomic<u64> join[4]{};           ///< joins of independent passes, by AsyncJoin
+    std::atomic<u64> joined{};            ///< independent passes joined before the frame end or not
+    std::atomic<u64> win_ops{};           ///< window ops summed over joined passes
+    std::atomic<u64> win_gfx{};           ///< window graphics ops that do not conflict, summed
+    std::atomic<u64> zero_window{};       ///< joined passes whose join was the next op
+};
+AsyncCounters acnt;
+
+bool Overlap(const AmdGpu::OpRange& a, const AmdGpu::OpRange& b) {
+    return a.size != 0 && b.size != 0 && a.addr < b.addr + b.size && b.addr < a.addr + a.size;
+}
+
+void AsyncJoined(const AsyncPass& p, AsyncJoin kind) {
+    acnt.join[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+    acnt.joined.fetch_add(1, std::memory_order_relaxed);
+    acnt.win_ops.fetch_add(p.window_ops, std::memory_order_relaxed);
+    acnt.win_gfx.fetch_add(p.window_gfx, std::memory_order_relaxed);
+    if (p.window_ops == 0) {
+        acnt.zero_window.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+/// Removes pending[i] by moving the last entry into its place (no self move-assign).
+void RemovePending(std::size_t i) {
+    if (i + 1 != as.pending.size()) {
+        as.pending[i] = std::move(as.pending.back());
+    }
+    as.pending.pop_back();
+}
+
+/// Joins every pending pass that conflicts with fp (an unknown fp conflicts with all).
+void JoinConflicting(const AmdGpu::OpFootprint& fp, AsyncJoin kind) {
+    for (std::size_t i = 0; i < as.pending.size();) {
+        if (AmdGpu::Conflicts(as.pending[i].fp, fp)) {
+            AsyncJoined(as.pending[i], kind);
+            RemovePending(i);
+        } else {
+            ++i;
+        }
+    }
+}
+
+/// True when fp must wait for an earlier access of this frame that stayed on graphics.
+bool NeedsSplit(const AmdGpu::OpFootprint& fp) {
+    if (as.barrier_seen) {
+        return true;
+    }
+    for (const AsyncAccess& a : as.accesses) {
+        if (a.write) {
+            for (const auto& r : fp.reads) {
+                if (Overlap(r, a.range)) {
+                    return true; // RAW
+                }
+            }
+        }
+        for (const auto& w : fp.writes) {
+            if (Overlap(w, a.range)) {
+                return true; // WAW (earlier write) or WAR (earlier read)
+            }
+        }
+    }
+    return false;
+}
+
+void AddAccesses(const AmdGpu::OpFootprint& fp) {
+    for (const auto& r : fp.reads) {
+        as.accesses.push_back({r, false});
+    }
+    for (const auto& w : fp.writes) {
+        as.accesses.push_back({w, true});
+    }
+}
+
+void AsyncClosePass() {
+    if (!as.in_pass) {
+        return;
+    }
+    as.in_pass = false;
+    acnt.passes.fetch_add(1, std::memory_order_relaxed);
+    if (!as.cur.fp.known) {
+        acnt.unknown.fetch_add(1, std::memory_order_relaxed);
+        JoinConflicting(as.cur.fp, AsyncJoin::UnmovedCompute);
+        as.barrier_seen = true;
+        return;
+    }
+    if (NeedsSplit(as.cur.fp)) {
+        acnt.needs_split.fetch_add(1, std::memory_order_relaxed);
+        JoinConflicting(as.cur.fp, AsyncJoin::UnmovedCompute);
+        AddAccesses(as.cur.fp);
+        return;
+    }
+    acnt.independent.fetch_add(1, std::memory_order_relaxed);
+    as.pending.push_back(std::move(as.cur));
+}
+
+/// The frame ends: an open pass closes, every pending pass joins at the frame end.
+void AsyncEndFrame() {
+    AsyncClosePass();
+    for (const AsyncPass& p : as.pending) {
+        AsyncJoined(p, AsyncJoin::FrameEnd);
+    }
+    as.pending.clear();
+    as.accesses.clear();
+    as.barrier_seen = false;
+}
+
+void AsyncObserveOp(const Sample& s) {
+    if (s.cls == Class::Compute) {
+        if (!as.in_pass) {
+            as.in_pass = true;
+            as.cur = AsyncPass{};
+            as.cur.fp.known = true;
+        }
+        if (!s.known) {
+            as.cur.fp.known = false;
+        } else if (as.cur.fp.known) {
+            as.cur.fp.reads.insert(as.cur.fp.reads.end(), s.fp.reads.begin(), s.fp.reads.end());
+            as.cur.fp.writes.insert(as.cur.fp.writes.end(), s.fp.writes.begin(), s.fp.writes.end());
+        }
+        for (AsyncPass& p : as.pending) {
+            p.window_ops++; // a compute op after the pass: not a join (in-order queue)
+        }
+        return;
+    }
+    AsyncClosePass();
+    const bool blocking = s.cls == Class::Other || !s.known;
+    for (std::size_t i = 0; i < as.pending.size();) {
+        AsyncPass& p = as.pending[i];
+        if (blocking || AmdGpu::Conflicts(p.fp, s.fp)) {
+            AsyncJoined(p, blocking ? AsyncJoin::OtherOrUnknown : AsyncJoin::Graphics);
+            RemovePending(i);
+            continue;
+        }
+        p.window_ops++;
+        if (s.cls == Class::Graphics) {
+            p.window_gfx++;
+        }
+        ++i;
+    }
+    if (!s.known) {
+        as.barrier_seen = true;
+    } else {
+        AddAccesses(s.fp);
+    }
+}
+
+/// Record hook (draw thread). Frame changes come from SotcStats::flip_count.
+void AsyncObserve(const Sample& s) {
+    const u64 flips = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (flips != as.frame) {
+        if (as.sampled) {
+            AsyncEndFrame();
+        }
+        as.frame = flips;
+        as.sampled = flips % AsyncEvery() == 0;
+        if (as.sampled) {
+            acnt.frames.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (as.sampled) {
+        AsyncObserveOp(s);
+    }
 }
 
 } // namespace
@@ -178,6 +395,10 @@ void Record(Sample& s) {
         }
     }
 
+    if (AsyncVerify()) { // sotc: SOTC_N5_ASYNC_COMPUTE=2 (classifier, sampled frames)
+        AsyncObserve(s);
+    }
+
     s.active = false;
     const auto dt = std::chrono::steady_clock::now() - t0;
     cnt.owner_ns.fetch_add(
@@ -234,6 +455,52 @@ void Report(std::string& out, double seconds) {
         static_cast<double>(pred) / f, static_cast<double>(non_op_events) / f,
         static_cast<unsigned long long>(missed), static_cast<unsigned long long>(unknown),
         static_cast<double>(func_ops) / f, static_cast<double>(owner_ns) / 1e6 / f);
+    out += line;
+}
+
+bool AsyncVerify() {
+    return SotcQueues::AsyncMode() == 2;
+}
+
+void ReportAsync(std::string& out, double seconds) {
+    if (!AsyncVerify()) {
+        return;
+    }
+    const u64 frames = Take(acnt.frames);
+    const u64 passes = Take(acnt.passes);
+    const u64 independent = Take(acnt.independent);
+    const u64 needs_split = Take(acnt.needs_split);
+    const u64 unknown = Take(acnt.unknown);
+    const u64 join_gfx = Take(acnt.join[static_cast<std::size_t>(AsyncJoin::Graphics)]);
+    const u64 join_comp = Take(acnt.join[static_cast<std::size_t>(AsyncJoin::UnmovedCompute)]);
+    const u64 join_other = Take(acnt.join[static_cast<std::size_t>(AsyncJoin::OtherOrUnknown)]);
+    const u64 join_end = Take(acnt.join[static_cast<std::size_t>(AsyncJoin::FrameEnd)]);
+    const u64 joined = Take(acnt.joined);
+    const u64 win_ops = Take(acnt.win_ops);
+    const u64 win_gfx = Take(acnt.win_gfx);
+    const u64 zero = Take(acnt.zero_window);
+    if (frames == 0 || seconds <= 0.0) {
+        return;
+    }
+    const double f = static_cast<double>(frames);
+    const double jd = joined ? static_cast<double>(joined) : 1.0;
+    const u64 waits = join_gfx + join_comp + join_other; // graphics submits that wait on async
+    char line[900];
+    std::snprintf(
+        line, sizeof(line),
+        "N5 async (SOTC_N5_ASYNC_COMPUTE=2, 1 in %u frames sampled, %llu frames): compute "
+        "passes/f %.1f: independent %.1f, would move after one submit split %.1f, unknown fp "
+        "%.1f; moved 0 (move not implemented); joins/f: graphics %.1f, unmoved compute %.1f, "
+        "other/unknown %.1f, frame end %.1f; window %.1f ops, zero-window %.0f%%, graphics ops in "
+        "windows/f %.1f (overlap candidates, not GPU time); timeline waits/f %.1f, submit "
+        "splits/f %.1f\n",
+        AsyncEvery(), static_cast<unsigned long long>(frames), static_cast<double>(passes) / f,
+        static_cast<double>(independent) / f, static_cast<double>(needs_split) / f,
+        static_cast<double>(unknown) / f, static_cast<double>(join_gfx) / f,
+        static_cast<double>(join_comp) / f, static_cast<double>(join_other) / f,
+        static_cast<double>(join_end) / f, static_cast<double>(win_ops) / jd,
+        100.0 * static_cast<double>(zero) / jd, static_cast<double>(win_gfx) / f,
+        static_cast<double>(waits) / f, static_cast<double>(waits) / f);
     out += line;
 }
 
