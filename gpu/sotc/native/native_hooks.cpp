@@ -182,7 +182,7 @@ struct Window {
     std::atomic<uint64_t> mip_announces{0}, mip_bytes{0};
     std::atomic<uint64_t> mip_releases{0}, mip_release_bytes{0};
     std::atomic<uint64_t> skipped{0};
-    Counter dcb, ccb, chunk, zc, mat, blk, inst, part, view, strm, cull;
+    Counter dcb, ccb, chunk, zc, mat, blk, inst, part, view, strm, cull, rec;
     Counter gmem; // sotc: guest copies (runtime memcpy/memset/memmove) announced
     std::atomic<uint64_t> desc{0};
     std::atomic<uint64_t> chunk_dropped{0};
@@ -394,6 +394,17 @@ HookAction InstEntry(GuestRegs& regs, void*) {
     const uint64_t block = GuestU64(regs.rdi + 0x1d8);
     if (block != 0) {
         AnnounceRange(block, block + 0x18, SotcNative::Kind::PerFrame, g_window.inst);
+    }
+    return HookAction::Continue;
+}
+
+// 0x18c390 (Entry, the only caller is 0x34ccac in sub_34cad0): rdi = the per-object binding record. Its
+// +0x278..+0x298 span (position, transform, one pointer) is rewritten by the body twice per frame; the record
+// is persistent (one address per session) and sits in ranges the GPU binds. PerFrame before the body: the bytes
+// are read at the next submit, after the job waits in 0xd07c0.
+HookAction RecordEntry(GuestRegs& regs, void*) {
+    if (SotcNative::On() && regs.rdi != 0) {
+        AnnounceRange(regs.rdi + 0x278, regs.rdi + 0x298, SotcNative::Kind::PerFrame, g_window.rec);
     }
     return HookAction::Continue;
 }
@@ -753,6 +764,7 @@ void Report(std::string& out, double seconds) {
     out += cls("view", g_window.view);
     out += cls("strm", g_window.strm);
     out += cls("cull", g_window.cull);
+    out += cls("rec", g_window.rec);
     out += cls("gmem", g_window.gmem);
     std::snprintf(line, sizeof(line), " desc %llu dropped %llu\n",
                   static_cast<unsigned long long>(take(g_window.desc)),
@@ -786,6 +798,7 @@ void Register() {
     SotcHooks::RegisterHandler("NATIVE_BUILDXPR_ZC", Handler{BuildXprExit, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_CULL_DISPATCH_BLK", Handler{CullDispatchEntry, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_MAT_COPY_STREAM", Handler{MatCopyStream, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_RECORD_18C390", Handler{RecordEntry, nullptr, nullptr});
 }
 
 // The RenderSingleFrameCPU ring (memtype 17): every block of it is per-frame GPU data written by the render jobs

@@ -80,7 +80,17 @@ void NoteDescriptor(uint64_t desc_addr, uint64_t base, uint64_t size, uint32_t f
 /// read of GPU-written memory (from the readback path), a CPU wait on the GPU outside FrameWait.
 void VerifyUnannouncedWrite(uint64_t addr, uint64_t size, uint64_t rip);
 void VerifyGpuRead(uint64_t addr, uint64_t size, uint64_t rip);
+/// One CPU wait on a GPU result outside FrameWait: label_addr is the GPU label the wait polls (0 when the
+/// port waits on a ticket instead), rip the guest RIP the wait returns to or a PortWaitSite() tag.
 void VerifyGpuWait(uint64_t label_addr, uint64_t rip);
+/// Port-side waits (the rip argument of VerifyGpuWait): the high bit marks a port site, the id names it.
+constexpr uint64_t PortWaitSite(uint32_t id) {
+    return (1ull << 63) | id;
+}
+enum PortWaitId : uint32_t {
+    kPortWaitFlipGpuIdle = 1, ///< PcHostFlipWait mode 1: liverpool WaitGpuIdle before the flip
+    kPortWaitFlipTick = 2,    ///< PcHostFlipWait: scheduler tick wait (mode 1 and mode 2)
+};
 
 /// 5 s report lines ("SOTC NATIVE ..."), window counters reset.
 void Report(std::string& out, double seconds);

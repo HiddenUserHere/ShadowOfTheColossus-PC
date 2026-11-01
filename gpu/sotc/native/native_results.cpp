@@ -29,6 +29,7 @@
 
 #include "../guest_mem.h"
 #include "../hooks.h"
+#include "native.h" // sotc: SotcNative::Verify / VerifyGpuWait
 
 // src/runtime_memory.c: a guest-visible block in the low range (the image and the stacks live there too).
 // Weak, as bb_low_block in engine_cmd.cpp: the test binaries that link libbbgpu.a without the loader
@@ -56,6 +57,8 @@ enum Spin : int { kSpinDecal = 0, kSpinXpr = 1, kSpinCull = 2, kSpinCull2 = 3, k
 constexpr const char* kSpinHook[kSpins] = {"NATIVE_SPIN_DECAL", "NATIVE_SPIN_XPR", "NATIVE_SPIN_CULL",
                                            "NATIVE_SPIN_CULL2"};
 constexpr const char* kSpinName[kSpins] = {"decal", "xpr", "cull", "cull2"};
+// Guest RIP of each continuation site (the expected offsets of the hooks in scripts/hooks.d/native_results.py).
+constexpr uint64_t kSpinSite[kSpins] = {0x11e219, 0x11dc79, 0x11d839, 0x11db19};
 
 struct ConsumerCounters {
     std::atomic<uint64_t> calls{0};
@@ -202,10 +205,17 @@ HookAction OnMaskConsume(GuestRegs& regs, void* user) {
 
 // Site after an XPR label spin (the skip target). rsi holds the label pointer on the skip path.
 HookAction OnSpinSite(GuestRegs& regs, void* user) {
+    const int which = static_cast<int>(reinterpret_cast<uintptr_t>(user));
+    // sotc: verify of the guest label wait. For the XPR spin the site (0x11dc79) is reached after the label
+    // loop exits and after the job-wait path (checked in the disassembly; the other three sites are assumed the
+    // same shape). With the spin removed (masks=all) no wait happens, so nothing is counted. rsi is the label
+    // pointer on the loop path; the job-wait path may leave another value in it.
+    if (SotcNative::Verify() && !MasksAll()) {
+        SotcNative::VerifyGpuWait(regs.rsi, kSpinSite[which]);
+    }
     if (!MasksAll()) {
         return HookAction::Continue; // the spin is only removed with SOTC_NATIVE_MASKS=all
     }
-    const int which = static_cast<int>(reinterpret_cast<uintptr_t>(user));
     SpinCounters& s = g_spins[which];
     s.skips++;
     uint64_t label = 0;

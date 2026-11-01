@@ -34,6 +34,8 @@ Entry (listed here because Wrap is refused for 0x121ed0):
 NATIVE_INST_121ED0   0x121ed0 (indirect jump: no Wrap), the persistent instance block at *(this+0x1d8),
                      rewritten with 0x18 bytes each frame. Announced PerFrame at entry: the bytes are read at the next
                      submit, after the job waits, so an announce before the body is safe for PerFrame data.
+NATIVE_RECORD_18C390 0x18c390, the per-object binding record written by the render item job 0x34cad0 (rdi = the
+                     object; +0x278..+0x298 rewritten twice per frame). PerFrame at entry, group native_rec.
 
 Site (one instruction inside a function, registers editable, the displaced instructions run next):
 NATIVE_PARTICLE_SHIFT 0x101817, ParticleRenderer_ShiftRecords after the record writes of one record: the source
@@ -289,6 +291,18 @@ HOOKS = [
         # makes the pattern unique: the NATIVE_MAT_COPY pattern at 0x11788f has its own call rel32).
         pattern='48 8d 05 ?? ?? ?? ?? 41 8b 14 24 4c 8b 64 24 08 48 89 d9 48 8b 30 c1 ea 02 4c 89 e7 41 89 d0 e8 6d a8 f7 ff',
         expected={EU_FINGERPRINT: 0x11805f},
+    ),
+    # --- impl-writes7-render: the per-object binding record written by the render item job (0x34cad0) ---
+    dict(
+        name='NATIVE_RECORD_18C390',
+        switch='SOTC_NATIVE',
+        group='native_rec',
+        mode='entry',
+        # sub_18c390 (rdi = the 0x298-byte object of [render item + 0xa0]; writes +0x278..+0x290 twice per frame, the
+        # only caller is 0x34ccac in sub_34cad0). The object is persistent (one address per session) and the GPU
+        # binds 192 KiB ranges over it; announced PerFrame before the body (read at the next submit).
+        pattern='55 48 89 e5 41 57 41 56 53 48 83 ec 18 4c 8b 3d ?? ?? ?? ?? 48 89 fb 49 89 ce',
+        expected={EU_FINGERPRINT: 0x18c390},
     ),
 ]
 
