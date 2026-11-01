@@ -95,6 +95,10 @@ void runtime_thread_attach_host(const char *name);
 void runtime_usleep_stats(char *out, size_t size, double seconds);
 /* sotc: SOTC_MUTEX_SPIN_US stats (src/runtime_mutex.c), printed by the driver.cpp 5 s report. */
 void runtime_mutex_spin_stats(char *out, size_t size, double seconds);
+/* sotc: "SOTC YIELD:" line (scePthreadYield counters and SOTC_YIELD_BACKOFF) and "SOTC CPU:" line (process
+ * CPU share), printed by the driver.cpp 5 s report (src/runtime_thread.c). */
+void runtime_yield_stats(char *out, size_t size, double seconds);
+void runtime_cpu_stats(char *out, size_t size, double seconds);
 /* sotc: runs fn(arg) on the thread's host stack (probe.c): the fault handler's alternate stack when
  * the caller runs on a guest fiber stack, the current stack otherwise. Reentrant: see probe.c. */
 #ifdef __cplusplus

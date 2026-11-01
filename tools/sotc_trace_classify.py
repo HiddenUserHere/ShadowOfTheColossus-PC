@@ -13,6 +13,8 @@ Then it names the most likely cause:
   readback game threads waited mostly on GPU readbacks while the draw thread had room
   fault    game threads waited mostly in page faults (write faults over GPU data)
   io       game threads waited mostly on file reads
+  gpu-chain the draw thread was busy over 60% of the frame and one main game thread waited in an
+           event flag, equeue (flip) or cond/sema wait for half of it: the game waits on GPU-side progress
   game-cpu the main game threads were mostly running, not waiting: the game's own work
   other    none of the above
 
@@ -61,6 +63,7 @@ def frame_stats(f0, f1, lanes):
     draw = cp = rec = gpu = 0.0
     waits = collections.Counter()
     running = []
+    sync_peak = 0.0  # the longest sync wait (evf, equeue, cond, sema) of one main game thread
     for n, spans in lanes:
         if 'GpuDraw' in n:
             draw = max(draw, union(spans, f0, f1, skip=('draw idle',)))
@@ -77,13 +80,18 @@ def frame_stats(f0, f1, lanes):
                 t = union([sp for sp in spans if sp[2] in kinds], f0, f1)
                 if main:
                     waits[key] += t
+            if main:
+                sync_peak = max(sync_peak, union(
+                    [sp for sp in spans if sp[2] in GUEST_KEYS['sync']], f0, f1))
             if main and not short.startswith('RenderFlip'):
                 busy = union(spans, f0, f1)
                 running.append((short, (dur - busy) / dur))
     main_run = max((r for _, r in running), default=0.0)
     blocking = {k: v for k, v in waits.items() if k in ('readback', 'fault', 'io', 'upload fence')}
     top = max(blocking, key=blocking.get) if blocking else None
-    if draw / dur >= 0.85:
+    if draw / dur >= 0.6 and sync_peak >= 0.5 * dur:
+        cause = 'gpu-chain'
+    elif draw / dur >= 0.85:
         cause = 'draw'
     elif gpu / dur >= 0.85:
         cause = 'gpu'
@@ -95,7 +103,8 @@ def frame_stats(f0, f1, lanes):
     else:
         cause = 'other'
     return {'dur': dur, 'draw': draw / dur, 'cp': cp / dur, 'rec': rec / dur, 'gpu': gpu / dur,
-            'game_running': main_run, 'waits': dict(waits), 'cause': cause}
+            'game_running': main_run, 'waits': dict(waits), 'sync_peak': sync_peak / dur,
+            'cause': cause}
 
 
 def _row(name, st):

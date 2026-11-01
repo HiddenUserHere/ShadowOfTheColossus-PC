@@ -15,7 +15,12 @@
 #include <sched.h>
 #include <setjmp.h>
 #include <errno.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include "compat_win.h"
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -585,7 +590,108 @@ static ABI __attribute__((noreturn)) void thread_exit(void *value) {
     /* No host unwinder: guest frames have no registered FDEs. */
     exit_longjmp(t);
 }
-static ABI int32_t thread_yield(void) { sched_yield(); return 0; }
+/* sotc: scePthreadYield with SOTC_YIELD_BACKOFF=<n>,<us> (off by default). The job workers' idle loop
+ * yields in a loop while a counter waiter exists (docs/re-stutters/reports2/16-job-system.md), which burns
+ * a core and is invisible in the trace. With the switch on, every n-th yield of a run sleeps us
+ * microseconds instead; a run is a series of yields less than 1 ms apart. Off: sched_yield, as before.
+ * Counters (yield calls, backoff sleeps, time slept) are kept while SOTC_FPS or SOTC_TRACE is set or the
+ * switch is on, and printed by runtime_yield_stats in the 5 s report. */
+#define YIELD_UNREAD UINT64_MAX
+/* bit 0: backoff on, bit 1: counting on, bits 8-23: n, bits 32-55: us. */
+static _Atomic uint64_t yield_config = YIELD_UNREAD;
+static _Atomic uint64_t yield_calls, yield_sleeps, yield_slept_ns;
+static __thread uint64_t yield_run, yield_last_ns;
+static uint64_t yield_config_get(void) {
+    uint64_t c = atomic_load_explicit(&yield_config, memory_order_relaxed);
+    if (c != YIELD_UNREAD) return c;
+    unsigned long n = 0, us = 0;
+    const char *env = getenv("SOTC_YIELD_BACKOFF");
+    if (env) {
+        char *end = NULL;
+        n = strtoul(env, &end, 10);
+        if (end && *end == ',') us = strtoul(end + 1, NULL, 10);
+    }
+    if (n > 0xffff) n = 0xffff;
+    if (us > 100000) us = 100000;
+    const int on = n && us;
+    c = (on ? 1u : 0u) | ((on || getenv("SOTC_FPS") || getenv("SOTC_TRACE")) ? 2u : 0u)
+        | ((uint64_t)n << 8) | ((uint64_t)us << 32);
+    atomic_store_explicit(&yield_config, c, memory_order_relaxed);
+    return c;
+}
+static uint64_t yield_now_ns(void) {
+    struct timespec t;
+    timespec_get(&t, TIME_UTC);
+    return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+}
+static ABI int32_t thread_yield(void) {
+    const uint64_t c = yield_config_get();
+    if (!(c & 3)) { sched_yield(); return 0; }
+    atomic_fetch_add_explicit(&yield_calls, 1, memory_order_relaxed);
+    if (!(c & 1)) { sched_yield(); return 0; }
+    const uint64_t now = yield_now_ns();
+    if (now - yield_last_ns > 1000000u) yield_run = 0; /* a gap of 1 ms starts a new run */
+    yield_last_ns = now;
+    if (++yield_run < ((c >> 8) & 0xffff)) { sched_yield(); return 0; }
+    yield_run = 0;
+    const uint64_t us = c >> 32;
+    const uint64_t tr = trace_now();
+    const uint64_t t0 = yield_now_ns();
+#ifdef _WIN32
+    compat_sleep_ns(us * 1000);
+#else
+    struct timespec s = {.tv_sec = (time_t)(us / 1000000), .tv_nsec = (long)(us % 1000000) * 1000};
+    while (nanosleep(&s, &s) && errno == EINTR) {}
+#endif
+    const uint64_t slept = yield_now_ns() - t0;
+    atomic_fetch_add_explicit(&yield_sleeps, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&yield_slept_ns, slept, memory_order_relaxed);
+    trace_span("yield backoff", tr, us, 0);
+    return 0;
+}
+/* sotc: one "SOTC YIELD:" line for the SOTC_FPS report (zero counters print nothing), then they are reset. */
+void runtime_yield_stats(char *out, size_t size, double seconds) {
+    if (!out || !size) return;
+    out[0] = '\0';
+    const uint64_t calls = atomic_exchange_explicit(&yield_calls, 0, memory_order_relaxed);
+    const uint64_t sleeps = atomic_exchange_explicit(&yield_sleeps, 0, memory_order_relaxed);
+    const uint64_t slept = atomic_exchange_explicit(&yield_slept_ns, 0, memory_order_relaxed);
+    if (!calls) return;
+    const uint64_t c = yield_config_get();
+    const double window = seconds > 0 ? seconds : 1.0;
+    if (c & 1)
+        snprintf(out, size, "SOTC YIELD: calls=%llu (%.0f/s) backoff every %llu yields for %llu us: sleeps=%llu (%.0f/s) slept=%.1f ms",
+                 (unsigned long long)calls, calls / window, (unsigned long long)((c >> 8) & 0xffff),
+                 (unsigned long long)(c >> 32), (unsigned long long)sleeps, sleeps / window, slept / 1e6);
+    else
+        snprintf(out, size, "SOTC YIELD: calls=%llu (%.0f/s) backoff off", (unsigned long long)calls, calls / window);
+}
+/* sotc: process CPU use for the SOTC_FPS report: CPU time of the whole process over the window, as a
+ * share of one logical CPU and of the machine. Near 100% of the machine means CPU contention. Windows only. */
+void runtime_cpu_stats(char *out, size_t size, double seconds) {
+    if (!out || !size) return;
+    out[0] = '\0';
+#ifdef _WIN32
+    static uint64_t previous_100ns;
+    FILETIME creation, exit_time, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit_time, &kernel, &user)) return;
+    ULARGE_INTEGER k, u;
+    k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime;
+    const uint64_t total = k.QuadPart + u.QuadPart;
+    const uint64_t delta = previous_100ns ? total - previous_100ns : 0;
+    previous_100ns = total;
+    if (!delta || seconds <= 0) return;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const unsigned cpus = si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1;
+    const double wall_100ns = seconds * 1e7;
+    snprintf(out, size, "SOTC CPU: process %.0f%% of one logical CPU, %.1f%% of %u logical CPUs",
+             100.0 * delta / wall_100ns, 100.0 * delta / wall_100ns / cpus, cpus);
+#else
+    (void)seconds;
+#endif
+}
 static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {
     if (!find_thread(t)) return ERR(3);
     if (!prio) return ERR(22);

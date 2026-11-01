@@ -345,16 +345,21 @@ static ABI int32_t evf_delete(EventFlag *f) {
 }
 static ABI int32_t evf_set(EventFlag *f, uint64_t bits) {
     if (!f) return KERNEL_ERROR(E_SRCH);
+    const uint64_t tr=trace_now(); /* sotc: SOTC_TRACE: 0 while the recorder is off */
     pthread_mutex_lock(&f->lock);
     if (f->traced) fprintf(stderr,"EVF set %p 0x%llx (was 0x%llx) from %p thread %lu\n",(void *)f,(unsigned long long)bits,
                            (unsigned long long)f->bits,(void *)(uintptr_t)GUEST_CALLER(),(unsigned long)get_thread_id());
     f->bits|=bits;
+    uint64_t woken=0;
     for (EventWaiter *w=f->waiters;w;w=w->next) {
         if (w->ready || !evf_met(f,w->bits,w->mode)) continue;
         w->result=f->bits; evf_clear(f,w->bits,w->mode);
-        w->ready=1; pthread_cond_signal(&w->cv);
+        w->ready=1; pthread_cond_signal(&w->cv); ++woken;
     }
     pthread_mutex_unlock(&f->lock);
+    /* sotc: instant "evf set": a = flag address, b = setter's guest caller, aux = waiters woken.
+     * Pairs with the "evf wait" spans of the waiters (which carry bits and their caller, not the flag). */
+    if (tr) trace_push(1,"evf set",tr,tr,(uint64_t)(uintptr_t)f,(uint64_t)GUEST_CALLER(),(uint32_t)woken);
     return 0;
 }
 static ABI int32_t evf_clear_bits(EventFlag *f, uint64_t bits) {

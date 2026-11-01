@@ -17,7 +17,7 @@ the IMPORT_STATS totals and the GPU time (EvGpu). --folded writes Brendan Gregg 
 
 hitch: for each slow frame, the time each thread spent in each span name inside it, against the
 median of the normal frames of the same segment; the biggest growth first, with the guest callers
-(the span's b field) and the cause of the frame (draw, gpu, readback, fault, io, game-cpu, other).
+(the span's b field) and the cause of the frame (draw, gpu, gpu-chain, readback, fault, io, game-cpu, other).
 When the trace has samples, imports or GPU spans: the sampled functions that grew, the import time
 that grew and the GPU verdict (GPU-bound or CPU-bound). When the trace has "mutex holder" spans:
 the "mutex wait" time of the frame by holder site and waiter caller, and the holder threads.

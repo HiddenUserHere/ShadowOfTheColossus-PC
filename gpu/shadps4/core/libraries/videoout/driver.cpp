@@ -99,6 +99,9 @@ void ReportPipeGpl(std::string& out, double seconds); // sotc: SOTC_PIPE_GPL
 extern "C" void runtime_usleep_stats(char* out, size_t size, double seconds);
 // sotc: src/runtime_mutex.c, SOTC_MUTEX_SPIN_US stats (Wave D C1).
 extern "C" void runtime_mutex_spin_stats(char* out, size_t size, double seconds);
+// sotc: src/runtime_thread.c, SOTC YIELD and SOTC CPU lines (wave 3).
+extern "C" void runtime_yield_stats(char* out, size_t size, double seconds);
+extern "C" void runtime_cpu_stats(char* out, size_t size, double seconds);
 // sotc: trace v2 import timing (src/runtime_trace_imports.c, SOTC_TRACE_IMPORTS).
 extern "C" void trace_imports_report(char* out, unsigned long size, double seconds);
 // sotc: Wave D B5/C6, declared in vk_presenter.h; forward-declared here in case the header lacks it.
@@ -2103,6 +2106,15 @@ void VideoOutDriver::Flip(const Request& req) {
                 usleep_line[0] = '\0';
                 runtime_usleep_stats(usleep_line, sizeof(usleep_line), seconds);
                 report += usleep_line;
+            }
+            { // sotc: scePthreadYield counters / SOTC_YIELD_BACKOFF and process CPU share (wave 3, src/runtime_thread.c)
+                char yield_line[256], cpu_line[256];
+                yield_line[0] = '\0';
+                cpu_line[0] = '\0';
+                runtime_yield_stats(yield_line, sizeof(yield_line), seconds);
+                runtime_cpu_stats(cpu_line, sizeof(cpu_line), seconds);
+                if (cpu_line[0]) { report += cpu_line; report += '\n'; }
+                if (yield_line[0]) { report += yield_line; report += '\n'; }
             }
             { // sotc: SOTC_MUTEX_SPIN_US stats (Wave D C1)
                 char spin_line[256];
