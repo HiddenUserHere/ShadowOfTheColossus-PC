@@ -109,15 +109,7 @@ UniqueImage::~UniqueImage() {
 
 void UniqueImage::Destroy() {
     if (image) {
-        // sotc: SOTC_VK_POOL: the vkDestroyImage/vkFreeMemory run on the helper thread once the
-        // GPU is past the tick (the draw thread used to pay for the driver call).
-        auto destroy = [allocator_ = allocator, handle = static_cast<VkImage>(image),
-                        alloc = allocation]() { vmaDestroyImage(allocator_, handle, alloc); };
-        if (GpuDestroyDeferred()) {
-            DeferGpuDestroy(std::move(destroy));
-        } else {
-            destroy();
-        }
+        vmaDestroyImage(allocator, static_cast<VkImage>(image), allocation);
         image = vk::Image{};
         allocation = {};
         images_destroyed.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_IMG_POOLED report
@@ -127,8 +119,8 @@ void UniqueImage::Destroy() {
     }
 }
 
-// sotc: SOTC_IMG_POOLED=1 (off by default): the image pool is on at 256 MiB even without
-// SOTC_VK_POOL, and an image the full pool cannot take gets a block of the pool, not a dedicated
+// sotc: SOTC_IMG_POOLED=1 (off by default): the image pool is on at 256 MiB, and an image the
+// full pool cannot take gets a block of the pool, not a dedicated
 // allocation. VMA never makes a dedicated allocation for a custom pool with an explicit block size,
 // while the default path does so for every image the driver prefers to have dedicated (render
 // targets on the AMD driver).
@@ -147,13 +139,13 @@ static bool ImgPooledEnabled() {
 // that cannot use it, or larger than a block, is allocated as before.
 static VmaPool ImagePool(VmaAllocator allocator, const VkImageCreateInfo& image_ci,
                          const VmaAllocationCreateInfo& alloc_ci) {
-    // sotc: SOTC_VK_POOL=1 turns the pool on at 256 MiB unless SOTC_IMAGE_POOL_MB sets a size.
+    // sotc: SOTC_IMG_POOLED=1 turns the pool on at 256 MiB unless SOTC_IMAGE_POOL_MB sets a size.
     static const u64 pool_mb = [] {
         const char* v = std::getenv("SOTC_IMAGE_POOL_MB");
         if (v) {
             return std::strtoull(v, nullptr, 10);
         }
-        return VkPoolEnabled() || ImgPooledEnabled() ? 256ULL : 0ULL;
+        return ImgPooledEnabled() ? 256ULL : 0ULL;
     }();
     if (pool_mb == 0) {
         return VK_NULL_HANDLE;
@@ -182,7 +174,7 @@ static VmaPool ImagePool(VmaAllocator allocator, const VkImageCreateInfo& image_
     return pool;
 }
 
-// sotc: the image pool (SOTC_IMAGE_POOL_MB / SOTC_VK_POOL / SOTC_IMG_POOLED) for one image.
+// sotc: the image pool (SOTC_IMAGE_POOL_MB / SOTC_IMG_POOLED) for one image.
 // True when the image was created in it. First in the blocks the pool has (no allocation on this
 // thread). With SOTC_IMG_POOLED, a full pool then allocates a block of its own, so the image
 // still avoids a dedicated allocation. False: the caller uses the default allocator.

@@ -753,83 +753,10 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
             SotcQueues::NoteFallback(SotcQueues::Fallback::NoTransferFamily);
         }
     }
-    // sotc: SOTC_PRESENT_UNLOCKED=1 picks how presents reach the queue (PresentPath). Submits and
-    // presents must not share a VkQueue without submit_mutex (Vulkan requires external
-    // synchronization per VkQueue), so:
-    // SecondQueue: a second queue of the graphics family presents (NVIDIA). The family already
-    //   presents to the surface, and so does a second queue of it.
-    // OtherFamily: a queue of another family that can present to the surface presents. The
-    //   swapchain is then CONCURRENT over both families (Swapchain::Create): no queue family
-    //   ownership transfer is needed, and the present waits on the semaphore of the graphics submit.
-    // SharedDepthWait: one queue and no other presenting family. The presents keep submit_mutex,
-    //   and the presenter waits for older presents (VK_KHR_present_wait) before it takes the lock.
-    // Otherwise (and with SOTC_PRESENT_UNLOCKED=0 or 2) the path is SharedQueue, as before.
-    constexpr u32 kNoPresentFamily = ~u32{0};
-    const bool unlocked_mode = PresentUnlockedMode() == 1;
-    const bool separate_present_queue =
-        unlocked_mode && family_properties[queue_family_index].queueCount >= 2;
-    u32 other_present_family = kNoPresentFamily;
-    if (unlocked_mode && !separate_present_queue) {
-        const auto find_present_family = [&]() -> u32 {
-            // The swapchain makes its surface later: a probe surface for the check, destroyed here.
-            const vk::SurfaceKHR probe = CreateSurface(GetInstance(), window);
-            u32 found = kNoPresentFamily;
-            for (u32 i = 0; i < static_cast<u32>(family_properties.size()) &&
-                            found == kNoPresentFamily;
-                 ++i) {
-                if (i == queue_family_index || family_properties[i].queueCount == 0 ||
-                    (HasXferQueue() && i == xfer_queue_family_index)) {
-                    continue;
-                }
-                const auto [support_result, supported] =
-                    physical_device.getSurfaceSupportKHR(i, probe);
-                if (support_result == vk::Result::eSuccess && supported) {
-                    found = i;
-                }
-            }
-            GetInstance().destroySurfaceKHR(probe);
-            return found;
-        };
-        other_present_family = find_present_family();
-    }
-    bool other_family_present = other_present_family != kNoPresentFamily;
-
-    PresentPath path = PresentPath::SharedQueue;
-    if (separate_present_queue) {
-        path = PresentPath::SecondQueue;
-    } else if (other_family_present) {
-        path = PresentPath::OtherFamily;
-    } else if (unlocked_mode && has_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
-               has_extension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
-        const vk::StructureChain wait_chain =
-            physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
-                                         vk::PhysicalDevicePresentIdFeaturesKHR,
-                                         vk::PhysicalDevicePresentWaitFeaturesKHR>();
-        if (wait_chain.get<vk::PhysicalDevicePresentIdFeaturesKHR>().presentId &&
-            wait_chain.get<vk::PhysicalDevicePresentWaitFeaturesKHR>().presentWait) {
-            // SOTC_PRESENT_WAIT=1 may have enabled both already.
-            if (!present_wait_enabled) {
-                if (!present_id_enabled) {
-                    add_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
-                    present_id_enabled = true;
-                }
-                add_extension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
-                present_wait_enabled = true;
-            }
-            present_depth_wait = true;
-            path = PresentPath::SharedDepthWait;
-        }
-    }
-    if (unlocked_mode && path == PresentPath::SharedQueue) {
-        LOG_WARNING(Render_Vulkan, "SOTC_PRESENT_UNLOCKED=1 but there is no second queue, no other "
-                                   "presenting family and no VK_KHR_present_wait; presents keep "
-                                   "submit_mutex unbounded");
-    }
-
-    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    static constexpr std::array queue_priorities = {1.0f};
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = separate_present_queue ? 2u : 1u,
+        .queueCount = 1u,
         .pQueuePriorities = queue_priorities.data(),
     };
     const vk::DeviceQueueCreateInfo xfer_queue_info = {
@@ -837,18 +764,10 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         .queueCount = 1u,
         .pQueuePriorities = queue_priorities.data(),
     };
-    const vk::DeviceQueueCreateInfo present_queue_info = {
-        .queueFamilyIndex = other_present_family,
-        .queueCount = 1u,
-        .pQueuePriorities = queue_priorities.data(),
-    };
-    // One entry per family: the present family is neither the graphics nor the transfer family.
-    boost::container::static_vector<vk::DeviceQueueCreateInfo, 3> queue_infos{queue_info};
+    // One entry per family: the transfer family, when there is one.
+    boost::container::static_vector<vk::DeviceQueueCreateInfo, 2> queue_infos{queue_info};
     if (HasXferQueue()) {
         queue_infos.push_back(xfer_queue_info);
-    }
-    if (other_family_present) {
-        queue_infos.push_back(present_queue_info);
     }
     const u32 queue_info_count = static_cast<u32>(queue_infos.size());
 
@@ -1176,19 +1095,13 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
-    if (device_result != vk::Result::eSuccess && (HasXferQueue() || other_family_present)) {
+    if (device_result != vk::Result::eSuccess && HasXferQueue()) {
         // sotc: an extra queue was refused: retry with the graphics queue alone, as without them.
         LOG_WARNING(Render_Vulkan, "Device creation with the extra queues failed ({}), "
                                    "retrying without them",
                     vk::to_string(device_result));
         xfer_queue_family_index = NoXferQueueFamily;
         SotcQueues::NoteFallback(SotcQueues::Fallback::TransferQueueRefused); // sotc: N5 log once
-        if (other_family_present) {
-            other_family_present = false;
-            if (path == PresentPath::OtherFamily) {
-                path = PresentPath::SharedQueue;
-            }
-        }
         device_chain.get<vk::DeviceCreateInfo>().queueCreateInfoCount = 1u;
         auto [retry_result, retry_dev] = physical_device.createDeviceUnique(device_chain.get());
         device_result = retry_result;
@@ -1203,42 +1116,10 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
     graphics_queue = device->getQueue(queue_family_index, 0);
-    // sotc: the queue that presents, by PresentPath (SOTC_PRESENT_UNLOCKED).
-    present_path = path;
-    present_queue_family_index = queue_family_index;
-    if (path == PresentPath::SecondQueue) {
-        present_queue = device->getQueue(queue_family_index, 1u);
-        LOG_INFO(Render_Vulkan, "SOTC_PRESENT_UNLOCKED=1: presents use queue 1 of family {}",
-                 queue_family_index);
-    } else if (path == PresentPath::OtherFamily) {
-        present_queue = device->getQueue(other_present_family, 0u);
-        present_queue_family_index = other_present_family;
-        LOG_INFO(Render_Vulkan, "SOTC_PRESENT_UNLOCKED=1: presents use queue 0 of family {}",
-                 other_present_family);
-    } else {
-        present_queue = device->getQueue(queue_family_index, 0u);
-    }
-    switch (path) {
-    case PresentPath::SecondQueue:
-        std::fprintf(stderr, "SOTC PRESENT: path second-queue (queue 1 of graphics family %u; "
-                             "presents and submits on separate VkQueues)\n",
-                     queue_family_index);
-        break;
-    case PresentPath::OtherFamily:
-        std::fprintf(stderr, "SOTC PRESENT: path other-family (queue of family %u, which presents "
-                             "to the surface; swapchain CONCURRENT over families %u and %u)\n",
-                     other_present_family, queue_family_index, other_present_family);
-        break;
-    case PresentPath::SharedDepthWait:
-        std::fprintf(stderr, "SOTC PRESENT: path shared-depth-wait (one queue, submit_mutex; "
-                             "VK_KHR_present_wait bounds the older presents before the lock)\n");
-        break;
-    case PresentPath::SharedQueue:
-        std::fprintf(stderr, "SOTC PRESENT: path shared-queue (one queue, presents under "
-                             "submit_mutex; SOTC_PRESENT_UNLOCKED=%d)\n",
-                     PresentUnlockedMode());
-        break;
-    }
+    // Presents share the graphics queue: submits and presents are serialized by submit_mutex.
+    present_queue = device->getQueue(queue_family_index, 0u);
+    std::fprintf(stderr, "SOTC PRESENT: path shared-queue (one queue, presents under "
+                         "submit_mutex)\n");
     // sotc: SOTC_HOST_IMPORT copies on the transfer queue: without it, the CPU path stays.
     if (host_import_enabled && !HasXferQueue()) {
         host_import_enabled = false;

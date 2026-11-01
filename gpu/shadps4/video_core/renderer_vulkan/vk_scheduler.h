@@ -510,23 +510,6 @@ private:
 using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
-/// sotc: SOTC_PRESENT_UNLOCKED. 0 (default): the present runs under Scheduler::submit_mutex as
-/// before. 1: the present takes only the present queue lock (Presenter::present_queue_mutex) when
-/// a VkQueue of its own (vk_instance.cpp, PresentPath: a second queue or another family); on one
-/// shared queue it is the same as 0, except PresentPath::SharedDepthWait, where the presenter waits
-/// for the older presents before it takes the lock (Presenter::WaitPresentDepth).
-/// 2: as 0, plus the presentKHR timer (Swapchain::present_khr_ns) without SOTC_FPS.
-inline int PresentUnlockedMode() {
-    static const int mode = [] {
-        const char* v = std::getenv("SOTC_PRESENT_UNLOCKED");
-        if (!v) {
-            return 0;
-        }
-        return v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
-    }();
-    return mode;
-}
-
 class Scheduler {
 public:
     /// record_thread: Vulkan commands are recorded and submitted on a thread of their own
@@ -863,18 +846,5 @@ private:
     /// Last member: stops (after running everything queued) before the rest is destroyed.
     std::unique_ptr<CommandRecorder> recorder;
 };
-
-/// sotc: SOTC_VK_POOL=1 (off by default). Images and BDA buffers are sub-allocated from VMA
-/// blocks, and their destruction runs on the draw scheduler's helper thread once the GPU is past
-/// the tick they were freed in. Read once.
-[[nodiscard]] bool VkPoolEnabled();
-
-/// sotc: true when DeferGpuDestroy will queue (SOTC_VK_POOL on and the draw scheduler exists).
-[[nodiscard]] bool GpuDestroyDeferred();
-
-/// sotc: queues func on the draw scheduler's helper thread (DeferPriorityOperation). Runs func
-/// at once when no scheduler is registered. Call only after GpuDestroyDeferred() returned true,
-/// or accept that func runs inline.
-void DeferGpuDestroy(Common::UniqueFunction<void>&& func);
 
 } // namespace Vulkan

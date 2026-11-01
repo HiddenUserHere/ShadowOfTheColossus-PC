@@ -44,18 +44,8 @@ void Swapchain::Create(u32 width_, u32 height_) {
 
     SetSurfaceProperties();
 
-    const std::array queue_family_indices = {
-        instance.GetGraphicsQueueFamilyIndex(),
-        instance.GetPresentQueueFamilyIndex(),
-    };
-
-    // sotc: SOTC_PRESENT_UNLOCKED=1 (PresentPath::OtherFamily): the present family differs from the
-    // graphics family, so the images are CONCURRENT over both. Concurrent images need no queue
-    // family ownership transfer, and the present waits on the semaphore the graphics submit signals.
-    const bool exclusive = queue_family_indices[0] == queue_family_indices[1];
-    const u32 queue_family_indices_count = exclusive ? 1u : 2u;
-    const vk::SharingMode sharing_mode =
-        exclusive ? vk::SharingMode::eExclusive : vk::SharingMode::eConcurrent;
+    // The graphics family presents, so the images are exclusive to it.
+    const u32 queue_family_index = instance.GetGraphicsQueueFamilyIndex();
     const auto format = needs_hdr ? SURFACE_FORMAT_HDR : surface_format;
     // sotc: VK_NV_low_latency2 (SOTC_LOW_LATENCY on NVIDIA) asks for latency mode on the swapchain.
     const vk::SwapchainLatencyCreateInfoNV latency_info = {
@@ -71,9 +61,9 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .imageArrayLayers = 1,
         .imageUsage = vk::ImageUsageFlagBits::eColorAttachment |
                       vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
-        .imageSharingMode = sharing_mode,
-        .queueFamilyIndexCount = queue_family_indices_count,
-        .pQueueFamilyIndices = queue_family_indices.data(),
+        .imageSharingMode = vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = 1u,
+        .pQueueFamilyIndices = &queue_family_index,
         .preTransform = transform,
         .compositeAlpha = composite_alpha,
         .presentMode = present_mode,
@@ -155,9 +145,9 @@ bool Swapchain::Present(u64 present_id) {
         .pImageIndices = &image_index,
     };
 
-    // sotc: the time inside presentKHR alone (SOTC_FPS, or SOTC_PRESENT_UNLOCKED=2): a driver
+    // sotc: the time inside presentKHR alone (SOTC_FPS): a driver
     // stall here is what held submit_mutex in the 10 s freeze (reports3/09-draw-freeze.md).
-    const bool time_present = SotcStats::kFpsLog || PresentUnlockedMode() == 2;
+    const bool time_present = SotcStats::kFpsLog;
     const u64 khr_start = time_present ? SotcStats::NowNs() : 0;
     auto result = instance.GetPresentQueue().presentKHR(present_info);
     if (time_present) {

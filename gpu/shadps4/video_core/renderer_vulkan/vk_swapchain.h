@@ -36,7 +36,7 @@ public:
     /// with SOTC_PRESENT_WAIT only) tags the present; 0 leaves it untagged.
     bool Present(u64 present_id = 0);
 
-    /// sotc: SOTC_FPS (or SOTC_PRESENT_UNLOCKED=2): time inside vkQueuePresentKHR alone, summed
+    /// sotc: SOTC_FPS: time inside vkQueuePresentKHR alone, summed
     /// over the presents since the last ReportFlipWait (vk_presenter.cpp), and the longest one.
     static inline std::atomic<uint64_t> present_khr_ns{0}, present_khr_count{0};
     static inline std::atomic<uint64_t> present_khr_max_ns{0};

@@ -22,33 +22,6 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
-namespace {
-// sotc: SOTC_VK_POOL: the scheduler DeferGpuDestroy queues on. The first scheduler constructed
-// while the switch is on (the draw scheduler: presenter members are built in that order).
-std::atomic<Scheduler*> pool_destroy_scheduler{};
-} // namespace
-
-bool VkPoolEnabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("SOTC_VK_POOL");
-        return v && v[0] == '1';
-    }();
-    return enabled;
-}
-
-bool GpuDestroyDeferred() {
-    return VkPoolEnabled() && pool_destroy_scheduler.load(std::memory_order_acquire) != nullptr;
-}
-
-void DeferGpuDestroy(Common::UniqueFunction<void>&& func) {
-    Scheduler* scheduler = pool_destroy_scheduler.load(std::memory_order_acquire);
-    if (!scheduler) {
-        func();
-        return;
-    }
-    scheduler->DeferPriorityOperation(std::move(func));
-}
-
 // sotc: SOTC_FPS (B5). Takes submit_mutex; with SOTC_FPS on, the wait is timed and counted (see
 // Scheduler::submit_lock_draw_ns, and by role in Scheduler::submit_lock_role_ns). With SOTC_FPS
 // off it is the plain lock.
@@ -99,11 +72,6 @@ static void RecordHostVisibility(vk::CommandBuffer cmdbuf) {
 
 Scheduler::Scheduler(const Instance& instance, bool record_thread)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
-    // sotc: SOTC_VK_POOL: the first scheduler is the one deferred destruction waits on.
-    if (VkPoolEnabled()) {
-        Scheduler* none = nullptr;
-        pool_destroy_scheduler.compare_exchange_strong(none, this, std::memory_order_acq_rel);
-    }
     if (record_thread) {
         recorder = std::make_unique<CommandRecorder>(instance, &work_semaphore);
         LOG_INFO(Render_Vulkan, "Vulkan commands are recorded on their own thread");
@@ -165,8 +133,6 @@ void Scheduler::TraceWatchThread(std::stop_token stoken) {
 }
 
 Scheduler::~Scheduler() {
-    Scheduler* self = this;
-    pool_destroy_scheduler.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif

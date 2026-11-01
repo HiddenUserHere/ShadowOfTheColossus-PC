@@ -129,10 +129,8 @@ SWITCHES = {
     # Full ring, protect then copy, with verify (=7).
     'ring7': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_FRAME_FLIP': '1', 'SOTC_PC_RING': '7'},
     # Draw thread: the fast switches together, then the same with their verify / timing modes.
-    'drawfast': {'SOTC_VK_POOL': '1',
-                 'SOTC_PROTECT_BATCH': '1', 'SOTC_PRESENT_UNLOCKED': '1'},
-    'drawverify': {'SOTC_TEX_BLOCK': '2',
-                   'SOTC_PRESENT_UNLOCKED': '2', 'SOTC_CMD_STATS': '1'},
+    'drawfast': {'SOTC_PROTECT_BATCH': '1'},
+    'drawverify': {'SOTC_TEX_BLOCK': '2', 'SOTC_CMD_STATS': '1'},
     # Arena rewrite attribution (who writes into the per-frame arena after a submit).
     'attrib': {'SOTC_ARENA_ATTRIB': '1', 'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_FRAME_FLIP': '1'},
     # Full ring, GPU reads the arena from imported host memory (no copy, no protection).
@@ -179,9 +177,7 @@ SWITCHES = {
                    'SOTC_HOOK_MEMTYPE_PROBE': '1', 'SOTC_MEMTYPE_CLASSES': '1', 'SOTC_CLASS_TRACK': '2',
                    'SOTC_PC_RING8_HEAPS': 'CPUMemory'},
     # Every draw-thread switch, plus the RAM breakdown.
-    'drawall': {'SOTC_VK_POOL': '1',
-                'SOTC_PROTECT_BATCH': '1', 'SOTC_PRESENT_UNLOCKED': '1',
-                'SOTC_RAM_REPORT': '1'},
+    'drawall': {'SOTC_PROTECT_BATCH': '1', 'SOTC_RAM_REPORT': '1'},
     # Old configurations, kept under their names.
     'ring': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PC_RING': '1'},
     'static': {'SOTC_STATIC_CLASS': '1'},

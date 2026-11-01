@@ -218,14 +218,9 @@ void Rasterizer::SotcLodFeedbackCycle() {
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
     cmdbuf.fillBuffer(feedback, 0, SotcLodFeedbackBytes, ~0u);
     // The next cycle measures only when this is the fourth (gate word, DefineLodFeedback).
-    // SOTC_LOD_FB_EVERY=<n>: one cycle in n (1: always).
-    static const u32 every = [] {
-        const char* v = std::getenv("SOTC_LOD_FB_EVERY");
-        const u32 n = v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 4u;
-        return n ? n : 1u;
-    }();
+    constexpr u32 kLodFeedbackEvery = 4u;
     cmdbuf.fillBuffer(feedback, SotcLodFeedbackBytes, sizeof(u32),
-                      ++sotc_lod_cycles % every == 0 ? 1u : 0u);
+                      ++sotc_lod_cycles % kLodFeedbackEvery == 0 ? 1u : 0u);
     barrier(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
             vk::PipelineStageFlagBits2::eAllCommands,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
