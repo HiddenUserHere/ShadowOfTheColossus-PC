@@ -171,6 +171,20 @@ Per-switch first test order (all one round, user/routes/tests.json): verify mode
 SOTC_GEN_TEX=2, SOTC_PR_GEN=2 with SOTC_PARALLEL_RECORD=1, SOTC_PIPE_DIRTY=2, SOTC_RB_HOST=2, SOTC_BDA=2 with
 SOTC_PC_RING=0), mismatches must be 0; then the =1 modes against default with SOTC_STALE_CHECK=16 in a separate run.
 
+In-game results of the draw-thread phases (1 Nov, one round each, users' culling cvars, ring8 default):
+- All on (+ honest labels): 8 FPS in gameplay. SOTC_LABELS_HONEST deferred 14-30% of labels (gate 2%): the CP spun
+  80-120 ms a frame. Labels, SOTC_FRAME_AHEAD, SOTC_RB_HOST=1 and heap serving need a redesign (defer only when the
+  CPU will read GPU-written data). Bug found on the way (fixed, 36b6846): the frame-ticket path never recorded the
+  ring8 flip-wait tick (every flip waited 200 ms with SOTC_FRAME_AHEAD).
+- Every verify mode reported 0 mismatches (GEN_BIND, GEN_DMA, PR_GEN, PIPE_DIRTY, RB_CLASS).
+- Bisect 084449: dp_gen 21.5 FPS (+11 ms draw work), dp_pr 23.1, dp_pipe 28.1, dp_img 29.0, dp_class 26.4 (readbacks
+  744 -> 519/s), default 27.2. Profile of the draw thread: MarkGpuModified/MarkWritten bumped every render target's
+  granules on every draw. Fixed (40e1c61): dp_gen 28.5 vs default 28.7.
+- drawbest (gen + pipe + img + class + flip off-thread, no resolve workers), 085630: 29.0 FPS vs 27.7, p99 57 vs 76,
+  max 102 vs 150, draw work 30.0 vs 34.0 ms/frame, readbacks 661 vs 925/s. One round; needs the user's visual
+  check and a long session before any of it goes default. Hit rates: bind memo ~85%, texture identity ~93%.
+- dp_pr (SOTC_PARALLEL_RECORD + SOTC_PR_GEN) still costs ~3 ms; SOTC_BDA not run (unsafe with ring8).
+
 ## Next
 Fix ring8 vertices, combined matrix (several rounds), long play test, AMD/Intel, enable proven switches by default,
 CHANGELOG (Portuguese) and docs, commit. Progress estimate ~74%.
