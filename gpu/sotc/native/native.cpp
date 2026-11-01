@@ -44,6 +44,9 @@ struct Counters {
     std::atomic<uint64_t> verify_unannounced{};
     std::atomic<uint64_t> verify_gpu_read{};
     std::atomic<uint64_t> verify_gpu_wait{};
+    std::atomic<uint64_t> readbacks_skipped{};  // mode 1: a GPU-to-guest copy the port did not make
+    std::atomic<uint64_t> stray_write_faults{}; // mode 1: a write fault no tracker protection caused
+    std::atomic<uint64_t> stray_read_faults{};  // mode 1: a read fault no tracker protection caused
 };
 Counters g_c;
 std::atomic<uint64_t> g_submitted_local{}; // frame counter when no backend is set
@@ -225,6 +228,19 @@ void NoteDescriptor(uint64_t desc_addr, uint64_t base, uint64_t size, uint32_t f
     }
 }
 
+void NoteSkippedReadback(uint64_t addr, uint64_t size) {
+    if (g_c.readbacks_skipped.fetch_add(1, std::memory_order_relaxed) < 8) {
+        std::fprintf(stderr, "SOTC NATIVE readback skipped: addr 0x%llx size 0x%llx\n",
+                     static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
+    }
+}
+
+void NoteStrayFault(uint64_t addr, bool is_write, uint64_t rip) {
+    VerifyCount(is_write ? "stray write fault (no tracker protection)"
+                         : "stray read fault (no tracker protection)",
+                addr, 0, rip, is_write ? g_c.stray_write_faults : g_c.stray_read_faults);
+}
+
 void VerifyUnannouncedWrite(uint64_t addr, uint64_t size, uint64_t rip) {
     if (g_verify) {
         VerifyCount("unannounced write", addr, size, rip, g_c.verify_unannounced);
@@ -289,6 +305,15 @@ void Report(std::string& out, double seconds) {
                   waits ? wait_ns / 1e6 / static_cast<double>(waits) : 0.0, wait_max / 1e6,
                   static_cast<unsigned long long>(fences));
     out += line;
+    if (g_mode == 1) {
+        std::snprintf(line, sizeof(line),
+                      "SOTC NATIVE tracking off (%.1f s): readbacks skipped %llu, stray faults write %llu "
+                      "read %llu\n",
+                      seconds, static_cast<unsigned long long>(take(g_c.readbacks_skipped)),
+                      static_cast<unsigned long long>(take(g_c.stray_write_faults)),
+                      static_cast<unsigned long long>(take(g_c.stray_read_faults)));
+        out += line;
+    }
     if (g_verify) {
         std::snprintf(line, sizeof(line),
                       "SOTC NATIVE verify: unannounced writes %llu, gpu-written reads %llu, label waits %llu\n",

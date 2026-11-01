@@ -563,6 +563,9 @@ private:
     /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
     /// still hold GPU data (see the definition).
     void MarkWrittenByGuest(VAddr addr, u64 size);
+    /// sotc: SOTC_NATIVE=1 (no tracking): the range stops being GPU-modified without a copy to guest
+    /// memory. The CPU write that replaces the GPU bytes is announced; nothing reads them back.
+    void DiscardGpuModified(VAddr addr, u64 size);
     void FinishAsyncReadback(AsyncReadback& readback);
     /// sotc: true once the GPU copied an in-flight readback's data (its ahead copy, or its tick).
     bool IsReadbackComplete(const AsyncReadback& readback);

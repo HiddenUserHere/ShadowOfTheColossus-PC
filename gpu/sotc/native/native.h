@@ -31,6 +31,14 @@ inline bool On() {
 }
 bool Verify();
 
+/// SOTC_NATIVE=1 turns the guest page tracking off: no page is write- or read-protected for the GPU,
+/// no fault is handled as a tracker fault, and GPU-written bytes are never copied back to guest memory.
+/// CPU writes then reach the port only through Announce (and the ring8 host imports). Mode 0 (today's UMA
+/// emulation) and mode 2 (verify, the tracker still runs underneath) keep the tracking.
+inline bool TracksGuestPages() {
+    return Mode() != 1;
+}
+
 /// What an announced range holds (decides the mechanism).
 enum class Kind : uint8_t {
     Persistent, ///< written once (resource build, mip stream), then read-only for the GPU: upload once
@@ -55,6 +63,11 @@ uint64_t FrameCompleted();
 /// Descriptor side records (framedata.md: 0x865410 / 0x8655d0 / 0x865600 / 0x865500): the engine encoded a
 /// V#/T# for [base, base + size); the port keeps the record so binds never decode guest descriptor words.
 void NoteDescriptor(uint64_t desc_addr, uint64_t base, uint64_t size, uint32_t format);
+
+/// Mode 1 without tracking: a read back the port skipped (ReadMemory, DownloadMemory, texture download),
+/// and a fault the tracker never caused (a write is made writable again, a read is not handled).
+void NoteSkippedReadback(uint64_t addr, uint64_t size);
+void NoteStrayFault(uint64_t addr, bool is_write, uint64_t rip);
 
 /// Verify (mode 2): a CPU write the announces did not cover (from the page tracker's fault path), a CPU
 /// read of GPU-written memory (from the readback path), a CPU wait on the GPU outside FrameWait.

@@ -41,6 +41,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/buffer_cache/memory_tracker.h" // sotc: SOTC_WRITE_DECL (MAX_CPU_PAGE_BITS)
 #include "../../sotc/write_decl.h" // sotc: SOTC_WRITE_DECL statistics and write fault classes
+#include "../../sotc/native/native.h" // sotc: SOTC_NATIVE=1 turns the tracking off (TracksGuestPages)
 #include "../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE write evidence
 #include "../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK write faults per pool (plan step 6)
 #include "../../sotc/pc_ring.h"     // sotc: SOTC_PC_RING shadow
@@ -1022,6 +1023,9 @@ public:
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+        if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, no page is ever protected
+            return;
+        }
         bool allow_write = True(perms & Core::MemoryPermission::Write);
         uffdio_writeprotect wp;
         wp.range.start = address;
@@ -1126,6 +1130,9 @@ struct SignalImpl : public PageManager::Impl {
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+        if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, no page is ever protected
+            return;
+        }
         // sotc: no RENDERER_TRACE zone here: Protect is reached from the guest fault handler, where
         // a zone's Span/RegisterZoneSite (allocation, a mutex) is unsafe. The fault span is
         // recorded separately with the no-alloc path.
@@ -1440,6 +1447,20 @@ struct SignalImpl : public PageManager::Impl {
             if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
                 SotcStats::fault_walker.fetch_add(1, std::memory_order_relaxed);
             }
+            return true;
+        }
+        // sotc: SOTC_NATIVE=1 (native.h): the tracker protects nothing, so no fault is its own. A write
+        // is made writable again (no invalidation, no readback); a read is left to the other handlers.
+        if (!SotcNative::TracksGuestPages()) {
+            const bool is_write = Common::IsWriteError(context);
+            SotcNative::NoteStrayFault(reinterpret_cast<VAddr>(fault_address), is_write,
+                                       reinterpret_cast<uint64_t>(Common::GetRip(context)));
+            if (!is_write) {
+                return false;
+            }
+            Core::Memory::Instance()->GetAddressSpace().Protect(
+                PageManager::GetPageAddr(addr), PageManager::PM_PAGE_SIZE,
+                Core::MemoryPermission::ReadWrite);
             return true;
         }
         if (Common::IsWriteError(context)) {
@@ -1779,6 +1800,9 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
 }
 
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op, bool deferrable) const {
+    if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, no watcher state, no protection
+        return;
+    }
     impl->UpdatePageWatchers(addr, size, write_op, deferrable);
 }
 
@@ -1786,6 +1810,9 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bou
                                               const RegionBits& write_mask,
                                               const RegionBits& read_mask, PageOp write_op,
                                               PageOp read_op, bool deferrable) const {
+    if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, see UpdatePageWatchers
+        return;
+    }
     impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op,
                                       deferrable);
 }
@@ -1850,7 +1877,7 @@ void PageManager::FaultProtectScope::Flush(VAddr fault_page) {
 // first, so a span with no write-protected page costs no thread switch.
 void PageManager::DeclareCpuWrite(VAddr addr, u64 size, DeclareRunFn on_run) {
     auto* rasterizer = Impl::rasterizer;
-    if (!rasterizer || !SignalImpl::ClipToTracked(addr, size)) {
+    if (!SotcNative::TracksGuestPages() || !rasterizer || !SignalImpl::ClipToTracked(addr, size)) {
         return;
     }
     if (rasterizer->RunsGpuWorkElsewhere()) {
@@ -1863,7 +1890,8 @@ void PageManager::DeclareCpuWrite(VAddr addr, u64 size, DeclareRunFn on_run) {
 
 // sotc: SOTC_WRITE_DECL=2 (page_manager.h). The look only: no thread switch, nothing invalidated.
 void PageManager::VisitDeclarableRuns(VAddr addr, u64 size, DeclareRunFn fn) {
-    if (!Impl::rasterizer || !fn || !SignalImpl::ClipToTracked(addr, size)) {
+    if (!SotcNative::TracksGuestPages() || !Impl::rasterizer || !fn ||
+        !SignalImpl::ClipToTracked(addr, size)) {
         return;
     }
     SignalImpl::ForEachDeclarableRunHere(addr, size, fn);
@@ -1871,13 +1899,13 @@ void PageManager::VisitDeclarableRuns(VAddr addr, u64 size, DeclareRunFn fn) {
 
 bool PageManager::MaybeWriteProtected(VAddr addr, u64 size) {
     auto* rasterizer = Impl::rasterizer;
-    return rasterizer && size != 0 &&
+    return SotcNative::TracksGuestPages() && rasterizer && size != 0 &&
            rasterizer->GetBufferCache().MaybeWriteProtected(addr, size);
 }
 
 u64 PageManager::CountWriteProtectedPages(VAddr addr, u64 size) {
     auto* rasterizer = Impl::rasterizer;
-    return rasterizer && size != 0
+    return SotcNative::TracksGuestPages() && rasterizer && size != 0
                ? rasterizer->GetBufferCache().CountWriteProtectedPages(addr, size)
                : 0;
 }
@@ -1924,7 +1952,7 @@ std::atomic<u64> g_ring_ns{};
 
 void PageManager::DeclareRingWrite(VAddr addr, u64 size) {
     auto* rasterizer = Impl::rasterizer;
-    if (!rasterizer || !SignalImpl::ClipToTracked(addr, size)) {
+    if (!SotcNative::TracksGuestPages() || !rasterizer || !SignalImpl::ClipToTracked(addr, size)) {
         return;
     }
     // Time of the whole call, skipped ones included (sum of the counters, one clock pair each).

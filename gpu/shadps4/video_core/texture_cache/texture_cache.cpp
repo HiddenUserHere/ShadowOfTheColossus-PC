@@ -335,6 +335,13 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+    // sotc: SOTC_NATIVE=1 (native.h): GPU-written texels are not copied to guest memory. The image
+    // stops being GPU-modified, so the collector and the next use do not wait for a copy.
+    if (!SotcNative::TracksGuestPages()) {
+        SotcNative::NoteSkippedReadback(image.info.guest_address, image.info.guest_size);
+        image.flags &= ~ImageFlagBits::GpuModified;
+        return;
+    }
     // sotc: SOTC_GC_DOWNLOAD=0: images freed by the collector are not written back to guest
     // memory. Asynchronous: the copy lands later, maybe over memory the game reused for a new
     // texture in the meantime (hunting the garbage on the Shrine altar, Maximum + PS4 Pro).

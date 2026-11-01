@@ -1151,6 +1151,16 @@ void ReportReadbackRips(std::string& out, double seconds) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    // sotc: SOTC_NATIVE=1 (native.h): no page is tracked, so this is a readback the native model
+    // does not make. A CPU write (a fault's InvalidateRegion) makes the GPU bytes stale: they are
+    // dropped, the write itself is announced. A read is not served (no read protection exists).
+    if (!SotcNative::TracksGuestPages()) {
+        SotcNative::NoteSkippedReadback(device_addr, size);
+        if (is_write) {
+            DiscardGpuModified(device_addr, size);
+        }
+        return;
+    }
     // sotc: SOTC_RB_STREAM=1: a guest thread whose faults walk GPU-written memory in sequence
     // (loading a new area, the game copies hundreds of MB the GPU wrote, while it holds a lock the
     // other job workers wait for) got one readback, and one wait for the GPU, per 64 KiB. Each
@@ -1340,6 +1350,17 @@ bool BufferCache::IsReadbackComplete(const AsyncReadback& readback) {
     }
     return readback.ahead_value != 0 ? scheduler.IsAheadDone(readback.ahead_value)
                                      : scheduler.IsFree(readback.tick);
+}
+
+void BufferCache::DiscardGpuModified(VAddr addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(addr, size);
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
 }
 
 void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
@@ -5017,6 +5038,12 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+    // sotc: SOTC_NATIVE=1: GPU-written bytes are not copied to guest memory (see ReadMemory), so the
+    // range keeps its GPU bits (nothing was copied, nothing is clean).
+    if (!SotcNative::TracksGuestPages()) {
+        SotcNative::NoteSkippedReadback(device_addr, size);
+        return;
+    }
     RbxDepth rbx_depth_guard{rbx_depth}; // sotc: SOTC_RB_EXACT: see BeginAsyncReadback
     SotcStats::readbacks.fetch_add(1, std::memory_order_relaxed);
     // sotc: the clock is read only with SOTC_FPS timers (kFpsTimers, SOTC_FPS_LEAN drops it); the
@@ -7777,8 +7804,13 @@ void BufferCache::NativeDrain(u64 budget) {
     u64 spent = 0;
     SotcNative::PendingUpload up{};
     while (spent < budget && SotcNative::TakeUpload(up)) {
+        // The announce is the CPU write the fault path used to see. Images in the range are
+        // invalidated as a guest write fault invalidates them (TextureCache::InvalidateMemory: dirty,
+        // untracked, re-hashed at the next use), and the buffer range is marked CPU-modified. The mark
+        // is needed for Persistent too: DrainRange skips a range that is not CPU-modified.
+        texture_cache.InvalidateMemory(up.addr, up.size);
+        memory_tracker->MarkRegionAsCpuModified(up.addr, up.size);
         if (up.kind == SotcNative::Kind::PerFrame) {
-            memory_tracker->MarkRegionAsCpuModified(up.addr, up.size);
             SotcNative::NoteMarked(up.size);
             spent += up.size;
             continue;
