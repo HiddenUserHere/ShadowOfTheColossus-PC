@@ -50,6 +50,26 @@ void Report(std::string& out, double seconds);
 /// (0x1b0e0) is called with. It reads the node's pool id (+0x68), size (+0x58) and backed bytes (+0x50).
 void OnFreeNode(uint64_t node);
 
+// sotc: the windows of the native path (pc_pool_windows.h, allocators.md section 6). Native mode only (SOTC_NATIVE=1 or
+// 2 with SOTC_PC_POOL_NATIVE=1); every function returns at once otherwise, so the hooks that call them are inert in
+// mode 0. Hook sites are in docs/re-stutters/native/impl-windows.md.
+/// After the arena creation (0x110a0): reserves window A (GPU arena) and window B (mask heap) and binds them to the two
+/// arena objects (globals 0x2dfb2b8 and 0x2dfb2c0). Once per session.
+void SetupWindows();
+/// At the render-target allocator entry (0x9b778) with its object: reserves window C once and binds it to that object.
+void BindRenderTargets(uint64_t rt_obj);
+/// The heap-slot scope (dispatcher 0x12820): the slot the next block of this thread is for. Entry sets, exit clears.
+void SetHeapKey(int64_t key);
+void ClearHeapKey();
+/// The release of a block (0x476f0 entry, with its owner and node): when the node is a parked window block, does
+/// the unlink, the count and the bytes of 0x476f0 and skips the VA return 0x1b0e0. Returns true when it did (the hook
+/// then returns without the original). False: nothing written, the original runs.
+bool WindowRelease(uint64_t owner, uint64_t node);
+/// The allocation of a block (0x479a0 entry, with its owner and rounded size): when a parked node of that owner and
+/// size exists, inserts it into the owner's list as 0x479a0 does and returns its node in *node. Returns true when
+/// it did (the hook returns that node). False: the original runs.
+bool WindowReuse(uint64_t owner, uint64_t size, uint64_t* node);
+
 namespace Model {
 
 /// The pool granule: every run, node size and alignment is a multiple of 64 KiB.
@@ -101,6 +121,9 @@ struct Request {
     uint64_t align = 0;
     int32_t kind = 0;
     uint64_t obj = 0; ///< rdi, the owner / family object. Not modelled; the native application reads it (node+0x40)
+    /// sotc: a window route (pc_pool_windows.h). The VA is not taken from a free-VA run (steps 1 and 3 of Predict are
+    /// skipped), so the call is a fresh block whose VA the window gives. Early reject and the page loop are unchanged.
+    bool force_fresh = false;
 };
 
 enum class Outcome {
@@ -138,6 +161,9 @@ uint32_t ParsePathMask(const char* spec, std::string* bad);
 /// The default eligible set: the exact free-run hits only. They take no node and change no bitmap and no batch
 /// op. Not yet verified against the game: a run reports the matches and mismatches of each path.
 constexpr uint32_t kDefaultPathMask = PathBit(Path::FlexHitExact) | PathBit(Path::PrimaryHitExact);
+/// sotc: the fresh paths, eligible for a window route (Request::force_fresh) whatever SOTC_PC_POOL_PATHS says.
+constexpr uint32_t kFreshPathMask = PathBit(Path::FreshPlain) | PathBit(Path::FreshReserve) |
+                                    PathBit(Path::FreshSpill) | PathBit(Path::FreshPoolFix);
 
 /// One phys run the game maps: bits [first_page, first_page + pages) of the set's bitmap, mapped at va.
 struct PhysRun {
