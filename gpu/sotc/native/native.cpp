@@ -24,6 +24,9 @@ namespace {
 
 constexpr uint64_t kMaxUploadChunk = uint64_t{64} << 20; // BufferCache::DrainRange limit
 constexpr size_t kMaxPending = 65536;
+// The guest address space the page tracker covers (MemoryTracker::MAX_CPU_PAGE_BITS). An announce past it
+// is a hook that read a wrong register or field; it would crash the tracker (1 Nov: 0x0053005000520052).
+constexpr uint64_t kGuestLimit = uint64_t{1} << 40;
 
 // Counters. Relaxed atomics: they feed the report only.
 struct Counters {
@@ -33,6 +36,7 @@ struct Counters {
     std::atomic<uint64_t> announce_in_window{};
     std::atomic<uint64_t> announce_dropped{};
     std::atomic<uint64_t> announce_released{};
+    std::atomic<uint64_t> announce_rejected{}; // outside the guest address space (kGuestLimit)
     std::atomic<uint64_t> binds_served{};
     std::atomic<uint64_t> binds_refused{};
     std::atomic<uint64_t> uploaded_bytes{};
@@ -147,6 +151,15 @@ bool Verify() {
 
 void Announce(uint64_t addr, uint64_t size, Kind kind) {
     if (g_mode == 0 || size == 0) {
+        return;
+    }
+    if (addr == 0 || addr >= kGuestLimit || size > kGuestLimit - addr) {
+        // The host caller is the native hook that produced it; the first few are logged.
+        if (g_c.announce_rejected.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::fprintf(stderr, "SOTC NATIVE announce rejected: addr 0x%llx size 0x%llx kind %d caller %p\n",
+                         static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size),
+                         static_cast<int>(kind), __builtin_return_address(0));
+        }
         return;
     }
     SotcVerify::NoteAnnounce(addr, size); // sotc: clears the coverage oracle's pending faults
@@ -340,6 +353,7 @@ void Report(std::string& out, double seconds) {
     const uint64_t ann_w = take(g_c.announce_in_window);
     const uint64_t dropped = take(g_c.announce_dropped);
     const uint64_t released = take(g_c.announce_released);
+    const uint64_t rejected = g_c.announce_rejected.load(std::memory_order_relaxed); // session total
     const uint64_t ups = take(g_c.uploads);
     const uint64_t clean = take(g_c.uploads_clean);
     const uint64_t up_bytes = take(g_c.uploaded_bytes);
@@ -363,13 +377,13 @@ void Report(std::string& out, double seconds) {
     std::snprintf(line, sizeof(line),
                   "SOTC NATIVE mode %d (%.1f s): windows %llu (%llu MiB) binds served %llu refused %llu; "
                   "announce persistent %llu per-frame %llu (in window %llu) gpu-written %llu dropped %llu "
-                  "released %llu\n",
+                  "released %llu rejected %llu (session)\n",
                   g_mode, seconds, static_cast<unsigned long long>(windows),
                   static_cast<unsigned long long>(win_bytes >> 20), static_cast<unsigned long long>(served),
                   static_cast<unsigned long long>(refused), static_cast<unsigned long long>(ann_p),
                   static_cast<unsigned long long>(ann_f), static_cast<unsigned long long>(ann_w),
                   static_cast<unsigned long long>(ann_g), static_cast<unsigned long long>(dropped),
-                  static_cast<unsigned long long>(released));
+                  static_cast<unsigned long long>(released), static_cast<unsigned long long>(rejected));
     out += line;
     std::snprintf(line, sizeof(line),
                   "SOTC NATIVE uploads %llu (clean %llu) %llu KiB, marked %llu KiB, queued %zu; descriptors "

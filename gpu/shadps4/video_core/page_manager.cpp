@@ -1574,6 +1574,10 @@ struct SignalImpl : public PageManager::Impl {
                 SotcStats::fault_gpu_reads.fetch_add(1, std::memory_order_relaxed);
             }
             NoteReadFault(context, addr, is_gpu_thread);
+            // sotc: SOTC_VERIFY: a guest read of a read-protected (GPU-written) page.
+            if (!is_gpu_thread && SotcNative::Verify()) {
+                SotcNative::VerifyGpuRead(addr, size, reinterpret_cast<uint64_t>(Common::GetRip(context)));
+            }
             // sotc: SOTC_CLASS_TRACK=2 read faults per allocator owner (mem_classes.cpp). Lock-free.
             if (SotcMemClasses::Mode() == 2) {
                 SotcMemClasses::NoteReadFault(addr);

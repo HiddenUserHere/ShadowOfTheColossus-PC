@@ -33,6 +33,8 @@
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_TEX (guest range generations)
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM (upload budget)
 #include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM (records and replay)
+#include "../../../sotc/native/native.h" // sotc: SotcNative::Verify
+#include "../../../sotc/native/verify.h" // sotc: SOTC_VERIFY (NoteGpuConsume)
 #include "video_core/texture_cache/host_compatibility.h"
 
 #include <vk_mem_alloc.h>
@@ -2026,6 +2028,12 @@ void TextureCache::RefreshImage(Image& image) {
     FlushTexProtect();
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
+    }
+    // sotc: SOTC_VERIFY: the image's guest bytes are about to be taken by the GPU (counted when uploaded or
+    // skipped as unchanged alike: either way the GPU reads them).
+    if (SotcNative::Verify()) {
+        SotcVerify::NoteGpuConsume(image.info.guest_address, image.info.guest_size,
+                                   SotcVerify::ConsumePath::ImageUpload, image.info.guest_size);
     }
     if (image.sotc_warm_used && !SotcLoadWarm::InWarm()) { // sotc: SOTC_LOAD_WARM: paid again
         image.sotc_warm_used = false;

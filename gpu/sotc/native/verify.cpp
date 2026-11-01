@@ -8,6 +8,10 @@
 #include "verify.h"
 
 #include "../arena_attrib.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "native.h"
 
 #include <algorithm>
@@ -40,6 +44,9 @@ constexpr size_t kTopResources = 10;
 constexpr size_t kTopCallers = 4;
 constexpr size_t kCallerCap = 256;
 constexpr uint64_t kOldAge = 2;            // bind_frame - publish_frame >= this: "written long before"
+constexpr size_t kSuspectBits = 14;
+constexpr size_t kSuspectSlots = size_t{1} << kSuspectBits;
+constexpr uint64_t kSuspectFrames = 4;     // an unannounced write the GPU has not taken by then expires
 
 // Pending write faults: the page, the last faulting write of it, and the frame it happened in.
 struct Pending {
@@ -51,6 +58,18 @@ struct Pending {
 Pending g_pending[kPendingSlots];
 std::atomic<uint64_t> g_pending_dropped{0};
 std::atomic<uint64_t> g_faults_win{0}; // write faults recorded (outside windows), this window
+
+// Unannounced writes waiting to be taken by the GPU (one per page, the latest; direct mapped).
+struct Suspect {
+    std::atomic<uint64_t> key{0}; // page + 1, 0 = free
+    std::atomic<uint64_t> addr{0};
+    std::atomic<uint64_t> size{0};
+    std::atomic<uint64_t> rip{0};
+    std::atomic<uint64_t> frame{0};
+};
+Suspect g_suspects[kSuspectSlots];
+std::atomic<bool> g_any_suspect{false};
+std::atomic<uint64_t> g_suspect_replaced{0}; // a newer suspect took a slot still live (lost, counted)
 
 // Last write per page (direct mapped; a collision overwrites, which only costs the range log a "unknown").
 struct LastWrite {
@@ -78,6 +97,18 @@ std::unordered_map<uint64_t, RipRow> g_rips;
 uint64_t g_rips_dropped = 0;
 uint64_t g_unannounced_win = 0;
 uint64_t g_unannounced_total = 0;
+// Consumed suspects (the GPU took the bytes): rows per RIP, split by path.
+struct ConsumedRow {
+    uint64_t count = 0;
+    uint64_t by_path[static_cast<size_t>(ConsumePath::Count)] = {};
+    uint64_t small_binds = 0; // taken by a bind of at most kSmallBind bytes
+    uint64_t max_bind = 0;
+    uint64_t last_addr = 0;
+};
+constexpr uint64_t kSmallBind = 64 * 1024;
+std::unordered_map<uint64_t, ConsumedRow> g_consumed;
+uint64_t g_consumed_win = 0;
+uint64_t g_consumed_total = 0;
 
 std::mutex g_range_mutex; // range log, publish table, first-bind set, caller split
 struct RangeEntry {
@@ -137,14 +168,26 @@ Pending* FindPending(uint64_t page, bool claim) {
     return nullptr;
 }
 
-// "0x<eboot offset>" inside the image, "host:0x<address>" elsewhere.
+// "0x<eboot offset>" inside the image, "host:<module>+0x<offset>" for port code (report thread only).
 void FormatRip(char* buf, size_t n, uint64_t addr) {
     uint64_t off = 0;
     if (SotcArenaAttrib::ImageOffset(addr, &off)) {
         std::snprintf(buf, n, "0x%llx", static_cast<unsigned long long>(off));
-    } else {
-        std::snprintf(buf, n, "host:0x%llx", static_cast<unsigned long long>(addr));
+        return;
     }
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    char path[MAX_PATH];
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(addr), &module) &&
+        GetModuleFileNameA(module, path, sizeof path) != 0) {
+        const char* name = std::strrchr(path, '\\');
+        std::snprintf(buf, n, "host:%s+0x%llx", name ? name + 1 : path,
+                      static_cast<unsigned long long>(addr - reinterpret_cast<uint64_t>(module)));
+        return;
+    }
+#endif
+    std::snprintf(buf, n, "host:0x%llx", static_cast<unsigned long long>(addr));
 }
 
 } // namespace
@@ -204,6 +247,10 @@ void NoteAnnounce(uint64_t addr, uint64_t size) {
             if (Pending* p = FindPending(page, false)) {
                 p->key.store(0, std::memory_order_relaxed);
             }
+            // A late announce (after the submit) covers the suspect too.
+            Suspect& s = g_suspects[Slot(page, kSuspectBits)];
+            uint64_t expect = page + 1;
+            s.key.compare_exchange_strong(expect, 0, std::memory_order_relaxed);
         }
         return;
     }
@@ -222,10 +269,25 @@ void OnSubmit() {
             if (p.key.exchange(0, std::memory_order_relaxed) == 0) {
                 continue;
             }
-            // Still pending at the submit: the GPU is about to read a range nobody announced.
-            SotcNative::VerifyUnannouncedWrite(p.addr.load(std::memory_order_relaxed),
-                                               p.size.load(std::memory_order_relaxed),
-                                               p.rip.load(std::memory_order_relaxed));
+            // Still pending at the submit: the GPU may read a range nobody announced.
+            const uint64_t addr = p.addr.load(std::memory_order_relaxed);
+            const uint64_t size = p.size.load(std::memory_order_relaxed);
+            const uint64_t rip = p.rip.load(std::memory_order_relaxed);
+            SotcNative::VerifyUnannouncedWrite(addr, size, rip);
+            // A suspect until the GPU takes its bytes (NoteGpuConsume) or it expires.
+            const uint64_t page = addr >> kPageShift;
+            const uint64_t frame = g_frame.load(std::memory_order_relaxed);
+            Suspect& s = g_suspects[Slot(page, kSuspectBits)];
+            const uint64_t old = s.key.load(std::memory_order_relaxed);
+            if (old != 0 && old != page + 1 && s.frame.load(std::memory_order_relaxed) + kSuspectFrames >= frame) {
+                g_suspect_replaced.fetch_add(1, std::memory_order_relaxed);
+            }
+            s.addr.store(addr, std::memory_order_relaxed);
+            s.size.store(size, std::memory_order_relaxed);
+            s.rip.store(rip, std::memory_order_relaxed);
+            s.frame.store(frame, std::memory_order_relaxed);
+            s.key.store(page + 1, std::memory_order_release);
+            g_any_suspect.store(true, std::memory_order_relaxed);
         }
     }
     g_frame.fetch_add(1, std::memory_order_relaxed);
@@ -233,6 +295,59 @@ void OnSubmit() {
 
 uint64_t Frame() {
     return g_frame.load(std::memory_order_relaxed);
+}
+
+void NoteGpuConsume(uint64_t addr, uint64_t size, ConsumePath path, uint64_t bind_size) {
+    if (size == 0 || !g_any_suspect.load(std::memory_order_relaxed) || !SotcNative::Verify()) {
+        return;
+    }
+    const uint64_t now = g_frame.load(std::memory_order_relaxed);
+    const auto take = [&](Suspect& s, uint64_t page) {
+        if (s.key.load(std::memory_order_acquire) != page + 1) {
+            return;
+        }
+        const uint64_t a = s.addr.load(std::memory_order_relaxed);
+        const uint64_t n = s.size.load(std::memory_order_relaxed);
+        if (a >= addr + size || a + n <= addr) {
+            return; // the upload covers the page, not the written bytes
+        }
+        uint64_t expect = page + 1;
+        if (!s.key.compare_exchange_strong(expect, 0, std::memory_order_relaxed)) {
+            return;
+        }
+        if (s.frame.load(std::memory_order_relaxed) + kSuspectFrames < now) {
+            return; // expired: never taken in time
+        }
+        const uint64_t rip = s.rip.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(g_agg_mutex);
+        ++g_consumed_win;
+        ++g_consumed_total;
+        if (g_consumed.size() >= kRipCap && g_consumed.find(rip) == g_consumed.end()) {
+            return;
+        }
+        ConsumedRow& row = g_consumed[rip];
+        ++row.count;
+        ++row.by_path[static_cast<size_t>(path)];
+        if (bind_size <= kSmallBind) {
+            ++row.small_binds;
+        }
+        row.max_bind = bind_size > row.max_bind ? bind_size : row.max_bind;
+        row.last_addr = a;
+    };
+    const uint64_t first = addr >> kPageShift;
+    const uint64_t last = (addr + size - 1) >> kPageShift;
+    if (last - first < 256) {
+        for (uint64_t page = first; page <= last; ++page) {
+            take(g_suspects[Slot(page, kSuspectBits)], page);
+        }
+        return;
+    }
+    for (Suspect& s : g_suspects) { // a large upload: one pass over the table
+        const uint64_t k = s.key.load(std::memory_order_relaxed);
+        if (k != 0 && k - 1 >= first && k - 1 <= last) {
+            take(s, k - 1);
+        }
+    }
 }
 
 void NotePublish(uint64_t addr, uint64_t size) {
@@ -377,6 +492,36 @@ void Report(std::string& out, double seconds) {
         g_rips.clear();
         g_unannounced_win = 0;
         g_rips_dropped = 0;
+
+        // The suspects the GPU took (real misses), top RIPs by count.
+        std::vector<std::pair<uint64_t, ConsumedRow>> taken(g_consumed.begin(), g_consumed.end());
+        std::sort(taken.begin(), taken.end(),
+                  [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+        std::snprintf(buf, sizeof buf,
+                      "SOTC VERIFY CONSUMED window=%.1fs writes=%llu rips=%zu total=%llu suspects_replaced=%llu "
+                      "(unannounced writes whose bytes the GPU uploaded within %llu frames; must be 0)\n",
+                      seconds, static_cast<unsigned long long>(g_consumed_win), g_consumed.size(),
+                      static_cast<unsigned long long>(g_consumed_total),
+                      static_cast<unsigned long long>(g_suspect_replaced.exchange(0, std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(kSuspectFrames));
+        out += buf;
+        for (size_t i = 0; i < taken.size() && i < kTopRips; ++i) {
+            const ConsumedRow& r = taken[i].second;
+            char where[64];
+            FormatRip(where, sizeof where, taken[i].first);
+            std::snprintf(buf, sizeof buf,
+                          "SOTC VERIFY CONSUMED %zu rip=%s n=%llu buffer=%llu image=%llu small_binds=%llu "
+                          "max_bind=%llu last_addr=0x%llx\n",
+                          i + 1, where, static_cast<unsigned long long>(r.count),
+                          static_cast<unsigned long long>(r.by_path[0]),
+                          static_cast<unsigned long long>(r.by_path[1]),
+                          static_cast<unsigned long long>(r.small_binds),
+                          static_cast<unsigned long long>(r.max_bind),
+                          static_cast<unsigned long long>(r.last_addr));
+            out += buf;
+        }
+        g_consumed.clear();
+        g_consumed_win = 0;
     }
     g_faults_win.store(0, std::memory_order_relaxed);
     g_pending_dropped.store(0, std::memory_order_relaxed);

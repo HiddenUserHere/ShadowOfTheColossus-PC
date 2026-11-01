@@ -30,6 +30,7 @@
 #include "../../../sotc/pc_ring.h"      // sotc: SOTC_PC_RING shadow
 #include "../../../sotc/native/native.h"       // sotc: SOTC_NATIVE (windows, announces, frame ticket)
 #include "../../../sotc/native/native_draw.h" // sotc: SOTC_NATIVE draw-thread side
+#include "../../../sotc/native/verify.h"      // sotc: SOTC_VERIFY (NoteGpuConsume)
 #include "../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST (L1)
 #include "../../../sotc/rb_host.h"      // sotc: SOTC_RB_HOST (R1)
 #include <xxhash.h>                     // sotc: SOTC_PC_RING=8 verify (XXH3, as stale_check.cpp)
@@ -8075,6 +8076,14 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         }
     }
     if (!copies.empty()) {
+        // sotc: SOTC_VERIFY: the CPU-written bytes the GPU takes here (dstOffset: guest address here) for
+        // a bind of `size` bytes.
+        if (SotcNative::Verify()) {
+            for (const auto& copy : copies) {
+                SotcVerify::NoteGpuConsume(copy.dstOffset, copy.size, SotcVerify::ConsumePath::BufferUpload,
+                                           size);
+            }
+        }
         const SotcStats::FrameTimer frame_timer{SotcStats::FrameBuffer};
         tl_sync_bytes += total_size_bytes; // sotc: SOTC_LOAD_WARM (WarmRange's copied bytes)
         if (SotcStats::kFpsLog) {

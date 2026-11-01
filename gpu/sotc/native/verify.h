@@ -11,6 +11,10 @@
 //     SotcNative::VerifyUnannouncedWrite (aggregated per guest RIP, eboot offsets). Faults are not
 //     reported at fault time: the engine writes first and announces after, so a fault-time report would
 //     count every ordinary write.
+//     Each unannounced write then stays a suspect for kSuspectFrames frames. NoteGpuConsume (the
+//     uploads of the old tracking path, which still runs in mode 2) marks the suspects whose bytes the GPU
+//     takes: those are real misses ("SOTC VERIFY CONSUMED", per RIP and path). A suspect that expires was
+//     never read by the GPU and needs no announce once page tracking is gone.
 //  3. Per-range log (loader.md section 8): one entry per sync-copy range at its upload, capped, reported
 //     per 5 s window as "SOTC VERIFY RANGE".
 //  4. Frame data counters (framedata.md section 3, a-j): "SOTC FRAMEDATA" line per 5 s window.
@@ -51,6 +55,14 @@ void OnSubmit();
 
 /// Frames submitted so far (OnSubmit count).
 uint64_t Frame();
+
+/// Where the GPU took CPU-written guest bytes (NoteGpuConsume).
+enum class ConsumePath : uint8_t { BufferUpload, ImageUpload, Count };
+/// The old tracking path uploads [addr, addr + size) for the GPU (draw thread), for a bind (buffer) or an
+/// image of bind_size bytes. Marks the unannounced writes in it as consumed. A small bind (<= 64 KiB) is
+/// a read the shader almost surely makes; a large one may only cover the bytes (a V# over a whole heap).
+/// Native verify only; one relaxed load otherwise.
+void NoteGpuConsume(uint64_t addr, uint64_t size, ConsumePath path, uint64_t bind_size);
 
 // ---- 3. Per-range log -----------------------------------------------------------------------------
 

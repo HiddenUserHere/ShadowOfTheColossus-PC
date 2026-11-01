@@ -201,6 +201,13 @@ void AnnounceRange(uint64_t begin, uint64_t end, SotcNative::Kind kind, Counter&
         g_window.skipped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    // A pointer read from an object of another class (1 Nov: UTF-16 text 0x0053005000520052 from a 0x18-byte
+    // instance block) is not a guest range: both ends must be mapped.
+    if (!runtime_memory_backing_pointer(static_cast<uintptr_t>(begin)) ||
+        !runtime_memory_backing_pointer(static_cast<uintptr_t>(end - 1))) {
+        g_window.skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     SotcNative::Announce(begin, end - begin, kind);
     c.Add(end - begin);
 }
