@@ -40,6 +40,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/sotc_stats.h"
+#include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (SOTC_PIPE_DIRTY default, N5)
 #include "bbport_threads.h"
 
 // sotc: generation of the runtime memory table (src/runtime_memory.c); odd while a change is in
@@ -1751,10 +1752,15 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 // draw, as before. 1: it is rebuilt only when the registers it reads changed (PipeKeyRegs), else
 // taken from the cached copy. 2: the same, and a draw that would take the cached copy rebuilds it
 // too and counts a different result (the rebuilt key is used).
+// sotc: N5 (SOTC_N5_PSO): unset with SOTC_NATIVE on, the default is 1; an explicit SOTC_PIPE_DIRTY
+// (0, 1 or 2) always wins.
 static int PipeDirtyMode() {
     static const int mode = [] {
         const char* v = std::getenv("SOTC_PIPE_DIRTY");
-        return v && v[0] == '1' ? 1 : v && v[0] == '2' ? 2 : 0;
+        if (!v) {
+            return SotcNative::On() ? 1 : 0;
+        }
+        return v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
     }();
     return mode;
 }
