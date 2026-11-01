@@ -26,10 +26,13 @@ the GPU, with the exact patch point for each.
   area (callers and callees, vtables, job-system entry points), cross-check each against the runtime evidence, and
   list what remains unknown with what would resolve it.
 - Do not edit engine/port code (C/C++). You work in your own worktree; write only your report
-  `docs/re-stutters/native/<your-id>.md` (and helper scripts under `tools/re/` if useful), commit them on your branch.
+  `docs/re-stutters/native/<your-id>.md` (and helper scripts under `tools/re/` if useful).
+- NEVER commit, merge or switch branches (user rule): leave everything as uncommitted files; the coordinator collects
+  them. Your worktree may be on an older base: read code from the main tree C:\Users\ptr\Documents\sotc-pc
+  (branch re/pc-native).
 - Do NOT run the game or tools that start it.
 - For every site give: eboot offset and decomp function name, what it writes/reads/waits on (address source, size,
   frequency per frame if known), the memory class (per-frame / persistent / GPU-result / sync), the proposed patch
   point (hook entry/wrap/return, or a byte patch) and what the patch would call (announce write (addr,size), write into
   host-shared region, drop the consumer, read without waiting), and the evidence (decomp lines, log counters).
-- Return: the inventory table, the count of sites by class, open questions, and your branch name.
+- Return: the inventory table, the count of sites by class, open questions, and the path of your report file.
