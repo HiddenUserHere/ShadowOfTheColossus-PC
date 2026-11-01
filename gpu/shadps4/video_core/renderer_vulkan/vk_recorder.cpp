@@ -29,6 +29,7 @@
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "bbport_threads.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/renderer_vulkan/vk_parallel_record.h" // sotc: SOTC_N5_PARALLEL counters
 
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
@@ -971,6 +972,9 @@ private:
     struct Scan {
         bool found{};
         bool bad{}; ///< a block the secondary cannot hold, or the scan gave up
+        // sotc: SOTC_N5_PARALLEL: why the scan gave up, and the blocking category (ScanBlock)
+        ParallelRecord::Fallback reason{ParallelRecord::Fallback::ScanBlock};
+        u8 block{0xFF};
         u32 draws{};
         Chunk* end_chunk{};
         u32 end_pos{};
@@ -1206,6 +1210,7 @@ bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& 
                 wait_start = now;
             } else if (now - wait_start > kMaxScanWait) {
                 scan.bad = true;
+                scan.reason = ParallelRecord::Fallback::ScanTimeout; // sotc: N5 counters
                 return true;
             }
             std::this_thread::yield();
@@ -1216,6 +1221,7 @@ bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& 
         if (h->kind == BlockKind::End) {
             if (scan.chunks.size() >= kMaxScanChunks) {
                 scan.bad = true;
+                scan.reason = ParallelRecord::Fallback::ScanChunks; // sotc: N5 counters
                 return true;
             }
             // NextChunk links the next chunk before it publishes the End block
@@ -1248,6 +1254,8 @@ bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& 
         default:
             // Dispatch, barriers, copies, nested passes and submits stay on the primary
             scan.bad = true;
+            scan.reason = ParallelRecord::Fallback::ScanBlock; // sotc: N5 counters
+            scan.block = static_cast<u8>(h->category);
             return true;
         }
         p += h->size;
@@ -1256,23 +1264,38 @@ bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& 
 
 bool PassSecondary::TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::stop_token stop) {
     auto* begin = reinterpret_cast<BeginPayload*>(header + 1);
+    const bool counted = ParallelRecord::Enabled(); // sotc: SOTC_N5_PARALLEL counters
     if (!begin->formats.valid || dropped.contains(begin->cmdbuf)) {
         if (SotcStats::kCmdStats) {
             SotcStats::passes_fallback.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (counted) {
+            ParallelRecord::NoteFallback(begin->formats.valid
+                                             ? ParallelRecord::Fallback::Dropped
+                                             : ParallelRecord::Fallback::FormatsInvalid);
         }
         return false;
     }
     Scan scan;
     if (!ScanPass(chunk, pos + header->size, stop, scan)) {
+        if (counted) {
+            ParallelRecord::NoteFallback(ParallelRecord::Fallback::ScanStopped);
+        }
         return false;
     }
     if (scan.bad) {
         if (SotcStats::kCmdStats) {
             SotcStats::passes_fallback.fetch_add(1, std::memory_order_relaxed);
         }
+        if (counted) {
+            ParallelRecord::NoteFallback(scan.reason, scan.block);
+        }
         return false;
     }
     if (scan.draws <= min_draws) {
+        if (counted) {
+            ParallelRecord::NoteFallback(ParallelRecord::Fallback::FewDraws);
+        }
         return false;
     }
 
@@ -1308,6 +1331,9 @@ bool PassSecondary::TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::st
         queue.push_back(job);
     }
     cv.notify_one();
+    if (counted) {
+        ParallelRecord::NotePassParallel(); // sotc: SOTC_N5_PARALLEL counters
+    }
     if (SotcStats::kCmdStats) {
         SotcStats::passes_secondary.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1339,7 +1365,17 @@ void PassSecondary::Replay(VkCommandBuffer fake) {
 
 void PassSecondary::Finish(BlockHeader* end) {
     Job* job = active;
+    // sotc: SOTC_N5_PARALLEL: the owner's wait for the worker (clock reads only when counted)
+    const bool counted = ParallelRecord::Enabled();
+    const auto wait_t0 =
+        counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     WaitJob(job->seq);
+    if (counted) {
+        ParallelRecord::NoteOwnerWait(static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 wait_t0)
+                .count()));
+    }
     const VkCommandBuffer primary = rec.Real(job->fake);
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdExecuteCommands(primary, 1, &job->secondary);
     awaiting.push_back(Awaiting{job->fake, job->secondary});
@@ -1369,6 +1405,11 @@ void PassSecondary::WorkerLoop() {
 }
 
 void PassSecondary::Record(Job* job) {
+    // sotc: SOTC_N5_PARALLEL: worker time and commands replayed (clock reads only when counted)
+    const bool counted = ParallelRecord::Enabled();
+    const auto job_t0 =
+        counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    u64 ops = 0;
     VkCommandBuffer secondary{};
     {
         std::scoped_lock lk{pool_mutex};
@@ -1399,6 +1440,7 @@ void PassSecondary::Record(Job* job) {
     tls_pass_real = secondary;
     for (const StateEntry& entry : job->state) {
         entry.header->invoke(entry.header + 1);
+        ++ops;
     }
     Chunk* c = job->begin_chunk;
     u32 p = job->begin_pos;
@@ -1411,6 +1453,7 @@ void PassSecondary::Record(Job* job) {
         }
         if (h->kind == BlockKind::Command) {
             h->invoke(h + 1);
+            ++ops;
         }
         p += h->size;
     }
@@ -1421,6 +1464,12 @@ void PassSecondary::Record(Job* job) {
     ASSERT_MSG(ended == VK_SUCCESS, "SOTC_PASS_SEC: vkEndCommandBuffer failed: {}",
                static_cast<u32>(ended));
     job->secondary = secondary;
+    if (counted) {
+        ParallelRecord::NoteWorkerJob(
+            ops, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - job_t0)
+                                      .count()));
+    }
 
     // The consumer may recycle the chunks from here on
     for (Chunk* pinned : job->pinned) {
