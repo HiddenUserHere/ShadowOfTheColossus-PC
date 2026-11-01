@@ -1374,6 +1374,20 @@ void VideoOutDriver::Flip(const Request& req) {
                                   static_cast<unsigned long long>(
                                       SotcStats::bind_cache_seen_prev_frame.exchange(0)));
                 }
+                if (SotcStats::kOpComputeBind) { // sotc: SOTC_OP_COMPUTE_BIND (sotc_stats.h)
+                    std::fprintf(
+                        stderr,
+                        "SOTC OP COMPUTE BIND mode %d: dispatches eligible %llu, hits %llu, verify "
+                        "checks %llu, mismatches %llu\n",
+                        SotcStats::kOpComputeBind,
+                        static_cast<unsigned long long>(
+                            SotcStats::op_compute_eligible.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::op_compute_hits.exchange(0)),
+                        static_cast<unsigned long long>(
+                            SotcStats::op_compute_verify_checks.exchange(0)),
+                        static_cast<unsigned long long>(
+                            SotcStats::op_compute_verify_mismatches.exchange(0)));
+                }
                 std::fprintf(stderr,
                              "SOTC BIND CACHE hits %llu/%llu (%.1f%%), refused %llu, not stored "
                              "%llu; flushes %s %llu %s %llu %s %llu %s %llu %s %llu%s\n",

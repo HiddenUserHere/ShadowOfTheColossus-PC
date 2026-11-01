@@ -126,6 +126,30 @@ inline const bool kBindCacheRanges = [] {
 /// sotc: SOTC_BIND_CACHE_RANGES counters (SOTC_FPS only): entries dropped by written ranges, and
 /// the writes checked against a non-empty cache.
 inline std::atomic<uint64_t> bind_cache_range_entries{0}, bind_cache_range_writes{0};
+/// sotc: SOTC_OP_COMPUTE_BIND (default 0; needs SOTC_BIND_CACHE, _RANGES, _XTICK and _FRAME, read
+/// here on their own, not from the other inline flags). 1: a read-only dispatch (no written buffer,
+/// no storage image, no DMA pointer, no shared memory) takes the frame bind cache as a read-only
+/// draw does, so its descriptors, barriers and buffer/image lookups are replayed on a hit instead
+/// of rebuilt (Rasterizer::BindResources). 2 (verify): dispatches never take a hit; each one whose
+/// entry would have been a hit (same key, valid, same flush and buffer version) is compared with
+/// the descriptors and push data the full bind just built. Stamps are not checked by the verify,
+/// so a stale entry can show as a mismatch; a mismatch on a fresh entry is a real difference.
+inline const int kOpComputeBind = [] {
+    const auto on = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && v[0] == '1';
+    };
+    if (!(on("SOTC_BIND_CACHE") && on("SOTC_BIND_CACHE_RANGES") && on("SOTC_BIND_CACHE_XTICK") &&
+          on("SOTC_BIND_CACHE_FRAME"))) {
+        return 0;
+    }
+    const char* v = std::getenv("SOTC_OP_COMPUTE_BIND");
+    return v && v[0] == '2' ? 2 : (v && v[0] == '1' ? 1 : 0);
+}();
+/// sotc: SOTC_OP_COMPUTE_BIND counters (SOTC_FPS only): dispatches that were eligible for the
+/// cache, hits taken, verify checks (would-be hits compared) and verify mismatches.
+inline std::atomic<uint64_t> op_compute_eligible{0}, op_compute_hits{0},
+    op_compute_verify_checks{0}, op_compute_verify_mismatches{0};
 /// sotc: SOTC_BIND_CACHE_XTICK=1 (default off; needs SOTC_BIND_CACHE=1 and SOTC_BIND_CACHE_RANGES=1):
 /// cached binds survive the submit tick (the next hit of an entry in a new tick replays the
 /// per-tick side effects a full bind has: image and sampler stamps, arena block stamps), the

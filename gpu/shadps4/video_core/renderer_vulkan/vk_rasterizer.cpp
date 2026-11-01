@@ -3049,6 +3049,11 @@ void BindDiffNote(u32 mask, bool hit) {
 }
 } // namespace
 
+// sotc: defined with the frame bind cache below (same unnamed namespace).
+namespace {
+u64 BindCacheFrameKey(const Pipeline* pipeline, u64 hash, u64 targets_key);
+}
+
 bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* prepared) {
     // sotc: SOTC_SYNC_PIPE counters: this call is one op (its Protect calls are counted).
     const SotcStats::SyncPipe::OpScope sync_pipe_op;
@@ -3079,6 +3084,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     }
     // sotc: SOTC_BIND_CACHE_FRAME, or SOTC_BUFFER_MEMO alone (the memo without the frame cache)
     bind_memo_ok = (SotcStats::kBindCacheFrame || SotcStats::kBufferMemo) && cache_eligible;
+    // sotc: SOTC_OP_COMPUTE_BIND. A dispatch eligible for the frame cache; mode 2 never takes a hit
+    // and compares the would-be hit (verify_ref, found before the full bind) with the full bind.
+    const bool compute_bind = cache_eligible && pipeline->IsCompute();
+    const bool compute_verify = compute_bind && SotcStats::kOpComputeBind == 2;
+    if (compute_bind && SotcStats::kFpsLog) {
+        SotcStats::op_compute_eligible.fetch_add(1, std::memory_order_relaxed);
+    }
+    BindCacheEntry* verify_ref = nullptr;
     compute_written_image = {};
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
@@ -3252,9 +3265,24 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             }
         }
         bind_input_push = push_data; // the draw's own viewport words (refreshed on a hit)
-        if (bool hit_dma = false; SotcStats::kBindCacheFrame
-                                      ? TryBindCacheFrame(pipeline, cache_hash, hit_dma)
-                                      : TryBindCache(pipeline, cache_hash, hit_dma)) {
+        if (compute_verify) {
+            // sotc: SOTC_OP_COMPUTE_BIND=2: the entry a hit would take, if it is still usable.
+            const u64 targets_key = bind_cache_state.targets_key;
+            BindCacheEntry* found =
+                BindCacheFindFrame(BindCacheFrameKey(pipeline, cache_hash, targets_key), pipeline,
+                                   cache_hash, targets_key);
+            if (found && found->valid && found->flush_gen == bind_cache_flush_gen &&
+                found->buffer_version == buffer_cache.BindVersion()) {
+                verify_ref = found;
+            }
+        }
+        if (bool hit_dma = false; !compute_verify &&
+                                  (SotcStats::kBindCacheFrame
+                                       ? TryBindCacheFrame(pipeline, cache_hash, hit_dma)
+                                       : TryBindCache(pipeline, cache_hash, hit_dma))) {
+            if (compute_bind && SotcStats::kFpsLog) {
+                SotcStats::op_compute_hits.fetch_add(1, std::memory_order_relaxed);
+            }
             // The arrays now hold this state: the next identical draw may take the fast bind.
             if (fast_eligible) {
                 CommitFastBind(pipeline, fast_hash, hit_dma);
@@ -3370,6 +3398,43 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         buffer_cache.SynchronizeDmaBuffers();
     }
 
+    if (verify_ref) {
+        // sotc: SOTC_OP_COMPUTE_BIND=2. The descriptors, their info arrays and the push data of
+        // the entry a hit would take, against the ones this full bind built (before the commit
+        // below overwrites the entry). Same encoding as CommitBindCacheFrame's write_info.
+        const BindCacheEntry& ref = *verify_ref;
+        bool same = std::memcmp(&ref.push_data, &push_data, sizeof(push_data)) == 0 &&
+                    ref.writes.size() == set_writes.size() &&
+                    ref.write_sets.size() == set_write_sets.size() &&
+                    ref.write_info.size() == set_writes.size() &&
+                    ref.buffer_infos.size() == buffer_infos.size() &&
+                    ref.image_infos.size() == image_infos.size();
+        for (size_t i = 0; same && i < set_writes.size(); ++i) {
+            const auto& a = ref.writes[i];
+            const auto& b = set_writes[i];
+            same = a.dstBinding == b.dstBinding && a.dstArrayElement == b.dstArrayElement &&
+                   a.descriptorCount == b.descriptorCount && a.descriptorType == b.descriptorType &&
+                   ref.write_sets[i] == set_write_sets[i];
+            const u32 info = b.descriptorType == vk::DescriptorType::eStorageBuffer
+                                 ? 0x80000000u | static_cast<u32>(b.pBufferInfo - buffer_infos.data())
+                                 : static_cast<u32>(b.pImageInfo - image_infos.data());
+            same = same && ref.write_info[i] == info;
+        }
+        same = same &&
+               (buffer_infos.empty() ||
+                std::memcmp(ref.buffer_infos.data(), buffer_infos.data(),
+                            buffer_infos.size() * sizeof(vk::DescriptorBufferInfo)) == 0) &&
+               (image_infos.empty() ||
+                std::memcmp(ref.image_infos.data(), image_infos.data(),
+                            image_infos.size() * sizeof(vk::DescriptorImageInfo)) == 0);
+        if (SotcStats::kFpsLog) {
+            SotcStats::op_compute_verify_checks.fetch_add(1, std::memory_order_relaxed);
+            if (!same) {
+                SotcStats::op_compute_verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
     if (fast_eligible) {
         CommitFastBind(pipeline, fast_hash, uses_dma);
     }
@@ -3393,7 +3458,11 @@ bool Rasterizer::BindCacheEligible(const Pipeline* pipeline, const AmdGpu::Regs&
     // sotc: SOTC_BIND_CACHE: graphics binds whose resources are all read-only (as FastBindEligible,
     // bindless sampler stages included: their heap slots are kept in the entry). A bind that
     // writes buffers or images, compute included, is not eligible and flushes the cache.
-    if (pipeline->IsCompute() || regs.clipper_control.user_clip_plane_enable != 0) {
+    // sotc: SOTC_OP_COMPUTE_BIND: a dispatch is eligible under the same rules when it reads only
+    // (no DMA pointer, no sharp table; the write checks below apply to it too).
+    const bool compute = pipeline->IsCompute();
+    if ((compute && SotcStats::kOpComputeBind == 0) ||
+        regs.clipper_control.user_clip_plane_enable != 0) {
         return false;
     }
     for (const auto* stage : pipeline->GetStages()) {
@@ -3401,6 +3470,9 @@ bool Rasterizer::BindCacheEligible(const Pipeline* pipeline, const AmdGpu::Regs&
             continue;
         }
         if (stage->has_storage_images || !stage->fmasks.empty()) {
+            return false;
+        }
+        if (compute && (stage->uses_dma || !stage->sharp_tables.empty())) {
             return false;
         }
         for (const auto& desc : stage->buffers) {
