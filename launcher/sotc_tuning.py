@@ -301,14 +301,14 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   '',
   ()),
  ('SOTC_DROP_FAST',
-  'flag_on',
+  'flag',
   'memory',
   ('Liberar memória que a GPU só leu, sem espera', 'Fast release of memory the GPU only read'),
-  ('Ligado por padrão: liberar memória que a GPU só leu não espera a thread de desenho. '
+  ('Desligado por padrão (de novo desde 1/11): liberar memória que a GPU só leu não espera a thread de desenho. '
    'Medido: menos travadas nas cargas (o pior quadro caiu de 417 ms para 125–185 ms, e as esperas '
    'ao liberar memória de ~9 s para menos de 50 ms por sessão). ATENÇÃO: em 1 de 4 testes o jogo '
    'fechou sozinho ao carregar o save; a causa ainda não foi encontrada.',
-   'On by default: releasing memory the GPU only read does not wait for the draw thread. '
+   'Off by default (again since 1 Nov): releasing memory the GPU only read does not wait for the draw thread. '
    'Measured: fewer hitches while loading (worst frame from 417 ms to 125-185 ms, memory-release '
    'waits from ~9 s to under 50 ms per session). WARNING: in 1 of 4 tests the game closed on its '
    'own while loading the save; the cause is not found yet.'),
@@ -1910,17 +1910,18 @@ def defaults():
             for name, kind, _group, _title, _hint, default, _options in TUNING}
 
 
-# Switches whose launcher default changed from off to on: a launcher setting saved before the change
-# holds False ("off, the old default") although the player never chose it. migrate() drops such a
-# saved value once, so the box shows the new default. (marker key, names)
+# Switches whose launcher default changed: a launcher setting saved before the change holds the old
+# default although the player never chose it. migrate() drops such a saved value once, so the box
+# shows the new default. (marker key, names)
 DEFAULT_ON_MIGRATIONS = [
     ('tune_migrated_20261030', ('SOTC_STAGING_LARGE_POW2',)),
     ('tune_migrated_20261030b', ('SOTC_DROP_FAST',)),
+    ('tune_migrated_20261101', ('SOTC_DROP_FAST',)),  # back to off (crash 1 in 4 sessions, not found)
 ]
 
 
 def migrate(saved):
-    """Drops the saved values of switches that became on by default (DEFAULT_ON_MIGRATIONS), once."""
+    """Drops the saved values of switches whose default changed (DEFAULT_ON_MIGRATIONS), once."""
     for marker, names in DEFAULT_ON_MIGRATIONS:
         if saved.get(marker):
             continue

@@ -751,12 +751,12 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
     // then does not wait for the draw thread to finish its current operation (up to a frame
     // while it waits for a free presentation frame; seconds per minute while loading, with the
     // region lock of the unmap held and the game's other threads sleeping on it).
-    // sotc: on by default since 30 Oct 2026 (=0 turns it off): worst load frame 417 -> 125-185 ms.
-    // Caveat kept from the first tests: 1 of 4 sessions closed while loading the save ("bad PM4
-    // packet"); Liverpool::CmdRanges now waits for command buffers in the freed memory.
+    // sotc: off by default again since 1 Nov 2026 (=1 turns it on; on from 30 Oct): worst load frame
+    // 417 -> 125-185 ms, but 1 of 4 sessions closed while loading the save ("bad PM4 packet") and the
+    // cause is not found; Liverpool::CmdRanges waits for command buffers in the freed memory.
     static const bool fast = [] {
         const char* v = std::getenv("SOTC_DROP_FAST");
-        return !v || v[0] != '0';
+        return v && v[0] == '1';
     }();
     if (fast) {
         bool gpu_ranges;
