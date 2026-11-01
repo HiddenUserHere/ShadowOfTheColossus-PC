@@ -55,9 +55,13 @@ struct Span {
 
 // Zero-copy (flag 0x800) creators: the per-frame particle and BPXPR builders, the 0x94fb0 draw buffers and the
 // 0x198bb0 writer (heaps.md 7.4).
+// impl-writes5 item 2: ResolveSunShadows 0xafcc0 and its twin 0xb0100 (per frame: reached from 0xafca0 by the
+// shadow pass; the 0x10-byte backing is written before the 0x804 creator call), and 0x1af960 (the GPU5 blocks of
+// the two 0x804 creators are filled by its loops before the creators run).
 constexpr Span kZeroCopyCallers[] = {
     {0xffe60, 0xfff9e},   {0x19b760, 0x19c193}, {0x19c1a0, 0x19c732}, {0x19c7e0, 0x19ce60},
     {0x94fb0, 0x95313},   {0x198bb0, 0x19a1c4},
+    {0xafcc0, 0xb0100},   {0xb0100, 0xb056e},   {0x1af960, 0x1afc33},
 };
 
 // The per-frame chunk writers of 0x8c0d0 (heaps.md 7.5: the 27 callers that memcpy into a chunk), the instance
@@ -71,6 +75,66 @@ constexpr Span kChunkCallers[] = {
     {0x1a3e50, 0x1a42de}, {0x1a4800, 0x1a4b6d}, {0x1a4b70, 0x1a4ffe}, {0x1a5490, 0x1a57c8},
     {0x1acb10, 0x1acdba}, {0x1acdc0, 0x1ad056}, {0xaaf80, 0xab309},   {0x11c710, 0x11cf37},
     {0x123410, 0x12380a}, {0x8b7f0, 0x8b8da}, // EndFrameView_WriteA (heaps.md 7.5 chunk user, per frame)
+    // impl-writes5 item 1: chunk-out callers of 0x8c0d0 that the GPU reads (decomp evidence per function).
+    // Tags: DIRECT = the chunk reaches a bind (0x85ecd0/0x85e5d0), PM4 (0x16edc0/0x16ee00/0x16ee80/0x16eb00/
+    // 0x16ed40), V# (0x865410 family), ZC (0x8be60) or DMA (0x16eb90), directly or in a callee within two hops;
+    // SLOT = the chunk is stored in an object slot that the same function (or the bind records of its family)
+    // reads back into a bind/PM4 record; HANDLE = the 0x8c0d0 block is the storage of a resource that 0x8be60
+    // creates in the same function. The 37 SLOT+0xb0 rows without a sink in their body are inferred from the
+    // family (the slot +0xb0 is copied into the bind records of sub_afcc0 and 0x1ad940); see impl-writes5.md.
+    {0xa1e10, 0xa20ab},   // sub_a1e10 SLOT(+0xb0) + bind
+    {0xa75b0, 0xa789b},   // sub_a75b0 SLOT(+0xb0) + PM4
+    {0xa78a0, 0xa7ead},   // sub_a78a0 DIRECT bind
+    {0xa7eb0, 0xa83ee},   // sub_a7eb0 SLOT(+0xb0) + PM4/bind
+    {0xa83f0, 0xa86f2},   // sub_a83f0 DIRECT bind
+    {0xafcc0, 0xb00fe},   // sub_afcc0 (ResolveSunShadows) SLOT(+0xb0) + PM4/bind
+    {0xb50c0, 0xb5b05},   // sub_b50c0 DIRECT bind + PM4
+    {0xb9710, 0xba57c},   // sub_b9710 VIA 0x93960 -> V# encoder 0x85fc10
+    {0xd83b0, 0xd8653},   // sub_d83b0 DIRECT bind
+    {0xe60c0, 0xe6342},   // sub_e60c0 SLOT(+0xb0) + PM4/bind
+    {0xe69e0, 0xe738f},   // sub_e69e0 SLOT(+0xb0) + PM4/bind
+    {0xe7390, 0xe7b53},   // sub_e7390 SLOT(+0xb0) + PM4/bind
+    {0xe7b60, 0xe80cd},   // sub_e7b60 SLOT(+0xb0) + PM4/bind
+    {0x103ad0, 0x1051e4}, // ParticleRenderer::UpdateSimulation DIRECT bind, SLOT(+0xb8) + PM4
+    {0x107540, 0x1097cb}, // ParticleRenderer::BeginFrame VIA 0xffe60 (particle ZC creator)
+    {0x10bfd0, 0x10c136}, // sub_10bfd0 SLOT(+0xb0) + PM4/bind
+    {0x10c140, 0x10c2dc}, // sub_10c140 SLOT(+0xb0) + PM4/bind
+    {0x10c8c0, 0x10cdad}, // sub_10c8c0 DIRECT PM4
+    {0x10cf60, 0x10d1ac}, // sub_10cf60 DIRECT bind + PM4
+    {0x10db10, 0x10df23}, // sub_10db10 SLOT(+0xb0) + PM4/bind
+    {0x118470, 0x118ca0}, // Frame::InsertWaitFlipDone HANDLE (8be60 at 0x118470+0x220160)
+    {0x17e6b0, 0x17e9b4}, // sub_17e6b0 SLOT(+0xb0) + PM4/bind
+    {0x17ecf0, 0x17f788}, // sub_17ecf0 SLOT(+0xb0) + PM4
+    {0x186540, 0x186a57}, // sub_186540 HANDLE (8be60 on local_80)
+    {0x1871a0, 0x187506}, // sub_1871a0 HANDLE (8be60 on local_80)
+    {0x187510, 0x187805}, // sub_187510 HANDLE (8be60 on local_80)
+    {0x1893e0, 0x1899e9}, // sub_1893e0 SLOT(+0x98) + PM4
+    {0x18a2c0, 0x18a448}, // sub_18a2c0 SLOT(+0xb0) + bind
+    {0x18cf40, 0x18d3f8}, // sub_18cf40 HANDLE (8be60 on local_188)
+    {0x1925a0, 0x1927c9}, // sub_1925a0 DIRECT bind
+    {0x1a5000, 0x1a5301}, // sub_1a5000 DIRECT bind, SLOT(param_3+0xb0) + PM4
+    {0x1ad940, 0x1adc83}, // sub_1ad940 DIRECT bind
+    {0x1ade10, 0x1ae168}, // sub_1ade10 DIRECT bind
+    {0x5d1540, 0x5d1746}, // sub_5d1540 HANDLE (8be60 on local_160)
+    {0x5de0b0, 0x5de876}, // sub_5de0b0 DIRECT ZC (chunk is the 8be60 backing)
+    {0x5deb40, 0x5df1e8}, // sub_5deb40 DIRECT ZC
+    {0x5df1f0, 0x5df9a3}, // sub_5df1f0 DIRECT ZC + HANDLE
+    {0x5df9b0, 0x5e056b}, // sub_5df9b0 HANDLE (8be60 on local_110)
+    {0x5e09e0, 0x5e18b0}, // sub_5e09e0 DIRECT ZC + HANDLE
+    {0x5e18b0, 0x5e2019}, // sub_5e18b0 DIRECT ZC
+    {0x5e29f0, 0x5e3b49}, // sub_5e29f0 HANDLE (8be60 on param_3)
+    {0x5e3b50, 0x5e410f}, // sub_5e3b50 HANDLE (8be60 on local_160)
+    // SLOT(+0xb0) functions without a sink in their body (inferred from the family, see the comment above)
+    {0xaf610, 0xafc99},   {0xb0100, 0xb056e},   {0xb0570, 0xb098a},   {0xb5b10, 0xb6588},
+    {0xb6760, 0xb6e15},   {0xb8c60, 0xb9205},   {0xb9210, 0xb9608},   {0xba870, 0xbab3b},
+    {0xbae70, 0xbb18d},   {0xbb310, 0xbb834},   {0xbbbf0, 0xbc00e},   {0xd79c0, 0xd7e95},
+    {0xe6350, 0xe65f7},   {0xe84b0, 0xe8e7e},   {0xe8e80, 0xe9670},   {0xe9670, 0xe9c00},
+    {0x1097d0, 0x109969}, {0x10c4e0, 0x10c6b3}, {0x10d890, 0x10db10}, {0x10df30, 0x10e38a},
+    {0x1642d0, 0x16450e}, {0x17cac0, 0x17cd82}, {0x17e000, 0x17e5c2}, {0x17e9c0, 0x17ecf0},
+    {0x17f790, 0x18028a}, {0x1802e0, 0x18056b}, {0x18a590, 0x18a719}, {0x1a28c0, 0x1a2bb6},
+    {0x1a42e0, 0x1a4628}, {0x5d5820, 0x5d5e32},
+    {0xa20b0, 0xa2368},   {0xa69d0, 0xa6de3},   {0xa8f80, 0xa9296},   {0xa92a0, 0xa9898},
+    {0xa98a0, 0xa9e05},   {0xa9e10, 0xaa13e},   {0xaea10, 0xaf60b},
 };
 
 bool InSpans(uint64_t image_offset, const Span* spans, size_t count) {
