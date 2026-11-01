@@ -135,6 +135,16 @@ managers, 300+ ranges) plus the full re-import walk; and the binds of the new ru
 ring add (AddRingRange, as mode 5), whole heap regions instead of 64 KiB granules (few imports, no class track),
 and a cheaper heap source than the memtype probe. Parked: off by default.
 
+Quick wins from the draw-thread design (reports3/draw/DRAW-THREAD-DESIGN.md), 1 Nov:
+- kFpsTimers was false with SOTC_FPS set (inline-variable init order): fixed (cc6f03e); "draw busy" and the
+  SOTCSTALL waits are real now. Draw busy with timers live: ~33 ms/frame (the draw thread is really full).
+- Matrix runs carry the users' culling cvars; base pins SOTC_PC_RING=0; "default" = current defaults.
+- ring8 on by default in sotc.py (f85137d). One round 080155: base 29.4 / p99 67.4 / max 108.3, default 29.1 /
+  50.3 / 147.3 (the max is one type-B burst frame, 114 readbacks; >100 ms frames 1 vs 2).
+- SOTC_STAGING_CACHED=1 on default (qw-staging): 29.4 / 42.3 / 116.2, >50 ms 2 — maybe better, within noise.
+  SOTC_REC_SPIN_US=0 (qw-recspin): 29.2 / 58.2 / 141.5 — no gain. Neither changed defaults.
+- Not done: wire static class mode 3; save the exe next to each profile.
+
 ## Next
 Fix ring8 vertices, combined matrix (several rounds), long play test, AMD/Intel, enable proven switches by default,
 CHANGELOG (Portuguese) and docs, commit. Progress estimate ~74%.
