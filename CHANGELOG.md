@@ -72,6 +72,28 @@ com `=0` (ou na aba Ajustes experimentais do lançador).
   o menu diz isso. O pulo para colosso usa a automação de comandos da engine descoberta por tabnul na
   PR AjncSystem/ShadowOfTheColossus-PC#345 (ainda não mesclada). Guia: `docs/sotc/LAB.md`.
 
+**Arena de quadro lida direto da RAM (ligado por padrão)**
+A memória que o jogo reescreve a cada quadro (a arena por quadro) agora é lida pela GPU direto da RAM,
+sem proteger páginas nem copiar para a VRAM (`SOTC_PC_RING=8`; `SOTC_PC_RING=0` volta ao comportamento
+antigo). Medido em 1/11 na rota de testes do Lab, com as configurações de culling padrão: FPS igual
+(29,3 contra 29,5), quadro mais lento de 139 para 67 ms, faltas de escrita no código do jogo −32% e nos
+módulos do host −73%.
+- Binds de buffers sem tamanho definido que começam na arena terminam no fim do bloco
+  (`SOTC_PC_RING8_CLIP`): eles reenviavam ~33 MB por bind e causavam vértices estranhos.
+- Páginas que deixam a arena são reenviadas: corrige linhas coloridas rápidas na tela de carregamento.
+- Na troca de quadro, o jogo espera só a GPU terminar o quadro que usou a metade da arena que ele vai
+  reescrever (`SOTC_PC_RING8_FLIPWAIT=2`, ~1 µs por troca; `=1` é a espera antiga, que custava ~6 FPS).
+- Usa o leitor de alocações e o gancho da troca de quadro (`SOTC_HOOK_ALLOC_PROBE`,
+  `SOTC_HOOK_FRAME_FLIP`), ligados junto com ele.
+- Só foi testado em placa NVIDIA. Em AMD/Intel, se o driver recusar importar a memória, os binds seguem
+  o caminho antigo; se aparecer algo estranho, teste com `SOTC_PC_RING=0`.
+
+**Diagnóstico**
+- Os tempos de `SOTC_FPS` (espera da draw thread, parse do processador de comandos, esperas, faltas)
+  marcavam 0: o interruptor que os liga era lido antes de ser inicializado. "draw busy" agora é o
+  trabalho real da thread, não a duração do quadro.
+- A matriz de testes (`tools/pcmem_matrix.py`) usa as configurações de culling dos jogadores.
+
 **Modelo de memória do PC (experimental, tudo desligado por padrão)**
 Troca em andamento da memória unificada do PS4: a RAM passa a guardar o que a CPU escreve, e a VRAM
 guarda o que a GPU lê e escreve. Sem as chaves abaixo, nada muda. Como testar: `docs/sotc/MODELO-MEMORIA-PC-2.md`.

@@ -337,6 +337,13 @@ in lot `-032958` ranged 26.2 to 28.1 across its two rounds; differences smaller 
   GPU when a served write came since the previous label, or an earlier deferred label is outstanding
   (`liverpool.cpp`, EventWriteEop; design note in `gpu/sotc/pc_ring.h`). ReleaseMem and EventWriteEos
   labels are not covered yet.
+- **Update, 1 Nov (later):** `SOTC_PC_RING=8` is now the default (sotc.py, with `SOTC_HOOK_ALLOC_PROBE=1` and
+  `SOTC_HOOK_FRAME_FLIP=1`; `SOTC_PC_RING=0` turns it off). Fixes since the table above: windowed binds clipped
+  to the imported run end (`SOTC_PC_RING8_CLIP`), cross-edge binds never memoized, pages leaving the ring marked
+  CPU-modified, precise flip wait (`SOTC_PC_RING8_FLIPWAIT=2`), deferred labels on in mode 8. Lot
+  `20261101-075954` (users' culling cvars, live timers): base 29.5 FPS / max 138.6 ms, ring8 29.3 / 66.8 ms,
+  write faults 3268/2910 -> 2235/788 per s. User checks: vertices and loading-screen lines gone. Heap serving
+  (`SOTC_PC_RING8_HEAPS`) is measured and parked (see HANDOFF.md).
 
 **Tools.** `tools/pcmem_matrix.py` runs named configurations (`SWITCHES` in the file) in interleaved
 rounds on the Lab test route and writes `summary.md` after each run. A run counts only when its log has

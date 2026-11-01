@@ -74,7 +74,11 @@ def merge_switches(name, *parts):
 
 
 SWITCHES = {
-    'base': {'SOTC_RAM_REPORT': '1'},
+    # The pre-ring8 reference: sotc.py turns SOTC_PC_RING=8 on by default since 1 Nov, so every other
+    # configuration without its own SOTC_PC_RING runs on top of ring8.
+    'base': {'SOTC_RAM_REPORT': '1', 'SOTC_PC_RING': '0'},
+    # The current defaults (sotc.py: ring8 and its hooks), nothing else set.
+    'default': {'SOTC_RAM_REPORT': '1'},
     # Current configurations.
     'verify': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_FRAME_FLIP': '1', 'SOTC_PC_RING': '4',
                'SOTC_PC_POOL': '2', 'SOTC_CLASS_TRACK': '2', 'SOTC_HOOK_MEMTYPE_PROBE': '1',

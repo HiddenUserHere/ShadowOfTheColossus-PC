@@ -351,6 +351,13 @@ def main():
     # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
     # in 120 Hz vblanks).
     env.setdefault('BB_VBLANK_HZ', '120')
+    # The per-frame arena read by the GPU in host memory (SOTC_PC_RING=8, gpu/sotc/pc_ring.h): same FPS,
+    # max frame ~140 -> ~67 ms and a third fewer write faults on the Lab route (1 Nov). It needs the
+    # allocator probe (the arena blocks) and the frame flip hook (the flip wait). SOTC_PC_RING=0 turns it off.
+    env.setdefault('SOTC_PC_RING', '8')
+    if env['SOTC_PC_RING'] == '8':
+        env.setdefault('SOTC_HOOK_ALLOC_PROBE', '1')
+        env.setdefault('SOTC_HOOK_FRAME_FLIP', '1')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
