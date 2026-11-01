@@ -18,6 +18,7 @@
 #include "static_class.h"
 #include "freecam.h"
 
+#include "native/native_particles.h"
 #include "native/native_results.h"
 #include "native/native_windows_hooks.h"
 #include "native/native_sync.h"
@@ -58,6 +59,7 @@ void RegisterAllHandlers() {
     SotcNativeHooks::Register(); // sotc: SOTC_NATIVE write hooks
     SotcNativeSync::Register();  // sotc: SOTC_NATIVE frame ticket hooks (native_sync.py)
     SotcNativeResults::Register(); // sotc: SOTC_NATIVE GPU-result consumers (native_results.py)
+    SotcNativeParticles::Register(); // sotc: SOTC_NATIVE_PARTICLES verify site (particle_prev.py)
     SotcNativeWindowHooks::Register(); // sotc: SOTC_NATIVE allocator windows (native_windows.py)
 }
 

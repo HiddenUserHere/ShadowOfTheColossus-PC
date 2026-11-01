@@ -61,6 +61,7 @@
 #include "../../../../sotc/native/native_sync.h" // sotc: SOTC_NATIVE frame ticket report
 #include "../../../../sotc/native/verify.h" // sotc: SOTC_VERIFY report
 #include "../../../../sotc/native/native_results.h" // sotc: SOTC_NATIVE results report
+#include "../../../../sotc/native/native_particles.h" // sotc: SOTC_NATIVE_PARTICLES report
 namespace SotcNativeHooks { void Report(std::string& out, double seconds); } // sotc: native_hooks.cpp
 #include "../../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST report
 #include "../../../../sotc/rb_class.h"    // sotc: SOTC_RB_CLASS report
@@ -2026,6 +2027,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcNativeSync::Report(report, seconds);  // sotc: SOTC_NATIVE frame ticket
             SotcVerify::Report(report, seconds);      // sotc: SOTC_VERIFY
             SotcNativeResults::Report(report, seconds); // sotc: SOTC_NATIVE GPU-result consumers
+            SotcNativeParticles::Report(report, seconds); // sotc: SOTC_NATIVE_PARTICLES=prev
             SotcQueues::Report(report, seconds);        // sotc: SOTC_N5_QUEUES
             Vulkan::FrameGraph::Report(report, seconds); // sotc: SOTC_N5_GRAPH
             Vulkan::FrameGraph::ReportAsync(report, seconds); // sotc: SOTC_N5_ASYNC_COMPUTE=2

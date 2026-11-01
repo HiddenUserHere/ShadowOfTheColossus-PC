@@ -25,16 +25,18 @@
 // Why no previous-frame serving: the read slot is already the oldest slot of the ring. The slot
 // dispatched last is the newer one, and the GPU may still be running it, so pointing the read at it
 // makes the CPU wait for newer GPU work. Older GPU data does not exist in a three-slot ring. A
-// stall-free read needs a port-owned copy of a finished slot, which is not built here. The stall
+// stall-free read needs a port-owned copy of a finished slot: mode 3 (native/native_particles.cpp). The stall
 // comes from the 64 KiB page being shared with GPU-written buffers (CHANGELOG, SOTC_RB_EXACT).
 //
-// SOTC_PARTICLE_PREV is observe-only in both modes:
+// SOTC_PARTICLE_PREV modes 1 and 2 only observe; 3 serves (SOTC_NATIVE_PARTICLES=prev, set by sotc.py):
 //   1 = count the ProcessStats reads and whether the slot read and the dispatch-before slot are
 //       readable; nothing is served ("served=0" in the report).
 //   2 = as 1, and compare the counts of the read slot and the previous slot for the systems the
 //       caller reads (active bitmap at pool+0x198, bound pool+0x1a8). The values come from the
 //       backing view, so they show what a non-faulting reader would see; they do not prove what the
 //       game reads.
+//   3 = the call's arrays go to SotcNativeParticles::OnStatsRead, which may return a completed copy
+//       instead of the GPU array. No observation counters (the native module reports).
 // Only the return address 0x1019b4 (ProcessStats) is measured. WaterRendering::ReadQueries calls
 // the same accessor from 0xe4930 and is ignored.
 #include <atomic>
@@ -49,6 +51,7 @@
 #include "particle_prev.h"
 #include "rb_class.h" // sotc: SOTC_RB_CLASS (stats ring arrays)
 #include "rb_host.h"  // sotc: SOTC_RB_HOST (stats arrays as host runs)
+#include "native/native_particles.h" // sotc: SOTC_NATIVE_PARTICLES=prev (mode 3)
 
 extern "C" {
 // runtime_memory.c: the unprotected backing view of a guest address (null when unmapped).
@@ -62,6 +65,7 @@ using SotcHooks::HookAction;
 
 constexpr const char* kHook = "PARTICLE_COUNT_READ";
 constexpr uint64_t kProcessStatsReturn = 0x1019b4; // eboot offset after "call sub_8c1b0" at 0x1019af
+constexpr uint64_t kPoolCounter = 0x64;            // pool+0x64: u32 call counter (incremented before the read)
 constexpr uint64_t kPoolRing = 0xf8;               // pool+0xf8: three descriptors
 constexpr uint64_t kSlotStride = 0x28;             // descriptor stride
 constexpr uint64_t kPoolBitmapPtr = 0x198;         // pool+0x198: u64* active-system bitmap
@@ -280,6 +284,25 @@ void RequestDispatched(uint64_t pool, uint64_t slot, uint64_t desc) {
     }
 }
 
+// Mode 3: hands the call's arrays to the native serving (native/native_particles.h). An unreadable
+// descriptor or pool keeps the exact read.
+HookAction ServeNative(GuestRegs& regs, uint64_t pool, uint64_t read_desc, uint64_t dispatch_desc) {
+    uint32_t counter = 0;
+    uint64_t read_base = 0;
+    uint64_t extent = 0;
+    if (!ReadGuest(pool + kPoolCounter, &counter, 4) || !ArrayAddress(read_desc, &read_base) ||
+        !ActiveExtent(pool, &extent)) {
+        return HookAction::Continue;
+    }
+    uint64_t dispatch_base = 0;
+    uint64_t dispatched = 0;
+    if (!ArrayAddress(dispatch_desc, &dispatch_base) || !DispatchEntries(dispatch_desc, &dispatched)) {
+        dispatch_base = 0;
+        dispatched = 0;
+    }
+    return SotcNativeParticles::OnStatsRead(regs, pool, counter, read_base, dispatch_base, dispatched, extent);
+}
+
 HookAction OnCountRead(GuestRegs& regs, void*) {
     // Read once, after the hooks are installed (the first call comes from the game).
     static const int mode = SotcHooks::HookMode(kHook);
@@ -309,6 +332,11 @@ HookAction OnCountRead(GuestRegs& regs, void*) {
     // The slot the next call reads, (read + 1) % 3, was dispatched in the previous call (mode 1/2
     // counters only). The slot dispatched in this call is (read + 2) % 3 (see the file comment).
     const uint64_t prev_desc = pool + kPoolRing + ((read_slot + 1) % 3) * kSlotStride;
+
+    // sotc: SOTC_NATIVE_PARTICLES=prev (sotc.py sets mode 3): the last completed copy, no observation.
+    if (mode == 3) {
+        return ServeNative(regs, pool, read_desc, pool + kPoolRing + ((read_slot + 2) % 3) * kSlotStride);
+    }
 
     g_calls.fetch_add(1, std::memory_order_relaxed);
 
@@ -405,6 +433,9 @@ void ReportParticlePrev(std::string& out, double seconds) {
         return;
     }
     const int mode = SotcHooks::HookMode(kHook);
+    if (mode == 3) {
+        return; // SotcNativeParticles::Report
+    }
     const uint64_t calls = g_calls.exchange(0, std::memory_order_relaxed);
     const uint64_t read_bad = g_read_unreadable.exchange(0, std::memory_order_relaxed);
     const uint64_t prev_bad = g_prev_unreadable.exchange(0, std::memory_order_relaxed);

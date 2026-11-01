@@ -399,6 +399,8 @@ private:
     u32 sotc_lod_cycles{};
     std::unique_ptr<VideoCore::Buffer> sotc_lod_feedback;
     std::unique_ptr<VideoCore::Buffer> sotc_lod_download;
+    /// sotc: SOTC_NATIVE_PARTICLES=prev: the ring the particle count arrays are copied into.
+    std::unique_ptr<VideoCore::Buffer> sotc_particle_copies;
     std::array<std::atomic<bool>, SotcLodFeedbackAreas> sotc_lod_pending{};
     u32 sotc_lod_area{};
     std::chrono::steady_clock::time_point sotc_lod_last{};
@@ -431,6 +433,8 @@ private:
     std::vector<RbMirror> rb_mirrors;
     bool rb_mirror_collect{};
     void FlushRbMirrors(vk::CommandBuffer cmdbuf);
+    /// sotc: SOTC_NATIVE_PARTICLES=prev: hands the dispatch's written binds to the particle stats copies.
+    void CopyParticleStats(vk::CommandBuffer cmdbuf);
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;

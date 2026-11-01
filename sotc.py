@@ -372,6 +372,13 @@ def main():
     if env.get('SOTC_NATIVE', '0') not in ('', '0'):
         env.setdefault('SOTC_HOOK_ALLOC_PROBE', '1')
         env.setdefault('SOTC_HOOK_MEMTYPE_PROBE', '1')
+    # Particle stats from the last completed GPU copy (gpu/sotc/native/native_particles.h): the stats hook
+    # serves in mode 3. Needs SOTC_NATIVE (the frame ticket); its observe modes 1 and 2 are replaced.
+    if env.get('SOTC_NATIVE_PARTICLES') == 'prev':
+        if env.get('SOTC_PARTICLE_PREV', '3') != '3':
+            print('sotc: SOTC_PARTICLE_PREV=3 (SOTC_NATIVE_PARTICLES=prev serves through the same hook)',
+                  file=sys.stderr)
+        env['SOTC_PARTICLE_PREV'] = '3'
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).

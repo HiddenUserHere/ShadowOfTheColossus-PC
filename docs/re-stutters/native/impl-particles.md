@@ -6,11 +6,9 @@ No hooks added, so `hooks_install_check` was not run for new patterns.
 
 ## Status
 
-Decision made (option 3, see below). Implementation NOT done: the serving source that option 3 needs (a completed
-copy of the count array that the CPU can read without waiting) does not exist in the native path, and the only
-copy machinery (`SotcRbClass::RequestCopy`, `rb_class.h`) is owned by another area. Adding a switch that serves
-from an unproven source would be worse than the current exact read, so no `SOTC_NATIVE_PARTICLES` switch was
-written. The next step is listed under "What remains".
+Option 3 approved by the user (1 Nov) and implemented (coordinator, after this report): `SOTC_NATIVE_PARTICLES=prev`,
+default off (the exact read). Built and hook-checked; not run in game. Section "Implementation" at the end describes
+it; sections 1-6 are the analysis it follows.
 
 ## 1. The read and the producer
 
@@ -114,3 +112,31 @@ the page was never downloaded. Serving it could retire live systems.
 3. Option 1 stays as the later target only if the emitter's `maxLife` and spawn state are pinned in the decomp;
    it would need its own user approval, since it changes retirement timing.
 4. The GPU stats shader body (what exactly the count counts) is not read; confirm before relying on "live particles".
+
+## Implementation (SOTC_NATIVE_PARTICLES=prev)
+
+Files: `gpu/sotc/native/native_particles.{h,cpp}` (policy, copies, verify), `gpu/sotc/particle_prev.cpp` (mode 3 hands the
+call's arrays over), `scripts/hooks.d/particle_prev.py` (NATIVE_PARTICLE_VERIFY site), `vk_rasterizer.cpp`
+(CopyParticleStats after each dispatch, the 2 MiB HostCached copy ring), `sotc.py` (sets SOTC_PARTICLE_PREV=3).
+Needs SOTC_NATIVE (the frame ticket).
+
+- Register: the call with pool counter c (after its increment) registers the array its pass writes as entry id c,
+  `min(dispatched, extent + 256)` u32 values (at most 4096; larger arrays keep the exact read).
+- Copy: after every dispatch, each written bind (`bound_buffers`, full bind or bind-cache hit) that overlaps a
+  registered array gets a GPU copy of the overlap into the ring (barrier compute write -> transfer, copy, barrier
+  transfer -> host read and all commands). The newest entry of an array takes the write.
+- Complete: the copies cover the whole entry and `SotcNative::FrameCompleted()` reached the frame the dispatch was
+  built in (FrameSubmitted + 1 at registration). Nothing waits: the check is a poll.
+- Serve: the entry of id c - 2 (the data the exact read sees) when complete; else the newest complete one of
+  c - 3 .. c - 4; else the exact read. Only an entry that holds every system the loop reads is served, so no
+  unknown value is served as zero. The counts go into one of 16 guest blocks of 16 KiB (runtime_low_map) and the
+  accessor 0x8c1b0 returns that block (HookAction::Return). ProcessStats only reads the array (decomp 0x1018c0).
+- Verify (SOTC_NATIVE=2 or SOTC_VERIFY=1): nothing is served; the candidate's counts are kept and the site after
+  the load at 0x101a98 (0x101a9c) compares each exact count with them.
+- Report line "SOTC NATIVE_PARTICLES": served same / older, exact reads (and how many had no copy), registered,
+  GPU copies, verify counts mismatched, "same-call" mismatches (must be 0), copy 0 for a live count.
+
+Memory: 2 MiB host-cached ring plus 256 KiB of low guest blocks. The first game session should run
+`SOTC_NATIVE=2 SOTC_NATIVE_PARTICLES=prev` (verify), then `SOTC_NATIVE=1` with the visual check of section 6.
+Open: if the count pass writes the array through something other than a buffer bind (texel or GDS), "no copy"
+stays high and nothing is served; the verify line shows it.
