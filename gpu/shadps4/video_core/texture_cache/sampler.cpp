@@ -10,6 +10,9 @@
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
+#include <boost/container/small_vector.hpp>
+#include "shader_recompiler/runtime_info.h" // sotc: SOTC_N5_BINDLESS
+#include "video_core/renderer_vulkan/vk_bindless.h" // sotc: SOTC_N5_BINDLESS
 
 namespace VideoCore {
 
@@ -117,38 +120,54 @@ BindlessSamplers::BindlessSamplers(const Vulkan::Instance& instance_) : instance
     const auto device = instance.GetDevice();
 
     // Samplers of the heap are read by any stage, so the layout is visible to all of them.
-    const vk::DescriptorSetLayoutBinding binding{
-        .binding = 0,
-        .descriptorType = vk::DescriptorType::eSampler,
-        .descriptorCount = Capacity,
-        .stageFlags = vk::ShaderStageFlagBits::eAll,
-    };
+    // sotc: SOTC_N5_BINDLESS: the heap image arrays (bindings 1 + key) join the same set.
+    const bool images = Shader::BindlessImagesEnabled();
+    boost::container::small_vector<vk::DescriptorSetLayoutBinding,
+                                  1 + Shader::NUM_BINDLESS_IMAGE_KEYS>
+        bindings{vk::DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eSampler,
+            .descriptorCount = Capacity,
+            .stageFlags = vk::ShaderStageFlagBits::eAll,
+        }};
+    if (images) {
+        for (const auto& image_binding : VideoCore::BindlessImageLayoutBindings()) {
+            bindings.push_back(image_binding);
+        }
+    }
     const vk::DescriptorBindingFlags binding_flags =
         vk::DescriptorBindingFlagBits::ePartiallyBound |
         vk::DescriptorBindingFlagBits::eUpdateAfterBind |
         // sotc: new samplers are written while earlier submits using the set are pending.
         vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+    boost::container::small_vector<vk::DescriptorBindingFlags, 1 + Shader::NUM_BINDLESS_IMAGE_KEYS>
+        binding_flag_list(bindings.size(), binding_flags);
     const vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info{
-        .bindingCount = 1,
-        .pBindingFlags = &binding_flags,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindingFlags = binding_flag_list.data(),
     };
     const vk::DescriptorSetLayoutCreateInfo layout_info{
         .pNext = &flags_info,
         .flags = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool,
-        .bindingCount = 1,
-        .pBindings = &binding,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
     };
     auto [layout_result, new_layout] = device.createDescriptorSetLayoutUnique(layout_info);
     ASSERT_MSG(layout_result == vk::Result::eSuccess, "Bindless sampler layout: {}",
                vk::to_string(layout_result));
     layout = std::move(new_layout);
 
-    const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eSampler, Capacity};
+    // sotc: SOTC_N5_BINDLESS: one pool size per descriptor type of the set.
+    const std::array<vk::DescriptorPoolSize, 2> pool_sizes{
+        vk::DescriptorPoolSize{vk::DescriptorType::eSampler, Capacity},
+        vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage,
+                               Shader::NUM_BINDLESS_IMAGE_KEYS * VideoCore::BindlessImageCapacity},
+    };
     const vk::DescriptorPoolCreateInfo pool_info{
         .flags = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind,
         .maxSets = 1,
-        .poolSizeCount = 1,
-        .pPoolSizes = &pool_size,
+        .poolSizeCount = images ? 2u : 1u,
+        .pPoolSizes = pool_sizes.data(),
     };
     auto [pool_result, new_pool] = device.createDescriptorPoolUnique(pool_info);
     ASSERT_MSG(pool_result == vk::Result::eSuccess, "Bindless sampler pool: {}",

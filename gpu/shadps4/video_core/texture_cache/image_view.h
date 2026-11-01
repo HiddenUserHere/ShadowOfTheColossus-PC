@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -49,11 +51,27 @@ struct ImageView {
     ImageView(const ImageView&) = delete;
     ImageView& operator=(const ImageView&) = delete;
 
-    ImageView(ImageView&&) = default;
-    ImageView& operator=(ImageView&&) = default;
+    // sotc: moves hand the heap slots over: the moved-from view releases nothing.
+    ImageView(ImageView&& other) noexcept;
+    ImageView& operator=(ImageView&& other) noexcept;
 
     ImageViewInfo info;
     vk::UniqueImageView image_view;
+
+    /// sotc: SOTC_N5_BINDLESS: the heap slot of this view per heap key (NO_BINDLESS_IMAGE_SLOT
+    /// when none), and the image layout that slot was written with (BindlessImages::Acquire).
+    std::array<u32, Shader::NUM_BINDLESS_IMAGE_KEYS> bindless_slots = NoBindlessSlots();
+    std::array<vk::ImageLayout, Shader::NUM_BINDLESS_IMAGE_KEYS> bindless_layouts{};
+
+    /// Gives every heap slot of this view back to the live heap (if any).
+    void ReleaseBindless() noexcept;
+
+private:
+    static std::array<u32, Shader::NUM_BINDLESS_IMAGE_KEYS> NoBindlessSlots() {
+        std::array<u32, Shader::NUM_BINDLESS_IMAGE_KEYS> slots{};
+        slots.fill(Shader::NO_BINDLESS_IMAGE_SLOT);
+        return slots;
+    }
 };
 
 } // namespace VideoCore

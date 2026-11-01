@@ -860,8 +860,14 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
 
     // sotc: SOTC_BINDLESS_SAMP=1 (default off) enables the global sampler heap (Vulkan 1.2
     // descriptor indexing). Only enabled when every feature it needs is present.
+    // sotc: SOTC_N5_BINDLESS (with SOTC_NATIVE) also turns the heap on: the image arrays are in its set.
+    const char* n5_env = std::getenv("SOTC_N5_BINDLESS");
+    const char* native_env = std::getenv("SOTC_NATIVE");
+    const bool n5_wanted = n5_env && (n5_env[0] == '1' || n5_env[0] == '2') && native_env &&
+                           (native_env[0] == '1' || native_env[0] == '2');
+    const char* sampler_env = std::getenv("SOTC_BINDLESS_SAMP");
     bindless_samplers = false;
-    if (const char* v = std::getenv("SOTC_BINDLESS_SAMP"); v && v[0] == '1') {
+    if (n5_wanted || (sampler_env && sampler_env[0] == '1')) {
         // Not combined with the other untested paths: they use the descriptors differently.
         const char* stage = std::getenv("SOTC_STAGE_BINDINGS");
         if (stage && stage[0] == '1') {
@@ -877,6 +883,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
                 vk12_features.descriptorBindingUpdateUnusedWhilePending &&
                 vk12_features.shaderSampledImageArrayNonUniformIndexing &&
                 features.shaderSampledImageArrayDynamicIndexing &&
+                // sotc: the push block is PushData + BindlessSamplerSlots (sampler and image words)
+                properties.limits.maxPushConstantsSize >=
+                    sizeof(Shader::PushData) + sizeof(Shader::BindlessSamplerSlots) &&
                 vk12_props.maxDescriptorSetUpdateAfterBindSamplers >= min_bindless_samplers &&
                 vk12_props.maxPerStageDescriptorUpdateAfterBindSamplers >= min_bindless_samplers;
             if (bindless_samplers) {
@@ -890,6 +899,19 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     // sotc: the shader compiler reads the setting (Shader::UsesBindlessSamplers); set before any
     // shader is compiled.
     Shader::SetBindlessSamplersEnabled(bindless_samplers);
+    // sotc: SOTC_N5_BINDLESS: sampled images from the heap arrays. The heap must hold every key at
+    // full capacity (update-after-bind limits), and the stages keep one set (no SOTC_STAGE_BINDINGS).
+    const char* stage_env = std::getenv("SOTC_STAGE_BINDINGS");
+    const u32 n5_descriptors = Shader::NUM_BINDLESS_IMAGE_KEYS * 4096u;
+    const bool bindless_images =
+        n5_wanted && bindless_samplers && !(stage_env && stage_env[0] == '1') &&
+        vk12_features.descriptorBindingSampledImageUpdateAfterBind &&
+        vk12_props.maxDescriptorSetUpdateAfterBindSampledImages >= n5_descriptors &&
+        vk12_props.maxPerStageDescriptorUpdateAfterBindSampledImages >= n5_descriptors;
+    if (n5_wanted && !bindless_images) {
+        LOG_WARNING(Render_Vulkan, "SOTC_N5_BINDLESS ignored: heap features or limits missing");
+    }
+    Shader::SetBindlessImagesEnabled(bindless_images);
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = queue_info_count,

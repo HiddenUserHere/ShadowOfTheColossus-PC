@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_bindless.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -197,6 +198,41 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         info.range.base.layer + info.range.extent.layers - 1, view_aspect);
 }
 
-ImageView::~ImageView() = default;
+ImageView::ImageView(ImageView&& other) noexcept
+    : info{other.info}, image_view{std::move(other.image_view)},
+      bindless_slots{other.bindless_slots}, bindless_layouts{other.bindless_layouts} {
+    other.bindless_slots.fill(Shader::NO_BINDLESS_IMAGE_SLOT);
+}
+
+ImageView& ImageView::operator=(ImageView&& other) noexcept {
+    if (this != &other) {
+        ReleaseBindless();
+        info = other.info;
+        image_view = std::move(other.image_view);
+        bindless_slots = other.bindless_slots;
+        bindless_layouts = other.bindless_layouts;
+        other.bindless_slots.fill(Shader::NO_BINDLESS_IMAGE_SLOT);
+    }
+    return *this;
+}
+
+ImageView::~ImageView() {
+    ReleaseBindless();
+}
+
+// sotc: SOTC_N5_BINDLESS: a view that dies gives its slots back. The heap clears them after the
+// frame ticket, so a draw submitted before the view died can still read them.
+void ImageView::ReleaseBindless() noexcept {
+    BindlessImages* heap = BindlessImages::Active();
+    for (u32 key = 0; key < Shader::NUM_BINDLESS_IMAGE_KEYS; ++key) {
+        if (bindless_slots[key] == Shader::NO_BINDLESS_IMAGE_SLOT) {
+            continue;
+        }
+        if (heap) {
+            heap->Release(key, bindless_slots[key]);
+        }
+        bindless_slots[key] = Shader::NO_BINDLESS_IMAGE_SLOT;
+    }
+}
 
 } // namespace VideoCore

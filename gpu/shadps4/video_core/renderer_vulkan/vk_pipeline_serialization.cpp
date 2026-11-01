@@ -665,6 +665,10 @@ void PipelineCache::WarmUp() {
         if (profile_data.size() == offsetof(Shader::Profile, bda_buffers)) {
             profile_data.resize(sizeof(Shader::Profile), 0);
         }
+        // sotc: SOTC_N5_BINDLESS added Profile::bindless_images (68 -> 72 bytes with the padding).
+        if (profile_data.size() == offsetof(Shader::Profile, bindless_images)) {
+            profile_data.resize(sizeof(Shader::Profile), 0);
+        }
         if (profile_data.size() == sizeof(Shader::Profile)) {
             // sotc: barycentric_via_gs, the last member, sits where older caches have a padding
             // byte (seen 0xe3, 0x36): anything but 1 there is off, so those caches still match.
@@ -675,6 +679,8 @@ void PipelineCache::WarmUp() {
             stage_bindings = stage_bindings == 1 ? 1 : 0;
             auto& bda_buffers = profile_data[offsetof(Shader::Profile, bda_buffers)]; // sotc: SOTC_BDA
             bda_buffers = bda_buffers == 1 ? 1 : 0;
+            auto& bindless_images = profile_data[offsetof(Shader::Profile, bindless_images)];
+            bindless_images = bindless_images == 1 ? 1 : 0;
             std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
         }
         compatible = profile_data.size() == sizeof(Shader::Profile) && cached_profile == profile;

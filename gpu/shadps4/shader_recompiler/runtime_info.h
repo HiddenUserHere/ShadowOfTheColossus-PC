@@ -7,6 +7,7 @@
 #include <span>
 #include "common/types.h"
 #include "shader_recompiler/frontend/tessellation.h"
+#include "shader_recompiler/resource.h" // sotc: NUM_BINDLESS_IMAGE_SLOTS for GetBindlessImageRange
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/regs_shader.h"
 #include "video_core/amdgpu/regs_vertex.h"
@@ -50,6 +51,35 @@ struct BindlessSamplerRange {
     u32 base;
     u32 count;
 };
+/// sotc: SOTC_N5_BINDLESS as the instance settled it (env, device features and the push constant
+/// limit), set once by Instance::CreateDevice next to SetBindlessSamplersEnabled. Also the gate of
+/// the Profile member bindless_images, so the shader cache is keyed by it.
+void SetBindlessImagesEnabled(bool enabled);
+bool BindlessImagesEnabled();
+
+/// sotc: N5 bindless image slots of each stage, out of NUM_BINDLESS_IMAGE_SLOTS (resource.h), fixed
+/// per stage like the sampler ranges. Sampled images beyond the count keep classic descriptors.
+struct BindlessImageRange {
+    u32 base;
+    u32 count;
+};
+constexpr BindlessImageRange GetBindlessImageRange(SwStage stage) {
+    switch (stage) {
+    case SwStage::Fragment:
+        return {0, 12};
+    case SwStage::Vertex:
+        return {12, 8};
+    case SwStage::Geometry:
+        return {20, 4};
+    case SwStage::TessellationControl:
+        return {24, 4};
+    case SwStage::TessellationEval:
+        return {28, 4};
+    default: // Compute is alone in its pipeline
+        return {0, NUM_BINDLESS_IMAGE_SLOTS};
+    }
+}
+
 constexpr BindlessSamplerRange GetBindlessSamplerRange(SwStage stage) {
     switch (stage) {
     case SwStage::Fragment:

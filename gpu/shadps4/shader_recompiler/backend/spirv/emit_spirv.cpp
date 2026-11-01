@@ -370,7 +370,8 @@ spv::ExecutionMode ExecutionMode(AmdGpu::TessellationPartitioning spacing) {
 void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeInfo& runtime_info,
                        EmitContext& ctx) {
     // sotc: SOTC_BINDLESS_SAMP: samplers are indexed in the runtime array of the heap
-    if (ctx.uses_bindless_samplers) {
+    // sotc: SOTC_N5_BINDLESS: the heap image arrays need the same two capabilities.
+    if (ctx.uses_bindless_samplers || ctx.uses_bindless_images) {
         ctx.AddCapability(spv::Capability::RuntimeDescriptorArray);
         ctx.AddCapability(spv::Capability::SampledImageArrayDynamicIndexing);
     }

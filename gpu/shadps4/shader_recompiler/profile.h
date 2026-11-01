@@ -65,6 +65,10 @@ struct Profile {
     /// member: it grows the profile to 68 bytes, so the cache check reads a 64-byte profile from
     /// an older cache as this flag off (vk_pipeline_serialization.cpp).
     bool bda_buffers{};
+    /// sotc: SOTC_N5_BINDLESS: sampled images come from the bindless heap (BindlessImageKeyOf).
+    /// Last member: the profile grows from 68 to 72 bytes (alignment 4). vk_pipeline_serialization.cpp
+    /// pads the 68-byte profiles of older caches with this byte off, the 64-byte ones through bda.
+    bool bindless_images{};
 
     bool operator==(const Profile&) const = default;
 };

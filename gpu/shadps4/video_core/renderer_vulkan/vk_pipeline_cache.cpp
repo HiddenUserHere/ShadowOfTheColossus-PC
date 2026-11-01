@@ -466,6 +466,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .stage_bindings = Shader::StageBindingsEnabled() &&
                           instance.GetMaxBoundDescriptorSets() >= Shader::MaxStageDescriptorSets,
         .bda_buffers = BdaTableMode(instance) != 0, // sotc: SOTC_BDA (block table, vk_bda_table.h)
+        .bindless_images = Shader::BindlessImagesEnabled(), // sotc: SOTC_N5_BINDLESS
     };
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
     // the loading screen on meanwhile.

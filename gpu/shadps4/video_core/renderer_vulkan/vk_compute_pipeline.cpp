@@ -40,7 +40,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
     }
-    for (const auto& image : info->images) {
+    for (u32 image_index = 0; image_index < info->images.size(); ++image_index) {
+        const auto& image = info->images[image_index];
+        // sotc: SOTC_N5_BINDLESS: a sampled image of the heap has no binding (AddBindings).
+        if (Shader::BindlessImageSlotOf(*info, image_index) != Shader::NO_BINDLESS_IMAGE_SLOT) {
+            continue;
+        }
         const u32 num_bindings = image.NumBindings(*info);
         bindings.push_back({
             .binding = binding,
@@ -52,7 +57,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         binding += num_bindings;
     }
     // sotc: SOTC_BINDLESS_SAMP: the samplers come from the global heap (set 1) instead.
-    uses_bindless_samplers = Shader::UsesBindlessSamplers(*info);
+    uses_bindless_samplers =
+        Shader::UsesBindlessSamplers(*info) || Shader::UsesBindlessImages(*info);
     for (const auto& sampler : info->samplers) {
         if (uses_bindless_samplers) {
             break;

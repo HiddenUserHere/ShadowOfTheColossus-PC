@@ -60,6 +60,83 @@ bool UsesBindlessSamplers(const Info& info) {
     return info.samplers.size() <= GetBindlessSamplerRange(info.sw_stage).count;
 }
 
+// sotc: SOTC_N5_BINDLESS (see runtime_info.h). Like the sampler flag, a process-wide setting.
+static std::atomic<bool> g_bindless_images{false};
+
+void SetBindlessImagesEnabled(bool enabled) {
+    g_bindless_images.store(enabled, std::memory_order_relaxed);
+}
+
+bool BindlessImagesEnabled() {
+    return g_bindless_images.load(std::memory_order_relaxed);
+}
+
+u32 BindlessImageKeyOf(const Info& info, const ImageResource& image) noexcept {
+    // Only plain sampled images: storage and atomics use typed image ops, descriptor arrays and
+    // mip-fallback images index descriptors in ways the heap does not cover yet.
+    if (!BindlessImagesEnabled() || image.is_written || image.is_atomic || image.array_size != 0 ||
+        image.mip_fallback_mode != MipStorageFallbackMode::None) {
+        return NO_BINDLESS_IMAGE_KEY;
+    }
+    // The same SPIR-V type ImageType() gives the descriptor: the view type of the T# decides the
+    // dimension, the number class the sampled type (ImageType in spirv_emit_context.cpp).
+    const auto sharp = image.GetSharp(info);
+    const auto number_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
+    u32 base{};
+    switch (number_class) {
+    case AmdGpu::NumberClass::Float:
+        base = 0;
+        break;
+    case AmdGpu::NumberClass::Uint:
+        base = 3;
+        break;
+    default:
+        return NO_BINDLESS_IMAGE_KEY; // sint: no heap array
+    }
+    switch (sharp.GetViewType(image.is_array)) {
+    case AmdGpu::ImageType::Color1D:
+    case AmdGpu::ImageType::Color2D:
+        return base + 0;
+    case AmdGpu::ImageType::Color1DArray:
+    case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Cube: // a 2D array image in SPIR-V
+        return base + 1;
+    case AmdGpu::ImageType::Color3D:
+        return base + 2;
+    default:
+        return NO_BINDLESS_IMAGE_KEY; // msaa and anything unknown
+    }
+}
+
+u32 BindlessImageSlotOf(const Info& info, u32 index) noexcept {
+    if (!BindlessImagesEnabled()) {
+        return NO_BINDLESS_IMAGE_SLOT;
+    }
+    // Slots go to the eligible images in order, up to the count of the stage; the rest keep
+    // their descriptors. Both the emitter and the host call this with the same Info.
+    const auto range = GetBindlessImageRange(info.sw_stage);
+    u32 next = 0;
+    for (u32 i = 0; i < info.images.size() && next < range.count; ++i) {
+        if (BindlessImageKeyOf(info, info.images[i]) == NO_BINDLESS_IMAGE_KEY) {
+            continue;
+        }
+        if (i == index) {
+            return range.base + next;
+        }
+        ++next;
+    }
+    return NO_BINDLESS_IMAGE_SLOT;
+}
+
+bool UsesBindlessImages(const Info& info) noexcept {
+    for (u32 i = 0; i < info.images.size(); ++i) {
+        if (BindlessImageSlotOf(info, i) != NO_BINDLESS_IMAGE_SLOT) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool LodFeedbackEnabled() {
     static const bool enabled = [] {
         // Off by default: using the measured mips made the game's streaming churn (one 150 s

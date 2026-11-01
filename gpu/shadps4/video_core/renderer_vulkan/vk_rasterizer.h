@@ -13,6 +13,7 @@
 #include "video_core/page_manager.h"
 #include "video_core/range_stamps.h"
 #include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA
+#include "video_core/renderer_vulkan/vk_bindless.h"  // sotc: SOTC_N5_BINDLESS
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -437,6 +438,8 @@ private:
     std::vector<u32> set_write_sets; ///< sotc: descriptor set of each set_writes entry
     Shader::PushData push_data;
     Shader::BindlessSamplerSlots bindless_slots{}; // sotc: SOTC_BINDLESS_SAMP, pushed after push_data
+    /// sotc: SOTC_N5_BINDLESS: the heap of the sampled images (null unless the mode is on).
+    std::unique_ptr<VideoCore::BindlessImages> bindless_images;
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;

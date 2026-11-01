@@ -80,6 +80,11 @@ struct InfoPersistent {
         : hw_stage{hw_stage_}, sw_stage{sw_stage_}, pgm_hash{pgm_hash_} {}
 };
 
+struct Info;
+/// sotc: SOTC_N5_BINDLESS: the push slot of images[index] in the bindless image heap, or
+/// NO_BINDLESS_IMAGE_SLOT when it keeps a classic descriptor (see the declarations at the end).
+u32 BindlessImageSlotOf(const Info& info, u32 index) noexcept;
+
 struct Info : InfoPersistent {
     struct AttributeFlags {
         bool Get(IR::Attribute attrib, u32 comp = 0) const {
@@ -216,10 +221,14 @@ struct Info : InfoPersistent {
     /// binding numbers. Must match what the SPIR-V emitter advances the counter by.
     void AddBindings(Backend::Bindings& bnd, bool bindless_samplers = false) const {
         bnd.buffer += buffers.size();
-        bnd.unified += buffers.size() + images.size() + (bindless_samplers ? 0 : samplers.size());
-        for (const auto& image : images) {
+        bnd.unified += buffers.size() + (bindless_samplers ? 0 : samplers.size());
+        for (u32 index = 0; index < images.size(); ++index) {
+            // sotc: a sampled image in the bindless heap takes no binding (BindlessImageSlotOf).
+            if (BindlessImageSlotOf(*this, index) != NO_BINDLESS_IMAGE_SLOT) {
+                continue;
+            }
             // Descriptor arrays take array_size + 1 bindings
-            bnd.unified += image.array_size;
+            bnd.unified += 1 + images[index].array_size;
         }
     }
 
@@ -280,5 +289,14 @@ bool StageBindingsEnabled();
 /// on (BindlessSamplersEnabled) and the stage's samplers fit its slots (GetBindlessSamplerRange).
 /// Shared by the pipeline layout and the SPIR-V emitter, so both agree on the descriptors.
 bool UsesBindlessSamplers(const Info& info);
+
+/// sotc: SOTC_N5_BINDLESS: the heap key of a sampled image: 0..2 for float (2D, 2D array, 3D),
+/// 3..5 for uint (the same shapes), or NO_BINDLESS_IMAGE_KEY when the image keeps a descriptor
+/// (storage, atomic, descriptor array, mip fallback, msaa, sint). Cube is a 2D array (key 1).
+/// The emitter types the heap array with this key, the host writes the view into it.
+u32 BindlessImageKeyOf(const Info& info, const ImageResource& image) noexcept;
+
+/// sotc: true when any image of the stage is in the bindless heap (BindlessImageSlotOf).
+bool UsesBindlessImages(const Info& info) noexcept;
 
 } // namespace Shader

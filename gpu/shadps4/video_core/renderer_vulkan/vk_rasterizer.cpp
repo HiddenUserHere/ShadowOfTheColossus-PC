@@ -90,6 +90,30 @@ static bool IsBindlessStage(const Instance& instance, const Shader::Info& stage)
            stage.samplers.size() <= Shader::GetBindlessSamplerRange(stage.sw_stage).count;
 }
 
+// sotc: SOTC_N5_BINDLESS: the heap index of one bindless sampled image of a draw, 0 (the null slot)
+// when nothing is bound. The view takes a slot of its key the first time, and a new one when it is
+// bound in another layout (the descriptor of a slot fixes its layout); the old slot is released
+// and reused only after the frame ticket. Mode 2 compares the heap mirror with the view.
+static u32 BindlessImageIndex(VideoCore::BindlessImages& heap, VideoCore::TextureCache& cache,
+                              VideoCore::ImageId image_id,
+                              const VideoCore::TextureCache::ImageDesc& desc, u32 key,
+                              vk::ImageLayout layout) {
+    if (!image_id) {
+        return heap.NullSlot(key);
+    }
+    VideoCore::ImageView& view = cache.FindTexture(image_id, desc);
+    u32& slot = view.bindless_slots[key];
+    if (slot == Shader::NO_BINDLESS_IMAGE_SLOT || view.bindless_layouts[key] != layout) {
+        heap.Release(key, slot);
+        slot = heap.Acquire(key, *view.image_view, layout);
+        view.bindless_layouts[key] = layout;
+    }
+    if (heap.Mode() == 2) {
+        heap.Verify(key, slot, *view.image_view);
+    }
+    return slot;
+}
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -120,6 +144,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     const auto& bindless = texture_cache.GetBindlessSamplers();
     if (bindless.Enabled()) {
         pipeline_cache.GetDescriptorHeap().SetBindlessSamplers(bindless.Layout(), bindless.Set());
+    }
+    // sotc: SOTC_N5_BINDLESS: the sampled images of the bindless stages come from the heap arrays
+    // of the same set (vk_bindless.h). The mode is read once, the layout bindings are in sampler.cpp.
+    if (bindless.Enabled() && Shader::BindlessImagesEnabled() &&
+        VideoCore::BindlessImagesMode() != 0) {
+        bindless_images = std::make_unique<VideoCore::BindlessImages>(
+            instance, scheduler, bindless.Set(), VideoCore::BindlessImagesMode());
     }
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
@@ -6712,9 +6743,31 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
 
     u32 image_info_idx = first_image_idx;
     u32 image_binding_idx = 0;
+    u32 stage_image = 0;
     for (u32 array_size : image_descriptor_array_sizes) {
-        const auto& [_, desc] = image_bindings[image_binding_idx];
+        const auto& [image_id, desc] = image_bindings[image_binding_idx];
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        const u32 image_index = stage_image++;
+        // sotc: SOTC_N5_BINDLESS: a sampled image of the heap takes no descriptor and no binding
+        // number (Info::AddBindings skips it). Its push slot gets the heap index of its view.
+        if (bindless_images && !is_storage && array_size == 1) {
+            const u32 heap_slot = Shader::BindlessImageSlotOf(stage, image_index);
+            if (heap_slot != Shader::NO_BINDLESS_IMAGE_SLOT) {
+                const u32 key = Shader::BindlessImageKeyOf(stage, stage.images[image_index]);
+                const u32 index = BindlessImageIndex(*bindless_images, texture_cache, image_id,
+                                                     desc, key, image_infos[image_info_idx].imageLayout);
+                const u32 shift = (heap_slot & 1) * 16;
+                auto& word = bindless_slots.image_words[heap_slot / 2];
+                word = (word & ~(0xFFFFu << shift)) | (index << shift);
+                // The heap slots are per view, so a block replayed by the bind cache or the texture
+                // block memo could hold a slot released since: those binds are not stored.
+                bind_cache_uncacheable = true;
+                store_ok = false;
+                image_info_idx += array_size;
+                image_binding_idx += array_size;
+                continue;
+            }
+        }
         set_write_sets[set_write_index] = set;
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;

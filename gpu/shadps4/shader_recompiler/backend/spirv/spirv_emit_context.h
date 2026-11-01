@@ -317,6 +317,11 @@ public:
         MipStorageFallbackMode mip_fallback_mode{};
         /// Descriptor array size (0 = single image), see ImageResource::array_size
         u32 array_size{};
+        /// sotc: SOTC_N5_BINDLESS: the image is read from the heap array of bindless_key at the
+        /// index of push slot bindless_slot (LoadImage). `id` is unused then.
+        bool bindless{};
+        u32 bindless_slot{NO_BINDLESS_IMAGE_SLOT};
+        u32 bindless_key{NO_BINDLESS_IMAGE_KEY};
     };
 
     enum class PointerType : u32 {
@@ -388,6 +393,15 @@ public:
     Id bindless_sampler_array{};
     /// Loads sampler `index` of info.samplers (the low 16 bits of a sampler handle).
     Id LoadSampler(u32 index);
+
+    /// sotc: SOTC_N5_BINDLESS: the sampled images of this stage in the bindless heap. Each key
+    /// has one runtime array of images (set 1, binding 1 + key, defined on first use) and the
+    /// image type all its elements have (bindless_image_types).
+    bool uses_bindless_images{};
+    std::array<Id, NUM_BINDLESS_IMAGE_KEYS> bindless_image_arrays{};
+    std::array<Id, NUM_BINDLESS_IMAGE_KEYS> bindless_image_types{};
+    /// Reads the heap index of push slot `slot` (BindlessSamplerSlots::image_words, 16 bits).
+    Id LoadBindlessImageIndex(u32 slot);
 
     struct SpirvAttribute {
         union {

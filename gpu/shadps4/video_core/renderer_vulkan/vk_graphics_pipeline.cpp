@@ -830,7 +830,12 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
                 .stageFlags = stage_bit,
             });
         }
-        for (const auto& image : stage->images) {
+        for (u32 image_index = 0; image_index < stage->images.size(); ++image_index) {
+            const auto& image = stage->images[image_index];
+            // sotc: SOTC_N5_BINDLESS: a sampled image of the heap has no binding (AddBindings).
+            if (Shader::BindlessImageSlotOf(*stage, image_index) != Shader::NO_BINDLESS_IMAGE_SLOT) {
+                continue;
+            }
             const u32 num_bindings = image.NumBindings(*stage);
             bindings.push_back({
                 .binding = binding,
@@ -844,6 +849,8 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
         // sotc: SOTC_BINDLESS_SAMP: the samplers of this stage come from the global heap instead.
         const bool bindless = Shader::UsesBindlessSamplers(*stage);
         uses_bindless_samplers |= bindless;
+        // sotc: SOTC_N5_BINDLESS: the heap image arrays are in the bindless set too.
+        uses_bindless_samplers |= Shader::UsesBindlessImages(*stage);
         for (const auto& sampler : stage->samplers) {
             if (bindless) {
                 break;

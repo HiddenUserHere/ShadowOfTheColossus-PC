@@ -145,6 +145,16 @@ Id EmitImageArrayHandle(EmitContext& ctx, u32 handle, Id element) {
 /// instruction's ImageArrayHandle (dynamic_tsharp_array_size, from Pink-shadPS4)
 static Id LoadImage(EmitContext& ctx, IR::Inst* inst,
                     const EmitContext::TextureDefinition& texture) {
+    if (texture.bindless) {
+        // sotc: SOTC_N5_BINDLESS: the view sits in the heap array of its key at the index of its
+        // push slot (the host writes the slot per draw, the heap holds the view).
+        const Id index = ctx.LoadBindlessImageIndex(texture.bindless_slot);
+        const Id pointer_type =
+            ctx.TypePointer(spv::StorageClass::UniformConstant, texture.image_type);
+        const Id pointer =
+            ctx.OpAccessChain(pointer_type, ctx.bindless_image_arrays[texture.bindless_key], index);
+        return ctx.OpLoad(texture.image_type, pointer);
+    }
     if (texture.array_size == 0) {
         return ctx.OpLoad(texture.image_type, texture.id);
     }

@@ -40,6 +40,7 @@
 #include "video_core/renderer_vulkan/vk_queues.h" // sotc: SOTC_N5_QUEUES report
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH report
 #include "video_core/renderer_vulkan/vk_parallel_record.h" // sotc: SOTC_N5_PARALLEL counters
+#include "video_core/renderer_vulkan/vk_bindless.h" // sotc: SOTC_N5_BINDLESS report
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND report
@@ -2031,6 +2032,13 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcQueues::Report(report, seconds);        // sotc: SOTC_N5_QUEUES
             Vulkan::FrameGraph::Report(report, seconds); // sotc: SOTC_N5_GRAPH
             Vulkan::ParallelRecord::Report(report, seconds); // sotc: SOTC_N5_PARALLEL (passes, waits)
+            if (VideoCore::BindlessImages* heap = VideoCore::BindlessImages::Active()) { // sotc: SOTC_N5_BINDLESS
+                char n5_line[256];
+                if (heap->Report(n5_line, sizeof n5_line) != 0) {
+                    report += n5_line;
+                    report += '\n';
+                }
+            }
             SotcRbClass::Report(report, seconds); // sotc: SOTC_RB_CLASS
             SotcRbHost::Report(report, seconds);  // sotc: SOTC_RB_HOST
             SotcStale::Report(report, seconds);   // sotc: SOTC_STALE_CHECK

@@ -808,10 +808,18 @@ void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     // sotc: a bindless stage also reads the sampler slots, pushed right after PushData
     // (BindlessSamplerSlots). Other stages keep the block as it was.
-    const bool bindless = UsesBindlessSamplers(info);
+    // sotc: SOTC_N5_BINDLESS: the image words follow the sampler words. A stage with bindless images
+    // and no bindless sampler gets the sampler words as padding, so the members stay in order.
+    const bool bindless_images = UsesBindlessImages(info);
+    const bool bindless = UsesBindlessSamplers(info) || bindless_images;
     std::vector<Id> members{F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]};
     if (bindless) {
         for (u32 word = 0; word < NUM_BINDLESS_SAMPLER_WORDS; ++word) {
+            members.push_back(U32[1]);
+        }
+    }
+    if (bindless_images) {
+        for (u32 word = 0; word < NUM_BINDLESS_IMAGE_WORDS; ++word) {
             members.push_back(U32[1]);
         }
     }
@@ -836,6 +844,13 @@ void EmitContext::DefinePushDataBlock() {
             MemberDecorate(struct_type, PushData::SamplerSlotIndex + word,
                            spv::Decoration::Offset,
                            static_cast<u32>(sizeof(PushData) + word * sizeof(u32)));
+        }
+    }
+    if (bindless_images) {
+        for (u32 word = 0; word < NUM_BINDLESS_IMAGE_WORDS; ++word) {
+            MemberDecorate(struct_type, PushData::ImageSlotIndex + word, spv::Decoration::Offset,
+                           static_cast<u32>(sizeof(PushData) +
+                                            (NUM_BINDLESS_SAMPLER_WORDS + word) * sizeof(u32)));
         }
     }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
@@ -1151,7 +1166,8 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
 }
 
 void EmitContext::DefineImagesAndSamplers() {
-    for (const auto& image_desc : info.images) {
+    for (u32 image_index = 0; image_index < info.images.size(); ++image_index) {
+        const auto& image_desc = info.images[image_index];
         const auto sharp = image_desc.GetSharp(info);
         const auto nfmt = sharp.GetNumberFmt();
         const bool is_integer = AmdGpu::IsInteger(nfmt);
@@ -1159,6 +1175,43 @@ void EmitContext::DefineImagesAndSamplers() {
         const MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const VectorIds& data_types = GetAttributeType(*this, nfmt);
         const Id sampled_type = data_types[1];
+
+        // sotc: SOTC_N5_BINDLESS: a sampled image of the heap has no variable. Its texture entry
+        // loads it from the runtime array of its key (LoadImage) at the index of its push slot.
+        // Every resource of a key shares the key's image type, so the array elements match.
+        const u32 bindless_slot = BindlessImageSlotOf(info, image_index);
+        if (bindless_slot != NO_BINDLESS_IMAGE_SLOT) {
+            const u32 key = BindlessImageKeyOf(info, image_desc);
+            if (!Sirit::ValidId(bindless_image_types[key])) {
+                bindless_image_types[key] = ImageType(*this, image_desc, sampled_type);
+                const Id array_type{TypeRuntimeArray(bindless_image_types[key])};
+                const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, array_type)};
+                bindless_image_arrays[key] =
+                    AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant);
+                Decorate(bindless_image_arrays[key], spv::Decoration::Binding, 1U + key);
+                Decorate(bindless_image_arrays[key], spv::Decoration::DescriptorSet, 1U);
+                Name(bindless_image_arrays[key],
+                     fmt::format("{}_bindless_img{}", hw_stage, key));
+                interfaces.push_back(bindless_image_arrays[key]);
+            }
+            uses_bindless_images = true;
+            images.push_back({
+                .data_types = &data_types,
+                .id = Id{},
+                .sampled_type = TypeSampledImage(bindless_image_types[key]),
+                .image_type = bindless_image_types[key],
+                .view_type = sharp.GetViewType(image_desc.is_array),
+                .is_integer = is_integer,
+                .is_storage = false,
+                .mip_fallback_mode = mip_fallback_mode,
+                .array_size = 0,
+                .bindless = true,
+                .bindless_slot = bindless_slot,
+                .bindless_key = key,
+            });
+            continue;
+        }
+
         const Id image_type{ImageType(*this, image_desc, sampled_type)};
 
         const u32 num_bindings = image_desc.NumBindings(info);
@@ -1235,6 +1288,15 @@ Id EmitContext::LoadSampler(u32 index) {
     const Id heap_index{OpBitFieldUExtract(U32[1], value, ConstU32(shift), ConstU32(16U))};
     const Id sampler_ptr{OpAccessChain(sampler_pointer_type, bindless_sampler_array, heap_index)};
     return OpLoad(sampler_type, sampler_ptr);
+}
+
+Id EmitContext::LoadBindlessImageIndex(u32 slot) {
+    // sotc: SOTC_N5_BINDLESS: two 16-bit slots per word, low half first (BindlessSamplerSlots).
+    const u32 shift = (slot & 1) * 16;
+    const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
+                               push_data_block, ConstU32(PushData::ImageSlotIndex + slot / 2))};
+    const Id value{OpLoad(U32[1], ptr)};
+    return OpBitFieldUExtract(U32[1], value, ConstU32(shift), ConstU32(16U));
 }
 
 void EmitContext::DefineSharedMemory() {
