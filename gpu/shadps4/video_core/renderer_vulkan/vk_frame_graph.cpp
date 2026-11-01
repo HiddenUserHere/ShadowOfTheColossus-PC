@@ -3,6 +3,7 @@
 
 // sotc: N5 frame graph, observe and verify (vk_frame_graph.h). See the header for the model.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -295,6 +296,110 @@ void AsyncObserve(const Sample& s) {
 
 } // namespace
 
+// sotc: N5 async compute move state (draw thread only). A pass here is one dispatch.
+namespace {
+
+struct MovedPass {
+    AmdGpu::OpFootprint fp;
+    u64 value; ///< async tick of the dispatch's submit
+};
+
+/// Beyond this many graphics accesses in a frame, no dispatch moves until the frame ends (and the
+/// list stops growing: every dispatch is then a conflict, see MoveNeedsSplit).
+constexpr std::size_t kMoveMaxAccesses = 1024;
+
+/// Window counters of the move (ReportMove). Draw thread writes, the report thread takes.
+struct MoveCounters {
+    std::atomic<u64> frames{};     ///< frame changes seen
+    std::atomic<u64> candidates{}; ///< dispatches AsyncBefore allowed to move
+    std::atomic<u64> moved{};      ///< dispatches recorded on the async queue
+    std::atomic<u64> unmoved{};    ///< dispatches recorded on graphics with a known footprint
+    std::atomic<u64> joins{};      ///< joins that made graphics work wait for moved dispatches
+    std::atomic<u64> joined{};     ///< moved dispatches those joins completed
+};
+MoveCounters mvc;
+
+struct MoveState {
+    u64 frame{~u64{0}};
+    bool barrier_seen{};               ///< an unknown op stayed on graphics this frame
+    std::vector<AsyncAccess> accesses; ///< accesses of the graphics ops and dispatches of this frame
+    std::vector<MovedPass> moved;      ///< moved dispatches not joined yet, in submit order
+};
+MoveState mv;
+
+void MoveAddAccesses(const AmdGpu::OpFootprint& fp) {
+    if (mv.accesses.size() > kMoveMaxAccesses) {
+        return;
+    }
+    for (const auto& r : fp.reads) {
+        mv.accesses.push_back({r, false});
+    }
+    for (const auto& w : fp.writes) {
+        mv.accesses.push_back({w, true});
+    }
+}
+
+/// True when fp conflicts with a graphics access of this frame: such a dispatch cannot move.
+bool MoveNeedsSplit(const AmdGpu::OpFootprint& fp) {
+    if (mv.barrier_seen || mv.accesses.size() > kMoveMaxAccesses) {
+        return true;
+    }
+    for (const AsyncAccess& a : mv.accesses) {
+        if (a.write) {
+            for (const auto& r : fp.reads) {
+                if (Overlap(r, a.range)) {
+                    return true; // RAW
+                }
+            }
+        }
+        for (const auto& w : fp.writes) {
+            if (Overlap(w, a.range)) {
+                return true; // WAW or WAR
+            }
+        }
+    }
+    return false;
+}
+
+/// Joins the moved dispatches fp conflicts with (all of them when blocking). The value of the
+/// join completes every earlier submit of the async queue, so those leave the list too.
+u64 MoveJoin(const AmdGpu::OpFootprint& fp, bool blocking) {
+    u64 join = 0;
+    for (std::size_t i = 0; i < mv.moved.size();) {
+        if (blocking || AmdGpu::Conflicts(mv.moved[i].fp, fp)) {
+            join = std::max(join, mv.moved[i].value);
+        }
+        ++i;
+    }
+    if (join == 0) {
+        return 0;
+    }
+    mvc.joins.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < mv.moved.size();) {
+        if (mv.moved[i].value <= join) {
+            if (i + 1 != mv.moved.size()) {
+                mv.moved[i] = std::move(mv.moved.back());
+            }
+            mv.moved.pop_back();
+            mvc.joined.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ++i;
+        }
+    }
+    return join;
+}
+
+u64 MoveAll() {
+    u64 join = 0;
+    for (const MovedPass& m : mv.moved) {
+        join = std::max(join, m.value);
+    }
+    mv.moved.clear();
+    return join;
+}
+
+} // namespace
+
 bool Enabled() {
     return SwitchValue() != 0;
 }
@@ -501,6 +606,87 @@ void ReportAsync(std::string& out, double seconds) {
         static_cast<double>(join_end) / f, static_cast<double>(win_ops) / jd,
         100.0 * static_cast<double>(zero) / jd, static_cast<double>(win_gfx) / f,
         static_cast<double>(waits) / f, static_cast<double>(waits) / f);
+    out += line;
+}
+
+bool AsyncMove() {
+    return SotcQueues::AsyncMoveOn();
+}
+
+AsyncPre AsyncBefore(const Sample& s) {
+    AsyncPre out;
+    if (!s.active) {
+        return out;
+    }
+    const u64 flips = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (flips != mv.frame) {
+        // The frame ended: every moved dispatch of it is joined by the tick being recorded, and the
+        // graphics accesses of the frame are not needed by the next one (Scheduler::AsyncBegin
+        // flushes every graphics op before a dispatch moves).
+        mv.frame = flips;
+        mvc.frames.fetch_add(1, std::memory_order_relaxed);
+        out.join = MoveAll();
+        out.frame_change = true;
+        mv.accesses.clear();
+        mv.barrier_seen = false;
+    }
+    if (s.cls == Class::Compute) {
+        out.candidate = s.known && !MoveNeedsSplit(s.fp);
+        if (out.candidate) {
+            mvc.candidates.fetch_add(1, std::memory_order_relaxed);
+        }
+        return out;
+    }
+    const bool blocking = s.cls == Class::Other || !s.known;
+    out.join = std::max(out.join, MoveJoin(s.fp, blocking));
+    if (blocking) {
+        mv.barrier_seen = true;
+    } else {
+        MoveAddAccesses(s.fp);
+    }
+    return out;
+}
+
+u64 AsyncConflicts(const AmdGpu::OpFootprint& fp) {
+    return MoveJoin(fp, !fp.known);
+}
+
+void AsyncAfter(const AmdGpu::OpFootprint& fp, bool moved, u64 value) {
+    if (moved) {
+        mvc.moved.fetch_add(1, std::memory_order_relaxed);
+        mv.moved.push_back(MovedPass{fp, value});
+        return;
+    }
+    if (!fp.known) {
+        mv.barrier_seen = true;
+        return;
+    }
+    mvc.unmoved.fetch_add(1, std::memory_order_relaxed);
+    MoveAddAccesses(fp);
+}
+
+void ReportMove(std::string& out, double seconds) {
+    if (!AsyncMove()) {
+        return;
+    }
+    const u64 frames = mvc.frames.exchange(0, std::memory_order_relaxed);
+    const u64 candidates = mvc.candidates.exchange(0, std::memory_order_relaxed);
+    const u64 moved = mvc.moved.exchange(0, std::memory_order_relaxed);
+    const u64 unmoved = mvc.unmoved.exchange(0, std::memory_order_relaxed);
+    const u64 joins = mvc.joins.exchange(0, std::memory_order_relaxed);
+    const u64 joined = mvc.joined.exchange(0, std::memory_order_relaxed);
+    if (seconds <= 0.0) {
+        return;
+    }
+    const double f = frames ? static_cast<double>(frames) : 1.0;
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "N5 move (SOTC_N5_ASYNC_COMPUTE=1): frames %llu, candidates/f %.1f, moved/f %.1f, "
+                  "graphics dispatches/f %.1f, joins/f %.2f (passes joined/join %.2f)\n",
+                  static_cast<unsigned long long>(frames), static_cast<double>(candidates) / f,
+                  static_cast<double>(moved) / f, static_cast<double>(unmoved) / f,
+                  static_cast<double>(joins) / f,
+                  joins ? static_cast<double>(joined) / static_cast<double>(joins) : 0.0);
     out += line;
 }
 

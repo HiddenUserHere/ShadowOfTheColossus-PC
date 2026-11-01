@@ -81,7 +81,7 @@ void LogAsyncPick(const AsyncPick& pick, uint32_t family_count) {
         return;
     }
     std::fprintf(stderr, "SOTC N5 ASYNC: mode %d, async compute queue family %u index %u%s "
-                         "(move of dispatches: not implemented, see impl-n5-asynccomp.md)\n",
+                         "(independent dispatches are recorded there, see impl-n5-asynccomp.md)\n",
                  AsyncMode(), pick.family, pick.queue_index,
                  pick.shares_xfer ? " (shared with the upload family)" : "");
 }

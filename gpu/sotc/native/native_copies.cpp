@@ -42,6 +42,7 @@ struct Entry {
     uint64_t frame;  // native frame of the registration
     uint64_t lo, hi; // guest bytes the recorded copies covered (bounds of their union)
     uint32_t copies;
+    uint64_t async; // sotc: newest async queue tick of a copy in this registration (0: graphics only)
 };
 
 std::mutex g_mutex; // everything below
@@ -51,6 +52,8 @@ std::unordered_map<uint64_t, std::vector<Entry*>> g_by_key; // newest first, at 
 uint64_t g_head = 0;
 VideoCore::Buffer* g_staging = nullptr;
 std::atomic<bool> g_watching{false};
+std::atomic<uint64_t> g_recording_tick{0};   // sotc: N5 async: the async tick being recorded (0: graphics)
+bool (*g_async_done)(uint64_t tick) = nullptr; // sotc: N5 async: completion of an async tick
 
 struct Counters {
     std::atomic<uint64_t> registered{0};
@@ -69,7 +72,8 @@ bool Valid(const Entry& e) {
 }
 
 bool Complete(const Entry& e, uint64_t completed) {
-    return e.copies != 0 && e.lo <= e.base && e.hi >= e.base + e.bytes && completed >= e.frame && Valid(e);
+    return e.copies != 0 && e.lo <= e.base && e.hi >= e.base + e.bytes && completed >= e.frame && Valid(e) &&
+           (e.async == 0 || (g_async_done && g_async_done(e.async)));
 }
 
 void RemoveFromIndexes(const Entry* e) {
@@ -144,7 +148,7 @@ bool Register(uint64_t key, uint64_t seq, uint64_t base, uint64_t bytes) {
         pos = AlignUp(pos, kRingBytes); // a range never wraps
     }
     g_head = pos + size;
-    g_entries.push_back(Entry{key, seq, base, bytes, pos, frame, 0, 0, 0});
+    g_entries.push_back(Entry{key, seq, base, bytes, pos, frame, 0, 0, 0, 0});
     Entry* e = &g_entries.back();
     g_by_base[base] = e;
     auto& list = g_by_key[key];
@@ -242,9 +246,21 @@ void NoteWrittenBind(vk::CommandBuffer cmdbuf, vk::Buffer src, uint64_t src_offs
         e.lo = e.copies == 0 || lo < e.lo ? lo : e.lo;
         e.hi = e.copies == 0 || hi > e.hi ? hi : e.hi;
         ++e.copies;
+        if (const uint64_t tick = g_recording_tick.load(std::memory_order_relaxed); tick > e.async) {
+            e.async = tick; // sotc: N5 async: the copy completes with its async submit
+        }
         g_c.copies.fetch_add(1, std::memory_order_relaxed);
         g_c.copied_bytes.fetch_add(hi - lo, std::memory_order_relaxed);
     }
+}
+
+void SetRecordingTick(uint64_t tick) {
+    g_recording_tick.store(tick, std::memory_order_relaxed);
+}
+
+void SetAsyncDone(bool (*done)(uint64_t tick)) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_async_done = done;
 }
 
 void Report(std::string& out, double seconds) {

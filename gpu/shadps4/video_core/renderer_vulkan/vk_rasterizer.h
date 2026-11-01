@@ -14,6 +14,7 @@
 #include "video_core/range_stamps.h"
 #include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA
 #include "video_core/renderer_vulkan/vk_bindless.h"  // sotc: SOTC_N5_BINDLESS
+#include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_ASYNC_COMPUTE (AsyncBeforeOp)
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -64,6 +65,15 @@ public:
                       VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset,
                       const Pipeline* resolved = nullptr, bool use_resolved = false,
                       const PreparedDraw* prepared = nullptr);
+
+    /// sotc: SOTC_N5_ASYNC_COMPUTE=1. The draw thread calls this before each op, after N5Begin: joins
+    /// the async dispatches the op conflicts with, and marks a dispatch that may move (candidate).
+    void AsyncBeforeOp(const Vulkan::FrameGraph::Sample& s);
+
+    /// sotc: state of AsyncBeforeOp for the next dispatch (consumed by DispatchDirect/Indirect).
+    bool async_pre_seen{};
+    bool async_candidate{};
+    AmdGpu::OpFootprint async_fp{};
 
     void DispatchDirect(const Pipeline* resolved = nullptr, bool use_resolved = false);
     void DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved = nullptr,

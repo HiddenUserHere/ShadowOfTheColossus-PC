@@ -138,6 +138,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+    if (SotcQueues::AsyncMoveOn()) { // sotc: SOTC_N5_ASYNC_COMPUTE=1: the async compute queue object
+        scheduler.EnableAsyncCompute();
+    }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -2346,11 +2349,51 @@ struct DirectDispatchGuard {
 };
 } // namespace
 
+// sotc: N5 async compute move (SOTC_N5_ASYNC_COMPUTE=1, impl-n5-asynccomp.md section 7).
+struct AsyncDispatch {
+    bool candidate{};          ///< AsyncBeforeOp said this dispatch may move
+    AmdGpu::OpFootprint fp{};  ///< its footprint (unknown when AsyncBeforeOp did not run for it)
+};
+
+AsyncDispatch TakeAsync(bool& pre_seen, bool& candidate, AmdGpu::OpFootprint& fp) {
+    AsyncDispatch out;
+    if (pre_seen) {
+        out.candidate = candidate;
+        out.fp = std::move(fp);
+    }
+    pre_seen = false;
+    candidate = false;
+    fp = {};
+    return out;
+}
+
+void Rasterizer::AsyncBeforeOp(const Vulkan::FrameGraph::Sample& s) {
+    async_pre_seen = s.active && s.cls == Vulkan::FrameGraph::Class::Compute;
+    async_candidate = false;
+    if (!s.active) {
+        return;
+    }
+    const Vulkan::FrameGraph::AsyncPre pre = Vulkan::FrameGraph::AsyncBefore(s);
+    // A frame change joins into the tick being recorded (it ends the frame); other joins go to the
+    // tick after the one flushed here, which holds the op.
+    if (pre.frame_change) {
+        scheduler.AsyncJoinAfter(pre.join);
+    } else {
+        scheduler.AsyncJoinBefore(pre.join);
+    }
+    async_candidate = pre.candidate;
+    if (s.cls == Vulkan::FrameGraph::Class::Compute) {
+        async_fp = s.fp;
+        async_fp.known = s.known;
+    }
+}
+
 void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     RENDERER_TRACE;
     const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     MdiBreak(); // sotc: SOTC_MDI_STATS
     const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDispatch}; // sotc: SOTC_OP_PHASES
+    const AsyncDispatch async = TakeAsync(async_pre_seen, async_candidate, async_fp); // sotc: N5 async
 
     scheduler.PopPendingOperations();
 
@@ -2448,6 +2491,10 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
         hle_done = ExecuteShaderHLE(cs, liverpool->DrawRegs(), cs_program, *this);
     }
     if (hle_done) {
+        // sotc: N5 async: the HLE recorded graphics work, which waits for the moved dispatches it
+        // conflicts with (the work is in the current tick: wait, then flush it).
+        scheduler.AsyncJoinAfter(Vulkan::FrameGraph::AsyncConflicts(async.fp));
+        Vulkan::FrameGraph::AsyncAfter(async.fp, false, 0);
         SotcStats::Drop(5, cs_program.Address<uintptr_t>(), 0);
         return;
     }
@@ -2498,6 +2545,18 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
         return;
     }
 
+    // sotc: N5 async move. A dispatch that may move starts the async command buffer here: the graphics
+    // work so far is flushed first (its producers), and everything recorded until AsyncEnd, the
+    // barriers, the bindings, the dispatch and its result copies, goes to the async queue. Otherwise
+    // the recording waits for the moved dispatches it conflicts with.
+    const u64 async_value =
+        async.candidate && scheduler.HasAsyncQueue() && pipeline->IsReady() &&
+                cs.images.empty()
+            ? scheduler.AsyncBegin()
+            : 0;
+    if (async_value == 0) {
+        scheduler.AsyncJoinBefore(Vulkan::FrameGraph::AsyncConflicts(async.fp));
+    }
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -2512,6 +2571,10 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     CopyGpuResults(cmdbuf); // sotc: PC-native GPU result copies (native_copies.h)
+    if (async_value != 0) {
+        scheduler.AsyncEnd();
+    }
+    Vulkan::FrameGraph::AsyncAfter(async.fp, async_value != 0, async_value);
     DebugState.IncDispatch();
     MaybeDumpImages(cs.pgm_hash);
 
@@ -2527,6 +2590,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     RENDERER_TRACE;
     const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDispatchIndirect}; // sotc: SOTC_OP_PHASES
+    const AsyncDispatch async = TakeAsync(async_pre_seen, async_candidate, async_fp); // sotc: N5 async
     MdiBreak(); // sotc: SOTC_MDI_STATS
     if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
         SotcStats::cmd_kinds[5].fetch_add(1, std::memory_order_relaxed);
@@ -2581,6 +2645,15 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
 
+    // sotc: N5 async move, see DispatchDirect.
+    const u64 async_value =
+        async.candidate && scheduler.HasAsyncQueue() && pipeline->IsReady() &&
+                pipeline->GetStage(Shader::SwStage::Compute).images.empty()
+            ? scheduler.AsyncBegin()
+            : 0;
+    if (async_value == 0) {
+        scheduler.AsyncJoinBefore(Vulkan::FrameGraph::AsyncConflicts(async.fp));
+    }
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -2595,6 +2668,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     CopyGpuResults(cmdbuf); // sotc: PC-native GPU result copies (native_copies.h)
+    if (async_value != 0) {
+        scheduler.AsyncEnd();
+    }
+    Vulkan::FrameGraph::AsyncAfter(async.fp, async_value != 0, async_value);
     DebugState.IncDispatch();
     runtime.AccessBuffer(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
                          vk::AccessFlagBits2::eIndirectCommandRead);

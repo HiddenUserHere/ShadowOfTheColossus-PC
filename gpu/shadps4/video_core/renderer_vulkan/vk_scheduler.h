@@ -507,6 +507,61 @@ private:
     std::mutex mutex;
 };
 
+/// sotc: SOTC_N5_ASYNC_COMPUTE=1 (docs/re-stutters/native/impl-n5-asynccomp.md). Compute dispatches
+/// that the frame graph proves independent are recorded here and submitted to the async compute queue
+/// (Instance::GetAsyncQueue) in submit order, on a timeline semaphore of their own. A submit waits for
+/// the graphics tick it was flushed behind (the dispatch's producers) and for the previous async submit
+/// (two submits of one queue are not ordered against each other's memory accesses). The graphics side
+/// joins with Scheduler::AsyncRequire: the next graphics submit waits for the async value.
+/// Draw thread only, except Done (any thread).
+class AsyncCompute {
+public:
+    AsyncCompute(const Instance& instance_, Scheduler* scheduler_);
+    ~AsyncCompute();
+
+    /// Begins the command buffer of the next async submit. value receives its timeline value.
+    vk::CommandBuffer Begin(u64& value);
+
+    /// Ends the command buffer of Begin and submits it. graphics_tick: the newest graphics tick the
+    /// dispatch depends on (0: none), waited for on graphics_sem.
+    void Submit(vk::Semaphore graphics_sem, u64 graphics_tick);
+
+    /// Timeline semaphore of the async submits.
+    [[nodiscard]] vk::Semaphore Handle() const noexcept {
+        return *timeline;
+    }
+
+    /// Timeline value of the newest submit (0: none yet).
+    [[nodiscard]] u64 LastTick() const noexcept {
+        return last_tick.load(std::memory_order_acquire);
+    }
+
+    /// True once the submit of value completed. Any thread, no wait.
+    [[nodiscard]] bool Done(u64 value) const;
+
+    /// Waits on the CPU until the submit of value completed.
+    void WaitValue(u64 value);
+
+private:
+    static constexpr u32 NumSlots = 8;
+    struct Slot {
+        vk::CommandBuffer cmd{};
+        u64 tick{}; ///< timeline value of the submit last recorded here; 0: never used
+    };
+
+    const Instance& instance;
+    Scheduler* scheduler{}; ///< to wait until a graphics tick is on the queue
+    vk::Queue queue;
+    vk::UniqueSemaphore timeline;
+    vk::UniqueCommandPool pool;
+    std::array<Slot, NumSlots> slots{};
+    u32 next_slot{};
+    u64 next_tick{1};
+    Slot* open{};    ///< slot begun by Begin and not submitted yet
+    u64 open_tick{};
+    std::atomic<u64> last_tick{};
+};
+
 using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
@@ -551,6 +606,40 @@ public:
     /// sotc: copies buffer data on the transfer queue (XferQueue::Copy). False: not routed, the
     /// caller records the copy on the graphics queue as before.
     bool XferCopy(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferCopy> copies);
+
+    /// sotc: SOTC_N5_ASYNC_COMPUTE=1. Creates the async compute queue object (AsyncCompute) when the
+    /// device has the queue. Called by the rasterizer, the only user of the async path.
+    void EnableAsyncCompute();
+
+    /// sotc: true when EnableAsyncCompute created the async compute queue object.
+    [[nodiscard]] bool HasAsyncQueue() const noexcept {
+        return async != nullptr;
+    }
+
+    /// sotc: starts a dispatch on the async queue. Ends the render pass and flushes the graphics
+    /// work recorded so far, then CommandBuffer() returns the async command buffer until AsyncEnd.
+    /// Returns its timeline value (0 when the queue is missing; nothing was started then).
+    u64 AsyncBegin();
+
+    /// sotc: ends the async command buffer of AsyncBegin and submits it.
+    void AsyncEnd();
+
+    /// sotc: the next graphics submit waits for the async value (the newest one wins).
+    void AsyncRequire(u64 value);
+
+    /// sotc: the graphics work recorded after this call waits for the async value: flushes the
+    /// current tick, then requires the value for the next submit. No-op when already joined.
+    void AsyncJoinBefore(u64 value);
+
+    /// sotc: the work recorded so far must wait for the async value: requires it, then flushes the
+    /// current tick with it. No-op when already joined.
+    void AsyncJoinAfter(u64 value);
+
+    /// sotc: the host reads or writes memory the async queue may touch: joins every async submit.
+    void AsyncSyncHost();
+
+    /// sotc: timeline value of the newest async submit (0: none).
+    [[nodiscard]] u64 AsyncLast() const noexcept;
 
     /// sotc: SOTC_HOST_IMPORT, see XferQueue::CopyAndWait. False without the transfer queue.
     bool XferCopyAndWait(std::span<const XferQueue::Region> regions) {
@@ -659,12 +748,18 @@ public:
 
     /// Returns the current command buffer.
     vk::CommandBuffer CommandBuffer() const {
+        if (redirect) { // sotc: SOTC_N5_ASYNC_COMPUTE, see AsyncBegin
+            return redirect;
+        }
         return sessions.back().primary;
     }
 
     /// sotc: number of the current session, which is the command buffer being recorded. It changes
     /// on every BeginSession, so per-command-buffer state (descriptor buffer bindings) can key on it.
     [[nodiscard]] u64 SessionSerial() const noexcept {
+        if (redirect) { // sotc: the async command buffer is its own serial (bindings are per buffer)
+            return (u64{1} << 63) | redirect_tick;
+        }
         return session_serial;
     }
 
@@ -843,6 +938,13 @@ private:
     std::atomic<u64> recorded_submit_tick{0};
     /// sotc: SOTC_XFER_QUEUE only; null otherwise.
     std::unique_ptr<XferQueue> xfer;
+    /// sotc: SOTC_N5_ASYNC_COMPUTE=1: the async compute queue (null when off or missing).
+    std::unique_ptr<AsyncCompute> async;
+    vk::CommandBuffer redirect{};  ///< sotc: the async command buffer while AsyncBegin is open
+    u64 redirect_tick{};           ///< sotc: its timeline value
+    u64 async_graphics_tick{};     ///< sotc: newest graphics tick the open async submit waits for
+    u64 async_pending{};           ///< sotc: async value the next graphics submit waits for
+    u64 async_joined{};            ///< sotc: newest async value a graphics submit waits for or the host
     /// Last member: stops (after running everything queued) before the rest is destroyed.
     std::unique_ptr<CommandRecorder> recorder;
 };

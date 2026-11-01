@@ -10,8 +10,9 @@
 // Image uploads are not routed (exclusive images would need ownership transfers): see the report.
 // The async compute family is only probed here; no dispatch is moved to it yet.
 // sotc: N5 async compute (docs/re-stutters/native/impl-n5-asynccomp.md). SOTC_N5_ASYNC_COMPUTE, with
-// SOTC_NATIVE on: 0 off; 1 the device creates one compute queue (PickAsyncQueue) and logs the pick;
-// 2 verify: 1 + the classifier in vk_frame_graph.cpp ("N5 async" line). Mode 1 moves NO dispatch yet.
+// SOTC_NATIVE on: 0 off; 1 the device creates one compute queue (PickAsyncQueue) and independent
+// dispatches are recorded there (AsyncCompute in vk_scheduler.h, join rules in vk_frame_graph.cpp);
+// 2 verify: the classifier only ("N5 async" line).
 //
 // Thread safety: Mode() is read once. Counters are atomics; Report resets its window.
 #pragma once
@@ -64,10 +65,15 @@ enum class Fallback : uint8_t {
 };
 void NoteFallback(Fallback reason);
 
-/// SOTC_N5_ASYNC_COMPUTE: 0 off, 1 queue created (plumbing), 2 verify (classifier). Needs SOTC_NATIVE.
+/// SOTC_N5_ASYNC_COMPUTE: 0 off, 1 move (independent dispatches run on the async compute queue),
+/// 2 verify (classifier only). Needs SOTC_NATIVE.
 int AsyncMode();
 inline bool AsyncOn() {
     return AsyncMode() != 0;
+}
+/// Mode 1: the frame graph moves independent compute dispatches to the async compute queue.
+inline bool AsyncMoveOn() {
+    return AsyncMode() == 1;
 }
 
 /// The queue the device creates for async compute. family == NoFamily: none (graphics queue).

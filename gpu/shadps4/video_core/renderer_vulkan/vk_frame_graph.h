@@ -78,4 +78,29 @@ bool AsyncVerify();
 /// Appends one "N5 async ..." line and resets its counters. Empty when AsyncVerify is off.
 void ReportAsync(std::string& out, double seconds);
 
+// sotc: N5 async compute move (SOTC_N5_ASYNC_COMPUTE=1, impl-n5-asynccomp.md section 7). The draw thread
+// calls AsyncBefore for every op after N5Begin. A dispatch with candidate set may move; each dispatch
+// then ends with AsyncConflicts (before recording it on graphics) or AsyncAfter (its outcome). The
+// joins are the caller's: it flushes and requires the async tick returned. Moved dispatches are ordered
+// on the async queue; a graphics op that conflicts with one waits for it. Single dispatches, not runs.
+bool AsyncMove();
+
+struct AsyncPre {
+    u64 join{};          ///< async tick the work recorded from this op on must wait for (0: none)
+    bool frame_change{}; ///< the frame ended with this op: join goes to the tick being recorded
+    bool candidate{};    ///< a compute op independent of the graphics ops and dispatches so far
+};
+AsyncPre AsyncBefore(const Sample& s);
+
+/// Async tick to wait for before a graphics dispatch with footprint fp is recorded: the moved
+/// dispatches it conflicts with (all of them when fp is unknown). Removes the joined ones.
+u64 AsyncConflicts(const AmdGpu::OpFootprint& fp);
+
+/// Records the outcome of a dispatch: moved to async tick value, or recorded on graphics.
+void AsyncAfter(const AmdGpu::OpFootprint& fp, bool moved, u64 value);
+
+/// Appends one "N5 move ..." line (SOTC_N5_ASYNC_COMPUTE=1) and resets its window counters.
+/// Empty when the move is off.
+void ReportMove(std::string& out, double seconds);
+
 } // namespace Vulkan::FrameGraph

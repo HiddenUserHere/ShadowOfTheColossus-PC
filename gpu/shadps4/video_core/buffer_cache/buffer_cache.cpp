@@ -5044,6 +5044,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         SotcNative::NoteSkippedReadback(device_addr, size);
         return;
     }
+    scheduler.AsyncSyncHost(); // sotc: N5 async: the host reads what moved dispatches wrote
     RbxDepth rbx_depth_guard{rbx_depth}; // sotc: SOTC_RB_EXACT: see BeginAsyncReadback
     SotcStats::readbacks.fetch_add(1, std::memory_order_relaxed);
     // sotc: the clock is read only with SOTC_FPS timers (kFpsTimers, SOTC_FPS_LEAN drops it); the
@@ -8015,6 +8016,9 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         }
     }
     if (!copies.empty()) {
+        // sotc: N5 async: the upload writes bytes that moved dispatches may read or write: join them
+        // before the copy is recorded (AsyncJoinBefore flushes the tick that precedes it).
+        scheduler.AsyncSyncHost();
         // sotc: SOTC_VERIFY: the CPU-written bytes the GPU takes here (dstOffset: guest address here) for
         // a bind of `size` bytes.
         if (SotcNative::Verify()) {

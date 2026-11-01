@@ -132,6 +132,20 @@ public:
         return properties.limits.timestampPeriod;
     }
 
+    /// sotc: SOTC_N5_ASYNC_COMPUTE=1: the compute-only queue of AsyncCompute (vk_scheduler.h). It is
+    /// the queue index async_pick names: a family of its own, or queue 1 of the upload family.
+    bool HasAsyncQueue() const {
+        return async_pick.family != SotcQueues::NoFamily;
+    }
+
+    u32 GetAsyncQueueFamilyIndex() const {
+        return async_pick.family;
+    }
+
+    vk::Queue GetAsyncQueue() const {
+        return async_queue;
+    }
+
     vk::Queue GetXferQueue() const {
         return xfer_queue;
     }
@@ -755,6 +769,8 @@ private:
     static constexpr u32 NoXferQueueFamily = ~u32{0};
     u32 xfer_queue_family_index{NoXferQueueFamily}; // sotc: see HasXferQueue()
     vk::Queue xfer_queue;                           // sotc: see HasXferQueue()
+    SotcQueues::AsyncPick async_pick{}; // sotc: see HasAsyncQueue()
+    vk::Queue async_queue;              // sotc: valid when HasAsyncQueue()
     bool xfer_routing{};          // sotc: see IsXferRoutingEnabled()
     SotcQueues::Probe n5_probe{}; // sotc: see N5Probe()
     bool rb_tick{};               // sotc: see IsRbTickEnabled()

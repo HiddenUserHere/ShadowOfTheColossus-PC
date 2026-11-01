@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
+#include "../../../sotc/native/native_copies.h" // sotc: SOTC_N5_ASYNC_COMPUTE (copies of an async submit)
 #include "sotc_gpu_trace.h"
 #include <chrono>
 #include <span>
@@ -296,6 +297,7 @@ void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
+    AsyncRequire(AsyncLast()); // sotc: the async dispatches go first
     SubmitExecution(info);
     Wait(presubmit_tick);
 }
@@ -303,6 +305,7 @@ void Scheduler::Finish() {
 void Scheduler::FinishHostRead() {
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
+    AsyncRequire(AsyncLast()); // sotc: the async dispatches go first
     SubmitExecution(info);
     WaitSubmitted(presubmit_tick);
     work_semaphore.WaitHostRead(presubmit_tick);
@@ -1042,8 +1045,220 @@ void XferQueue::WaitValue(u64 value, u32 spin_us) {
                vk::to_string(wait_result));
 }
 
+void Scheduler::EnableAsyncCompute() {
+    if (!async && instance.HasAsyncQueue()) {
+        async = std::make_unique<AsyncCompute>(instance, this);
+    }
+}
+
+u64 Scheduler::AsyncBegin() {
+    if (!async) {
+        return 0;
+    }
+    EndRendering();
+    // Every graphics op recorded so far goes first: the producers of the dispatch are in that tick.
+    Flush();
+    async_graphics_tick = CurrentTick() - 1; // the tick Flush submitted (ticks start at 1)
+    u64 value = 0;
+    redirect = async->Begin(value);
+    redirect_tick = value;
+    SotcNativeCopies::SetRecordingTick(value);
+    return value;
+}
+
+void Scheduler::AsyncEnd() {
+    redirect = vk::CommandBuffer{};
+    redirect_tick = 0;
+    SotcNativeCopies::SetRecordingTick(0);
+    async->Submit(work_semaphore.Handle(), async_graphics_tick);
+    async_graphics_tick = 0;
+}
+
+void Scheduler::AsyncRequire(u64 value) {
+    if (value == 0) {
+        return;
+    }
+    async_pending = std::max(async_pending, value);
+    async_joined = std::max(async_joined, value);
+}
+
+void Scheduler::AsyncJoinBefore(u64 value) {
+    if (value == 0 || value <= async_joined) {
+        return;
+    }
+    Flush();
+    AsyncRequire(value);
+}
+
+void Scheduler::AsyncJoinAfter(u64 value) {
+    if (value == 0 || value <= async_joined) {
+        return;
+    }
+    AsyncRequire(value);
+    Flush();
+}
+
+void Scheduler::AsyncSyncHost() {
+    if (async) {
+        AsyncJoinBefore(async->LastTick());
+    }
+}
+
+u64 Scheduler::AsyncLast() const noexcept {
+    return async ? async->LastTick() : 0;
+}
+
 bool Scheduler::XferCopy(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferCopy> copies) {
     return xfer && xfer->Copy(src, dst, copies);
+}
+
+// sotc: SOTC_N5_ASYNC_COMPUTE=1. See AsyncCompute in vk_scheduler.h.
+namespace {
+
+std::atomic<AsyncCompute*> g_async_live{nullptr}; // the async queue of the draw scheduler
+
+bool AsyncDoneFn(uint64_t value) {
+    AsyncCompute* live = g_async_live.load(std::memory_order_acquire);
+    return live != nullptr && live->Done(value);
+}
+
+} // namespace
+
+AsyncCompute::AsyncCompute(const Instance& instance_, Scheduler* scheduler_)
+    : instance{instance_}, scheduler{scheduler_} {
+    const vk::Device device = instance.GetDevice();
+    queue = instance.GetAsyncQueue();
+
+    const vk::StructureChain semaphore_chain = {
+        vk::SemaphoreCreateInfo{},
+        vk::SemaphoreTypeCreateInfo{
+            .semaphoreType = vk::SemaphoreType::eTimeline,
+            .initialValue = 0,
+        },
+    };
+    auto [sem_result, sem] = device.createSemaphoreUnique(semaphore_chain.get());
+    ASSERT_MSG(sem_result == vk::Result::eSuccess, "Failed to create the async semaphore: {}",
+               vk::to_string(sem_result));
+    timeline = std::move(sem);
+
+    const vk::CommandPoolCreateInfo pool_info = {
+        .flags = vk::CommandPoolCreateFlagBits::eTransient |
+                 vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+        .queueFamilyIndex = instance.GetAsyncQueueFamilyIndex(),
+    };
+    auto [pool_result, pool_handle] = device.createCommandPoolUnique(pool_info);
+    ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create the async pool: {}",
+               vk::to_string(pool_result));
+    pool = std::move(pool_handle);
+
+    const vk::CommandBufferAllocateInfo alloc_info = {
+        .commandPool = *pool,
+        .level = vk::CommandBufferLevel::ePrimary,
+        .commandBufferCount = NumSlots,
+    };
+    auto [alloc_result, cmdbufs] = device.allocateCommandBuffers(alloc_info);
+    ASSERT_MSG(alloc_result == vk::Result::eSuccess,
+               "Failed to allocate the async command buffers: {}", vk::to_string(alloc_result));
+    for (u32 i = 0; i < NumSlots; ++i) {
+        slots[i].cmd = cmdbufs[i];
+    }
+
+    g_async_live.store(this, std::memory_order_release);
+    SotcNativeCopies::SetAsyncDone(&AsyncDoneFn);
+}
+
+AsyncCompute::~AsyncCompute() {
+    SotcNativeCopies::SetAsyncDone(nullptr);
+    g_async_live.store(nullptr, std::memory_order_release);
+    // Nothing of the dispatches may still run when the pool and the semaphore are destroyed.
+    (void)queue.waitIdle();
+}
+
+vk::CommandBuffer AsyncCompute::Begin(u64& value) {
+    Slot& slot = slots[next_slot];
+    next_slot = (next_slot + 1) % NumSlots;
+    // A command buffer is reused only after the submit recorded in it has completed.
+    WaitValue(slot.tick);
+    open = &slot;
+    open_tick = next_tick++;
+    value = open_tick;
+    Check(slot.cmd.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    return slot.cmd;
+}
+
+void AsyncCompute::Submit(vk::Semaphore graphics_sem, u64 graphics_tick) {
+    ASSERT_MSG(open != nullptr, "AsyncCompute::Submit without Begin");
+    Check(open->cmd.end());
+    const u64 tick = open_tick;
+    // The graphics tick may still wait in the recording thread: the async submit must not be queued
+    // ahead of its signal (see XferQueue::Copy).
+    if (graphics_tick != 0 && scheduler) {
+        scheduler->WaitSubmitted(graphics_tick);
+    }
+    const vk::Semaphore sem = *timeline;
+    std::array<vk::Semaphore, 2> wait_sems{};
+    std::array<u64, 2> wait_values{};
+    u32 num_waits = 0;
+    if (graphics_tick != 0) {
+        wait_sems[num_waits] = graphics_sem;
+        wait_values[num_waits++] = graphics_tick;
+    }
+    if (const u64 prev = last_tick.load(std::memory_order_acquire); prev != 0) {
+        wait_sems[num_waits] = sem;
+        wait_values[num_waits++] = prev;
+    }
+    const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
+    const std::array<vk::PipelineStageFlags, 2> wait_stages{wait_stage, wait_stage};
+    const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+        .waitSemaphoreValueCount = num_waits,
+        .pWaitSemaphoreValues = wait_values.data(),
+        .signalSemaphoreValueCount = 1u,
+        .pSignalSemaphoreValues = &tick,
+    };
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_info,
+        .waitSemaphoreCount = num_waits,
+        .pWaitSemaphores = wait_sems.data(),
+        .pWaitDstStageMask = wait_stages.data(),
+        .commandBufferCount = 1u,
+        .pCommandBuffers = &open->cmd,
+        .signalSemaphoreCount = 1u,
+        .pSignalSemaphores = &sem,
+    };
+    const vk::Result submit_result = queue.submit(submit_info, vk::Fence{});
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault();
+        UNREACHABLE_MSG("Device lost during async compute submit");
+    }
+    ASSERT_MSG(submit_result == vk::Result::eSuccess, "Async compute submit failed: {}",
+               vk::to_string(submit_result));
+
+    open->tick = tick;
+    last_tick.store(tick, std::memory_order_release);
+    open = nullptr;
+}
+
+bool AsyncCompute::Done(u64 value) const {
+    const auto [result, counter] = instance.GetDevice().getSemaphoreCounterValue(*timeline);
+    return result == vk::Result::eSuccess && counter >= value;
+}
+
+void AsyncCompute::WaitValue(u64 value) {
+    if (value == 0 || Done(value)) {
+        return;
+    }
+    const vk::Semaphore sem = *timeline;
+    const vk::SemaphoreWaitInfo wait_info = {
+        .semaphoreCount = 1,
+        .pSemaphores = &sem,
+        .pValues = &value,
+    };
+    const vk::Result wait_result =
+        instance.GetDevice().waitSemaphores(wait_info, std::numeric_limits<u64>::max());
+    ASSERT_MSG(wait_result == vk::Result::eSuccess, "Async compute wait failed: {}",
+               vk::to_string(wait_result));
 }
 
 // The queue submit of SubmitExecution, from the command processor or the recording thread.
@@ -1144,6 +1359,16 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                 xfer->WaitLastCopy(); // no wait slot left: wait on the CPU instead
             }
         }
+    }
+    // sotc: SOTC_N5_ASYNC_COMPUTE=1: this submit waits for the async dispatches joined since the
+    // previous one (AsyncRequire).
+    if (async_pending != 0) {
+        if (info.num_wait_semas < info.wait_semas.size()) {
+            info.AddWait(async->Handle(), async_pending, vk::PipelineStageFlagBits::eAllCommands);
+        } else {
+            async->WaitValue(async_pending); // no wait slot left: wait on the CPU instead
+        }
+        async_pending = 0;
     }
 
     const vk::Semaphore timeline = work_semaphore.Handle();

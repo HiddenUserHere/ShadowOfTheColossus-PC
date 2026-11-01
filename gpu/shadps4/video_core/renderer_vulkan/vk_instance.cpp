@@ -736,7 +736,7 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
 
     // sotc: SOTC_N5_QUEUES: probe the families once (vendor, flags, async compute family) and log it.
     // Vulkan 1.3 baseline; a missing family is a logged fallback, never an error.
-    if (SotcQueues::On()) {
+    if (SotcQueues::On() || SotcQueues::AsyncOn()) {
         std::vector<SotcQueues::FamilyInfo> infos;
         infos.reserve(family_properties.size());
         for (const auto& f : family_properties) {
@@ -752,6 +752,10 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         if (xfer_routing && !HasXferQueue()) {
             SotcQueues::NoteFallback(SotcQueues::Fallback::NoTransferFamily);
         }
+        if (SotcQueues::AsyncOn()) { // sotc: SOTC_N5_ASYNC_COMPUTE, one compute-only queue
+            async_pick = SotcQueues::PickAsyncQueue(infos, xfer_queue_family_index);
+            SotcQueues::LogAsyncPick(async_pick, static_cast<uint32_t>(infos.size()));
+        }
     }
     static constexpr std::array queue_priorities = {1.0f};
     const vk::DeviceQueueCreateInfo queue_info = {
@@ -759,15 +763,27 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         .queueCount = 1u,
         .pQueuePriorities = queue_priorities.data(),
     };
+    // sotc: the async queue is queue 1 of the upload family when that family is the only compute
+    // one (async_pick.shares_xfer); otherwise it has a family entry of its own.
+    static constexpr std::array two_priorities = {1.0f, 1.0f};
+    const bool async_shares_xfer = HasAsyncQueue() && async_pick.shares_xfer && HasXferQueue();
     const vk::DeviceQueueCreateInfo xfer_queue_info = {
         .queueFamilyIndex = xfer_queue_family_index,
+        .queueCount = async_shares_xfer ? 2u : 1u,
+        .pQueuePriorities = two_priorities.data(),
+    };
+    const vk::DeviceQueueCreateInfo async_queue_info = {
+        .queueFamilyIndex = async_pick.family,
         .queueCount = 1u,
         .pQueuePriorities = queue_priorities.data(),
     };
-    // One entry per family: the transfer family, when there is one.
-    boost::container::static_vector<vk::DeviceQueueCreateInfo, 2> queue_infos{queue_info};
+    // One entry per family: the transfer family, when there is one, and the async family.
+    boost::container::static_vector<vk::DeviceQueueCreateInfo, 3> queue_infos{queue_info};
     if (HasXferQueue()) {
         queue_infos.push_back(xfer_queue_info);
+    }
+    if (HasAsyncQueue() && !async_shares_xfer) {
+        queue_infos.push_back(async_queue_info);
     }
     const u32 queue_info_count = static_cast<u32>(queue_infos.size());
 
@@ -1109,13 +1125,19 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
-    if (device_result != vk::Result::eSuccess && HasXferQueue()) {
+    if (device_result != vk::Result::eSuccess && (HasXferQueue() || HasAsyncQueue())) {
         // sotc: an extra queue was refused: retry with the graphics queue alone, as without them.
         LOG_WARNING(Render_Vulkan, "Device creation with the extra queues failed ({}), "
                                    "retrying without them",
                     vk::to_string(device_result));
-        xfer_queue_family_index = NoXferQueueFamily;
-        SotcQueues::NoteFallback(SotcQueues::Fallback::TransferQueueRefused); // sotc: N5 log once
+        if (HasXferQueue()) {
+            xfer_queue_family_index = NoXferQueueFamily;
+            SotcQueues::NoteFallback(SotcQueues::Fallback::TransferQueueRefused); // sotc: N5 log once
+        }
+        if (HasAsyncQueue()) { // sotc: the async queue goes with them
+            SotcQueues::NoteFallback(SotcQueues::Fallback::AsyncQueueRefused);
+            async_pick = SotcQueues::AsyncPick{};
+        }
         device_chain.get<vk::DeviceCreateInfo>().queueCreateInfoCount = 1u;
         auto [retry_result, retry_dev] = physical_device.createDeviceUnique(device_chain.get());
         device_result = retry_result;
@@ -1142,6 +1164,12 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         LOG_INFO(Render_Vulkan, "SOTC_HOST_IMPORT: large uploads are copied by the GPU from "
                                 "imported guest memory (alignment {} bytes)",
                  host_import_alignment);
+    }
+    if (HasAsyncQueue()) { // sotc: SOTC_N5_ASYNC_COMPUTE
+        async_queue = device->getQueue(async_pick.family, async_pick.queue_index);
+        LOG_INFO(Render_Vulkan, "Dispatches move to the async compute queue family {} index {} "
+                                "(SOTC_N5_ASYNC_COMPUTE=1)",
+                 async_pick.family, async_pick.queue_index);
     }
     if (HasXferQueue()) {
         xfer_queue = device->getQueue(xfer_queue_family_index, 0);

@@ -342,7 +342,9 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     // sotc: SOTC_N5_GRAPH (observe/verify; footprints come from the prep threads, see N5Begin).
     // The draw thread is the only one that runs ExecuteBackOp; its per-op state needs it.
     // sotc: SOTC_N5_ASYNC_COMPUTE=2 classifies compute passes from the same samples.
-    n5_on = (Vulkan::FrameGraph::Enabled() || Vulkan::FrameGraph::AsyncVerify()) && back_threaded;
+    n5_on = (Vulkan::FrameGraph::Enabled() || Vulkan::FrameGraph::AsyncVerify() ||
+             Vulkan::FrameGraph::AsyncMove()) &&
+            back_threaded;
     if (n5_on) {
         LOG_INFO(Render, "SOTC_N5_GRAPH: on (footprints need SOTC_PARALLEL_RECORD=1; without it "
                          "every op is a barrier point)");
@@ -1282,6 +1284,9 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
     const u64 ob_t1 = opstat ? SotcStats::NowNs() : 0; // sotc: SOTC_OPSTAT
     if (n5_on) { // sotc: SOTC_N5_GRAPH: this op's pass sample, before its own work
         N5Begin(op);
+    }
+    if (n5_on && Vulkan::FrameGraph::AsyncMove()) { // sotc: SOTC_N5_ASYNC_COMPUTE=1: joins, move
+        rasterizer->AsyncBeforeOp(n5_cur);
     }
     if (ovl_on) { // sotc: SOTC_OP_OVERLAP (7c.0): back_regs now holds this op's registers
         NoteOpOverlap(op);

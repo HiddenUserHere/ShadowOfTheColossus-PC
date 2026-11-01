@@ -65,6 +65,12 @@ public:
     /// sotc: binds the pipeline in the current command buffer. A deferred pipeline still being
     /// built is bound on the recording thread, which waits for it there, so the command
     /// processor goes on (and other new pipelines build meanwhile).
+    /// sotc: SOTC_N5_ASYNC_COMPUTE: the pipeline is built, so its bind is recorded right away (a
+    /// bind that is still deferred would land in the graphics command buffer).
+    [[nodiscard]] bool IsReady() const noexcept {
+        return ready.load(std::memory_order_acquire);
+    }
+
     void BindWhenReady() const;
 
     /// sotc: waits until a deferred construction has made its pipeline (building it here if no

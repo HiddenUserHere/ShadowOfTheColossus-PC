@@ -260,15 +260,30 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         .sharingMode = vk::SharingMode::eExclusive,
     };
     // sotc: SOTC_XFER_QUEUE: uploads copy into and out of these buffers on the transfer queue.
-    const std::array<u32, 2> families = {instance.GetGraphicsQueueFamilyIndex(),
-                                         instance.GetXferQueueFamilyIndex()};
+    // sotc: SOTC_N5_ASYNC_COMPUTE=1: dispatches on the async compute queue use them too.
+    std::array<u32, 3> families{instance.GetGraphicsQueueFamilyIndex(), 0u, 0u};
+    u32 num_families = 1;
+    if (instance.HasXferQueue()) {
+        families[num_families++] = instance.GetXferQueueFamilyIndex();
+    }
+    if (instance.HasAsyncQueue()) {
+        const u32 async_family = instance.GetAsyncQueueFamilyIndex();
+        bool listed = false;
+        for (u32 i = 0; i < num_families; ++i) {
+            listed |= families[i] == async_family;
+        }
+        if (!listed) {
+            families[num_families++] = async_family;
+        }
+    }
     // sotc: SOTC_HOST_IMPORT alone writes only device-local staging on the transfer queue: the
     // other buffers stay exclusive, as without the transfer queue.
     // sotc: SOTC_RB_TICK: the arena and the download staging of a readback copy on that queue.
     if (instance.IsXferRoutingEnabled() || instance.IsRbTickEnabled() ||
-        (instance.IsHostImportEnabled() && mem_type_ == MemoryType::DeviceLocal)) {
+        (instance.IsHostImportEnabled() && mem_type_ == MemoryType::DeviceLocal) ||
+        instance.HasAsyncQueue()) {
         buffer_ci.sharingMode = vk::SharingMode::eConcurrent;
-        buffer_ci.queueFamilyIndexCount = static_cast<u32>(families.size());
+        buffer_ci.queueFamilyIndexCount = num_families;
         buffer_ci.pQueueFamilyIndices = families.data();
     }
     VmaAllocationInfo alloc_info{};

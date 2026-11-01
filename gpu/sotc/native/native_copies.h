@@ -56,6 +56,14 @@ void NoteWrittenBind(vk::CommandBuffer cmdbuf, vk::Buffer src, uint64_t src_offs
 bool Watching();
 
 /// "SOTC NATIVE COPIES" 5 s line (counters reset). Nothing when not armed.
+/// sotc: SOTC_N5_ASYNC_COMPUTE. The async queue tick the GPU copies recorded now belong to (0: the
+/// graphics queue). A copy is complete only once that async submit completed (see CopyOut).
+void SetRecordingTick(uint64_t tick);
+
+/// sotc: SOTC_N5_ASYNC_COMPUTE. Completion test of an async queue tick, set by the async compute
+/// queue (null when there is none). Non-blocking.
+void SetAsyncDone(bool (*done)(uint64_t tick));
+
 void Report(std::string& out, double seconds);
 
 } // namespace SotcNativeCopies
