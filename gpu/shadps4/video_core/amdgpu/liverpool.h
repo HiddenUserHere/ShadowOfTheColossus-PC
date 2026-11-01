@@ -29,6 +29,7 @@
 #include "video_core/amdgpu/op_footprint.h" // sotc: SOTC_OP_OVERLAP
 #include "video_core/amdgpu/regs.h"
 #include "video_core/sotc_stats.h" // sotc: SOTC_DROP_FAST counters (CmdRanges::AddNested)
+#include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH (pass / hazard model)
 #include "../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST (label kinds, counters)
 
 namespace Vulkan {
@@ -1117,6 +1118,12 @@ private:
     AmdGpu::OpFootprint ovl_prev;
     /// Draw thread, before the op runs: compare its footprint with the previous op's.
     void NoteOpOverlap(const BackOp& op);
+    /// sotc: SOTC_N5_GRAPH (vk_frame_graph.h). n5_on is set before the prep threads start. n5_cur
+    /// is draw-thread only: N5Begin runs in ExecuteBackOp before the op, N5End after it.
+    bool n5_on{};
+    Vulkan::FrameGraph::Sample n5_cur{};
+    void N5Begin(const BackOp& op);
+    void N5End();
     void XpPoll(u64 tail);
     /// Draw thread: returns true when the segment was consumed (ran ahead or dropped).
     bool XpEvaluate(const XpSeg& seg, u64 tail);

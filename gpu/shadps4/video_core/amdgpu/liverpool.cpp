@@ -339,6 +339,13 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     if (frame_tickets || asc_rptr_mode) {
         LOG_INFO(Render, "SOTC_CP_AHEAD={} SOTC_ASC_RPTR={}", CpAheadMode(), asc_rptr_mode);
     }
+    // sotc: SOTC_N5_GRAPH (observe/verify; footprints come from the prep threads, see N5Begin).
+    // The draw thread is the only one that runs ExecuteBackOp; its per-op state needs it.
+    n5_on = Vulkan::FrameGraph::Enabled() && back_threaded;
+    if (n5_on) {
+        LOG_INFO(Render, "SOTC_N5_GRAPH: on (footprints need SOTC_PARALLEL_RECORD=1; without it "
+                         "every op is a barrier point)");
+    }
     // sotc: SOTC_CULL_EXPRESS=1 (default off; needs the draw thread and SOTC_PARALLEL_RECORD=1 for
     // the footprints). Read before the draw thread starts (XpPoll).
     if (back_threaded && SotcStats::kCullExpress) {
@@ -1283,6 +1290,9 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         rt.pgm_base = stage.pgm_base;
     }
     const u64 ob_t1 = opstat ? SotcStats::NowNs() : 0; // sotc: SOTC_OPSTAT
+    if (n5_on) { // sotc: SOTC_N5_GRAPH: this op's pass sample, before its own work
+        N5Begin(op);
+    }
     if (ovl_on) { // sotc: SOTC_OP_OVERLAP (7c.0): back_regs now holds this op's registers
         NoteOpOverlap(op);
     }
@@ -1311,6 +1321,9 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         rasterizer->DispatchIndirect(op.address, op.offset, op.size, op.pipeline, true);
         break;
     }
+    if (n5_on) { // sotc: SOTC_N5_GRAPH: closes the sample (N5Begin)
+        N5End();
+    }
     if (opstat) { // sotc: SOTC_OPSTAT
         const u64 ob_t2 = SotcStats::NowNs();
         OpStatAdd(OsPreNs, ob_t1 - ob_t0);
@@ -1328,7 +1341,7 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
     Shader::g_info_slot = 2 + index; // info.h: slots 2..5 are the draw workers'
     Regs& prep = *prep_regs[index];
     // sotc: the op footprints are filled for SOTC_CULL_EXPRESS and for SOTC_OP_OVERLAP.
-    const bool fp_fill = xp_on || ovl_on;
+    const bool fp_fill = xp_on || ovl_on || n5_on;
     u64 seq = 0;
     while (!stoken.stop_requested()) {
         if (back_head.load(std::memory_order_acquire) == seq) {
@@ -1753,6 +1766,92 @@ void Liverpool::NoteOpOverlap(const BackOp& op) {
     }
     ovl_prev = std::move(cur);
     ovl_prev_known = true;
+}
+
+// sotc: SOTC_N5_GRAPH (vk_frame_graph.h). The render-target identity of the back registers: the
+// bound color and depth surfaces by address, format and extent. Ops with the same key draw into
+// the same surfaces.
+static u64 N5TargetKey(const AmdGpu::Regs& regs) {
+    u64 h = 0x9E3779B97F4A7C15ull;
+    const auto mix = [&h](u64 v) { h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2); };
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const AmdGpu::ColorBuffer& col = regs.color_buffers[cb];
+        if (!col || !regs.color_target_mask.GetMask(cb)) {
+            continue;
+        }
+        mix(cb + 1);
+        mix(col.Address());
+        mix(col.info.format);
+        mix(col.Pitch());
+        mix(col.Height());
+        mix(col.NumSlices());
+    }
+    const auto& db = regs.depth_buffer;
+    if (regs.depth_control.depth_enable && db.DepthValid()) {
+        mix(0x100);
+        mix(db.DepthAddress());
+        mix(static_cast<u64>(db.z_info.format));
+        mix(db.Pitch());
+        mix(db.Height());
+    }
+    return h;
+}
+
+// sotc: SOTC_N5_GRAPH. Draw thread, in ExecuteBackOp after the op's registers are replayed (as
+// NoteOpOverlap). The footprint comes from the op's prep slot: it is known only when the prep
+// threads prepared this op (SOTC_PARALLEL_RECORD=1); otherwise the op is a barrier point.
+void Liverpool::N5Begin(const BackOp& op) {
+    using namespace AmdGpu;
+    using enum BackOp::Kind;
+    Vulkan::FrameGraph::Sample& s = n5_cur;
+    s = Vulkan::FrameGraph::Sample{};
+    s.barrier0 = Vulkan::FrameGraph::BarrierEvents();
+    if (op.kind == Func) {
+        if (!op.func) {
+            return; // a flushed WRITE_DATA batch with nothing left to run
+        }
+        s.active = true;
+        s.cls = Vulkan::FrameGraph::Class::Other;
+        return;
+    }
+    if (!op.pipeline) {
+        return; // dropped by the draw filter: runs as nothing
+    }
+    const u64 t0 = SotcStats::NowNs();
+    const bool dispatch = op.kind == Dispatch || op.kind == DispatchIndirect;
+    s.active = true;
+    s.cls = dispatch ? Vulkan::FrameGraph::Class::Compute : Vulkan::FrameGraph::Class::Graphics;
+    if (prep_workers) {
+        const Vulkan::PreparedDraw& slot = prep_ring[back_exec_seq % BackRingSize];
+        if (slot.ready_seq.load(std::memory_order_acquire) == back_exec_seq &&
+            slot.resources_ready) {
+            OpArgs args;
+            args.indirect = op.kind == DrawIndirect || op.kind == DispatchIndirect;
+            args.is_indexed = op.is_indexed;
+            args.index_offset = op.index_offset;
+            args.address = op.address;
+            args.offset = op.offset;
+            args.stride = op.stride;
+            args.max_count = op.max_count;
+            args.count_address = op.count_address;
+            args.size = op.size;
+            AmdGpu::OpFootprint cur;
+            const bool ok = dispatch ? ComputeDispatchFootprint(slot, op.cs, cur, &args)
+                                     : ComputeDrawFootprint(slot, back_regs, cur, &args);
+            if (ok && cur.known) {
+                s.known = true;
+                s.fp = std::move(cur);
+            }
+        }
+    }
+    s.target_key = dispatch ? 0 : N5TargetKey(back_regs);
+    Vulkan::FrameGraph::AddOwnerNs(SotcStats::NowNs() - t0);
+}
+
+void Liverpool::N5End() {
+    if (n5_cur.active) {
+        Vulkan::FrameGraph::Record(n5_cur);
+    }
 }
 
 void Liverpool::XpPublishSeg(const XpSeg& seg) {

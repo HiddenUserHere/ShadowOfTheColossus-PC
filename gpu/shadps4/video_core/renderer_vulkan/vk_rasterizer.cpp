@@ -44,6 +44,7 @@
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH (barrier events)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -164,6 +165,7 @@ void Rasterizer::SotcLodFeedbackCycle() {
             .offset = 0,
             .size = SotcLodFeedbackBytes + sizeof(u32),
         };
+        Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH (verify counts barrier events)
         scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
             .bufferMemoryBarrierCount = 1,
             .pBufferMemoryBarriers = &buffer_barrier,
@@ -202,6 +204,7 @@ void Rasterizer::SotcLodFeedbackCycle() {
         .dstStageMask = vk::PipelineStageFlagBits2::eHost,
         .dstAccessMask = vk::AccessFlagBits2::eHostRead,
     };
+    Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH (verify counts barrier events)
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &host_barrier,
@@ -1324,6 +1327,7 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
             .image = hudless_clear.image,
             .subresourceRange = color_range,
         };
+        Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH (verify counts barrier events)
         cmdbuf.pipelineBarrier2(
             vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_clear});
         cmdbuf.clearColorImage(hudless_clear.image, vk::ImageLayout::eTransferDstOptimal,
@@ -1338,6 +1342,7 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
             .image = hudless_clear.image,
             .subresourceRange = color_range,
         };
+        Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH (verify counts barrier events)
         cmdbuf.pipelineBarrier2(
             vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
     }
@@ -1352,6 +1357,7 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
         .image = target.image,
         .subresourceRange = color_range,
     };
+    Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH (verify counts barrier events)
     cmdbuf.pipelineBarrier2(
         vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_target});
     // sotc: the descriptor arrays of the last bind change here (the UI image becomes the clear
@@ -1412,6 +1418,7 @@ vk::ImageView Rasterizer::TakeHudless(VAddr address, vk::Format format) {
         .image = target.image,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     };
+    Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH (verify counts barrier events)
     scheduler.CommandBuffer().pipelineBarrier2(
         vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
     return target.read_view;
@@ -1502,6 +1509,7 @@ bool Rasterizer::BeginUiShadow(const GraphicsPipeline* pipeline, const RenderSta
         .image = ui_shadow.image,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     };
+    Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH (verify counts barrier events)
     scheduler.CommandBuffer().pipelineBarrier2(
         vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_target});
     RenderState shadow = state;

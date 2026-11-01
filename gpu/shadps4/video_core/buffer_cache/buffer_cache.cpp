@@ -61,6 +61,7 @@ extern "C" uintptr_t runtime_sotc_heap_table(void);
 #include "../../../sotc/stale_check.h" // sotc: SOTC_STALE_CHECK
 #include "../../../sotc/static_class.h" // sotc: SOTC_STATIC_CLASS=3 (TrySkip / NoteClean)
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
+#include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH
 
 namespace VideoCore {
 
@@ -5215,6 +5216,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
         };
+        Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH verify (barrier events)
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
             .memoryBarrierCount = 1,
             .pMemoryBarriers = &pre_barrier,
@@ -5228,6 +5230,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             .dstStageMask = vk::PipelineStageFlagBits2::eHost,
             .dstAccessMask = vk::AccessFlagBits2::eHostRead,
         };
+        Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH verify (barrier events)
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
             .memoryBarrierCount = 1,
             .pMemoryBarriers = &host_barrier,

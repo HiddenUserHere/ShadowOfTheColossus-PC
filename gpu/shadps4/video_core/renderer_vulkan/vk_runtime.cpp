@@ -13,6 +13,7 @@
 #include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH
 
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -492,6 +493,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
         .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
     };
+    Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH verify (barrier events)
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .memoryBarrierCount = 1u,
@@ -900,6 +902,7 @@ void Runtime::FlushBarriers() {
 
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
+    Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH verify (barrier events)
     cmdbuf.pipelineBarrier2(dep_info);
 
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
