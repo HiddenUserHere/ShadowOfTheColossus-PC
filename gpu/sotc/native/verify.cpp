@@ -102,6 +102,8 @@ struct ConsumedRow {
     uint64_t count = 0;
     uint64_t by_path[static_cast<size_t>(ConsumePath::Count)] = {};
     uint64_t small_binds = 0; // taken by a bind of at most kSmallBind bytes
+    uint64_t read_binds = 0;  // taken by a bind the shader does not write
+    uint64_t read_small = 0;  // both: the strongest sign of a real GPU read
     uint64_t max_bind = 0;
     uint64_t last_addr = 0;
 };
@@ -297,7 +299,7 @@ uint64_t Frame() {
     return g_frame.load(std::memory_order_relaxed);
 }
 
-void NoteGpuConsume(uint64_t addr, uint64_t size, ConsumePath path, uint64_t bind_size) {
+void NoteGpuConsume(uint64_t addr, uint64_t size, ConsumePath path, uint64_t bind_size, bool bind_written) {
     if (size == 0 || !g_any_suspect.load(std::memory_order_relaxed) || !SotcNative::Verify()) {
         return;
     }
@@ -330,6 +332,12 @@ void NoteGpuConsume(uint64_t addr, uint64_t size, ConsumePath path, uint64_t bin
         ++row.by_path[static_cast<size_t>(path)];
         if (bind_size <= kSmallBind) {
             ++row.small_binds;
+        }
+        if (!bind_written) {
+            ++row.read_binds;
+            if (bind_size <= kSmallBind) {
+                ++row.read_small;
+            }
         }
         row.max_bind = bind_size > row.max_bind ? bind_size : row.max_bind;
         row.last_addr = a;
@@ -511,11 +519,13 @@ void Report(std::string& out, double seconds) {
             FormatRip(where, sizeof where, taken[i].first);
             std::snprintf(buf, sizeof buf,
                           "SOTC VERIFY CONSUMED %zu rip=%s n=%llu buffer=%llu image=%llu small_binds=%llu "
-                          "max_bind=%llu last_addr=0x%llx\n",
+                          "read_binds=%llu read_small=%llu max_bind=%llu last_addr=0x%llx\n",
                           i + 1, where, static_cast<unsigned long long>(r.count),
                           static_cast<unsigned long long>(r.by_path[0]),
                           static_cast<unsigned long long>(r.by_path[1]),
                           static_cast<unsigned long long>(r.small_binds),
+                          static_cast<unsigned long long>(r.read_binds),
+                          static_cast<unsigned long long>(r.read_small),
                           static_cast<unsigned long long>(r.max_bind),
                           static_cast<unsigned long long>(r.last_addr));
             out += buf;

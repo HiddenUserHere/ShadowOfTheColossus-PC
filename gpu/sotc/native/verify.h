@@ -61,8 +61,9 @@ enum class ConsumePath : uint8_t { BufferUpload, ImageUpload, Count };
 /// The old tracking path uploads [addr, addr + size) for the GPU (draw thread), for a bind (buffer) or an
 /// image of bind_size bytes. Marks the unannounced writes in it as consumed. A small bind (<= 64 KiB) is
 /// a read the shader almost surely makes; a large one may only cover the bytes (a V# over a whole heap).
-/// Native verify only; one relaxed load otherwise.
-void NoteGpuConsume(uint64_t addr, uint64_t size, ConsumePath path, uint64_t bind_size);
+/// bind_written: the bind is a shader write (the old path uploads the dirty bytes before a GPU write too, so
+/// such a take is no proof of a read). Native verify only; one relaxed load otherwise.
+void NoteGpuConsume(uint64_t addr, uint64_t size, ConsumePath path, uint64_t bind_size, bool bind_written);
 
 // ---- 3. Per-range log -----------------------------------------------------------------------------
 

@@ -8081,7 +8081,7 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         if (SotcNative::Verify()) {
             for (const auto& copy : copies) {
                 SotcVerify::NoteGpuConsume(copy.dstOffset, copy.size, SotcVerify::ConsumePath::BufferUpload,
-                                           size);
+                                           size, is_written);
             }
         }
         const SotcStats::FrameTimer frame_timer{SotcStats::FrameBuffer};

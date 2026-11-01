@@ -2033,7 +2033,8 @@ void TextureCache::RefreshImage(Image& image) {
     // skipped as unchanged alike: either way the GPU reads them).
     if (SotcNative::Verify()) {
         SotcVerify::NoteGpuConsume(image.info.guest_address, image.info.guest_size,
-                                   SotcVerify::ConsumePath::ImageUpload, image.info.guest_size);
+                                   SotcVerify::ConsumePath::ImageUpload, image.info.guest_size,
+                                   false);
     }
     if (image.sotc_warm_used && !SotcLoadWarm::InWarm()) { // sotc: SOTC_LOAD_WARM: paid again
         image.sotc_warm_used = false;
