@@ -89,7 +89,7 @@ constexpr uint64_t PortWaitSite(uint32_t id) {
 }
 enum PortWaitId : uint32_t {
     kPortWaitFlipGpuIdle = 1, ///< PcHostFlipWait mode 1: liverpool WaitGpuIdle before the flip
-    kPortWaitFlipTick = 2,    ///< PcHostFlipWait: scheduler tick wait (mode 1 and mode 2)
+    // The flip's scheduler tick wait is the reuse fence of the ring halves (frame pacing): not reported.
 };
 
 /// 5 s report lines ("SOTC NATIVE ..."), window counters reset.

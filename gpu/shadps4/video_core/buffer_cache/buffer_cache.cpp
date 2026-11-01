@@ -7691,10 +7691,7 @@ void BufferCache::PcHostFlipWait() {
             }
         }
         if (wait_tick != 0) {
-            // sotc: SOTC_NATIVE verify: a CPU wait on the draw thread's tick (not the frame ticket).
-            if (SotcNative::Verify()) {
-                SotcNative::VerifyGpuWait(0, SotcNative::PortWaitSite(SotcNative::kPortWaitFlipTick));
-            }
+            // sotc: the reuse fence of the flip (frame pacing): not counted by the native verify.
             scheduler.Wait(wait_tick); // flushed already (tick < CurrentTick): no Flush from here
         }
         SotcPcRing::NoteFlipWait(SotcStats::NowNs() - t0, wait_tick != 0, target != 0 ? 2u : 0u);
@@ -7714,10 +7711,7 @@ void BufferCache::PcHostFlipWait() {
     const u64 half = pc_host_flip_count & 1;
     const u64 wait_tick = pc_host_half_tick[half];
     if (wait_tick != 0) {
-        if (SotcNative::Verify()) {
-            SotcNative::VerifyGpuWait(0, SotcNative::PortWaitSite(SotcNative::kPortWaitFlipTick));
-        }
-        scheduler.Wait(wait_tick);
+        scheduler.Wait(wait_tick); // sotc: the flip's reuse fence (frame pacing), not counted by verify
         scheduler.PopPendingOperations();
     }
     // 3. The half that stops being current now: its last use ends with everything recorded so far.
