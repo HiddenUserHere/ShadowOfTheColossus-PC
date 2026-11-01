@@ -289,7 +289,7 @@ Tool: `tools/re/eboot_re.py` (callers / callees / fstr / func), run from the mai
 ### 6.2 Slots 20-22 (done in 2.9)
 Slot 20 = RTAllocator (render targets, 322 MiB), slot 22 = particle renderer buffers (`FUN_000ffe60`), slot 21 open.
 
-### 6.3 The ring flip `FUN_000136f0`: does it wait on the GPU?
+### 6.3 The ring flip `FUN_000136f0`: does it wait on the GPU? (superseded by 7.1: no GPU wait in the flip body)
 - `FUN_000136f0(param_1)` (146 bytes, callers `FUN_00a3f140`, `FUN_0008c860`, `FUN_0025ae80`): reads the heap id `*param_1`,
   returns at once if it is 1 (CPUMemory), otherwise calls the heap object's **vtable entry +0x20** (a virtual flip,
   `goto` indirect). So the flip's behaviour is whatever the ring family's `+0x20` method does.
@@ -349,3 +349,96 @@ Not walked in round 2 (156 callers). Same method as 6.6. Open.
 - Done: 6.1 (creators, GPU/CPU base), 6.2 (slots 20, 22), 6.5 (flags), 6.8 (fault unit), 6.9 (H12 structure).
 - Partial: 6.6 (classes known, full writer walk not done), 6.4 (frees).
 - Open: 6.3 (flip vtable +0x20), 6.7 (0x8c0d0 writers), slot 21, the particle heap id.
+
+## 7. Round 3: flip, frees and reuse, slot 21, writer walks
+
+### 7.1 The ring flip `FUN_0001d230` does NOT wait on the GPU (decomp 0001/0001d230.c)
+- Entry: vtable +0x20 of the ring family (class 0x1594ca0, +0x20 = 0x1d230, +0xa0 = 0x1d750, from the allocators specialist's
+  eboot read). `FUN_000136f0` calls it for the ring objects of 0x2ed1f54 and 0x2ed1f58.
+- What it does, in order: (1) clears the frame's intrusive lists and per-frame counters of the ring object (offsets
+  0xa0..0x2d0); (2) adds the list sizes to a usage counter at `+0x90` and keeps the high-water mark at `+0x98`;
+  (3) advances the frame index `+0x88 = (index + 1) % depth` (depth = high half of `+0x88`); (4) calls the base heap's
+  virtual `+0xf0` with the new index and subtracts its result from `+0x90`; (5) if `+0x28` (a sync record) is set, calls
+  `FUN_000454d0(record, &index)`.
+- `FUN_000454d0` (0004/000454d0.c, 219 bytes): returns at once unless the byte at `+0x538` is set. Otherwise it takes a
+  free slot of a small table at `+0x5b0` with an atomic CAS, subtracts the retiring frame's byte counts from the totals at
+  `+0x840`/`+0x848`, memsets the frame record (0x648 bytes at `+0xe80 + index*0x648`), and releases the slot. Its only
+  wait is a CPU spin on the table slot with `sceKernelUsleep(1)` after 10,000 tries. No GPU label is read.
+- Conclusion: the flip is CPU bookkeeping and **does not wait on the GPU**. The only waits are CPU spins on a table
+  slot (uncontended in practice). Still unread: the base heap's `+0xf0` (called with the index, returns a size). The base
+  is the Default TaggedArena of 6.1, so read its `+0xf0` before calling the flip GPU-free.
+- Consequence: the game reuses a ring block after `depth` flips without a CPU wait. Safety comes from the game's frame
+  pacing (30 FPS locked), not from a fence on this path. The port's native ring must fence frame N-depth itself, because
+  the game's flip will not do it.
+
+### 7.2 Frees and reuse (GPUMemory and CPUMemory)
+- Ring families (RenderSingleFrame, GameToRenderThread, ...): no per-block free. Reuse is per frame index: the flip resets
+  the lists and the frame record of the index it advances to, so frame bytes are returned in bulk.
+- The lane allocator `FUN_0001d750` (587 bytes; called from `FUN_0001d700`, `FUN_0001d5a0` and others) takes a lane with
+  `FUN_000332b0` (the thread id from the TLS word at fs:-0x10): lanes 0..10 are per thread, lane 11 and up share a
+  spin-locked list (the same CAS + `sceKernelUsleep` pattern). It adds the frame offset from `FUN_000452d0` (the current
+  frame index, from the record at `+0x2c0` when the byte at `+0x1f8` is set) and carves from the block list. This is the
+  TaggedArena allocation path of the ring families.
+- CPUMemory and GPUMemory are not ring families. Their blocks are freed through the heap objects' vtable (`+0x98` is the
+  "can fail" probe; the free slot is not identified). Open. The port's `pc_pool*` models the game's block allocator, and
+  its Free path is the reference.
+
+### 7.3 Slot 21: most likely `ParticleDoubleFrame`
+- `FUN_00101ee0` (particle renderer init) creates the family "ParticleDoubleFrame" (fstr at 0x101eee, `mem_family_ctor`
+  call at 0x101efa) and attaches it as a ring (`FUN_0001cfb0`, called from 0x101ee0), on the same GPU/CPU bases as the
+  render rings. A depth-2 ring is the same shape as RenderSingleFrame. The probe logs no slot-21 calls, which fits a ring
+  written through the chunk allocator. **Likely, not verified:** the runtime id is 21. Verify with the family's `+0x1c`
+  value from a log or the probe's SlotLabel.
+
+### 7.4 Writers of the 0x8be60 buffers after creation (walk of 105 direct callers, 230 sites)
+Tool: `tools/re/eboot_re.py callers 8be60`. Each caller's decomp was scanned for `memcpy` and `memset` calls (script in the
+scratchpad, output `walk_8be60.tsv`). These are text counts of calls: struct stores are not included.
+- 105 caller functions. 18 contain a memcpy or memset: 10 memcpy, 10 memset. The other 87 only build descriptors (views of
+  a block created or owned elsewhere, flags `0x2`), so they do not write the block themselves.
+- Writers with a memcpy/memset of the block, and their roots:
+  - `FUN_000d8f40` (4 sites, memcpy 4, memset 3), called by `FUN_000bd170`.
+  - `FUN_00094fb0` (`sub_94fb0`, 3 sites, memcpy 6, zero-copy `0x800`), called by `FUN_00165360`, `FUN_00178cb0`,
+    `FUN_0017a6c0`, `FUN_00173160`.
+  - Memcpy 2 each: `FUN_000dfcf0` (root `FUN_000d9cf0`), `FUN_00194a00` (`FUN_00194970`), `FUN_00198bb0` (zero-copy,
+    `FUN_000d0040`), `FUN_0019b760` (`BPXPR_BuildSetDraws`, `FUN_000c6f70`), `FUN_0019c1a0` (`FUN_000c6bd0`),
+    `FUN_0019c7e0` (`FUN_000c5200`), `FUN_000f5cd0` (MaterialParam sub-buffers, `FUN_000f8270`, `FUN_000f6c90`),
+    `FUN_000fef40` (`FUN_000fffa0`).
+  - Memset: `FUN_001264d0` (6 at 2 sites), `FUN_00112db0` (5, called by `FUN_002569d0`, the 12.6 KB driver called by
+    `FUN_00533100`), `FUN_001abba0` (2, `FUN_001824b0`), `FUN_001805b0`, `FUN_001ac080`, `FUN_001ac860`, `FUN_000fffa0`
+    (1 each). These clear the descriptors or blocks at build time.
+  - `FUN_000ffe60` (particles, slot 22, zero-copy, 3 sites): called by `FUN_001051f0`, `FUN_00103ad0`, `FUN_00107540`
+    (ParticleRenderer UpdateSimulation and BeginFrame, per frame).
+  - `FUN_000a27d0`, `FUN_000a1dd0`: descriptor only.
+- Per frame vs per level: the writers under the frame driver `FUN_000cefa0` (it contains `Frame::InsertWaitFlipDone`,
+  0x118470) are per frame, e.g. the BPXPR build functions `FUN_000c6f70`, `FUN_000c6bd0`, `FUN_000c5200`. The writers under
+  `FUN_000bd170`/`FUN_000d9930` (`FUN_000d8f40`, `FUN_001a3200`, `FUN_000d7f70`, `FUN_000dfae0`) and under `FUN_00533100` are
+  load or setup paths. This split is by the roots' call chains, not a per-frame count.
+- Summary: the buffers rewritten after creation are the zero-copy ones (`0x800`/`0x804`: particles, BPXPR instance and
+  draw buffers, MaterialParam sub-buffers). They are the set the write-hook agent should announce on each write, not the
+  146 descriptor-only sites.
+
+### 7.5 Writers of the 0x8c0d0 chunks (walk of 153 direct callers, 226 sites)
+- Same method, output `walk_8c0d0.tsv`. 27 of 153 callers memcpy into the chunk; none memset.
+- Chunk writers (memcpy count per caller): `FUN_000b6e20` (10, root `FUN_000b6590`), `FUN_0001371e0` (8, `FUN_00136b30`),
+  `FUN_000dd7c0`, `FUN_000ddc90`, `FUN_000df300`, `FUN_000df7e0` (4 each, roots `FUN_000da220`, `FUN_000dcc80`,
+  `FUN_000ddf80`, `FUN_000de680`), `ParticleRenderer_TranslucentHelper` (`FUN_0010a5e0`, `FUN_0010a500` and 5 more),
+  `FUN_00133fb0` (`FUN_00238160`, `FUN_00133f90`), `FUN_0017c6c0` (`FUN_000c59d0`), `FUN_00186df0` (`FUN_000c4210`),
+  `FUN_00018d6f0`, `FUN_00018e3d0` (`FUN_00183d10`), `FUN_00018f8a0`, `FUN_00018fc70` (`FUN_00183640`), `FUN_00190bc0`
+  (`FUN_00182620`), `FUN_00191700`, `FUN_00191cb0` (`FUN_00183310`), `FUN_00194a00` (`FUN_00194970`), `FUN_00198bb0`
+  (`FUN_000d0040`), `FUN_0001a3e50`, `FUN_0001a4800`, `FUN_0001a4b70`, `FUN_0001a5490` (chain under `FUN_000da160`),
+  `FUN_0001acb10`, `FUN_0001acdc0` (`FUN_00182620`), `FUN_000aaf80` (`FUN_000caed0`, `FUN_000c2380`).
+- Several of these callers are the same functions listed in 7.4 (`FUN_00194a00`, `FUN_00198bb0`): one function can allocate
+  from both the 0x8be60 and the 0x8c0d0 paths.
+- The roots `FUN_000d0040`, `FUN_000da160`, `FUN_00183d10`, `FUN_00183640`, `FUN_00182620`, `FUN_00183310`, `FUN_000c59d0`,
+  `FUN_000c4210` look like render command builders (per frame). `FUN_000b6590`, `FUN_00136b30` and the particle translucent
+  helper are per frame too. Their names are not in the names list; confirm with `eboot_re.py func` before any patch.
+- So 27 chunk users write per frame. The other 126 callers do not memcpy into the chunk; they fill it with struct stores or
+  pass it on, which this scan does not count. Open.
+
+### 7.6 Summary, round 3
+- Flip: resolved. No GPU wait in `0x1d230` itself (CPU spin only in `0x454d0`, uncontended). The base's `+0xf0` is open.
+- Frees and reuse: ring reuse is per frame index with no per-block free. The CPUMemory and GPUMemory block free path is open.
+- Slot 21: most likely ParticleDoubleFrame (depth-2 ring), unverified.
+- Writer walks: 0x8be60 has 10 memcpy and 10 memset writers among 105 callers (the zero-copy particle, BPXPR and material
+  buffers are the rewritten ones). 0x8c0d0 has 27 memcpy writers among 153 callers, mostly render command builders and
+  particles. Struct stores are not counted, so the 126 non-memcpy callers of 0x8c0d0 are not classified.
