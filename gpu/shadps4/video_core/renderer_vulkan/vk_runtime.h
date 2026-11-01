@@ -104,13 +104,9 @@ private:
     };
     BufferBarriers* resource{};
     std::vector<BufferBarriers> resources;
-    // sotc: entries [0, active_resources) are live. With access_reuse the rest keep their list
-    // capacity across barriers (no malloc for the first ranges after every FlushBarriers);
-    // SOTC_ACCESS_REUSE=0 clears the vector as before. access_union: IntervalList::AddUnion
-    // (SOTC_ACCESS_UNION=0: Add).
+    // sotc: entries [0, active_resources) are live. The rest keep their list capacity across
+    // barriers (no malloc for the first ranges after every FlushBarriers).
     std::size_t active_resources{};
-    bool access_reuse{true};
-    bool access_union{true};
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
 };

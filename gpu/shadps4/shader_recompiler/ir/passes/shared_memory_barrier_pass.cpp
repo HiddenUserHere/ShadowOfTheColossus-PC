@@ -174,14 +174,9 @@ static constexpr u32 GcnSubgroupSize = 64;
 // reorder the loads of other lanes' values: SotC's auto-exposure averaged its luminance history
 // to 0.78 instead of 2.06. Those workgroups get subgroup barriers at the same points (a workgroup
 // barrier there would also wait on the other waves, which the guest code never does).
-// SotC only; SOTC_LDS_BARRIERS=0/1 overrides.
+// SotC only.
 static bool MultiWaveLdsBarriersEnabled() {
-    static const bool enabled = [] {
-        if (const char* v = std::getenv("SOTC_LDS_BARRIERS")) {
-            return std::atoi(v) != 0;
-        }
-        return Common::ElfInfo::Instance().IsSotc();
-    }();
+    static const bool enabled = Common::ElfInfo::Instance().IsSotc();
     return enabled;
 }
 
@@ -189,14 +184,9 @@ static bool MultiWaveLdsBarriersEnabled() {
 // values of the other lanes with no s_barrier at all. On the host the compiler may move those
 // reads before the writes, so they read stale LDS: SotC's particle count prefix sum (cs
 // 0xbb7eb2dd, 16 threads) gave 0 instances to every GPU particle draw (no waterfall spray, foam
-// or mist). They get workgroup barriers like a full wave. SotC only; SOTC_LDS_SMALL=0/1 overrides.
+// or mist). They get workgroup barriers like a full wave. SotC only.
 static bool SmallGroupLdsBarriersEnabled() {
-    static const bool enabled = [] {
-        if (const char* v = std::getenv("SOTC_LDS_SMALL")) {
-            return std::atoi(v) != 0;
-        }
-        return Common::ElfInfo::Instance().IsSotc();
-    }();
+    static const bool enabled = Common::ElfInfo::Instance().IsSotc();
     return enabled;
 }
 

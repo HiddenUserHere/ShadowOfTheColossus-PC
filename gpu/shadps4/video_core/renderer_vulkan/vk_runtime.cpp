@@ -107,12 +107,6 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.dstAccessMask =
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-    const auto off = [](const char* name) {
-        const char* v = std::getenv(name);
-        return v && v[0] == '0';
-    };
-    access_reuse = !off("SOTC_ACCESS_REUSE");
-    access_union = !off("SOTC_ACCESS_UNION");
 }
 
 void Runtime::TickFrame() {
@@ -866,18 +860,10 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
     if (src_access & WRITE_MASK) {
-        if (access_union) {
-            resource->write_ranges.AddUnion(range);
-        } else {
-            resource->write_ranges.Add(range);
-        }
+        resource->write_ranges.AddUnion(range);
     }
     if (src_access & READ_MASK) {
-        if (access_union) {
-            resource->read_ranges.AddUnion(range);
-        } else {
-            resource->read_ranges.Add(range);
-        }
+        resource->read_ranges.AddUnion(range);
     }
 
     memory_barrier.srcStageMask |= src_stage;
@@ -913,9 +899,6 @@ void Runtime::FlushBarriers() {
         resources[i].read_ranges.Clear();
         resources[i].write_ranges.Clear();
         resources[i].handle = nullptr;
-    }
-    if (!access_reuse) {
-        resources.clear();
     }
     active_resources = 0;
     resource = nullptr;

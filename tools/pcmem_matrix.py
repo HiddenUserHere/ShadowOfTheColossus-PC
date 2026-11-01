@@ -188,8 +188,8 @@ SWITCHES = {
                    'SOTC_PC_RING8_HEAPS': 'CPUMemory'},
     # Every draw-thread switch, plus the RAM breakdown.
     'drawall': {'SOTC_TEX_BIND_FAST': '1', 'SOTC_BUF_BIND_FAST': '1', 'SOTC_VK_POOL': '1',
-                'SOTC_PROTECT_BATCH': '1', 'SOTC_PRESENT_UNLOCKED': '1', 'SOTC_UD_SWAP': '1',
-                'SOTC_HLE_TABLE_GEN': '1', 'SOTC_RAM_REPORT': '1'},
+                'SOTC_PROTECT_BATCH': '1', 'SOTC_PRESENT_UNLOCKED': '1',
+                'SOTC_RAM_REPORT': '1'},
     # Old configurations, kept under their names.
     'ring': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PC_RING': '1'},
     'static': {'SOTC_STATIC_CLASS': '1'},

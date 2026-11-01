@@ -236,37 +236,24 @@ inline void Collect(u64 (&entries)[256]) {
     }
     const u64 mip = std::min<u64>(level + coarser, 14);
     // sotc: the measured mips (gpu_mip). Without SOTC_LOD_FEEDBACK=1: the fixed mip above for every
-    // sampled bank. SOTC_LOD_FB_BIAS=<n> asks n mips coarser (negative: finer), SOTC_LOD_FB_MIN
-    // the finest mip ever asked for. A bank keeps its last measured mip for SOTC_LOD_FB_KEEP
-    // reports (default 60) after its last sample; the page pool switch still adds `coarser`.
+    // sampled bank. A bank keeps its last measured mip for fb_keep reports after its last sample;
+    // the page pool switch still adds `coarser`.
     static const bool feedback = [] { // Shader::LodFeedbackEnabled: off unless =1
         const char* v = std::getenv("SOTC_LOD_FEEDBACK");
         return v && v[0] == '1';
     }();
-    static const int fb_bias = [] {
-        const char* v = std::getenv("SOTC_LOD_FB_BIAS");
-        return v ? std::atoi(v) : 0;
-    }();
-    // Default: the fixed mip (level). Measured near textures asking for mip 0 made the game
-    // stream far more than its page pool and the disk give (9 FPS, stalls of 7-9 s and the
-    // allocator fault at 0x1a371 within 6 minutes, PS4 Pro + Maximum, 22 Oct): near textures keep
-    // the old detail and only the distant ones ask for less.
-    static const int fb_min = [] {
-        const char* v = std::getenv("SOTC_LOD_FB_MIN");
-        return v ? std::atoi(v) : int(level);
-    }();
-    static const u32 fb_keep = [] {
-        const char* v = std::getenv("SOTC_LOD_FB_KEEP");
-        return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 60u;
-    }();
-    // SOTC_LOD_FB_HOLD_MS=<ms> (default 8000): a bank asks for a finer mip at once, and for one
-    // mip coarser only after no sample needed its current mip for that long (one step per
-    // period). Measured mips move between neighbours from frame to frame, and every switch makes
-    // the game drop or stream mips: stalls down to 0.1 FPS when it followed them (22 Oct).
-    static const u64 fb_hold_ms = [] {
-        const char* v = std::getenv("SOTC_LOD_FB_HOLD_MS");
-        return v ? std::strtoull(v, nullptr, 0) : 8000ull;
-    }();
+    // The finest mip ever asked for: the fixed mip of the first call (level). Measured near
+    // textures asking for mip 0 made the game stream far more than its page pool and the disk
+    // give (9 FPS, stalls of 7-9 s and the allocator fault at 0x1a371 within 6 minutes, PS4 Pro +
+    // Maximum, 22 Oct): near textures keep the old detail and only the distant ones ask for less.
+    static const int fb_min = int(level);
+    // Reports a bank keeps its measured mip after its last sample.
+    constexpr u32 fb_keep = 60;
+    // A bank asks for a finer mip at once, and for one mip coarser only after no sample needed its
+    // current mip for fb_hold_ms (one step per period). Measured mips move between neighbours from
+    // frame to frame, and every switch makes the game drop or stream mips: stalls down to 0.1 FPS
+    // when it followed them (22 Oct).
+    constexpr u64 fb_hold_ms = 8000;
     const u64 now_ms = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::steady_clock::now().time_since_epoch())
                                             .count());
@@ -302,9 +289,7 @@ inline void Collect(u64 (&entries)[256]) {
             ++idle[i];
         }
         // Banks not seen lately read as not sampled (15), as on the hardware: the game may then
-        // drop their fine mips. SOTC_LOD_KEEP=1 reports them as sampled with no samples instead
-        // (what the zeroed buffer said before; not soak-tested with the streaming).
-        static const bool keep = std::getenv("SOTC_LOD_KEEP") != nullptr;
+        // drop their fine mips.
         u64 bank_mip = mip;
         bool gpu_fresh = false;
         if (feedback) {
@@ -325,7 +310,7 @@ inline void Collect(u64 (&entries)[256]) {
             // Only banks the binds marked count as sampled, as before: the measurement makes a
             // sampled bank coarser, never adds one.
             if (gpu_last[i] != 0xff && gpu_age[i] <= fb_keep) {
-                const int m = std::max(int(gpu_last[i]) + fb_bias, fb_min) + int(coarser);
+                const int m = std::max(int(gpu_last[i]), fb_min) + int(coarser);
                 const u64 measured_mip = static_cast<u64>(std::clamp(m, 0, 14));
                 ++measured;
                 ++mip_hist[std::min<u64>(measured_mip, 3)];
@@ -336,8 +321,7 @@ inline void Collect(u64 (&entries)[256]) {
             (void)gpu_fresh;
         }
         entries[i] = idle[i] < linger_now ? (bank_mip << 56) | (u64{std::max<u32>(last_count[i], 1)} << 32)
-                     : keep           ? level << 56
-                                      : u64{0xf} << 56;
+                                          : u64{0xf} << 56;
     }
     static u32 fb_reports = 0;
     if (pool_log && feedback && fb_reports++ % 30 == 0) {

@@ -1275,18 +1275,7 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         rt.user_data = stage.num_user_data == ~0u
                            ? std::span<const u32>{}
                            : std::span<const u32>{stage.user_data.data(), stage.num_user_data};
-        // sotc: SOTC_UD_SWAP=1 (off by default): with no prep workers the draw thread is the
-        // only reader of stage.flat and an op runs once, so the flattened user data is moved
-        // into the runtime slot instead of copied (the front thread refills stage.flat on reuse).
-        static const bool ud_swap = [] {
-            const char* v = std::getenv("SOTC_UD_SWAP");
-            return v && v[0] == '1';
-        }();
-        if (ud_swap && prep_workers == 0) {
-            rt.flattened_ud_buf.swap(stage.flat);
-        } else {
-            rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
-        }
+        rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
         rt.pgm_base = stage.pgm_base;
     }
     const u64 ob_t1 = opstat ? SotcStats::NowNs() : 0; // sotc: SOTC_OPSTAT
@@ -3138,16 +3127,6 @@ void Liverpool::Process(std::stop_token stoken) {
         VideoCore::StartCapture();
 
         curr_qid = -1;
-        // sotc: SOTC_CP_YIELD (default 1). Every YIELD sits in a wait loop (WaitRegMem,
-        // MemSemaphore, Rewind, the CE/DE counters, or a child buffer's wait), so a resumed task
-        // that is not done is waiting. When a whole round over the mapped queues finishes no task
-        // and runs no command, the thread gives up its time slice instead of spinning: with few
-        // cores the spin took a core from the game's threads and the draw thread. With a core to
-        // spare, yield returns at once.
-        static const bool cp_yield = [] {
-            const char* v = std::getenv("SOTC_CP_YIELD");
-            return !v || std::atoi(v) != 0;
-        }();
         u32 since_progress = 0;
 
         // sotc: no-progress tracking, for the SOTC_FPS spin accounting and SOTC_CP_IDLE_US.
@@ -3339,7 +3318,11 @@ void Liverpool::Process(std::stop_token stoken) {
             }
 
             if (!task.done()) {
-                if (cp_yield && since_progress >= num_mapped_queues) {
+                // sotc: every YIELD sits in a wait loop (WaitRegMem, MemSemaphore, Rewind, the
+                // CE/DE counters, or a child buffer's wait). When a whole round over the mapped
+                // queues finishes no task and runs no command, the thread gives up its time slice
+                // instead of spinning.
+                if (since_progress >= num_mapped_queues) {
                     since_progress = 0;
                     std::this_thread::yield();
                 }
@@ -4094,12 +4077,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-                        // SOTC_OCCLUSION_STEP overrides the fake per-dump increment (A/B tests:
-                        // 0 = nothing passes the depth test, i.e. every query reads "occluded").
-                        static const u64 OcclusionCounterStep = [] {
-                            const char* v = std::getenv("SOTC_OCCLUSION_STEP");
-                            return v ? std::strtoull(v, nullptr, 0) : 0x2FFFFFFULL;
-                        }();
+                        // Fake per-dump increment of the pixel counter.
+                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
                         g_sotc_zpass_dumps.fetch_add(1, std::memory_order_relaxed);
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {

@@ -25,16 +25,9 @@ namespace {
 constexpr u64 RING_IDLE_FRAMES = 300;
 constexpr u64 LARGE_IDLE_FRAMES = 120;
 constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
-// sotc: ring blocks of SOTC_STAGING_BLOCK_MB (default 16 as upstream). An allocation costs about
-// the same at any size (~2 ms), and a streaming burst asks for 200+ MB in one frame.
-u64 BlockSize() {
-    static const u64 size = [] {
-        const char* v = std::getenv("SOTC_STAGING_BLOCK_MB");
-        const u64 mb = v ? std::strtoull(v, nullptr, 10) : 16;
-        return std::max<u64>(mb, 1) << 20;
-    }();
-    return size;
-}
+// sotc: ring blocks are 16 MB (as upstream). An allocation costs about the same at any size
+// (~2 ms), and a streaming burst asks for 200+ MB in one frame.
+constexpr u64 RING_BLOCK_SIZE = 16_MB;
 
 // sotc: SOTC_STAGING_LARGE_POW2 (on by default since 30 Oct 2026; =0 turns it off). Large uploads (streaming bursts) come in many
 // sizes: matched within 1.25x they seldom found a free buffer and allocated a new one inside the
@@ -72,7 +65,7 @@ StagingBufferPool::~StagingBufferPool() = default;
 StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 alignment, bool deferred,
                                             bool unsynchronized) {
     Ring& ring = rings[u32(type)];
-    if (deferred || size > BlockSize()) {
+    if (deferred || size > RING_BLOCK_SIZE) {
         return RequestLarge(size, type, deferred, unsynchronized);
     }
     return RequestFromRing(ring, size, alignment, type, unsynchronized);
@@ -164,19 +157,19 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
             best_offset = 0;
         } else {
             const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
-            const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingBlock, BlockSize()};
+            const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingBlock, RING_BLOCK_SIZE};
             // sotc: upload blocks move to the large BAR heap under SOTC_REBAR_UPLOAD, per block.
             const MemoryType block_type =
                 type == MemoryType::HostUncached
-                    ? VideoCore::ResolveRebarType(instance, BlockSize(), type)
+                    ? VideoCore::ResolveRebarType(instance, RING_BLOCK_SIZE, type)
                     : type;
             best = &ring.blocks.emplace_back(Block{
                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, block_type,
-                                                                    BlockSize()),
+                                                                    RING_BLOCK_SIZE),
                 .last_used_frame = frame,
             });
             ring.current = ring.blocks.size() - 1;
-            held_bytes[u32(type)].fetch_add(BlockSize(), std::memory_order_relaxed); // sotc: RAM report
+            held_bytes[u32(type)].fetch_add(RING_BLOCK_SIZE, std::memory_order_relaxed); // sotc: RAM report
             best_offset = *best->buffer->Reserve(size, alignment, false);
         }
     }
@@ -268,16 +261,12 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     ++frame;
-    // sotc: the first SOTC_STAGING_KEEP_MB (default 0) of each host-memory ring stay allocated.
-    // Trimmed after 300 idle frames, they were allocated again (~2 ms each) by the next
-    // streaming burst, inside the frame that needed them: 115 allocations in a 6-minute attract
-    // run. The device-local ring is still trimmed (video memory is short on 6 GB cards).
-    static const size_t keep_host_blocks = [] {
-        const char* v = std::getenv("SOTC_STAGING_KEEP_MB");
-        return static_cast<size_t>((v ? std::strtoull(v, nullptr, 10) : 0ull) / (BlockSize() >> 20));
-    }();
+    // sotc: every ring is trimmed. Trimmed after 300 idle frames, a block is allocated again (~2 ms
+    // each) by the next streaming burst, inside the frame that needed it: 115 allocations in a
+    // 6-minute attract run. The device-local ring is trimmed too (video memory is short on 6 GB
+    // cards).
     for (size_t type = 0; type < rings.size(); ++type) {
-        TrimRing(rings[type], type == u32(MemoryType::DeviceLocal) ? 0 : keep_host_blocks);
+        TrimRing(rings[type]);
     }
     for (auto& cache : large_caches) {
         TrimLarge(cache);
@@ -285,9 +274,9 @@ void StagingBufferPool::TickFrame() {
     PublishStats();
 }
 
-void StagingBufferPool::TrimRing(Ring& ring, size_t keep_blocks) {
+void StagingBufferPool::TrimRing(Ring& ring) {
     auto& blocks = ring.blocks;
-    for (size_t i = blocks.size(); i-- > keep_blocks;) {
+    for (size_t i = blocks.size(); i-- > 0;) {
         const Block& block = blocks[i];
         if (frame - block.last_used_frame < RING_IDLE_FRAMES ||
             !scheduler.IsFree(block.buffer->LastTick())) {

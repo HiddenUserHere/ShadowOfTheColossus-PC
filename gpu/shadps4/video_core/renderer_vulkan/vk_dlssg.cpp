@@ -44,7 +44,7 @@ namespace Vulkan::Dlssg {
 // far plane its depth is.
 constexpr float kSkyBias = 1.0f;
 constexpr float kSkyDepth = 1e-6f;
-// FillCameraMotion writes the bias images (not with SOTC_MVEC_FILL=0).
+// FillCameraMotion writes the bias images.
 bool sky_bias_written = false;
 
 namespace {
@@ -1677,17 +1677,8 @@ void NoteDraw(const AmdGpu::Regs& regs, u32 mrt_mask, VideoCore::ImageId depth_i
 }
 
 // sotc: the sky writes no motion vector: give pixels without one the camera's motion
-// (dlss_mvec_fill.comp). SOTC_MVEC_FILL=0 off, 2 camera motion everywhere (debug).
+// (dlss_mvec_fill.comp). Pixels that have a motion vector keep it (fill_all = 0).
 void FillCameraMotion(vk::CommandBuffer cmdbuf, const FrameSlot& f, const sl::Constants& c) {
-    static const int mode = [] {
-        const char* v = std::getenv("SOTC_MVEC_FILL");
-        const int m = v && *v ? std::atoi(v) : 1;
-        std::fprintf(stderr, "SOTC DLSS: camera motion fill mode %d\n", m);
-        return m;
-    }();
-    if (mode == 0) {
-        return;
-    }
     struct Params {
         sl::float4x4 clip_to_prev;
         u32 width, height, fill_all, inverted;
@@ -1807,7 +1798,7 @@ void FillCameraMotion(vk::CommandBuffer cmdbuf, const FrameSlot& f, const sl::Co
     const Params params{c.clipToPrevClip,
                         f.width,
                         f.height,
-                        mode == 2 ? 1u : 0u,
+                        0u,
                         c.depthInverted == sl::Boolean::eTrue ? 1u : 0u,
                         kSkyBias,
                         kSkyDepth};

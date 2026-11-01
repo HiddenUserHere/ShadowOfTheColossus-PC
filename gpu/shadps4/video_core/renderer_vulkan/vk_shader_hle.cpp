@@ -14,7 +14,6 @@
 #include <vector>
 #include "core/memory.h"
 #include "shader_recompiler/info.h"
-#include "video_core/buffer_cache/region_manager.h" // sotc: SOTC_HLE_TABLE_GEN gates (generations)
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_shadow_cull.h" // sotc: SOTC_HLE_SHADOW_CULL
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -51,21 +50,11 @@ const int kHleSkipMode = [] {
     return 0;
 }();
 
-// sotc: SOTC_HLE_TABLE_GEN=1 (off by default): the replicate tables skip pages that are known
-// unchanged (TableGen, below). Its counters are on the SOTC HLE SKIP line.
-const bool kTableGen = [] {
-    const char* v = std::getenv("SOTC_HLE_TABLE_GEN");
-    return v && v[0] == '1';
-}();
-
 struct HleSkipStats {
     std::atomic<u64> runs{0};           ///< replicate dispatches seen
     std::atomic<u64> noop{0};           ///< replicates that wrote nothing (already in place)
     std::atomic<u64> merged{0};         ///< per-copy marks saved by coalescing (mode 1)
     std::atomic<u64> mismatches{0};     ///< mode 2: merged runs that differ from the marks made
-    std::atomic<u64> tbl_skipped{0};    ///< SOTC_HLE_TABLE_GEN: table pages not compared (known)
-    std::atomic<u64> tbl_compared{0};   ///< SOTC_HLE_TABLE_GEN: table pages compared (memcmp)
-    std::atomic<u64> tbl_rebuilt{0};    ///< SOTC_HLE_TABLE_GEN: table pages written (replaced)
     std::atomic<std::int64_t> window_start_ns{0};
 };
 HleSkipStats hle_skip_stats;
@@ -90,20 +79,13 @@ void HleSkipTick() {
     const u64 noop = hle_skip_stats.noop.exchange(0, std::memory_order_relaxed);
     const u64 merged = hle_skip_stats.merged.exchange(0, std::memory_order_relaxed);
     const u64 mismatches = hle_skip_stats.mismatches.exchange(0, std::memory_order_relaxed);
-    const u64 tbl_skipped = hle_skip_stats.tbl_skipped.exchange(0, std::memory_order_relaxed);
-    const u64 tbl_compared = hle_skip_stats.tbl_compared.exchange(0, std::memory_order_relaxed);
-    const u64 tbl_rebuilt = hle_skip_stats.tbl_rebuilt.exchange(0, std::memory_order_relaxed);
-    // No copy-mark skip is built (see above): "skipped" is always 0. The table counters are the
-    // pages of the replicate tables (SOTC_HLE_TABLE_GEN; 0 when it is off).
+    // No copy-mark skip is built (see above): "skipped" is always 0.
     std::fprintf(stderr,
                  "SOTC HLE SKIP: runs %llu, skipped 0, already no-op %llu, marks merged %llu, "
-                 "verify mismatches %llu, table pages skipped %llu, compared %llu, rebuilt %llu\n",
+                 "verify mismatches %llu\n",
                  static_cast<unsigned long long>(runs), static_cast<unsigned long long>(noop),
                  static_cast<unsigned long long>(merged),
-                 static_cast<unsigned long long>(mismatches),
-                 static_cast<unsigned long long>(tbl_skipped),
-                 static_cast<unsigned long long>(tbl_compared),
-                 static_cast<unsigned long long>(tbl_rebuilt));
+                 static_cast<unsigned long long>(mismatches));
 }
 
 // One destination byte interval [lo, hi) of a copy batch, relative to the destination base.
@@ -265,50 +247,46 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         // marked GPU-written. Marking the whole range made readbacks bring back the gaps between
         // the copies from the GPU's stale copy, over what the CPU wrote there since (the game
         // moves streamed textures with this shader; its allocator keeps free-list nodes in the
-        // gaps: heap corruption). SOTC_COPY_HLE_WHOLE=1 marks the whole range (as before).
-        static const bool mark_whole = std::getenv("SOTC_COPY_HLE_WHOLE") != nullptr;
+        // gaps: heap corruption).
         const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(
-            dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min,
-            mark_whole);
-        if (!mark_whole) {
-            const auto pieces = std::span{copies}.subspan(batch_start, batch_end - batch_start);
-            // sotc: SOTC_HLE_SKIP. Mode 0: one mark per copy (unchanged). Mode 1: one mark per
-            // merged run (the union of the copies, so the same GPU-written bytes). Mode 2: the
-            // per-copy marks, as in mode 0, then the merged runs are checked (see the top).
-            if (kHleSkipMode == 0) {
+            dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min, false);
+        const auto pieces = std::span{copies}.subspan(batch_start, batch_end - batch_start);
+        // sotc: SOTC_HLE_SKIP. Mode 0: one mark per copy (unchanged). Mode 1: one mark per
+        // merged run (the union of the copies, so the same GPU-written bytes). Mode 2: the
+        // per-copy marks, as in mode 0, then the merged runs are checked (see the top).
+        if (kHleSkipMode == 0) {
+            for (u32 i = batch_start; i < batch_end; ++i) {
+                (void)buffer_cache.ObtainBuffer(
+                    dst_buf_sharp.base_address + copies[i].dstOffset,
+                    static_cast<u32>(copies[i].size), true);
+            }
+        } else {
+            static std::vector<MarkRun> mark_runs;
+            MergeMarkRuns(pieces, mark_runs);
+            if (kHleSkipMode == 2) {
+                if (!MarkRunsMatch(pieces, mark_runs)) {
+                    hle_skip_stats.mismatches.fetch_add(1, std::memory_order_relaxed);
+                }
                 for (u32 i = batch_start; i < batch_end; ++i) {
                     (void)buffer_cache.ObtainBuffer(
                         dst_buf_sharp.base_address + copies[i].dstOffset,
                         static_cast<u32>(copies[i].size), true);
                 }
-            } else {
-                static std::vector<MarkRun> mark_runs;
-                MergeMarkRuns(pieces, mark_runs);
-                if (kHleSkipMode == 2) {
-                    if (!MarkRunsMatch(pieces, mark_runs)) {
+                // The per-copy marks must leave every merged run fully marked, which is what
+                // mode 1's one mark per run produces. Hot pages (fault grace) keep their CPU
+                // bit and can count here although nothing is wrong.
+                for (const auto& run : mark_runs) {
+                    if (!buffer_cache.IsWrittenRangeSynced(dst_buf_sharp.base_address + run.lo,
+                                                           run.hi - run.lo)) {
                         hle_skip_stats.mismatches.fetch_add(1, std::memory_order_relaxed);
                     }
-                    for (u32 i = batch_start; i < batch_end; ++i) {
-                        (void)buffer_cache.ObtainBuffer(
-                            dst_buf_sharp.base_address + copies[i].dstOffset,
-                            static_cast<u32>(copies[i].size), true);
-                    }
-                    // The per-copy marks must leave every merged run fully marked, which is what
-                    // mode 1's one mark per run produces. Hot pages (fault grace) keep their CPU
-                    // bit and can count here although nothing is wrong.
-                    for (const auto& run : mark_runs) {
-                        if (!buffer_cache.IsWrittenRangeSynced(dst_buf_sharp.base_address + run.lo,
-                                                               run.hi - run.lo)) {
-                            hle_skip_stats.mismatches.fetch_add(1, std::memory_order_relaxed);
-                        }
-                    }
-                } else {
-                    hle_skip_stats.merged.fetch_add(pieces.size() - mark_runs.size(),
-                                                    std::memory_order_relaxed);
-                    for (const auto& run : mark_runs) {
-                        (void)buffer_cache.ObtainBuffer(dst_buf_sharp.base_address + run.lo,
-                                                        static_cast<u32>(run.hi - run.lo), true);
-                    }
+                }
+            } else {
+                hle_skip_stats.merged.fetch_add(pieces.size() - mark_runs.size(),
+                                                std::memory_order_relaxed);
+                for (const auto& run : mark_runs) {
+                    (void)buffer_cache.ObtainBuffer(dst_buf_sharp.base_address + run.lo,
+                                                    static_cast<u32>(run.hi - run.lo), true);
                 }
             }
         }
@@ -369,166 +347,24 @@ struct TableData {
     }
 };
 
-// sotc: SOTC_HLE_TABLE_GEN=1 (off by default). ReplaceChangedPages compared every page of a table
-// with the bytes it should hold, every frame, and most pages are unchanged. With this on, a page
-// that compares equal while CPU-clean is remembered with the write-generation sum of its 2 MiB
-// window (BufferCache::SyncGeneration, the RegionManager::sync_gen counters), and it is not compared
-// again while that sum is the same. What moves a window's sum:
-//  - a guest write to a clean page: the page is write-protected, the write faults and the CPU bit
-//    rises, which bumps the sum before the write lands. A page with its CPU bit set is never
-//    remembered (a dirty page takes writes without a rise);
-//  - our own replaces and the other declared host writes (MarkRegionAsCpuModified,
-//    InvalidateMemory): CPU rises as above;
-//  - NOT covered: bytes written without a CPU rise. TryWriteThroughFromCpu and
-//    TryFillThroughFromCpu leave the CPU bits as they are, and the TryWriteBacking callers do not
-//    touch them. Until BufferCache::BumpSyncGeneration is called after those writes (report), the
-//    pages written by this file are forgotten here (TableGenNoteWrite, for every table they
-//    overlap), and any other such write is not seen.
-// The source is part of the state: its window sum is recorded only while it is CPU-clean, and a
-// change of that sum forgets every page. Gates, checked at every use (TableGenUsable): the sums
-// exist (SOTC_SYNC_FAST or SOTC_BUF_BIND_FAST), and no page is unprotected while clean (untrack
-// masks: SOTC_UNTRACK_AUTO, SOTC_UNTRACK_RANGES, class mode; PC ring mask). Those are fixed for the
-// process once set, so a table is never used across a change of them. An owed readback touching
-// the table or its source (data not yet in the backing) disables the state for that dispatch.
-// Command processor thread only, like the other statics of this file.
-constexpr VAddr kTableGenWindow = VAddr{2} << 20;
-
-struct TableGen {
-    bool keyed = false;
-    VAddr src = 0;
-    u64 bytes = 0;      ///< destination bytes
-    u64 period = 0;     ///< source bytes
-    u64 first_page = 0; ///< destination address >> 12
-    bool src_ok = false;
-    u64 src_sum = 0;    ///< window sum of the source when it was last found CPU-clean
-    std::vector<u64> page_sum; ///< per page: the window sum at its last clean equal compare
-    std::vector<u8> page_ok;   ///< per page: 1 when it equals its table entry as of page_sum
-
-    void Forget() {
-        std::fill(page_ok.begin(), page_ok.end(), u8{0});
-    }
-};
-static std::unordered_map<VAddr, TableGen> table_gen;
-
-// True when the generation signal covers this table's writes (the gates of the comment above).
-static bool TableGenUsable() {
-    static const bool untrack_ranges = [] {
-        const char* v = std::getenv("SOTC_UNTRACK_RANGES");
-        return v && v[0];
-    }();
-    return kTableGen && VideoCore::SotcBufBindFast::kGenStamps &&
-           !VideoCore::SotcUntrack::AutoOn() && !VideoCore::RegionManager::RingOn() &&
-           SotcMemClasses::Mode() == 0 && !untrack_ranges;
-}
-
-// The state of this dispatch's table and source, or nullptr when it cannot be used now.
-static TableGen* TableGenBegin(VideoCore::BufferCache& buffer_cache, VAddr address, u64 bytes,
-                               VAddr src, u64 period) {
-    if (!TableGenUsable() || buffer_cache.OwedIntersects(address, bytes) ||
-        buffer_cache.OwedIntersects(src, period)) {
-        return nullptr;
-    }
-    u64 src_sum = 0;
-    if (!buffer_cache.SyncGeneration(src, period, src_sum) ||
-        !buffer_cache.IsCpuClean(src, period)) {
-        if (auto it = table_gen.find(address); it != table_gen.end()) {
-            it->second.src_ok = false;
-            it->second.Forget();
-        }
-        return nullptr;
-    }
-    TableGen& st = table_gen[address];
-    const u64 pages = ((address + bytes - 1) >> 12) - (address >> 12) + 1;
-    if (!st.keyed || st.bytes != bytes || st.src != src || st.period != period) {
-        st.keyed = true;
-        st.src = src;
-        st.bytes = bytes;
-        st.period = period;
-        st.first_page = address >> 12;
-        st.src_ok = false;
-        st.page_sum.assign(pages, 0);
-        st.page_ok.assign(pages, 0);
-    }
-    if (!st.src_ok || st.src_sum != src_sum) {
-        st.Forget();
-        st.src_ok = true;
-        st.src_sum = src_sum;
-    }
-    return &st;
-}
-
-// Forgets the remembered pages that [addr, addr + size) overlaps, in every table.
-static void TableGenNoteWrite(VAddr addr, u64 size) {
-    if (size == 0) {
-        return;
-    }
-    const u64 first = addr >> 12;
-    const u64 last = (addr + size - 1) >> 12;
-    for (auto& [key, st] : table_gen) {
-        if (!st.keyed || st.page_ok.empty()) {
-            continue;
-        }
-        const u64 lo = std::max(first, st.first_page);
-        const u64 hi = std::min(last, st.first_page + st.page_ok.size() - 1);
-        for (u64 page = lo; page <= hi && lo <= hi; ++page) {
-            st.page_ok[page - st.first_page] = 0;
-        }
-    }
-}
-
-// True when every page of the table is remembered with its window's current sum: nothing to do.
-static bool TableGenAllKnown(VideoCore::BufferCache& buffer_cache, const TableGen& st,
-                             VAddr address, u64 bytes) {
-    const VAddr end = address + bytes;
-    u64 pages = 0;
-    for (VAddr lo = address; lo < end;) {
-        const VAddr win_base = lo & ~(kTableGenWindow - 1);
-        const VAddr win_hi = std::min<VAddr>(end, win_base + kTableGenWindow);
-        u64 sum = 0;
-        if (!buffer_cache.SyncGeneration(std::max(address, win_base), win_hi - std::max(address, win_base), sum)) {
-            return false;
-        }
-        for (VAddr page = lo; page < win_hi;) {
-            const u64 idx = (page >> 12) - st.first_page;
-            if (!st.page_ok[idx] || st.page_sum[idx] != sum) {
-                return false;
-            }
-            ++pages;
-            page = std::min<VAddr>((page & ~VAddr{4095}) + 4096, win_hi);
-        }
-        lo = win_hi;
-    }
-    hle_skip_stats.tbl_skipped.fetch_add(pages, std::memory_order_relaxed);
-    return true;
-}
-
-// `wrote` is set when bytes were written (false: every page already held the table). With `gen`
-// (SOTC_HLE_TABLE_GEN), the pages remembered by earlier calls are not compared, and the pages that
-// compare equal while CPU-clean are remembered (see TableGen).
+// `wrote` is set when bytes were written (false: every page already held the table).
 static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8* current,
-                                const TableData& data, u64 size, bool& wrote, TableGen* gen) {
+                                const TableData& data, u64 size, bool& wrote) {
     auto& buffer_cache = rasterizer.GetBufferCache();
     VAddr run_start = 0;
     VAddr run_end = 0; // the pending run of changed pages, empty while run_end == run_start
-    u64 compared = 0;
-    u64 rebuilt = 0;
     const auto flush = [&] {
         if (run_end == run_start) {
             return true;
         }
         const u64 offset = run_start - address;
         const u64 run_size = run_end - run_start;
-        const u64 run_pages = ((run_end - 1) >> 12) - (run_start >> 12) + 1;
         run_start = run_end;
         if (!buffer_cache.TryWriteThroughFromCpu(address + offset, data.Run(offset, run_size),
                                                  run_size)) {
             return false;
         }
         wrote = true;
-        if (gen) {
-            TableGenNoteWrite(address + offset, run_size); // the written pages are not known now
-            rebuilt += run_pages;
-        }
         if (SotcStats::kCmdStats) {
             SotcStats::inv_hle.fetch_add(run_size, std::memory_order_relaxed);
         }
@@ -536,36 +372,10 @@ static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8*
         return true;
     };
     const VAddr end = address + size;
-    VAddr win_end = 0; // the window of the current page is [win_end - window, win_end)
-    u64 win_sum = 0;
-    bool win_ok = false;
     bool ok = true;
     for (VAddr lo = address; lo < end && ok;) {
         const VAddr hi = std::min<VAddr>((lo & ~VAddr{4095}) + 4096, end);
-        u64 idx = 0;
-        bool clean = false;
-        if (gen) {
-            // The window sum is read before the page's CPU bit and its bytes: a write after the
-            // read moves the sum (or leaves the bit set), so the page is not remembered past it.
-            const VAddr win_base = lo & ~(kTableGenWindow - 1);
-            if (lo >= win_end) {
-                const VAddr win_lo = std::max(address, win_base);
-                win_end = std::min<VAddr>(end, win_base + kTableGenWindow);
-                win_ok = buffer_cache.SyncGeneration(win_lo, win_end - win_lo, win_sum);
-            }
-            idx = (lo >> 12) - gen->first_page;
-            if (win_ok && gen->page_ok[idx] && gen->page_sum[idx] == win_sum) {
-                hle_skip_stats.tbl_skipped.fetch_add(1, std::memory_order_relaxed);
-                lo = hi;
-                continue;
-            }
-            clean = win_ok && buffer_cache.IsCpuClean(lo, hi - lo);
-            ++compared;
-        }
         if (std::memcmp(current + (lo - address), data.At(lo - address), hi - lo) != 0) {
-            if (gen) {
-                gen->page_ok[idx] = 0;
-            }
             if (run_end != lo && !flush()) {
                 ok = false;
                 break;
@@ -574,21 +384,11 @@ static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8*
                 run_start = lo;
             }
             run_end = hi;
-        } else if (gen) {
-            gen->page_ok[idx] = clean ? 1 : 0;
-            gen->page_sum[idx] = win_sum;
         }
         lo = hi;
     }
     if (ok) {
         ok = flush();
-    }
-    if (gen) {
-        if (!ok) {
-            gen->Forget(); // partly written: unknown
-        }
-        hle_skip_stats.tbl_compared.fetch_add(compared, std::memory_order_relaxed);
-        hle_skip_stats.tbl_rebuilt.fetch_add(rebuilt, std::memory_order_relaxed);
     }
     return ok;
 }
@@ -683,14 +483,6 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         const u64 period = src_count * 4;
         const bool overlap = src.base_address < address + count * 4 &&
                              address < src.base_address + period;
-        // sotc: SOTC_HLE_TABLE_GEN: the remembered pages of this table (nullptr: not usable now).
-        TableGen* gen = kTableGen && in_run && page_replace && !overlap
-                            ? TableGenBegin(buffer_cache, address, count * 4, src.base_address,
-                                            period)
-                            : nullptr;
-        if (gen && TableGenAllKnown(buffer_cache, *gen, address, count * 4)) {
-            return true;
-        }
         if (in_run && page_replace && !overlap && (src_count == count || period <= 64_KB)) {
             TableData table{};
             if (src_count == count) {
@@ -708,7 +500,7 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                 table.period = period;
             }
             return ReplaceChangedPages(rasterizer, address, run + (address - run_start), table,
-                                       count * 4, wrote, gen);
+                                       count * 4, wrote);
         }
         BuildTable(source, src_count, count);
         if (in_run) {
@@ -717,7 +509,7 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
             if (!same && page_replace) {
                 return ReplaceChangedPages(rasterizer, address, current,
                                            TableData{reinterpret_cast<const u8*>(data.data())},
-                                           count * 4, wrote, gen);
+                                           count * 4, wrote);
             }
         } else {
             static std::vector<u32> current;
@@ -743,11 +535,6 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     }();
     const u64 table_bytes = count * 4;
     const u64 period = src_count * 4;
-    if (kTableGen) {
-        // sotc: SOTC_HLE_TABLE_GEN: a whole-table write below; its pages (and any other table's
-        // overlapping pages) are not known any more.
-        TableGenNoteWrite(address, table_bytes);
-    }
     if (fill_gpu) {
         const bool overlap = src.base_address < address + table_bytes &&
                              address < src.base_address + period;
@@ -781,8 +568,8 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
 
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
-    if (kHleSkipMode != 0 || kTableGen) {
-        HleSkipTick(); // sotc: SOTC_HLE_SKIP / SOTC_HLE_TABLE_GEN counters; every dispatch comes here
+    if (kHleSkipMode != 0) {
+        HleSkipTick(); // sotc: SOTC_HLE_SKIP counters; every dispatch comes here
     }
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:

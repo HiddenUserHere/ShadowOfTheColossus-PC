@@ -576,21 +576,17 @@ extern "C" void runtime_memory_cache_stats(uint64_t* misses, uint64_t* stale, ui
 // sotc: src/runtime_file.c, guest file read time since the last call.
 extern "C" uint64_t runtime_file_read_ns_take(void);
 
-// sotc: SOTC_ASYNC_PRESENT=1. Measured with DLSS-G: Streamline's present returns in 0.1 ms
-// (its pacer presents on a thread of its own), so the vblank thread keeps presenting by default.
-// FSR 3 frame generation presents the game frame half a frame after the generated one: from
-// the first FSR 3 frame on, the presenter has a thread of its own (vblank thread only).
+// sotc: the vblank thread keeps presenting with DLSS-G (Streamline's present returns in 0.1 ms,
+// its pacer presents on a thread of its own). FSR 3 frame generation presents the game frame half
+// a frame after the generated one: from the first FSR 3 frame on, the presenter has a thread of
+// its own (vblank thread only).
 bool VideoOutDriver::AsyncPresent() {
-    static const bool async = [] {
-        const char* v = std::getenv("SOTC_ASYNC_PRESENT");
-        return v && v[0] == '1';
-    }();
     static bool fsr = false;
     if (!fsr && Vulkan::FrameGen::Current() == Vulkan::FrameGen::Mode::Fsr) {
         fsr = true;
         std::fprintf(stderr, "SOTC FRAMEGEN: FSR 3, presenting on the presenter thread\n");
     }
-    return async || fsr;
+    return fsr;
 }
 
 void VideoOutDriver::RunPresentJob(std::function<void()> job, bool droppable) {
@@ -2690,8 +2686,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     //     60 / (flip rate + 1). Until 4 intervals are known, k is 1;
     //   - the gate waits at most 100 ms, then the flip goes out on the timer (the fallback);
     //   - each tick waits at most one vblank for it, so this thread keeps counting vblanks.
-    // Off by default: nothing below runs. Async present (SOTC_ASYNC_PRESENT, FSR 3 frame
-    // generation) has no gate, since its present id is taken after Flip returns.
+    // Off by default: nothing below runs. Async present (FSR 3 frame generation) has no gate,
+    // since its present id is taken after Flip returns.
     static const bool present_wait = [] {
         const char* v = std::getenv("SOTC_PRESENT_WAIT");
         return v && v[0] == '1';

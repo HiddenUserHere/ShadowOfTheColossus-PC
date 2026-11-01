@@ -6,8 +6,8 @@
 // LIVE dict): not part of a pipeline/shader key, recompiler output or descriptor layout; not used at
 // device or swapchain creation; no allocation sizing at init; read on the use path.
 //
-//   // before:  static const bool kFoo = [] { const char* v = getenv("SOTC_FOO"); ... }();
-//   // after:   static SotcLive::Int kFoo{"SOTC_FOO", 0};   ...   if (kFoo.get()) { ... }
+//   // before:  static const bool kExample = [] { const char* v = getenv("SOTC_EXAMPLE"); ... }();
+//   // after:   static SotcLive::Int kExample{"SOTC_EXAMPLE", 0};   ...   if (kExample.get()) { ... }
 #pragma once
 
 #include <atomic>

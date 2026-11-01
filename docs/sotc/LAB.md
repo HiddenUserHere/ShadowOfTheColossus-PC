@@ -424,12 +424,12 @@ Engenharia reversa (`docs/re-stutters/`):
 
    ```cpp
    // antes: lida uma vez, na inicialização
-   static const bool kFoo = [] { const char* v = getenv("SOTC_FOO"); ... }();
+   static const bool kExample = [] { const char* v = getenv("SOTC_EXAMPLE"); ... }();
 
    // depois: lida a cada uso, com leitura relaxada
-   static SotcLive::Int kFoo{"SOTC_FOO", 0};
+   static SotcLive::Int kExample{"SOTC_EXAMPLE", 0};
    ...
-   if (kFoo.get()) { ... }
+   if (kExample.get()) { ... }
    ```
 
 3. Em `launcher/sotc_tuning.py`, inclua o nome no dicionário `LIVE` (a forma das tuplas de `TUNING`

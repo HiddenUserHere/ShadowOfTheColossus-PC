@@ -23,12 +23,6 @@
 
 namespace Shader::Gcn {
 
-// SHADPS4_ABSOLUTE_INSTANCE_ID=1 restores the old absolute instance ID (A/B tests).
-static bool RelativeInstanceIdEnabled() {
-    static const bool enabled = std::getenv("SHADPS4_ABSOLUTE_INSTANCE_ID") == nullptr;
-    return enabled;
-}
-
 static IR::VectorReg IterateBarycentrics(const RuntimeInfo& runtime_info, auto&& set_attribute) {
     if (runtime_info.hw_stage != HwStage::Fragment) {
         return IR::VectorReg::V0;
@@ -125,8 +119,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         // the fog (white flashes over the bird boss lake).
         const auto relative_instance_id = [&] {
             IR::U32 id = ir.GetAttributeU32(IR::Attribute::InstanceId);
-            if (RelativeInstanceIdEnabled() &&
-                !(base_instance_sgpr != -1 && fetch_data.Empty() &&
+            if (!(base_instance_sgpr != -1 && fetch_data.Empty() &&
                   fetch_data.instance_offset_sgpr != -1)) {
                 id = ir.ISub(id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
             }
@@ -188,7 +181,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                     ASSERT_MSG(fetch_data.instance_offset_sgpr == base_instance_sgpr,
                                "Fetch shader in indirect draw uses wrong base instance");
                 }
-            } else if (RelativeInstanceIdEnabled()) {
+            } else {
                 instance_id = relative_instance_id();
             }
             ir.SetVectorReg(dst_vreg++, instance_id);
