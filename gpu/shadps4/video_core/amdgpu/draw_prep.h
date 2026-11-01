@@ -54,7 +54,7 @@ struct DynamicValues {
     std::array<float, 4> blend_constants{};
 };
 
-/// Field-wise bit equality (SOTC_PR_VERIFY): floats by their bits, the vectors by their sizes and
+/// Field-wise bit equality (the prepared-draw verify, SOTC_VERIFY=1): floats by their bits, the vectors by their sizes and
 /// live elements only.
 bool SameDynamicValues(const DynamicValues& a, const DynamicValues& b);
 

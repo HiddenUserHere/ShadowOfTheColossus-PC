@@ -9,7 +9,7 @@ holds a FNV-1a 32 hash of everything after its 16 bytes (at offset 4) and that s
 
     python tools/save_place.py <source save folder> <new folder> <x> <y> <z> [--render]
 
---render: x y z are renderer coordinates (as SOTC_CAM_LOG prints them).
+--render: x y z are renderer coordinates (as the SOTC CAM line prints them with SOTC_FPS=1).
 """
 import argparse
 import shutil

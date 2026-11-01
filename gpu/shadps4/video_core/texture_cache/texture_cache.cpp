@@ -2449,8 +2449,8 @@ void TextureCache::SotcGlyphHook(Image& image) {
         }
     }
     const u64 hash = readable ? XXH3_64bits(guest, info.guest_size) : 0;
-    // sotc: SOTC_GLYPH_LOG=1 prints each distinct RGBA8 glyph-sized texture the hook sees.
-    static const bool glyph_log = std::getenv("SOTC_GLYPH_LOG") != nullptr;
+    // sotc: with SOTC_FPS (was SOTC_GLYPH_LOG=1) prints each distinct RGBA8 glyph-sized texture the hook sees.
+    static const bool glyph_log = SotcStats::kFpsLog;
     if (glyph_log && rgba8) {
         static std::unordered_set<u64> logged;
         const u64 key = readable ? hash : (info.guest_address ^ 0xdead);

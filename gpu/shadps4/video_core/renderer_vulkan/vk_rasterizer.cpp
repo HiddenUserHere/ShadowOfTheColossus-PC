@@ -44,6 +44,7 @@
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
+#include "../../../sotc/native/verify.h" // sotc: SOTC_VERIFY (SotcVerify::VerifyAll)
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH (barrier events)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -750,12 +751,12 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
-// sotc: SOTC_PASS_TRACE=1: every 300 flips, the render passes of one frame in order (depth
+// sotc: SOTC_TRACE (was SOTC_PASS_TRACE): every 300 flips, the render passes of one frame in order (depth
 // target, its size, colour target 0, screen and generic scissors, CB mode, draws) on stderr.
 // A diagnostic for finding which passes are the sun shadow cascades.
 template <typename Regs>
 static void TracePass(const Regs& regs) {
-    static const bool on = std::getenv("SOTC_PASS_TRACE") != nullptr;
+    static const bool on = SotcTrace::kOn; // sotc: SOTC_PASS_TRACE is part of SOTC_TRACE
     if (!on) {
         return;
     }
@@ -841,11 +842,11 @@ static void TracePass(const Regs& regs) {
     passes.push_back(p);
 }
 
-// sotc: SOTC_PASS_TRACE: with the pass list, the shader hashes (all stages, as the dump file
+// sotc: SOTC_TRACE: with the pass list, the shader hashes (all stages, as the dump file
 // names) of the G-buffer draws, recognised by their R16G16 float target in MRT 4.
 template <typename Regs, typename Pipe>
 static void TraceGbufferShaders(const Regs& regs, const Pipe* pipeline) {
-    static const bool on = std::getenv("SOTC_PASS_TRACE") != nullptr;
+    static const bool on = SotcTrace::kOn; // sotc: SOTC_PASS_TRACE is part of SOTC_TRACE
     if (!on || !pipeline) {
         return;
     }
@@ -887,11 +888,11 @@ static void TraceGbufferShaders(const Regs& regs, const Pipe* pipeline) {
     ++counts[key];
 }
 
-// sotc: SOTC_PASS_TRACE: the shader hashes of the draws into square depth targets of 512+ texels
+// sotc: SOTC_TRACE: the shader hashes of the draws into square depth targets of 512+ texels
 // (the sun shadow map's cascades) per slice, every 300 flips.
 template <typename Regs, typename Pipe>
 static void TraceShadowShaders(const Regs& regs, const Pipe* pipeline) {
-    static const bool on = std::getenv("SOTC_PASS_TRACE") != nullptr;
+    static const bool on = SotcTrace::kOn; // sotc: SOTC_PASS_TRACE is part of SOTC_TRACE
     if (!on || !pipeline || !regs.depth_buffer.DepthValid()) {
         return;
     }
@@ -1076,7 +1077,7 @@ bool Rasterizer::ReuseShadowCascade() {
         s.decided.fill(false);
         s.frame_seen = frame;
         // Every ~60 s in the log (every 300 frames with SOTC_SHADOW_REUSE_STATS).
-        static const bool stats = std::getenv("SOTC_SHADOW_REUSE_STATS") != nullptr;
+        static const bool stats = SotcStats::kFpsLog; // sotc: SOTC_SHADOW_REUSE_STATS is part of SOTC_FPS
         if (frame % (stats ? 300 : 1800) == 0) {
             std::fprintf(stderr,
                          "SOTC SHADOW REUSE: far cascades drawn %llu, moved %llu, refused %llu, "
@@ -1206,7 +1207,7 @@ bool Rasterizer::ReuseShadowCascade() {
         const bool whole = std::abs(fx - rx) < 0.02 && std::abs(fy - ry) < 0.02 &&
                            std::abs(rx) <= 128 && std::abs(ry) <= 128;
         static u32 logged = 0;
-        if ((!same_basis || !whole) && std::getenv("SOTC_SHADOW_REUSE_STATS") && logged < 20) {
+        if ((!same_basis || !whole) && SotcStats::kFpsLog && logged < 20) {
             ++logged;
             std::fprintf(stderr,
                          "SOTC SHADOW REUSE refused slice %u: basis %s, move %.4f,%.4f texels, dz "
@@ -2178,9 +2179,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    // sotc: SOTC_INDIRECT_TRACE=1: the indirect draws that keep their GPU arguments (first 80):
+    // sotc: with SOTC_TRACE on: the indirect draws that keep their GPU arguments (first 80):
     // where the arguments are and what guest memory holds there (missing GPU particles).
-    static const bool indirect_trace = std::getenv("SOTC_INDIRECT_TRACE") != nullptr;
+    static const bool indirect_trace = SotcTrace::kOn; // sotc: SOTC_INDIRECT_TRACE is part of SOTC_TRACE
     if (indirect_trace) {
         static int shown = 0;
         if (shown++ < 80) {
@@ -3008,13 +3009,13 @@ void PrGenNote(u32 mode, bool hit, bool needs_owner, bool table_gen, bool mismat
 }
 } // namespace
 
-// sotc: SOTC_BIND_DIFF=1 (off by default; a measurement). For every fast-bind-eligible draw that
+// sotc: SOTC_VERIFY turns this on (off by default; a measurement). For every fast-bind-eligible draw that
 // misses the fast bind, which of its conditions failed, as a bit mask: the 6-8 most frequent masks
 // are printed every 5 s. "epoch" alone means nothing the draw binds changed, only the global
 // mem_epoch counter that any write anywhere bumps (memory_tracker.h, NoteHostWrite).
 namespace {
-// sotc: live (SotcLive): read on every draw that misses the bind shortcut.
-SotcLive::Int kBindDiff{"SOTC_BIND_DIFF", 0};
+// sotc: SOTC_BIND_DIFF is part of SOTC_VERIFY (verify.h): on with SOTC_VERIFY=1.
+const bool kBindDiff = SotcVerify::VerifyAll();
 enum BindDiffBit : u32 {
     BdInvalid = 1, BdPipeline = 2, BdBufGen = 4, BdTexGen = 8, BdStreamGen = 16, BdEpoch = 32,
     BdHash = 64, BdTick = 128,
@@ -3198,7 +3199,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             fast_bind.stream_generation == buffer_cache.StreamGeneration() &&
             fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
             fast_bind.hash == fast_hash;
-        if (kBindDiff.get()) { // sotc: SOTC_BIND_DIFF: which conditions failed
+        if (kBindDiff) { // sotc: SOTC_BIND_DIFF (SOTC_VERIFY): which conditions failed
             u32 mask = 0;
             if (!fast_bind.valid) {
                 mask = BdInvalid;
@@ -6386,9 +6387,9 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
                 }
             }
         }
-        // sotc: SOTC_TSHARP_TRACE=1: mip fields of the large streamed textures (first 120
+        // sotc: with SOTC_TRACE on: mip fields of the large streamed textures (first 120
         // distinct address/field combinations): which mips the game says are resident.
-        static const bool tsharp_trace = std::getenv("SOTC_TSHARP_TRACE") != nullptr;
+        static const bool tsharp_trace = SotcTrace::kOn; // sotc: SOTC_TSHARP_TRACE is part of SOTC_TRACE
         if (tsharp_trace && tsharp.width + 1 >= 1024 && tsharp.last_level > 0) {
             static std::mutex m;
             static std::set<std::tuple<u64, u32, u32, u32, u32>> seen;
@@ -6840,7 +6841,7 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
         if (ui_asset && ssharp.xy_mag_filter.Value() == AmdGpu::Filter::Point &&
             !sampler.is_depth) {
             ssharp.xy_mag_filter.Assign(AmdGpu::Filter::Bilinear);
-            static const bool trace = std::getenv("SOTC_UI_LINEAR_TRACE") != nullptr;
+            static const bool trace = SotcTrace::kOn; // sotc: SOTC_UI_LINEAR_TRACE is part of SOTC_TRACE
             if (trace) {
                 static std::mutex m;
                 static std::set<u64> seen;
@@ -7534,12 +7535,9 @@ void Rasterizer::PrefetchImagesShared(const Pipeline* pipeline) {
 const PreparedDraw* Rasterizer::CheckPrepared(const PreparedDraw& prepared,
                                               const GraphicsPipeline* pipeline, bool is_indexed,
                                               bool direct) {
-    // sotc: SOTC_PR_VERIFY=N: every Nth prepared draw is computed inline as well; a difference is
-    // logged (first 16), counted, and the inline values are used.
-    static const u32 verify_every = [] {
-        const char* v = std::getenv("SOTC_PR_VERIFY");
-        return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 0u;
-    }();
+    // sotc: SOTC_VERIFY=1 (verify.h; replaces SOTC_PR_VERIFY=N): every prepared draw is computed
+    // inline as well; a difference is logged (first 16), counted, and the inline values are used.
+    static const u32 verify_every = SotcVerify::VerifyAll() ? 1u : 0u;
     pr_verify_off = false; // sotc: SOTC_PR_RESOLVE (set below when the verify differs)
     if (prepared.is_indexed != is_indexed) {
         return nullptr; // cannot happen (same op); refused rather than trusted

@@ -634,8 +634,8 @@ int PS4_SYSV_ABI sceKernelTriggerUserEvent(OrbisKernelEqueue eq, int id, void* u
     }
 
     const bool found = kqueues[eq]->TriggerEvent(id, OrbisKernelEvent::Filter::User, udata);
-    // sotc: SOTC_FLIP_TRACE=1 logs the frame handshake (user events, flips).
-    static const bool trace = std::getenv("SOTC_FLIP_TRACE") != nullptr;
+    // sotc: with SOTC_TRACE on, logs the frame handshake (user events, flips).
+    static const bool trace = SotcTrace::kOn; // sotc: SOTC_FLIP_TRACE is part of SOTC_TRACE
     if (trace) {
         std::fprintf(stderr, "FLIPTRACE %lld user event '%s' id %d udata %p%s\n",
                      static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(

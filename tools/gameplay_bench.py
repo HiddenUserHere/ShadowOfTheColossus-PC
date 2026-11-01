@@ -148,7 +148,7 @@ def main():
                     return
         if args.horse:
             # Whistle for Agro (Triangle), wait for it, then hold Triangle next to it to mount. The
-            # camera position (SOTC_CAM_LOG lines of the game log) tells riding from walking: a
+            # camera position (the SOTC CAM lines of the game log, printed with SOTC_FPS=1) tells riding from walking: a
             # spurred Agro runs much faster than Wander. Never press Triangle once mounted (it
             # dismounts).
             cam_line = re.compile(r'SOTC CAM (\d+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+)')
@@ -270,7 +270,7 @@ def main():
         pad.write_text('')
 
     # --explore SECONDS: turn the camera right for SECONDS (the heading: ~90 degrees a second at
-    # full stick), then run straight ahead; when the camera (SOTC_CAM_LOG, needs SOTC_DLSSG=1)
+    # full stick), then run straight ahead; when the camera (SOTC CAM lines: SOTC_FPS=1, needs SOTC_DLSSG=1)
     # barely moves for 2 s, Wander is blocked: turn the camera a little and go on.
     explore_cam = re.compile(r'SOTC CAM (\d+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+)')
 

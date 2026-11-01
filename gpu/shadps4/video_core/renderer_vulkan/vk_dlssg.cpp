@@ -476,12 +476,9 @@ bool MakeConstants(const Pending& p, u32 width, u32 height, sl::Constants& out) 
         }
     }
     out.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-    // SOTC_CAM_LOG=1: the camera position every 10 frames with a millisecond clock, for scripted
+    // SOTC_FPS (was SOTC_CAM_LOG=1): the camera position every 10 frames with a millisecond clock, for scripted
     // runs (gameplay_bench --horse tells riding from walking by the speed).
-    static const bool cam_log = [] {
-        const char* v = std::getenv("SOTC_CAM_LOG");
-        return v && v[0] == '1';
-    }();
+    static const bool cam_log = SotcStats::kFpsLog; // sotc: SOTC_CAM_LOG is part of SOTC_FPS
     if (cam_log && next_index % 10 == 0) {
         LARGE_INTEGER t, f;
         QueryPerformanceCounter(&t);

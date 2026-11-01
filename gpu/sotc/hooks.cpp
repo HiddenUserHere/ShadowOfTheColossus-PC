@@ -730,11 +730,8 @@ bool InstallHooks(const char* hooks_path, void* image, uint64_t module_size, Ins
         }
     }
     // sotc: one manifest line per enabled hook; hooks whose switch is unset are listed only with
-    // SOTC_HOOKS_LOG=1 (every boot would print them otherwise).
-    static const bool log_all = [] {
-        const char* v = std::getenv("SOTC_HOOKS_LOG");
-        return v && v[0] == '1';
-    }();
+    // SOTC_FPS (was SOTC_HOOKS_LOG=1; every boot would print them otherwise).
+    static const bool log_all = std::getenv("SOTC_FPS") != nullptr; // sotc: SOTC_HOOKS_LOG is part of SOTC_FPS
     for (const Record& rec : g_records) {
         if (!rec.enabled && !log_all) {
             continue;
