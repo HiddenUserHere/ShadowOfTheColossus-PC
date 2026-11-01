@@ -2122,6 +2122,13 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::adaptive_evict_deferred.exchange(0)));
             }
+            static bool flags_logged = false; // sotc: which report switches are live (timers at 0, 1 Nov)
+            if (!flags_logged) {
+                flags_logged = true;
+                std::fprintf(stderr, "SOTC FPS switches: log %d lean %d timers %d trace %d\n",
+                             SotcStats::kFpsLog ? 1 : 0, SotcStats::kFpsLean ? 1 : 0,
+                             SotcStats::kFpsTimers ? 1 : 0, SotcTrace::kOn ? 1 : 0);
+            }
             if (flips) {
                 const double idle_ms = SotcStats::draw_idle_ns.exchange(0) / 1e6;
                 const double parse_ms = SotcStats::cp_parse_ns.exchange(0) / 1e6;

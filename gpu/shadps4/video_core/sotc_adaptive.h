@@ -62,14 +62,17 @@ inline std::atomic<bool> relieved{false};
 } // namespace Detail
 
 /// Read once at static initialisation, like SotcStats::kFpsLog.
-inline const bool kEnabled = [] {
+// sotc: the flags below read the environment through EnabledFromEnv, not kEnabled: the partial
+// ordering of inline variables did not hold in this build (SotcStats::kFpsTimers read false, 1 Nov).
+inline bool EnabledFromEnv() {
     const char* v = std::getenv("SOTC_ADAPTIVE_LOAD");
     return v && v[0] == '1';
-}();
-inline const bool kShadows = kEnabled && Detail::EnvOn("SOTC_ADAPTIVE_SHADOW", true);
-inline const bool kDefer = kEnabled && Detail::EnvOn("SOTC_ADAPTIVE_DEFER", true);
+}
+inline const bool kEnabled = EnabledFromEnv();
+inline const bool kShadows = EnabledFromEnv() && Detail::EnvOn("SOTC_ADAPTIVE_SHADOW", true);
+inline const bool kDefer = EnabledFromEnv() && Detail::EnvOn("SOTC_ADAPTIVE_DEFER", true);
 inline const uint64_t kFlushUs =
-    kEnabled ? static_cast<uint64_t>(Detail::EnvNumber("SOTC_ADAPTIVE_FLUSH_US", 4000.0)) : 0;
+    EnabledFromEnv() ? static_cast<uint64_t>(Detail::EnvNumber("SOTC_ADAPTIVE_FLUSH_US", 4000.0)) : 0;
 
 /// Any thread: the game is below its target and the port sheds load.
 inline bool Relieved() {

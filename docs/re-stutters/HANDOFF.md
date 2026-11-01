@@ -123,7 +123,7 @@ idle frame-end path in liverpool.cpp records (SubmitDone seq, flushed tick) thro
 BufferCache::PcHostNoteFrameRecorded; at a flip the game thread waits only for the tick of the frames that ended
 before the previous boundary (no WaitGpuIdle drain; 200 ms cap). Run 20261101-074045: ring8 27.5 FPS vs base 26.7,
 max 84 vs 176 ms, flip wait ~1 us avg. Verify run 074212: ~0.1% of sampled read binds changed before the next
-submit (inflated by clipped binds that reach the block end). Vertices with this build: waiting for the user.
+submit (inflated by clipped binds that reach the block end). User (1 Nov): vertices look fixed with this build.
 Heap serving (SOTC_PC_RING8_HEAPS=CPUMemory, off by default; mem_classes CollectHostServe, pc_ring
 SetHostExtras, pc_ring_copy CollectHeapRuns): written and built, not yet run.
 Heap serving measured (074556, 074852, 075018): CPUMemory faults -27..-31% (2122-2288 -> 1471-1678/s), host

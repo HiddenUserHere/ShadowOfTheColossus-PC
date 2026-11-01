@@ -42,7 +42,14 @@ inline const bool kFpsLean = [] {
     const char* v = std::getenv("SOTC_FPS_LEAN");
     return v && v[0] == '1';
 }();
-inline const bool kFpsTimers = kFpsLog && !kFpsLean;
+// sotc: read from the environment, not from kFpsLog/kFpsLean: the partial ordering of inline variables
+// did not hold in this build (ThinLTO, static library), and kFpsTimers came out false with SOTC_FPS set
+// ("SOTC FPS switches: log 1 lean 0 timers 0", 1 Nov), so every timer it gates read 0.
+inline bool FpsTimersFromEnv() {
+    const char* lean = std::getenv("SOTC_FPS_LEAN");
+    return std::getenv("SOTC_FPS") != nullptr && !(lean && lean[0] == '1');
+}
+inline const bool kFpsTimers = FpsTimersFromEnv();
 /// sotc: SOTC_CEILING=<sync,tex> (off by default): MEASUREMENT ONLY, the picture is wrong. Skips
 /// a whole part of the draw thread's work to show how much faster it would be if that part cost
 /// nothing: "sync" skips the buffer memory synchronization (uploads of CPU-written bytes and the
@@ -66,7 +73,7 @@ inline const unsigned kCeiling = [] {
     }
     return parts;
 }();
-inline const bool kWriteMarks = kFpsLog && !kFpsLean;
+inline const bool kWriteMarks = FpsTimersFromEnv(); // sotc: same switches as kFpsTimers
 /// sotc: skip BindResources on consecutive draws whose pipeline, push data and resource
 /// handles did not change. On by default (SOTC_FAST_BIND=0 turns it off). In 0.60.5 it left black
 /// dots in a grid on sandy ground (new constants at the same address); with the fix (mem_epoch

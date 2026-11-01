@@ -8,7 +8,7 @@
     python tools/pcmem_matrix.py --parse-only LOG [LOG ...]
 
 Each run is one launch of `python sotc.py` (cwd = repo root) with the common Lab route environment
-(SOTC_LAB_ROUTE=user/routes/tests.json, SOTC_CVARS="skipSplash=1 nointro", SOTC_FPS=1) and the
+(SOTC_LAB_ROUTE=user/routes/tests.json, SOTC_CVARS="skipSplash=1 nointro" plus the culling cvars, SOTC_FPS=1) and the
 configuration's switches. The game plays the route and closes itself. A run is valid only when its log
 has "SOTC LAB ROUTE done:"; a run without it is reported as "route did not run" (with --retry it is
 retried once first). One round (--repeat 1) and no retry are the defaults: N configurations = N runs. A run that is still going after RUN_TIMEOUT_S seconds is killed with its
@@ -55,7 +55,9 @@ COMMON_ENV = {
     'SOTC_SYS_MODULES': 'C:/Users/ptr/Documents/SOTC/user/sys_modules',
     'SOTC_LAB': '1',
     'SOTC_LAB_ROUTE': 'user/routes/tests.json',
-    'SOTC_CVARS': 'skipSplash=1 nointro',
+    # sotc: the users' culling settings (sotc.py and the launcher default): without them every Lab run had
+    # the GPU index-buffer culling on (~2100 extra dispatches a frame, 1 Nov).
+    'SOTC_CVARS': 'skipSplash=1 nointro doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0',
     'SOTC_FPS': '1',
 }
 
