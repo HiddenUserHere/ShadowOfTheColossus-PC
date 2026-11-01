@@ -3,7 +3,13 @@
 
 #pragma once
 
+#include <atomic>
+#include <array>
+#include <functional>
+#include <mutex>
+#include <string>
 #include <boost/container/static_vector.hpp>
+#include <tsl/robin_map.h>
 #include <xxhash.h>
 
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -68,6 +74,39 @@ struct GraphicsPipelineKey {
     bool Deserialize(Serialization::Archive& ar);
 };
 
+/// sotc: SOTC_PIPE_GPL=1. Graphics pipeline libraries (VK_EXT_graphics_pipeline_library) that the
+/// fast-linked pipelines of one PipelineCache share. A part is keyed by the exact bytes of the state
+/// it was created from (layout included), so a library is reused only for an identical part.
+/// Thread-safe: one mutex, held while a missing library is built.
+class GplLibraryCache {
+public:
+    enum Part : u32 { VertexInput, PreRaster, Fragment, FragmentOutput, NumParts };
+
+    /// Returns the library stored under key, or builds it with build (a null handle on failure).
+    /// built tells whether build ran.
+    vk::Pipeline GetOrBuild(Part part, const std::string& key, bool& built,
+                            const std::function<vk::UniquePipeline()>& build);
+
+private:
+    std::mutex mutex;
+    tsl::robin_map<std::string, vk::UniquePipeline> parts[NumParts];
+};
+
+/// sotc: SOTC_PIPE_GPL counters, summed since the start. Written by GraphicsPipeline and
+/// PipelineCache, printed by ReportPipeGpl (vk_pipeline_cache.cpp).
+struct GplCounters {
+    std::atomic<u64> cold_misses{};       ///< draws that found no built pipeline for their key
+    std::atomic<u64> unlinkable{};        ///< cold misses whose state the fast link does not cover
+    std::atomic<u64> linked_served{};     ///< draws served by a fast-linked pipeline
+    std::array<std::atomic<u64>, GplLibraryCache::NumParts> lib_built{}; ///< libraries created
+    std::array<std::atomic<u64>, GplLibraryCache::NumParts> lib_reused{}; ///< libraries found
+    std::atomic<u64> links{};             ///< fast links that succeeded
+    std::atomic<u64> link_failed{};       ///< library or link creation refused by the driver
+    std::atomic<u64> link_ns{};           ///< time in vkCreateGraphicsPipelines for the links
+    std::atomic<u64> replaced{};          ///< optimized builds that replaced a linked pipeline
+};
+inline GplCounters g_gpl_counters;
+
 class GraphicsPipeline : public Pipeline {
 public:
     struct SerializationSupport {
@@ -95,8 +134,22 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading, bool async_build = false);
+                     bool preloading, bool async_build = false,
+                     GplLibraryCache* gpl = nullptr);
     ~GraphicsPipeline();
+
+    /// sotc: true when this pipeline was fast-linked from pipeline libraries (SOTC_PIPE_GPL), and
+    /// so is replaced by the optimized build once that one is collected.
+    bool IsLinked() const noexcept {
+        return linked;
+    }
+
+    /// sotc: SOTC_PIPE_GPL: whether the state of key, with these stages, can be fast-linked. The
+    /// constructor links only when this is true (with a library cache).
+    static bool FastLinkable(const GraphicsPipelineKey& key,
+                             std::span<const Shader::Info*, MaxShaderStages> infos,
+                             std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+                             const Shader::Profile& profile);
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
         return fetch_shader;
@@ -120,6 +173,7 @@ private:
 private:
     GraphicsPipelineKey key;
     Shader::Gcn::FetchShaderData fetch_shader{};
+    bool linked{}; ///< sotc: SOTC_PIPE_GPL: built by fast-linking the libraries
 };
 
 struct ClipDistanceShaderKey {

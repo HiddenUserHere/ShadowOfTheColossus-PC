@@ -62,6 +62,11 @@ bool SameDynamicValues(const DynamicValues& a, const DynamicValues& b);
 // thread resolves from the op's flat copy and the runtime memory table (Rasterizer::PrepareResources).
 // BindBuffers and BindTextures use them in place of the inline V#/T# decode and mapping checks.
 // Valid only while PreparedResources::runtime_gen equals runtime_memory_generation() at bind time.
+// sotc: SOTC_PR_GEN (default 0; 1 use, 2 verify). The same values, with the runtime generation
+// replaced for each range by the per-64 KiB generation sums (sotc_generation.h): gen_sum is
+// SotcGen::Sum of the range the prep thread read, taken before the read. The draw thread uses the
+// values only while every recorded sum still matches (Rasterizer::BindResources, needs-owner
+// otherwise).
 
 /// One buffer descriptor. Specials (flat buffer, GDS, ...) are never resolved: computed false.
 struct PrBuffer {
@@ -70,6 +75,7 @@ struct PrBuffer {
     u64 mapped{};    ///< ClampRangeSize(base, vsize); 0 when base or vsize is 0
     u64 size{};      ///< mapped, limited to the unbounded window: what BindBuffers binds
     bool computed{}; ///< false: BindBuffers reads this descriptor itself
+    u64 gen_sum{};   ///< SOTC_PR_GEN: SotcGen::Sum(base, vsize) read before the mapping check
 };
 
 /// One texture descriptor (never an array descriptor): the T# and the checks BindTextures makes.
@@ -79,6 +85,7 @@ struct PrImage {
     /// 0 not resolved (inline), 1 bindable, 2 null (address 0 or invalid format),
     /// 3 rejected (unmapped address or bad enum).
     u8 verdict{};
+    u64 gen_sum{};      ///< SOTC_PR_GEN: SotcGen::Sum(address, 1) read before the mapping check
 };
 
 /// The prepared entries of one stage (its position in GraphicsPipeline::GetStages()).
@@ -98,7 +105,8 @@ struct PreparedResources {
     std::array<PrBuffer, MaxBuffers> buffers{};
     std::array<PrImage, MaxImages> images{};
 };
-static_assert(sizeof(PreparedResources) <= 4096, "sotc: SOTC_PR_RESOLVE slot size");
+// sotc: SOTC_PR_GEN adds one u64 per descriptor; the bound moves with it (8 KiB).
+static_assert(sizeof(PreparedResources) <= 8192, "sotc: SOTC_PR_RESOLVE slot size");
 
 struct PreparedDraw {
     /// The back op sequence number this slot was published for; stored last (release).
@@ -129,7 +137,8 @@ struct PreparedDraw {
     u8 mrt_mask{0xFF}; ///< GraphicsPipeline::GetGraphicsKey().mrt_mask; all set = unknown
     AmdGpu::OpFootprint resources{};
     /// sotc: SOTC_PR_RESOLVE. Written by Rasterizer::PrepareResources at the end of PrepareDraw;
-    /// used by BindResources only while runtime_gen matches (see above).
+    /// used by BindResources only while runtime_gen matches (see above), and with SOTC_PR_GEN also
+    /// while every gen_sum still matches.
     PreparedResources resolved{};
 };
 

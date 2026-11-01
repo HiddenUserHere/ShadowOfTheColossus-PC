@@ -25,6 +25,7 @@
 #include "../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK=1 owns the untrack list (plan step 6)
 #include "../../../sotc/pc_ring.h"     // sotc: SotcPcRing::FullRingMode (stall guard in LockTimed)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
+#include "../sotc_generation.h"      // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA granule generations
 // sotc: SOTC_UNTRACK_MAX_MB (default 16 MiB), live (SotcLive): the cap of the untrack list.
 inline SotcLive::Int kUntrackMaxMb{"SOTC_UNTRACK_MAX_MB", 16};
 
@@ -651,6 +652,9 @@ public:
                 if (SotcBufBindFast::kGenStamps) {
                     sync_gen[index / SYNC_GEN_WORDS].fetch_add(1, std::memory_order_release);
                 }
+                if (SotcGen::Bumps()) { // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA, see ChangeRegionState
+                    SotcGen::BumpWordPages(CpuAddress() + index * BYTES_PER_WORD, clean);
+                }
             }
         });
         mutex.unlock();
@@ -1018,6 +1022,9 @@ public:
     /// sotc: SOTC_HLE_TABLE_GEN. Bumps the generation of every granule the span touches, for a
     /// write that set no CPU bit (the bytes changed without a fault or a bit rise).
     void BumpSyncGen(u64 offset, u64 size) noexcept {
+        if (SotcGen::Bumps()) { // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA (no CPU bit is set here)
+            SotcGen::Bump(CpuAddress() + offset, size);
+        }
         if (!SotcBufBindFast::kGenStamps) {
             return;
         }
@@ -1352,17 +1359,20 @@ private:
         // sotc: SOTC_PC_RING. The generation follows the CPU-bit change (and the GPU-bit change of a
         // clear), never the protection change: a cached "clean" answer reads the bits.
         if constexpr (cpu_op == StateOp::Set || gpu_op == StateOp::Clear) {
-            if (SotcBufBindFast::kGenStamps) { // SOTC_SYNC_FAST or SOTC_BUF_BIND_FAST
-                u64 changed = 0;
-                if constexpr (cpu_op == StateOp::Set) {
-                    changed |= cpu_changed;
-                }
-                if constexpr (gpu_op == StateOp::Clear) {
-                    changed |= (gpu[index] ^ prev_gpu) & mask;
-                }
-                if (changed) {
-                    sync_gen[index / SYNC_GEN_WORDS].fetch_add(1, std::memory_order_release);
-                }
+            u64 changed = 0;
+            if constexpr (cpu_op == StateOp::Set) {
+                changed |= cpu_changed;
+            }
+            if constexpr (gpu_op == StateOp::Clear) {
+                changed |= (gpu[index] ^ prev_gpu) & mask;
+            }
+            if (SotcBufBindFast::kGenStamps && changed) { // SOTC_SYNC_FAST or SOTC_BUF_BIND_FAST
+                sync_gen[index / SYNC_GEN_WORDS].fetch_add(1, std::memory_order_release);
+            }
+            // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA (sotc_generation.h): the same changes, per 64 KiB
+            // granule of the guest space, after the bit store (release).
+            if (SotcGen::Bumps() && changed) {
+                SotcGen::BumpWordPages(CpuAddress() + index * BYTES_PER_WORD, changed);
             }
         }
         return cpu_changed;

@@ -132,8 +132,6 @@ static std::atomic<u64> g_lbl_waits{}, g_lbl_skippable{}, g_lbl_skipped{}, g_lbl
 // sotc: SOTC_PC_RING full ring. ProcessGraphics nesting depth (command processor thread only).
 static u32 pc_ring_gfx_depth = 0;
 static u32 pc_ring_asc_depth = 0; // sotc: SOTC_PC_RING full ring, compute submits
-// sotc: SOTC_PC_RING=8. HostWriteSeq at the previous gfx EOP label (only the back thread reads it).
-static u64 g_ring8_label_seq = 0;
 // sotc: SOTC_PC_RING=8. 8-byte keys of the addresses the command processor waits on (WAIT_REG_MEM,
 // both queues), learned while the stream is parsed. A label the CP waits on is never deferred:
 // a CP wait on a deferred label hung the boot (1 Nov). Learned, so the first wait of an address may
@@ -304,6 +302,22 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     eop_poll = eop_tick || rbx;
     // sotc: SOTC_PC_RING8_LABELS (default on, 0 disables). Used with SOTC_PC_RING=8 only (checked at use).
     ring8_labels = Ring8LabelsEnv();
+    // sotc: SOTC_LABELS_HONEST=1 (draw thread needed) uses the same deferred-label machinery (Ring8Track,
+    // watchdog, CP wait step, BackLoop poll), so ring8_labels is on with it. label_machinery: the
+    // deferral rule runs (mode 8 for the served-write rule; honest adds the shared-touch rule).
+    // Not combined with SOTC_RB_EXACT (rbx): the new deferrals skip its owed-download rules, so the
+    // switch is refused there (logged) rather than run untested.
+    labels_honest = back_threaded && !rbx && SotcLabels::On();
+    if (labels_honest) {
+        ring8_labels = true;
+        SotcLabels::MarkLive();
+        LOG_INFO(Render, "SOTC_LABELS_HONEST=1: EOP, ReleaseMem and EventWriteEos labels are deferred "
+                         "after shared-memory touches");
+    } else if (SotcLabels::On()) {
+        LOG_WARNING(Render, "SOTC_LABELS_HONEST=1 is off: it needs the draw thread and is not combined "
+                            "with SOTC_RB_EXACT");
+    }
+    label_machinery = ring8_labels && (SotcPcRing::Mode() == 8 || labels_honest);
     VideoCore::BufferCache::SetLabelSideActive(rbx); // sotc: SOTC_RB_EXACT (cache side agrees)
     if (rbx) {
         g_rbx_self.store(this, std::memory_order_release);
@@ -314,7 +328,12 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
                             "(3-7 FPS). Use it only to test streaming corruption.");
     }
     // sotc: SOTC_CP_AHEAD=2 (frame tickets) and SOTC_ASC_RPTR, both off by default.
-    frame_tickets = CpAheadMode() == 2;
+    // sotc: SOTC_FRAME_AHEAD=1 (gnmdriver.cpp FrameAheadActive) runs on the frame tickets too: without the
+    // marks FramesMarked() stays 0 and the submit gate would let the guest run unbounded ahead.
+    frame_tickets = CpAheadMode() == 2 || [] {
+        const char* v = std::getenv("SOTC_FRAME_AHEAD");
+        return v && v[0] == '1';
+    }();
     asc_rptr_mode = AscRptrMode();
     if (frame_tickets || asc_rptr_mode) {
         LOG_INFO(Render, "SOTC_CP_AHEAD={} SOTC_ASC_RPTR={}", CpAheadMode(), asc_rptr_mode);
@@ -741,11 +760,13 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         } else {
             using enum BackOp::Kind;
             // sotc: SOTC_DRAW_SPLIT: the time of the operation itself, by kind (not the replay above).
-            const SotcStats::SplitTimer op_split{
+            const SotcStats::SplitPart op_part =
                 op.kind == Draw           ? SotcStats::SplitDraw
                 : op.kind == DrawIndirect ? SotcStats::SplitIndirect
                 : op.kind == Func         ? SotcStats::SplitFunc
-                                          : SotcStats::SplitDispatch};
+                                          : SotcStats::SplitDispatch;
+            SotcStats::NoteDrawOp(op_part); // sotc: SOTC_DRAW_WORK, op counts
+            const SotcStats::SplitTimer op_split{op_part};
             if (SotcStats::kFpsTimers && op.kind == BackOp::Kind::Func && op.func) { // sotc: SOTC_FPS_LEAN
                 const u64 func_start = SotcStats::NowNs();
                 ExecuteBackOp(op);
@@ -2341,6 +2362,43 @@ std::shared_ptr<Liverpool::RbxJob> Liverpool::QueueDeferredLabel(
     return job;
 }
 
+// sotc: SOTC_PC_RING8_LABELS / SOTC_LABELS_HONEST. Draw thread, once per label in queue order. A label
+// is deferred (written after the GPU runs the work recorded before it) when a rule applies and the
+// submit does not wait on it:
+//   - ring8 rule (mode 8): a served write (HostWriteSeq) came since the queue's previous label;
+//   - honest rule (SOTC_LABELS_HONEST): SotcLabels::SharedSeq moved since then (served host ranges or
+//     GPU-to-CPU results were touched by the work recorded in between);
+//   - outstanding: a deferred label of any queue is still outstanding (labels land in order).
+// waited (the lookahead, see Ring8ScanSubmit) and a learned CP wait on the label both exclude it.
+// Deadlock argument: a deferred label is tracked in ring8_jobs and has three ways out: the GPU
+// finishes its tick (landed by BackLoop's Ring8Service or EopService), a CP wait on it flushes the
+// open buffer and queues Ring8Service (Ring8CpWaitStep, graphics and compute waits), or the 500 ms
+// watchdog writes it (Ring8Watchdog). BackLoop polls while anything is outstanding, so the watchdog
+// runs even while the CP spins. A label that the CP waits on is never deferred when the wait is seen
+// (lookahead), and a wait that is seen late is covered by the flush and the watchdog.
+Liverpool::LabelDecision Liverpool::LabelDecide(SotcLabels::Kind kind, u32 q, VAddr label,
+                                               bool waited) {
+    const bool mode8 = SotcPcRing::Mode() == 8;
+    const u64 ring_seq = mode8 ? SotcPcRing::HostWriteSeq() : 0;
+    const u64 shared_seq = labels_honest ? SotcLabels::SharedSeq() : 0;
+    const bool ring_hit = ring_seq != label_ring_seq[q];
+    const bool shared_hit = labels_honest && shared_seq != label_shared_seq[q];
+    label_ring_seq[q] = ring_seq;
+    label_shared_seq[q] = shared_seq;
+    const bool outstanding = eop_outstanding.load(std::memory_order_acquire) != 0;
+    LabelDecision d;
+    d.pending = ring_hit || shared_hit || outstanding;
+    const bool learned = d.pending && !waited && Ring8CpWaits(label);
+    d.waited = d.pending && waited;
+    d.defer = d.pending && !waited && !learned;
+    d.honest_only = d.defer && shared_hit && !ring_hit && !outstanding;
+    SotcLabels::NoteLabel(kind, d.defer, d.honest_only);
+    if (d.pending && (waited || learned)) {
+        SotcLabels::NoteExcluded(kind);
+    }
+    return d;
+}
+
 // sotc: SOTC_PC_RING8_LABELS. Draw thread. Lands the job unless it already landed (the watchdog
 // may have forced it; the scheduler op and RbxDrain then find it claimed).
 void Liverpool::LandOnce(RbxJob& job) {
@@ -2428,6 +2486,7 @@ void Liverpool::Ring8Watchdog() {
     for (const auto& job : due) {
         if (!job->claimed.load(std::memory_order_acquire)) {
             SotcPcRing::NoteHostLabelForced();
+            SotcLabels::NoteForced(job->label_kind);
             LandOnce(*job);
         }
     }
@@ -3413,7 +3472,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // op of the submit. The copy runs in the draw thread's order (BackOrRun).
     const bool pc_ring_top = pc_ring_gfx_depth++ == 0;
     // sotc: SOTC_PC_RING8_LABELS lookahead: the waits of the whole submit, before any of it is parsed.
-    if (pc_ring_top && ring8_labels && SotcPcRing::Mode() == 8) {
+    if (pc_ring_top && label_machinery) {
         Ring8ScanSubmit(dcb, ccb);
     }
     // sotc: mode 8 also runs OnSubmitStart (import and ring at the submit start, PcHostSubmitStart).
@@ -3933,12 +3992,43 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     XpSetHint(XpLabel, reinterpret_cast<VAddr>(eos.Address()), 8);
                 }
                 const u64 lb_prev = LabelPrevBarrier(GfxQueueId); // sotc: CP_LABEL_SKIP
-                BackOrRun([this, eos] {
+                // sotc: SOTC_LABELS_HONEST: the lookahead of EOP (Ring8ScanSubmit), for a SIGNAL_FENCE.
+                const bool eos_waited =
+                    label_machinery && eos.command == PM4CmdEventWriteEos::Command::SignalFence &&
+                    (g_ring8_wait_unknown ||
+                     g_ring8_submit_waits.contains(reinterpret_cast<VAddr>(eos.Address()) &
+                                                   ~VAddr{7}));
+                BackOrRun([this, eos, eos_waited] {
                     if (rasterizer) {
                         rasterizer->OnFence();
                     }
                     // sotc: SOTC_RB_EXACT rules 5-7 for EOS (RbxTryDefer).
                     u64 rbx_snap = 0;
+                    // sotc: SOTC_LABELS_HONEST. A SIGNAL_FENCE dword is deferred under the same rule as an
+                    // EOP label (LabelDecide, graphics queue 0). The GPU copy of its page is invalidated
+                    // first, as for EOP. With SOTC_RB_EXACT the snapshot is taken here (rule 7).
+                    if (labels_honest && rasterizer &&
+                        eos.command == PM4CmdEventWriteEos::Command::SignalFence) {
+                        const VAddr addr = reinterpret_cast<VAddr>(eos.Address());
+                        if (LabelDecide(SotcLabels::Kind::Eos, 0, addr, eos_waited).defer) {
+                            rasterizer->InvalidateMemory(addr, 8, true);
+                            if (rbx) {
+                                rbx_snap = rasterizer->GetBufferCache().HotWriteSeq();
+                            }
+                            const u32 value = eos.DataDWord();
+                            const auto job = QueueDeferredLabel(
+                                0, addr, true, false, value, 0, rbx_snap,
+                                Common::UniqueFunction<void>{[this, eos] {
+                                    eos.SignalFence([this](void* a, u64 d, u32 n) {
+                                        WriteFenceValue(a, d, n);
+                                    });
+                                }});
+                            job->label_kind = SotcLabels::Kind::Eos;
+                            Ring8Track(job);
+                            rasterizer->Flush(); // the guest may spin on this fence (see EOP)
+                            return;
+                        }
+                    }
                     // sotc: publish mode defers an EOS only to keep the per-address FIFO (a
                     // deferred label to the same address is outstanding: writing this one now
                     // would be overwritten by the older value when that one lands); otherwise
@@ -4005,7 +4095,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // the submit waits on this label (or its waits could not all be seen), so it is
                 // never deferred. See Ring8ScanSubmit.
                 const bool ring8_waited =
-                    ring8_labels && SotcPcRing::Mode() == 8 &&
+                    label_machinery &&
                     (g_ring8_wait_unknown ||
                      g_ring8_submit_waits.contains(reinterpret_cast<VAddr>(
                                                        eop_packet.Address<void>()) &
@@ -4060,20 +4150,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // a label must not announce a served write before the GPU has run it: the label is
                 // deferred when a served write came since the previous label, or when an earlier
                 // deferred label is still outstanding (the labels land in order). See pc_ring.h.
+                // sotc: SOTC_LABELS_HONEST adds the shared-touch rule (LabelDecide). ring8_defer is the
+                // deferral decision of either rule (the name is kept from the ring8 path).
                 bool ring8_defer = false;
                 // sotc: opt-in (SOTC_PC_RING8_LABELS=1, member ring8_labels): without the lookahead
                 // it hung the boot (1 Nov). A label the CP waits on is written early, as before.
-                if (rasterizer && ring8_labels && SotcPcRing::Mode() == 8) {
-                    const u64 seq = SotcPcRing::HostWriteSeq();
-                    const bool pending = seq != g_ring8_label_seq ||
-                                         eop_outstanding.load(std::memory_order_acquire) != 0;
-                    g_ring8_label_seq = seq;
-                    if (pending && ring8_waited) {
-                        SotcPcRing::NoteHostLabelExcluded();
+                if (rasterizer && label_machinery) {
+                    const LabelDecision d = LabelDecide(SotcLabels::Kind::Eop, 0,
+                                                        reinterpret_cast<VAddr>(event_eop->Address<void>()),
+                                                        ring8_waited);
+                    ring8_defer = d.defer;
+                    if (SotcPcRing::Mode() == 8) {
+                        if (d.waited) {
+                            SotcPcRing::NoteHostLabelExcluded();
+                        }
+                        SotcPcRing::NoteHostLabel(ring8_defer);
                     }
-                    ring8_defer = pending && !ring8_waited &&
-                                  !Ring8CpWaits(reinterpret_cast<VAddr>(event_eop->Address<void>()));
-                    SotcPcRing::NoteHostLabel(ring8_defer);
                 }
                 if ((eop_tick || rbx_defer || ring8_defer) && rasterizer) {
                     const PM4CmdEventWriteEop eop = *event_eop;
@@ -4102,6 +4194,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         }},
                         rbp_cand ? t_cp : 0, t_draw);
                     if (ring8_defer) {
+                        job->label_kind = SotcLabels::Kind::Eop;
                         Ring8Track(job); // sotc: SOTC_PC_RING8_LABELS: pending until it lands
                     }
                     if ((rbx_defer && rbx_hot) || ring8_defer) {
@@ -4328,7 +4421,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
-                if (SotcPcRing::Mode() == 8) { // sotc: SOTC_PC_RING=8, label side (see Ring8NoteCpWait)
+                if (label_machinery) { // sotc: SOTC_PC_RING=8 / SOTC_LABELS_HONEST (see Ring8NoteCpWait)
                     Ring8NoteCpWait(reinterpret_cast<VAddr>(wait_addr));
                 }
                 if (vo_port->IsVoLabel(wait_addr) &&
@@ -4802,7 +4895,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            if (SotcPcRing::Mode() == 8) { // sotc: SOTC_PC_RING=8, label side (see Ring8NoteCpWait)
+            if (label_machinery) { // sotc: SOTC_PC_RING=8 / SOTC_LABELS_HONEST (see Ring8NoteCpWait)
                 Ring8NoteCpWait(reinterpret_cast<VAddr>(wait_reg_mem->Address<u64*>()));
             }
             // sotc: SOTC_CP_LABEL_SKIP: as in the graphics wait (queue of the compute ring).
@@ -4812,7 +4905,16 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 ++cp_wait_exits; // sotc: progress marker (Process)
                 break;
             }
+            bool ring8_flushed = false; // sotc: SOTC_LABELS_HONEST, this wait (as in the graphics wait)
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                // sotc: SOTC_LABELS_HONEST: a wait on a deferred label submits the open buffer once and
+                // makes the draw thread land what the GPU finished (Ring8CpWaitStep). Without it a compute
+                // wait on a deferred graphics label would sit until the 500 ms watchdog. Off with the
+                // switch (the mode 8 default keeps its compute spin unchanged).
+                if (labels_honest && eop_outstanding.load(std::memory_order_acquire) != 0) {
+                    Ring8CpWaitStep(reinterpret_cast<VAddr>(wait_reg_mem->Address<u64*>()),
+                                    ring8_flushed);
+                }
                 // sotc: SOTC_RB_EXACT: as in the graphics wait, a deferred label's pending value
                 // satisfies the stream's own wait, and a wait blocked on a label queued behind
                 // unsubmitted work makes the draw thread submit it (EopWaitGuard).
@@ -4838,7 +4940,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             const u32 lq = LabelQueueOf(vqid); // sotc: SOTC_CP_LABEL_SKIP
             const u64 lb_prev = LabelPrevBarrier(lq);
-            BackOrRun([this, release, pipe_id = queue.pipe_id] {
+            // sotc: SOTC_LABELS_HONEST lookahead (as EOP). Ring8ScanSubmit only scans graphics submits, so
+            // this uses the last scanned graphics submit's waits (conservative: a stale hit only means
+            // no deferral) and the learned CP waits. A compute wait on a deferred fence is covered by
+            // Ring8CpWaitStep in ProcessCompute.
+            const bool rm_waited =
+                label_machinery && (g_ring8_wait_unknown ||
+                                    g_ring8_submit_waits.contains(release.Address<VAddr>() & ~VAddr{7}));
+            BackOrRun([this, release, pipe_id = queue.pipe_id, rm_waited] {
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
@@ -4858,14 +4967,21 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 } else if (rbx_label) {
                     rbx_defer = RbxDecide(1, release.Address<VAddr>(), rbx_snap, &rbx_hot);
                 }
-                if (rbx_defer) {
+                // sotc: SOTC_LABELS_HONEST: the same rule as EOP for a compute fence (queue slot 1). A
+                // GDS store is a GPU copy, not a label.
+                const bool honest_defer =
+                    labels_honest && rasterizer &&
+                    release.data_sel.Value() != DataSelect::GdsMemStore &&
+                    LabelDecide(SotcLabels::Kind::ReleaseMem, 1, release.Address<VAddr>(), rm_waited)
+                        .defer;
+                if (rbx_defer || honest_defer) {
                     const auto ds = release.data_sel.Value();
                     if (rbx_hot) {
                         rasterizer->GetBufferCache().RecordLabelDownloads();
                     }
                     // Same page invalidation the early write path never needed (the write goes
                     // straight to the guest mapping), so none here either.
-                    QueueDeferredLabel(
+                    const auto job = QueueDeferredLabel(
                         1, release.Address<VAddr>(), ds == DataSelect::Data32Low,
                         ds == DataSelect::Data64, release.data_lo, release.data_hi, rbx_snap,
                         Common::UniqueFunction<void>{[release, pipe_id] {
@@ -4876,7 +4992,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                 },
                                 [](VAddr, u16, u16) {});
                         }});
-                    if (rbx_hot) {
+                    if (honest_defer) {
+                        job->label_kind = SotcLabels::Kind::ReleaseMem;
+                        Ring8Track(job); // pending until it lands (watchdog, CP wait step)
+                    }
+                    if (rbx_hot || honest_defer) {
                         rasterizer->Flush(); // the guest may spin on this label (see EOP)
                     }
                     return;

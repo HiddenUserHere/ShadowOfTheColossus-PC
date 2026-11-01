@@ -31,6 +31,10 @@ using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
 
+// sotc: images created by this module (counted at creation, not at the live count).
+static std::atomic<u64> images_created{};
+static std::atomic<u64> images_destroyed{};
+
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                                            const ImageInfo& info) {
     vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eTransferSrc |
@@ -116,10 +120,24 @@ void UniqueImage::Destroy() {
         }
         image = vk::Image{};
         allocation = {};
+        images_destroyed.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_IMG_POOLED report
         SotcStats::image_bytes.fetch_sub(size_bytes, std::memory_order_relaxed);
         SotcStats::image_count.fetch_sub(1, std::memory_order_relaxed);
         size_bytes = 0;
     }
+}
+
+// sotc: SOTC_IMG_POOLED=1 (off by default): the image pool is on at 256 MiB even without
+// SOTC_VK_POOL, and an image the full pool cannot take gets a block of the pool, not a dedicated
+// allocation. VMA never makes a dedicated allocation for a custom pool with an explicit block size,
+// while the default path does so for every image the driver prefers to have dedicated (render
+// targets on the AMD driver).
+static bool ImgPooledEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_IMG_POOLED");
+        return v && v[0] == '1';
+    }();
+    return enabled;
 }
 
 // sotc: SOTC_IMAGE_POOL_MB=<n> (off by default). A VMA pool of 64 MiB blocks for images, n MiB of
@@ -135,7 +153,7 @@ static VmaPool ImagePool(VmaAllocator allocator, const VkImageCreateInfo& image_
         if (v) {
             return std::strtoull(v, nullptr, 10);
         }
-        return VkPoolEnabled() ? 256ULL : 0ULL;
+        return VkPoolEnabled() || ImgPooledEnabled() ? 256ULL : 0ULL;
     }();
     if (pool_mb == 0) {
         return VK_NULL_HANDLE;
@@ -164,6 +182,34 @@ static VmaPool ImagePool(VmaAllocator allocator, const VkImageCreateInfo& image_
     return pool;
 }
 
+// sotc: the image pool (SOTC_IMAGE_POOL_MB / SOTC_VK_POOL / SOTC_IMG_POOLED) for one image.
+// True when the image was created in it. First in the blocks the pool has (no allocation on this
+// thread). With SOTC_IMG_POOLED, a full pool then allocates a block of its own, so the image
+// still avoids a dedicated allocation. False: the caller uses the default allocator.
+static bool CreateInImagePool(VmaAllocator allocator, const VkImageCreateInfo& image_ci_unsafe,
+                              const VmaAllocationCreateInfo& alloc_ci, VkImage& unsafe_image,
+                              VmaAllocation& allocation, VmaAllocationInfo& alloc_info) {
+    const VmaPool pool = ImagePool(allocator, image_ci_unsafe, alloc_ci);
+    if (!pool) {
+        return false;
+    }
+    VmaAllocationCreateInfo pool_ci = alloc_ci;
+    pool_ci.pool = pool;
+    pool_ci.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT; // only the blocks it has
+    VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &pool_ci, &unsafe_image,
+                                     &allocation, &alloc_info);
+    if (result != VK_SUCCESS && ImgPooledEnabled()) {
+        pool_ci.flags &= ~VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT; // sotc: a block of its own
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &pool_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+    }
+    if (result != VK_SUCCESS) {
+        return false;
+    }
+    SotcStats::image_pool_allocs.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
@@ -180,23 +226,13 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
     const SotcStats::ScopedTimer alloc_timer{SotcStats::image_alloc_ns};
-    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    bool from_pool = false;
-    if (const VmaPool pool = ImagePool(allocator, image_ci_unsafe, alloc_ci)) {
-        VmaAllocationCreateInfo pool_ci = alloc_ci;
-        pool_ci.pool = pool;
-        pool_ci.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT; // only the blocks it has
-        result = vmaCreateImage(allocator, &image_ci_unsafe, &pool_ci, &unsafe_image, &allocation,
-                                &alloc_info);
-        from_pool = result == VK_SUCCESS;
-        if (from_pool) {
-            SotcStats::image_pool_allocs.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    if (!from_pool) {
+    VkResult result = VK_SUCCESS;
+    if (!CreateInImagePool(allocator, image_ci_unsafe, alloc_ci, unsafe_image, allocation,
+                           alloc_info)) {
         result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
                                 &alloc_info);
     }
+    images_created.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_IMG_POOLED report
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
         // Over the video memory budget (loading screens peak before the cache collects old
         // images). Going over budget lets the driver page memory out instead of aborting.
@@ -240,20 +276,9 @@ bool UniqueImage::TryCreateWithinBudget(const vk::ImageCreateInfo& image_ci) {
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
-    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    bool from_pool = false;
-    if (const VmaPool pool = ImagePool(allocator, image_ci_unsafe, alloc_ci)) {
-        VmaAllocationCreateInfo pool_ci = alloc_ci;
-        pool_ci.pool = pool;
-        pool_ci.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
-        result = vmaCreateImage(allocator, &image_ci_unsafe, &pool_ci, &unsafe_image, &allocation,
-                                &alloc_info);
-        from_pool = result == VK_SUCCESS;
-        if (from_pool) {
-            SotcStats::image_pool_allocs.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    if (!from_pool) {
+    VkResult result = VK_SUCCESS;
+    if (!CreateInImagePool(allocator, image_ci_unsafe, alloc_ci, unsafe_image, allocation,
+                           alloc_info)) {
         result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
                                 &alloc_info);
     }
@@ -261,6 +286,7 @@ bool UniqueImage::TryCreateWithinBudget(const vk::ImageCreateInfo& image_ci) {
         allocation = {};
         return false;
     }
+    images_created.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_IMG_POOLED report
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
     SotcStats::image_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
@@ -636,6 +662,50 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         before.pl_stage != dst_stage || had_subresources != !subresource_states.empty()) {
         backing->state_version = NextBackingVersion(); // sotc: SOTC_TEX_BLOCK
     }
+}
+
+void ImageChurnReport() {
+    if (!ImgPooledEnabled() && !AsyncImageCreateEnabled()) {
+        return;
+    }
+    // Self-throttled: any thread may call it often; one caller per 5 s window wins the CAS.
+    static std::atomic<u64> due{};
+    static std::atomic<u64> last_created{}, last_destroyed{}, last_pooled{}, last_dedicated{};
+    static std::atomic<u64> last_requested{}, last_skipped{}, last_built{}, last_taken{};
+    static std::atomic<u64> last_waits{}, last_sync{}, last_taken_back{}, last_expired{};
+    const u64 now = SotcStats::NowNs();
+    u64 next = due.load(std::memory_order_relaxed);
+    if (now < next || !due.compare_exchange_strong(next, now + 5'000'000'000ULL)) {
+        return;
+    }
+    const auto delta = [](const std::atomic<u64>& now_value, std::atomic<u64>& last) {
+        const u64 value = now_value.load(std::memory_order_relaxed);
+        return value - last.exchange(value, std::memory_order_relaxed);
+    };
+    const u64 created = delta(images_created, last_created);
+    const u64 destroyed = delta(images_destroyed, last_destroyed);
+    const u64 pooled = delta(SotcStats::image_pool_allocs, last_pooled);
+    const u64 dedicated = delta(SotcStats::image_dedicated, last_dedicated);
+    const u64 requested = delta(SotcStats::async_image_requested, last_requested);
+    const u64 skipped = delta(SotcStats::async_image_skipped, last_skipped);
+    const u64 built = delta(SotcStats::async_image_built, last_built);
+    const u64 taken = delta(SotcStats::async_image_taken, last_taken);
+    const u64 waits = delta(SotcStats::async_image_waits, last_waits);
+    const u64 sync = delta(SotcStats::async_image_sync, last_sync);
+    const u64 taken_back = delta(SotcStats::async_image_taken_back, last_taken_back);
+    const u64 expired = delta(SotcStats::async_image_expired, last_expired);
+    std::fprintf(stderr,
+                 "SOTC IMG CREATE 5s: images created %llu (pool %llu, dedicated %llu), freed %llu, "
+                 "live %llu | ahead: queued %llu (refused %llu), made %llu, used ready %llu, "
+                 "waited %llu, draw made %llu (taken back %llu), wasted %llu\n",
+                 static_cast<unsigned long long>(created), static_cast<unsigned long long>(pooled),
+                 static_cast<unsigned long long>(dedicated),
+                 static_cast<unsigned long long>(destroyed),
+                 static_cast<unsigned long long>(SotcStats::image_count.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(requested), static_cast<unsigned long long>(skipped),
+                 static_cast<unsigned long long>(built), static_cast<unsigned long long>(taken),
+                 static_cast<unsigned long long>(waits), static_cast<unsigned long long>(sync + taken_back),
+                 static_cast<unsigned long long>(taken_back), static_cast<unsigned long long>(expired));
 }
 
 void NoteMipTailWrite(const Image& image) {

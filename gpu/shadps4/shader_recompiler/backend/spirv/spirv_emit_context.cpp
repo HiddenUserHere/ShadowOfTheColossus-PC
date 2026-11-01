@@ -14,6 +14,7 @@
 #include <fmt/format.h>
 #include <spirv/unified1/spirv.hpp11>
 
+#include <bit>
 #include <numbers>
 #include <string_view>
 
@@ -73,7 +74,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma) {
+    if (info.uses_dma || info.HasBdaBlockTable()) { // sotc: SOTC_BDA needs physical pointers too
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -889,6 +890,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     case BufferType::LodFeedback:
         Name(id, "lod_feedback");
         break;
+    case BufferType::BdaBlockTable:
+        Name(id, "bda_block_table");
+        break;
     case BufferType::SharedMemory:
         Name(id, "ssbo_shmem");
         break;
@@ -899,6 +903,84 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     interfaces.push_back(id);
     return {id, pointer_type};
 };
+
+std::pair<Id, Id> EmitContext::LoadBdaBlock(u32 handle) {
+    const auto [table_id, table_pointer] = buffers[bda_table_index].Alias(PointerType::U32);
+    const auto word = [&](u32 index) {
+        const Id ptr{OpAccessChain(table_pointer, table_id, u32_zero_value,
+                                   ConstU32(handle * 4 + index))};
+        return OpLoad(U32[1], ptr);
+    };
+    const Id low{word(0)};
+    const Id high{word(1)};
+    const Id size{word(2)};
+    const Id address{OpBitcast(U64, OpCompositeConstruct(U32[2], std::array<Id, 2>{low, high}))};
+    return {address, size};
+}
+
+std::pair<Id, Id> EmitContext::BdaAddress(u32 handle, Id index, u32 elem_size, u32 count) {
+    const auto [block_address, block_size] = LoadBdaBlock(handle);
+    const u32 elem_shift = static_cast<u32>(std::countr_zero(elem_size));
+    const Id num_elements{OpShiftRightLogical(U32[1], block_size, ConstU32(elem_shift))};
+    // The access fits when index <= num_elements - count (and count fits at all).
+    const Id has_room{OpUGreaterThanEqual(U1[1], num_elements, ConstU32(count))};
+    const Id last_index{OpISub(U32[1], num_elements, ConstU32(count))};
+    const Id in_range{OpULessThanEqual(U1[1], index, last_index)};
+    const Id valid{OpLogicalAnd(U1[1], has_room, in_range)};
+    const Id safe_index{OpSelect(U32[1], valid, index, u32_zero_value)};
+    const Id byte_offset{OpIMul(U64, OpUConvert(U64, safe_index),
+                                Constant(U64, static_cast<u64>(elem_size)))};
+    return {OpIAdd(U64, block_address, byte_offset), valid};
+}
+
+Id EmitContext::BdaPointer(Id address, Id elem_type) {
+    return OpConvertUToPtr(TypePointer(spv::StorageClass::PhysicalStorageBuffer, elem_type),
+                           address);
+}
+
+Id EmitContext::BdaLoad(u32 handle, Id index, u32 elem_size, Id elem_type, Id zero,
+                        Id result_type, u32 count) {
+    const auto [address, valid] = BdaAddress(handle, index, elem_size, count);
+    boost::container::static_vector<Id, 4> ids;
+    for (u32 i = 0; i < count; i++) {
+        const Id elem_address = i == 0 ? address
+                                       : OpIAdd(U64, address,
+                                                Constant(U64, static_cast<u64>(i * elem_size)));
+        const Id value = OpLoad(elem_type, BdaPointer(elem_address, elem_type),
+                                spv::MemoryAccessMask::Aligned, elem_size);
+        ids.push_back(OpSelect(elem_type, valid, value, zero));
+    }
+    return count == 1 ? ids[0] : OpCompositeConstruct(result_type, ids);
+}
+
+void EmitContext::BdaStore(u32 handle, Id index, u32 elem_size, Id elem_type, Id value,
+                           u32 count) {
+    const auto [address, valid] = BdaAddress(handle, index, elem_size, count);
+    const Id merge{BdaBeginIf(valid)};
+    for (u32 i = 0; i < count; i++) {
+        const Id elem_address = i == 0 ? address
+                                       : OpIAdd(U64, address,
+                                                Constant(U64, static_cast<u64>(i * elem_size)));
+        const Id elem_value = count == 1 ? value : OpCompositeExtract(elem_type, value, i);
+        OpStore(BdaPointer(elem_address, elem_type), elem_value, spv::MemoryAccessMask::Aligned,
+                elem_size);
+    }
+    BdaEndIf(merge);
+}
+
+Id EmitContext::BdaBeginIf(Id valid) {
+    const Id then_label{OpLabel()};
+    const Id merge{OpLabel()};
+    OpSelectionMerge(merge, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(valid, then_label, merge);
+    AddLabel(then_label);
+    return merge;
+}
+
+void EmitContext::BdaEndIf(Id merge) {
+    OpBranch(merge);
+    AddLabel(merge);
+}
 
 void EmitContext::DefineBuffers() {
     for (const auto& desc : info.buffers) {
@@ -917,10 +999,21 @@ void EmitContext::DefineBuffers() {
             fault_buffer_index = buffers.size();
         } else if (desc.buffer_type == BufferType::LodFeedback) {
             lod_feedback_index = buffers.size();
+        } else if (desc.buffer_type == BufferType::BdaBlockTable) {
+            bda_table_index = buffers.size();
         }
 
         // Define aliases depending on the shader usage.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
+        // sotc: SOTC_BDA: a guest buffer that is not texel or coherent takes no descriptor; its
+        // block table slot gives its address. Coherent buffers keep the descriptor (Coherent
+        // decoration, which physical pointers do not get).
+        if (profile.bda_buffers && info.HasBdaBlockTable() &&
+            desc.buffer_type == BufferType::Guest && !desc.is_formatted && !is_coherent) {
+            spv_buffer.bda = true;
+            ++binding.unified;
+            continue;
+        }
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
                 DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);

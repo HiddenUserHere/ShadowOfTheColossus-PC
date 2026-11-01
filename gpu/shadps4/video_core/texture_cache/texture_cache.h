@@ -9,6 +9,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_set>
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
 #include <deque>
 #include <memory>
@@ -512,6 +513,35 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
+    /// sotc: SOTC_GEN_TEX texture identity key: the raw words of the T# (AmdGpu::Image, 32 bytes)
+    /// and `extra`, every other bit the bind reads from the shader resource (is_depth, is_array,
+    /// is_atomic, is_r128, constant_mip_index, mip_fallback_mode, post_op), packed by the caller.
+    struct TexIdentityKey {
+        std::array<u64, 4> words{};
+        u64 extra{};
+        bool operator==(const TexIdentityKey&) const = default;
+    };
+    /// sotc: what a texture bind gets: the image and its view (valid while the image lives).
+    struct TexBind {
+        ImageId image_id{};
+        ImageView* view{};
+    };
+    /// sotc: SOTC_GEN_TEX (0 off, 1 on, 2 verify), read once. Off unless SotcGen::On().
+    [[nodiscard]] static int TexIdentityMode();
+    /// sotc: FindImage + FindTexture for a texture bind (BindingType::Texture; other types and
+    /// mip-tail candidates take the plain path). A memo hit returns what the full path returns for
+    /// the same key without FindImage, the overlap scan or a refresh: the image is registered,
+    /// fully tracked and clean, its guest range has the SotcGen::Sum it had when it was last
+    /// refreshed clean, and no image was (un)registered or aliased since (tex_epoch). Mode 2 runs
+    /// the full path too and counts the hits that differ; the full path's answer is returned.
+    [[nodiscard]] TexBind FindTextureIdentity(const TexIdentityKey& key, ImageDesc& desc,
+                                              bool exact_fmt = false);
+    /// sotc: SOTC_GEN_TEX counters, appends one "SOTC TEX IDENTITY" line (nothing when off).
+    static void ReportTexIdentity(std::string& out, double seconds);
+    /// sotc: SOTC_RT_MAXEXTENT counters (render and depth target families), appends one
+    /// "SOTC RT MAXEXTENT" line (nothing when off).
+    static void ReportRtMaxExtent(std::string& out, double seconds);
+
     /// sotc: SOTC_LOAD_WARM trace instants (texture_cache.cpp).
     static void TraceWarmTex(const char* name, VAddr addr, u64 size);
 
@@ -602,6 +632,25 @@ public:
 
     /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
+
+    /// sotc: SOTC_RT_MAXEXTENT (T1): render and depth targets are created with the layer count
+    /// their family has been seen with, so a later request for more layers is a view, not an
+    /// expand. Off by default; every helper here runs under `mutex`.
+    static bool IsRtTarget(BindingType type) {
+        return type == BindingType::RenderTarget || type == BindingType::DepthTarget;
+    }
+    [[nodiscard]] static int RtMaxExtentMode();
+    /// `info` with the family's layer count when that is larger (raised). Only layer-linear guest
+    /// sizes are scaled; anything else returns `info` unchanged and counts a fallback.
+    [[nodiscard]] ImageInfo RtRaiseLayers(const ImageInfo& info, bool& raised);
+    /// Records the family's image (created or expanded to `max_layers`) and the layers the old
+    /// path would have given it (`first_layers`, the request that made it).
+    void RtNoteImage(const ImageInfo& request, u32 first_layers, u32 max_layers, ImageId image_id);
+    /// A request served by an image that already exists: counts the expands the old path would
+    /// have made (request layers above the old image's layers) and the views of a larger image.
+    void RtNoteServed(const ImageInfo& info, ImageId image_id);
+    /// ExpandImage for a render or depth target, to the family's layer count when that is larger.
+    [[nodiscard]] ImageId ExpandRt(const ImageInfo& info, ImageId image_id);
 
     /// Reuploads image contents.
     void RefreshImage(Image& image);
@@ -962,6 +1011,79 @@ private:
     ImageId MemoLookup(const ImageInfo& info, bool exact_fmt, bool writer);
     /// The generation a memo for `address` is valid in (per-address unless SOTC_MEMO_ADDR_GEN=0).
     u64 MemoGeneration(VAddr address) const;
+    /// sotc: SOTC_GEN_TEX identity memo (FindTextureIdentity), direct-mapped on the key. Allocated
+    /// only when TexIdentityMode() is on.
+    struct TexIdMemo {
+        TexIdentityKey key{};
+        bool exact_fmt{};
+        bool valid{};
+        ImageId image_id{};
+        u64 image_uid{}; ///< the image the slot held when stored (slots are reused)
+        ImageViewInfo pre_view_info{}; ///< desc.view_info as the caller built it (before FindImage);
+                                       ///< the caller may adjust it per binding (mip fallback index)
+        ImageViewInfo view_info{};     ///< desc.view_info after FindImage: the view it resolves to
+        u64 epoch{};               ///< tex_epoch when stored
+        u64 sum{};                 ///< SotcGen::Sum of the image's guest range when stored
+    };
+    static constexpr size_t NumTexIdMemos = 4096;
+    std::unique_ptr<std::array<TexIdMemo, NumTexIdMemos>> tex_id_memos;
+
+    /// sotc: SOTC_RT_MAXEXTENT family of a render or depth target: everything that fixes its
+    /// layout except the layer count. Pitch and height fix BlockDim, so the overlap rules treat
+    /// two requests of one family as one image (a view or an expand), never as a free.
+    struct RtFamily {
+        VAddr address{};
+        VAddr stencil_addr{};
+        u32 stencil_size{};
+        u32 pitch{};
+        u32 width{};
+        u32 height{};
+        u32 depth{};
+        u32 levels{};
+        u32 num_bits{};
+        u32 num_samples{};
+        u32 flags{}; ///< is_volume, is_tiled, is_pow2, is_block, is_depth, has_stencil (bits 0-5)
+        vk::Format pixel_format{};
+        AmdGpu::ImageType type{};
+        AmdGpu::TileMode tile_mode{};
+        AmdGpu::ArrayMode array_mode{};
+        bool alt_tile{};
+        bool operator==(const RtFamily&) const = default;
+    };
+    struct RtFamilyHash {
+        size_t operator()(const RtFamily& f) const noexcept {
+            u64 h = 0x9E3779B97F4A7C15ULL;
+            const auto mix = [&h](u64 v) {
+                h = (h ^ v) * 0xC2B2AE3D27D4EB4FULL;
+                h ^= h >> 29;
+            };
+            mix(f.address);
+            mix(f.stencil_addr);
+            mix(f.stencil_size);
+            mix(u64(f.pitch) << 32 | f.width);
+            mix(u64(f.height) << 32 | f.depth);
+            mix(u64(f.levels) << 32 | f.num_bits);
+            mix(u64(f.num_samples) << 32 | f.flags);
+            mix(static_cast<u64>(f.pixel_format));
+            mix(static_cast<u64>(f.type));
+            mix(static_cast<u64>(f.tile_mode) << 8 | static_cast<u64>(f.array_mode));
+            mix(f.alt_tile);
+            return static_cast<size_t>(h ^ (h >> 32));
+        }
+    };
+    struct RtExtentEntry {
+        u32 max_layers{};   ///< layers new images of the family are created with
+        u32 first_layers{}; ///< layers the old path's image of the family would have
+        ImageId image_id{}; ///< the family's latest image (valid while image_uid matches)
+        u64 image_uid{};
+    };
+    /// The family of a render or depth target request.
+    [[nodiscard]] static RtFamily RtFamilyOf(const ImageInfo& info);
+    static constexpr size_t MaxRtFamilies = 4096;
+    std::unordered_map<RtFamily, RtExtentEntry, RtFamilyHash> rt_extents;
+    /// sotc: moves when an image is (un)registered or its ImageInfo is replaced (aliasing, mip
+    /// tails, unmap parking): every identity memo entry older than the move is stale. Under `mutex`.
+    u64 tex_epoch{};
     u64 image_set_generation{};
     /// sotc: SOTC_BIND_CACHE_FRAME: (un)registered image ranges (ImageChangedSince).
     VideoCore::RangeStamps image_stamps;

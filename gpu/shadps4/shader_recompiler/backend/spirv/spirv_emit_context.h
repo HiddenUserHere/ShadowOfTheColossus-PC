@@ -5,6 +5,7 @@
 
 #include <array>
 #include <unordered_map>
+#include <utility>
 #include <sirit/sirit.h>
 
 #include "shader_recompiler/backend/bindings.h"
@@ -346,6 +347,9 @@ public:
         BufferType buffer_type;
         std::array<Id, u32(PointerSize::NumClass)> offsets;
         std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
+        /// sotc: SOTC_BDA: no descriptor. The buffer is accessed through its block table slot
+        /// (EmitContext::BdaAddress); aliases and offsets stay unset.
+        bool bda{};
 
         template <class Self>
         auto& Alias(this Self& self, PointerType alias) {
@@ -369,6 +373,7 @@ public:
     size_t bda_pagetable_index{};
     size_t fault_buffer_index{};
     size_t lod_feedback_index{};
+    size_t bda_table_index{}; ///< sotc: SOTC_BDA: info.buffers index of the block table
     Id physical_pointer_type_u32;
 
     Id sampler_type{};
@@ -411,6 +416,28 @@ public:
 
     /// sotc: void lod_feedback(u32 tsharp_dw2, u32 tsharp_dw3, u32 tsharp_dw6, vec2 uv)
     Id lod_feedback{};
+
+    /// sotc: SOTC_BDA. Device address (U64) and size in bytes (U32) of buffer `handle`, read from
+    /// its slot of the block table.
+    std::pair<Id, Id> LoadBdaBlock(u32 handle);
+    /// sotc: SOTC_BDA. Byte address (U64) of element `index` of buffer `handle` (elem_size bytes
+    /// each), and whether `count` elements from `index` lie inside the block. An invalid access
+    /// gets the block start as its address, so a load from it stays in memory; the caller
+    /// selects zero for it, and a store is guarded by BdaBeginIf.
+    std::pair<Id, Id> BdaAddress(u32 handle, Id index, u32 elem_size, u32 count);
+    /// sotc: SOTC_BDA. Loads `count` elements (elem_type) at `index`; zero when out of range.
+    Id BdaLoad(u32 handle, Id index, u32 elem_size, Id elem_type, Id zero, Id result_type,
+               u32 count);
+    /// sotc: SOTC_BDA. Stores `value` (a vector of `count` elements when count > 1); nothing when
+    /// out of range.
+    void BdaStore(u32 handle, Id index, u32 elem_size, Id elem_type, Id value, u32 count);
+    /// sotc: SOTC_BDA. Physical storage buffer pointer to elem_type at a byte address.
+    Id BdaPointer(Id address, Id elem_type);
+    /// sotc: SOTC_BDA. Opens a block that runs only when `valid`; returns its merge label. The
+    /// block that branches to it is last_label before the call.
+    Id BdaBeginIf(Id valid);
+    /// sotc: SOTC_BDA. Closes the block opened by BdaBeginIf.
+    void BdaEndIf(Id merge);
 
 private:
     void DefineArithmeticTypes();

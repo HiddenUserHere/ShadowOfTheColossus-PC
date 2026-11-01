@@ -296,6 +296,11 @@ def main():
     if cvars is None:
         # Without the launcher: the culling settings of Pink-shadPS4 (same image, fewer GPU waits).
         cvars = 'doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0'
+    if env.get('SOTC_FRAME_AHEAD') == '1' and 'gameMaxDeltaTime' not in cvars:
+        # One frame of command-processor lead (gnmdriver.cpp FrameAheadActive): a burst frame then runs
+        # over two frames; the clamp keeps the game's simulation step from jumping (default 0.1 s).
+        cvars = ' '.join(filter(None, (cvars, 'gameMaxDeltaTime=0.05')))
+        env['SOTC_CVARS'] = cvars
     if lab and 'RetailBuild=' not in cvars:
         # The engine's debug console commands the lab sends (shadow_jumpToBoss, toggleDebugCam,
         # SetCameraPos...) need the developer build flag, as in PR AjncSystem#345.

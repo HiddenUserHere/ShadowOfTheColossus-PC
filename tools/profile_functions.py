@@ -3,11 +3,21 @@
 profile_functions.py dump [exe] [top] [--inlines] [--qualified]
 --inlines: an address counts for every function inlined at it (self time for the innermost one),
 so code inlined into big callers (LTO/PGO builds) shows under its own name.
---qualified: Namespace::Class::function names instead of short ones (lambdas: operator() of ...)."""
-import collections, re, subprocess, sys
+--qualified: Namespace::Class::function names instead of short ones (lambdas: operator() of ...).
+exe: the bb-probe.exe the dump came from. The dump holds bb-probe.exe offsets, so use the build of
+that run. When omitted: <dump>.exe if it exists (tools/sotc_run.sh keeps it there when
+SOTC_PROFILE_OUT is set), else out/gpu/bb-probe.exe, which is the newest build and not necessarily
+the one that wrote the dump."""
+import collections, os, re, subprocess, sys
 flags = {a for a in sys.argv[1:] if a.startswith('--')}
 args = [a for a in sys.argv[1:] if not a.startswith('--')]
-exe = args[1] if len(args) > 1 else 'out/gpu/bb-probe.exe'
+if len(args) > 1:
+    exe = args[1]
+elif os.path.isfile(args[0] + '.exe'):
+    exe = args[0] + '.exe'
+else:
+    exe = 'out/gpu/bb-probe.exe'
+print(f'symbols from: {exe}', file=sys.stderr)
 top = int(args[2]) if len(args) > 2 else 45
 inlines = '--inlines' in flags
 qualified = '--qualified' in flags

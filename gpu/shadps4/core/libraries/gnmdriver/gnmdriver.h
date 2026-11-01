@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "common/types.h"
 #include "core/libraries/kernel/equeue.h"
 
@@ -13,6 +15,10 @@ class SymbolsResolver;
 namespace Libraries::GnmDriver {
 
 using namespace Kernel;
+
+/// sotc: appends the SOTC_FRAME_AHEAD counters line for the window since the last call. Nothing
+/// is appended when the switch is off or no frame was submitted. See gnmdriver.cpp.
+void ReportFrameAhead(std::string& out);
 
 s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata);
 int PS4_SYSV_ABI sceGnmAreSubmitsAllowed();

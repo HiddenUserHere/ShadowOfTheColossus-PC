@@ -13,6 +13,7 @@
 
 #include "../../../sotc/mem_classes.h" // sotc: SOTC_PC_RING8_HEAPS (heap granule runs)
 #include "../../../sotc/pc_ring.h"
+#include "../../../sotc/rb_host.h" // sotc: SOTC_RB_HOST (R1) result runs
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/buffer_cache/pc_ring_copy.h"
@@ -304,6 +305,104 @@ void ProtectThenCopy(Vulkan::Rasterizer& rasterizer, BufferCache& cache, int mod
 // write faults sit on CPU-written, GPU-read memory (memtype:CPUMemory about 2400/s), not on CPU-only memory.
 // A run with GPU-modified pages in the tracker is left out: its newest bytes are in the device copy.
 // Recollected at most every kHeapEvery submits, and only when the class state moved.
+// sotc: SOTC_PC_RING8_HEAPS_MODE=2: whole heap regions instead of granule runs (see CollectHeapRuns). The
+// granules of each heap (SotcMemClasses::CollectHostGranules) are walked in address order. A segment is a
+// stretch of clean granules with no hole; its bound granules are the anchors. Two anchors become one run,
+// the unbound clean granules between them included, unless the tracker holds a GPU bit in that gap (then
+// the run is cut there). A run with a GPU bit is left out, as in mode 1. At most kCoarseRuns runs are
+// served (the largest by bytes); the others keep the normal path. Fewer runs: fewer imports and ring ranges.
+// sotc: SOTC_RB_HOST (rb_host.h, R1): the heap runs last published, kept for the merge in HostMaintain.
+static std::vector<SotcPcRing::RingExtent> g_heap_runs;
+
+static void CollectCoarseRuns(BufferCache& cache, const std::vector<std::string>& heaps,
+                              uint64_t& last_version) {
+    constexpr size_t kCoarseRuns = 64;
+    std::vector<SotcPcRing::RingExtent> runs;
+    uint64_t version = 0;
+    uint64_t joined = 0;
+    uint64_t capped = 0;
+    uint64_t gpu_left = 0;
+    struct Segment {
+        uint64_t begin;
+        uint64_t end;
+        std::vector<std::pair<uint64_t, uint64_t>> anchors; // bound granules, [lo, hi)
+    };
+    for (const std::string& heap : heaps) {
+        std::vector<Segment> segments;
+        for (const auto& g : SotcMemClasses::CollectHostGranules(heap.c_str(), version)) {
+            if (!g.clean) {
+                continue;
+            }
+            if (segments.empty() || segments.back().end != g.addr) {
+                segments.push_back(Segment{g.addr, g.addr + g.size, {}});
+            }
+            segments.back().end = g.addr + g.size;
+            if (g.bound) {
+                segments.back().anchors.emplace_back(g.addr, g.addr + g.size);
+            }
+        }
+        for (const Segment& segment : segments) {
+            std::vector<SotcPcRing::RingExtent> candidates;
+            bool open = false;
+            SotcPcRing::RingExtent cur{0, 0};
+            for (const auto& [lo, hi] : segment.anchors) {
+                if (open) {
+                    const uint64_t gap_lo = cur.addr + cur.size; // the gap is [gap_lo, lo)
+                    if (lo == gap_lo || !cache.IsRegionGpuModified(gap_lo, lo - gap_lo)) {
+                        if (lo != gap_lo) {
+                            ++joined;
+                        }
+                        cur.size = hi - cur.addr;
+                        continue;
+                    }
+                    candidates.push_back(cur);
+                }
+                cur = {lo, hi - lo};
+                open = true;
+            }
+            if (open) {
+                candidates.push_back(cur);
+            }
+            for (const auto& run : candidates) {
+                if (cache.IsRegionGpuModified(run.addr, run.size)) {
+                    ++gpu_left;
+                } else {
+                    runs.push_back(run);
+                }
+            }
+        }
+    }
+    if (runs.size() > kCoarseRuns) {
+        std::sort(runs.begin(), runs.end(),
+                  [](const SotcPcRing::RingExtent& a, const SotcPcRing::RingExtent& b) {
+                      return a.size > b.size;
+                  });
+        capped = runs.size() - kCoarseRuns;
+        runs.resize(kCoarseRuns);
+    }
+    std::sort(runs.begin(), runs.end(),
+              [](const SotcPcRing::RingExtent& a, const SotcPcRing::RingExtent& b) {
+                  return a.addr < b.addr;
+              });
+    u64 bytes = 0;
+    for (const auto& r : runs) {
+        bytes += r.size;
+    }
+    SotcPcRing::NoteHeapRuns(runs.size(), bytes, joined, capped, gpu_left);
+    static int logged = 0;
+    if (logged++ < 32) {
+        std::fprintf(stderr,
+                     "SOTC PC RING8 heaps (mode 2): %zu runs (%llu MiB) served, %llu gap joins, %llu "
+                     "capped, %llu left out (GPU-modified)\n",
+                     runs.size(), static_cast<unsigned long long>(bytes >> 20),
+                     static_cast<unsigned long long>(joined), static_cast<unsigned long long>(capped),
+                     static_cast<unsigned long long>(gpu_left));
+    }
+    last_version = version;
+    g_heap_runs = runs; // sotc: SOTC_RB_HOST merges the result runs with these (HostMaintain)
+    SotcPcRing::SetHostExtras(std::move(runs));
+}
+
 static void CollectHeapRuns(BufferCache& cache, uint32_t epoch) {
     static const std::vector<std::string> heaps = [] {
         std::vector<std::string> out;
@@ -329,6 +428,10 @@ static void CollectHeapRuns(BufferCache& cache, uint32_t epoch) {
         return;
     }
     last_epoch = epoch;
+    if (SotcPcRing::Ring8HeapsMode() == 2) {
+        CollectCoarseRuns(cache, heaps, last_version);
+        return;
+    }
     std::vector<SotcPcRing::RingExtent> runs;
     uint64_t version = 0;
     uint64_t gpu_modified = 0;
@@ -355,7 +458,76 @@ static void CollectHeapRuns(BufferCache& cache, uint32_t epoch) {
                      runs.size(), static_cast<unsigned long long>(bytes >> 20),
                      static_cast<unsigned long long>(gpu_modified));
     }
+    g_heap_runs = runs; // sotc: SOTC_RB_HOST merges the result runs with these (HostMaintain)
     SotcPcRing::SetHostExtras(std::move(runs));
+}
+
+// sotc: SOTC_PC_RING8_HEAPS_MODE=2, draw thread, from HostMaintain. An add-only change (every applied range
+// is still inside a live range, and some ranges are new) imports the new ranges and rings just those
+// (BufferCache::PcHostAddRing): the other imports are not walked again and the ring is not re-applied over
+// every region. Returns false, with nothing applied, for a removal or a refused import: those take the full
+// path. The full ring apply runs again every kAddsPerFull adds, so regions created since the last one get their
+// ring bits; until then they are tracked normally (correct, only more write faults).
+static bool HostAddOnly(BufferCache& cache, const std::vector<SotcPcRing::RingExtent>& blocks,
+                 std::vector<SotcPcRing::RingExtent>& applied) {
+    constexpr uint32_t kAddsPerFull = 64;
+    std::vector<SotcPcRing::RingExtent> want = blocks;
+    std::sort(want.begin(), want.end(),
+              [](const SotcPcRing::RingExtent& a, const SotcPcRing::RingExtent& b) {
+                  return a.addr < b.addr;
+              });
+    for (const auto& old : applied) {
+        const bool covered =
+            std::any_of(want.begin(), want.end(), [&old](const SotcPcRing::RingExtent& w) {
+                return old.addr >= w.addr && old.addr + old.size <= w.addr + w.size;
+            });
+        if (!covered) {
+            SotcPcRing::NoteHostFull(0); // removal: the full path yields the left-over marks
+            return false;
+        }
+    }
+    std::vector<SotcPcRing::RingExtent> added;
+    for (const auto& w : want) {
+        const bool known =
+            std::any_of(applied.begin(), applied.end(), [&w](const SotcPcRing::RingExtent& a) {
+                return a.addr == w.addr && a.size == w.size;
+            });
+        if (!known) {
+            added.push_back(w);
+        }
+    }
+    if (added.empty()) {
+        return true; // the same set (applied is disjoint, so every applied range is in want)
+    }
+    u64 added_bytes = 0;
+    for (const auto& range : added) {
+        if (!Vulkan::SotcGuestMemory::ImportGuestRange(range.addr, range.size)) {
+            SotcPcRing::NoteHostFull(1); // refused: the full path imports what it can
+            return false;
+        }
+        added_bytes += range.size;
+    }
+    u64 bytes = 0;
+    for (const auto& w : want) {
+        bytes += w.size;
+    }
+    SotcPcRing::NoteHostBlocks(want.size(), bytes);
+    applied = want;
+    RegionManager::ring_enabled.store(true, std::memory_order_release);
+    cache.PcHostAddRing(added); // pc_host_blocks, and AddRingRange per added range (buffer_cache.cpp)
+    SotcPcRing::NoteHostAdd(added.size(), added_bytes);
+    static int logged = 0;
+    if (logged++ < 8) {
+        std::fprintf(stderr, "SOTC PC RING8 host add: %zu ranges (%llu KiB) ringed incrementally, %zu applied\n",
+                     added.size(), static_cast<unsigned long long>(added_bytes >> 10), applied.size());
+    }
+    static uint32_t adds = 0;
+    if (++adds >= kAddsPerFull) {
+        adds = 0;
+        cache.PcHostApply(applied); // periodic full ring apply (no removals: no marks)
+        SotcPcRing::NoteHostFull(2);
+    }
+    return true;
 }
 
 void HostMaintain(BufferCache& cache) {
@@ -363,6 +535,29 @@ void HostMaintain(BufferCache& cache) {
         return;
     }
     CollectHeapRuns(cache, SotcPcRing::SubmitEpoch());
+    // sotc: SOTC_RB_HOST (R1): the GPU-to-CPU result runs (stats arrays) as host runs, every submit. Merged
+    // with the heap runs: SetHostExtras needs them sorted and disjoint. Granules with GPU-modified pages
+    // are left out, as for heap runs (their newest bytes are in the device copy).
+    if (SotcRbHost::On()) {
+        std::vector<SotcPcRing::RingExtent> all = g_heap_runs;
+        for (const SotcRbClass::Range& r : SotcRbHost::Runs()) {
+            if (!cache.IsRegionGpuModified(r.addr, r.size)) {
+                all.push_back({r.addr, r.size});
+            }
+        }
+        std::sort(all.begin(), all.end(), [](const SotcPcRing::RingExtent& a, const SotcPcRing::RingExtent& b) {
+            return a.addr < b.addr;
+        });
+        std::vector<SotcPcRing::RingExtent> merged;
+        for (const SotcPcRing::RingExtent& e : all) {
+            if (!merged.empty() && e.addr <= merged.back().addr + merged.back().size) {
+                merged.back().size = std::max(merged.back().size, e.addr + e.size - merged.back().addr);
+            } else {
+                merged.push_back(e);
+            }
+        }
+        SotcPcRing::SetHostExtras(std::move(merged));
+    }
     // Once per submit epoch, and whenever the arena block set changed. The epoch is read first: a
     // block that appears after it is seen at the next submit.
     static uint32_t seen_epoch = 0;
@@ -390,6 +585,12 @@ void HostMaintain(BufferCache& cache) {
         if (!held.contains(block.addr) && runtime_memory_hold_range(block.addr, block.size) == 0) {
             held.insert(block.addr);
         }
+    }
+    // sotc: SOTC_PC_RING8_HEAPS_MODE=2: an add-only change takes the incremental path (HostAddOnly); anything
+    // else falls through to the full path below, which is the mode 1 behaviour.
+    if (SotcPcRing::Ring8HeapsMode() == 2 && !SotcPcRing::Ring8Group() &&
+        HostAddOnly(cache, blocks, applied)) {
+        return;
     }
     // Blocks that are adjacent in guest address space are imported as one range (one import call,
     // one run when the backing is contiguous), so a bind across their edge is served. A refused

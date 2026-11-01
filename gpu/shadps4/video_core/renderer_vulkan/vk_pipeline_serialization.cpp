@@ -660,6 +660,11 @@ void PipelineCache::WarmUp() {
     bool compatible = true;
     if (!profile_data.empty()) {
         Shader::Profile cached_profile{};
+        // sotc: SOTC_BDA added Profile::bda_buffers after stage_bindings (64 -> 68 bytes): a cache written
+        // before it matches with the flag off instead of being discarded.
+        if (profile_data.size() == offsetof(Shader::Profile, bda_buffers)) {
+            profile_data.resize(sizeof(Shader::Profile), 0);
+        }
         if (profile_data.size() == sizeof(Shader::Profile)) {
             // sotc: barycentric_via_gs, the last member, sits where older caches have a padding
             // byte (seen 0xe3, 0x36): anything but 1 there is off, so those caches still match.
@@ -668,6 +673,8 @@ void PipelineCache::WarmUp() {
             // sotc: stage_bindings sits in the padding byte after it (see Profile).
             auto& stage_bindings = profile_data[offsetof(Shader::Profile, stage_bindings)];
             stage_bindings = stage_bindings == 1 ? 1 : 0;
+            auto& bda_buffers = profile_data[offsetof(Shader::Profile, bda_buffers)]; // sotc: SOTC_BDA
+            bda_buffers = bda_buffers == 1 ? 1 : 0;
             std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
         }
         compatible = profile_data.size() == sizeof(Shader::Profile) && cached_profile == profile;

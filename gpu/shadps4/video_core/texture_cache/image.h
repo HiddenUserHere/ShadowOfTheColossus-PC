@@ -15,6 +15,7 @@
 #include <optional>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
+#include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_TEX (MarkGpuModified)
 
 namespace Vulkan {
 class Instance;
@@ -263,7 +264,17 @@ inline std::atomic<u64> gpu_modified_epoch{0};
 /// sotc: counts and reports a GPU write to a mip-tail image (they must never be written).
 void NoteMipTailWrite(const Image& image);
 
+/// sotc: SOTC_IMG_POOLED / SOTC_IMG_CREATE_AHEAD: one stderr line per 5 s with the image creation
+/// counters (deltas). Self-throttled: any thread may call it often (called from the draw thread's
+/// per-frame report).
+void ImageChurnReport();
+
 inline void MarkGpuModified(Image& image, bool bump_epoch = true) {
+    // sotc: SOTC_GEN_BIND / SOTC_GEN_TEX: every GPU write into the image (copies, clears, render)
+    // moves the generation of its guest range, not only the first one (the GPU-modified epoch).
+    if (SotcGen::On()) {
+        SotcGen::Bump(image.info.guest_address, image.info.guest_size);
+    }
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         if (bump_epoch) {
             gpu_modified_epoch.fetch_add(1, std::memory_order_relaxed);

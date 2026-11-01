@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: counters printed with the frame rate (SOTC_FPS=1, videoout/driver.cpp).
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -8,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <string>
 #include "video_core/sotc_trace.h" // sotc: SOTC_TRACE
 
 namespace SotcStats {
@@ -1646,4 +1649,104 @@ inline std::atomic<uint64_t> rbp_lat_land_ns{0};       ///< sum: tick done -> la
 inline std::atomic<uint64_t> rbp_lat_samples{0};       ///< number of labels in the sums above
 inline std::atomic<uint64_t> rbp_reads_before{0};      ///< guest readbacks on bytes of a label download not yet applied
 inline std::atomic<uint64_t> rbp_reads_after{0};       ///< guest readbacks that still faulted on a page a label download applied earlier
+} // namespace SotcStats
+
+// sotc: SOTC_DRAW_WORK=1 (off by default): the "SOTC DRAW WORK" line of the 5 s report
+// (videoout/driver.cpp, next to "SOTC threads per frame") and the op counts of the SOTCSTALL
+// lines (vk_presenter.cpp). Needs SOTC_FPS=1 (draw_idle_ns) and SOTC_DRAW_SPLIT=1 (the operation
+// and wait timers); without them the report says so. Counting only.
+namespace SotcStats {
+inline const bool kDrawWork = std::getenv("SOTC_DRAW_WORK") != nullptr;
+/// Ops the draw thread executed, by SplitDraw, SplitIndirect, SplitDispatch, SplitFunc (index 0-3),
+/// cumulative: DrawWorkReport takes the difference since its last call.
+inline std::atomic<uint64_t> draw_work_ops[4]{};
+/// The same ops since the last TakeFrameDrawOps (one frame, for SOTCSTALL).
+inline std::atomic<uint64_t> frame_draw_ops[4]{};
+/// Called by Liverpool::BackLoop for each op it executes (not for the ops that express execution
+/// replays without running). `part` is the SplitPart the op's timer uses.
+inline void NoteDrawOp(SplitPart part) {
+    if (kDrawWork) {
+        const int i = static_cast<int>(part) - static_cast<int>(SplitDraw);
+        draw_work_ops[i].fetch_add(1, std::memory_order_relaxed);
+        frame_draw_ops[i].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+/// Ops of one frame: draws (direct and indirect), dispatches and func ops. Zero without SOTC_DRAW_WORK.
+struct FrameDrawOps {
+    uint64_t draws, dispatches, funcs;
+};
+/// Takes and resets the frame's op counts. Call once per presented frame (vk_presenter.cpp, SOTCSTALL).
+inline FrameDrawOps TakeFrameDrawOps() {
+    FrameDrawOps out{};
+    if (kDrawWork) {
+        // Indices as in NoteDrawOp: 0 SplitDraw, 1 SplitIndirect, 2 SplitDispatch, 3 SplitFunc.
+        out.draws = frame_draw_ops[0].exchange(0, std::memory_order_relaxed) +
+                    frame_draw_ops[1].exchange(0, std::memory_order_relaxed);
+        out.dispatches = frame_draw_ops[2].exchange(0, std::memory_order_relaxed);
+        out.funcs = frame_draw_ops[3].exchange(0, std::memory_order_relaxed);
+    }
+    return out;
+}
+/// The "SOTC DRAW WORK" line for the window since the previous call, or "" (first call, flips 0,
+/// switch off). Call it once per 5 s report with the frame count and the window's draw idle time
+/// (the idle_ms of "SOTC threads per frame", which the caller resets). All values are per frame:
+///   X = (window - idle - flip wait) / flips   draw thread work
+///   Y = ops: ExecuteBackOp by kind, waits inside the ops included (SplitDraw..SplitFunc)
+///   Z = commands: the ProcessCommands callbacks on the draw thread (SplitCommands)
+///   R = guest readback waits, the four SplitRb parts (guest threads' waits, not in X; the
+///       draw thread's readback work is inside Z)
+///   F = flip wait on the draw thread (SplitWaitFrame; zero when the draw thread never blocks there)
+///   N = draws, indirect draws and dispatches (func ops not counted)
+/// X is more than Y + Z: the loop's own overhead and the ops replayed by express execution are
+/// in X only. The window is the time between two calls, not the report's `seconds`.
+inline std::string DrawWorkReport(uint64_t flips, double idle_ms) {
+    if (!kDrawWork || flips == 0) {
+        return {};
+    }
+    if (!kFpsTimers || !kDrawSplit) {
+        return "SOTC DRAW WORK: unavailable (needs SOTC_FPS=1 and SOTC_DRAW_SPLIT=1)";
+    }
+    static uint64_t last_ns = 0, last_tick = 0;
+    static uint64_t last_ticks[SplitParts]{};
+    static uint64_t last_ops[4]{};
+    const uint64_t now_ns = NowNs(), now_tick = Ticks();
+    uint64_t now_ticks[SplitParts]{};
+    for (int c = 0; c < SplitParts; ++c) {
+        now_ticks[c] = split_ticks[c].load(std::memory_order_relaxed);
+    }
+    uint64_t now_ops[4]{};
+    for (int i = 0; i < 4; ++i) {
+        now_ops[i] = draw_work_ops[i].load(std::memory_order_relaxed);
+    }
+    std::string text;
+    if (last_ns != 0 && now_ns > last_ns && now_tick > last_tick) {
+        const double window_ms = static_cast<double>(now_ns - last_ns) / 1e6;
+        const double ticks_per_ms = static_cast<double>(now_tick - last_tick) / window_ms;
+        const auto ms = [&](SplitPart part) {
+            return static_cast<double>(now_ticks[part] - last_ticks[part]) / ticks_per_ms;
+        };
+        const double frames = static_cast<double>(flips);
+        const double flip_ms = ms(SplitWaitFrame);
+        const double work = (window_ms - idle_ms - flip_ms) / frames;
+        const double ops = (ms(SplitDraw) + ms(SplitIndirect) + ms(SplitDispatch) + ms(SplitFunc)) / frames;
+        const double commands = ms(SplitCommands) / frames;
+        const double readbacks =
+            (ms(SplitRbQueue) + ms(SplitRbSubmit) + ms(SplitRbGpu) + ms(SplitRbFinish)) / frames;
+        double op_count = 0;
+        for (int i = 0; i < 3; ++i) { // draws, indirect draws, dispatches
+            op_count += static_cast<double>(now_ops[i] - last_ops[i]);
+        }
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "SOTC DRAW WORK: %.2f ms/frame (ops %.2f ms, commands %.2f ms, readbacks %.2f ms, "
+                      "flip wait %.2f ms; ops %.0f/frame)",
+                      work, ops, commands, readbacks, flip_ms / frames, op_count / frames);
+        text = buf;
+    }
+    last_ns = now_ns;
+    last_tick = now_tick;
+    std::copy(std::begin(now_ticks), std::end(now_ticks), std::begin(last_ticks));
+    std::copy(std::begin(now_ops), std::end(now_ops), std::begin(last_ops));
+    return text;
+}
 } // namespace SotcStats

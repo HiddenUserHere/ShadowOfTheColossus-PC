@@ -85,6 +85,26 @@ struct DrawIndirectParams {
     u32 instance_sgpr_offset;
 };
 
+/// sotc: SOTC_PIPE_DIRTY. The registers RefreshGraphicsKeyRegs reads, copied when the register part
+/// of the graphics key was built. Equal registers give an equal register part (no memory is read).
+/// Extend this struct (and PipeKeyRegsMatch / PipeKeyRegsCapture) when that function reads another
+/// register: a missing member would let a stale key through.
+struct PipeKeyRegs {
+    AmdGpu::DepthBuffer depth_buffer;
+    AmdGpu::DepthRenderOverride depth_render_override;
+    AmdGpu::ClipperControl clipper_control;
+    AmdGpu::PolygonControl polygon_control;
+    AmdGpu::PrimitiveType primitive_type;
+    AmdGpu::ShaderStageEnable stage_enable;
+    AmdGpu::LsHsConfig ls_hs_config;
+    AmdGpu::ColorControl color_control;
+    AmdGpu::ColorBufferMask color_shader_mask;
+    AmdGpu::ColorBufferMask color_target_mask;
+    AmdGpu::ColorExportFormat color_export_format;
+    std::array<AmdGpu::ColorBuffer, AmdGpu::NUM_COLOR_BUFFERS> color_buffers;
+    std::array<AmdGpu::BlendControl, AmdGpu::NUM_COLOR_BUFFERS> blend_control;
+};
+
 class PipelineCache {
 public:
     /// sotc: SOTC_RAM_REPORT: counts of the programs and pipelines kept in host memory, and the size
@@ -162,6 +182,17 @@ private:
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
+
+    /// sotc: the register part of the graphics key: everything RefreshGraphicsKey derives from the
+    /// registers before the shader stages are bound. Reads no guest memory.
+    void RefreshGraphicsKeyRegs(GraphicsPipelineKey& key) const;
+    /// sotc: SOTC_PIPE_DIRTY=1/2. Fills graphics_key's register part: from the cached copy when
+    /// PipeKeyRegs still matches the registers, else rebuilt and cached. =2 also rebuilds on a hit
+    /// and counts a different result (the rebuilt one is used).
+    void RefreshGraphicsKeyRegsDirty(int mode);
+    bool pipe_dirty_valid{};        ///< pipe_dirty_regs and pipe_dirty_key hold a built register part
+    PipeKeyRegs pipe_dirty_regs{};  ///< the registers the cached register part was built from
+    GraphicsPipelineKey pipe_dirty_key{}; ///< the register part (stage fields zero)
 
     /// sotc: SOTC_PIPE_MEMO=1/2 (see GetProgram). The permutation a stage last resolved to, with
     /// every input its specialization reads: the program and stage pair, the shader hash, the user
@@ -308,6 +339,9 @@ private:
                            Shader::Pools& worker_pools);
     void InstallTranslation(AsyncPipelineJob::Translate& job);
     void CollectAsyncPipelines();
+    /// sotc: SOTC_PIPE_GPL. Builds the fast-linked pipeline of graphics_key into slot, when its
+    /// state can be linked. Returns false (slot untouched) when it cannot. Command processor only.
+    bool TryFastLink(std::unique_ptr<GraphicsPipeline>& slot);
     /// sotc: SOTC_ASYNC_COMPUTE_XLATE: waits for (or takes back) a prefetched translation.
     void WaitPendingTranslation(u64 hash);
     void AsyncPipelineWorker(std::stop_token token);
@@ -319,6 +353,9 @@ private:
     DescriptorHeap desc_heap;
     // sotc: shared pipeline layouts. Declared before the pipelines, so they outlive them.
     LayoutCache layout_cache;
+    /// sotc: SOTC_PIPE_GPL: the pipeline libraries of the fast-linked pipelines. Declared after the
+    /// layouts, so it is destroyed before them.
+    GplLibraryCache gpl_libs;
     vk::UniquePipelineCache pipeline_cache;
     size_t saved_driver_cache_size{};
     std::mutex driver_cache_save_mutex;
@@ -376,5 +413,13 @@ private:
 /// sotc: SOTC_PIPE_MEMO=1/2 counters (vk_pipeline_cache.cpp): appends one line for the 5 s report
 /// when the switch is on and the window had lookups. Call from one thread only.
 void ReportPipeMemo(std::string& out, double seconds);
+
+/// sotc: SOTC_PIPE_DIRTY=1/2 counters (vk_pipeline_cache.cpp): appends one line for the 5 s report
+/// when the switch is on and the window had graphics key or flat buffer work. Call from one thread.
+void ReportPipeDirty(std::string& out, double seconds);
+
+/// sotc: SOTC_PIPE_GPL counters (vk_pipeline_cache.cpp): appends one line for the 5 s report when the
+/// switch is on and the window had cold misses or libraries. Call from one thread.
+void ReportPipeGpl(std::string& out, double seconds);
 
 } // namespace Vulkan

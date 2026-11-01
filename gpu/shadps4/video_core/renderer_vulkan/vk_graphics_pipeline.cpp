@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <string>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
@@ -27,13 +29,72 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eCompute,
 };
 
+namespace {
+/// sotc: SOTC_PIPE_GPL. The exact bytes a library is keyed by (compared in full, no hash).
+class GplKey {
+public:
+    template <typename T>
+    void Add(const T& value) {
+        bytes.append(reinterpret_cast<const char*>(&value), sizeof(T));
+    }
+    std::string bytes;
+};
+} // namespace
+
+vk::Pipeline GplLibraryCache::GetOrBuild(Part part, const std::string& key, bool& built,
+                                         const std::function<vk::UniquePipeline()>& build) {
+    std::scoped_lock lock{mutex};
+    auto& map = parts[part];
+    if (const auto it = map.find(key); it != map.end()) {
+        built = false;
+        return *it->second;
+    }
+    built = true;
+    vk::UniquePipeline library = build();
+    if (!library) {
+        return {};
+    }
+    const vk::Pipeline handle = *library;
+    map.emplace(key, std::move(library));
+    return handle;
+}
+
+bool GraphicsPipeline::FastLinkable(const GraphicsPipelineKey& key,
+                                    std::span<const Shader::Info*, MaxShaderStages> infos,
+                                    std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+                                    const Shader::Profile& profile) {
+    // Rect and quad lists take auxiliary tessellation shaders made from the fragment shader inputs,
+    // which no library key here covers.
+    if (key.prim_type == AmdGpu::PrimitiveType::RectList ||
+        key.prim_type == AmdGpu::PrimitiveType::QuadList) {
+        return false;
+    }
+    const Shader::Info* fs_info = infos[u32(Shader::SwStage::Fragment)];
+    const auto& fs_runtime = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+    // Without a fragment shader, the constructor emits a discard shader from the vertex outputs.
+    if (!fs_info && fs_runtime.clip_distance_emulation) {
+        return false;
+    }
+    // The barycentric geometry shader (same test as the constructor below).
+    const auto topology = LiverpoolToVK::PrimitiveType(key.prim_type);
+    const bool triangles = topology == vk::PrimitiveTopology::eTriangleList ||
+                           topology == vk::PrimitiveTopology::eTriangleStrip ||
+                           topology == vk::PrimitiveTopology::eTriangleFan;
+    if (fs_info && profile.barycentric_via_gs && triangles &&
+        !infos[u32(Shader::SwStage::Geometry)] && !infos[u32(Shader::SwStage::TessellationEval)] &&
+        Shader::Backend::SPIRV::NeedsBarycentricGs(fs_runtime, *fs_info)) {
+        return false;
+    }
+    return true;
+}
+
 GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
     LayoutCache& layout_cache, const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
-    SerializationSupport& sdata, bool preloading, bool async_build)
+    SerializationSupport& sdata, bool preloading, bool async_build, GplLibraryCache* gpl)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_} {
     if (fetch_shader_) {
         fetch_shader = *fetch_shader_;
@@ -442,6 +503,230 @@ GraphicsPipeline::GraphicsPipeline(
         .pDynamicState = &dynamic_info,
         .layout = pipeline_layout,
     };
+
+    // sotc: SOTC_PIPE_GPL. The pipeline as four libraries, each shared by every pipeline whose state
+    // for that part is equal (the key is the exact bytes of that state, with the layout and the
+    // dynamic states), then fast-linked without link-time optimization. A refused library or link
+    // leaves the pipeline unbuilt (linked stays false): the caller keeps the draw skipped.
+    if (gpl && !preloading && FastLinkable(key, infos, runtime_infos, profile)) {
+        const vk::PipelineLayout layout = pipeline_layout;
+        const vk::PipelineCreateFlags lib_flags =
+            pipeline_flags | vk::PipelineCreateFlagBits::eLibraryKHR;
+
+        // Every part has the layout and the dynamic states: the libraries of one link must agree.
+        const auto add_common = [&](GplKey& k) {
+            k.Add(static_cast<VkPipelineLayout>(layout));
+            k.Add(static_cast<u32>(dynamic_states.size()));
+            for (const auto state : dynamic_states) {
+                k.Add(static_cast<u32>(state));
+            }
+        };
+        // The rendering info (attachment formats and samples) of the fragment and output parts.
+        const auto add_render = [&](GplKey& k) {
+            k.Add(pipeline_rendering_ci.colorAttachmentCount);
+            for (u32 i = 0; i < pipeline_rendering_ci.colorAttachmentCount; ++i) {
+                k.Add(static_cast<u32>(color_formats[i]));
+                k.Add(static_cast<u32>(color_samples[i]));
+            }
+            k.Add(static_cast<u32>(pipeline_rendering_ci.depthAttachmentFormat));
+            k.Add(static_cast<u32>(pipeline_rendering_ci.stencilAttachmentFormat));
+            k.Add(static_cast<u32>(mixed_samples.depthStencilAttachmentSamples));
+        };
+        const auto stage_module = [&](Shader::SwStage stage) -> VkShaderModule {
+            return infos[u32(stage)] ? static_cast<VkShaderModule>(modules[u32(stage)])
+                                     : VK_NULL_HANDLE;
+        };
+
+        // Vertex input interface: the vertex attributes (when not dynamic) and the topology.
+        GplKey vi_key;
+        add_common(vi_key);
+        vi_key.Add(static_cast<u32>(topology));
+        vi_key.Add(static_cast<u32>(instance.IsVertexInputDynamicState()));
+        vi_key.Add(static_cast<u32>(sdata.vertex_attributes.size()));
+        for (const auto& attr : sdata.vertex_attributes) {
+            vi_key.Add(attr);
+        }
+        vi_key.Add(static_cast<u32>(sdata.vertex_bindings.size()));
+        for (const auto& binding : sdata.vertex_bindings) {
+            vi_key.Add(binding);
+        }
+        vi_key.Add(static_cast<u32>(sdata.divisors.size()));
+        for (const auto& divisor : sdata.divisors) {
+            vi_key.Add(divisor);
+        }
+
+        // Pre-rasterization: the vertex, tessellation and geometry modules, and the rasterization
+        // state, a function of these key fields and of the instance.
+        GplKey pre_key;
+        add_common(pre_key);
+        for (const auto stage : {Shader::SwStage::Vertex, Shader::SwStage::Geometry,
+                                 Shader::SwStage::TessellationControl,
+                                 Shader::SwStage::TessellationEval}) {
+            pre_key.Add(stage_module(stage));
+        }
+        pre_key.Add(static_cast<u32>(tessellation_state.patchControlPoints));
+        pre_key.Add(static_cast<u32>(key.prim_type));
+        pre_key.Add(static_cast<u32>(key.polygon_mode));
+        pre_key.Add(static_cast<u32>(key.provoking_vtx_last));
+        pre_key.Add(static_cast<u32>(key.depth_clamp_enable));
+        pre_key.Add(static_cast<u32>(key.depth_clip_enable));
+        pre_key.Add(static_cast<u32>(key.clip_space));
+
+        // Fragment: the fragment module, the multisampling and the depth/stencil formats.
+        GplKey fs_key;
+        add_common(fs_key);
+        fs_key.Add(stage_module(Shader::SwStage::Fragment));
+        fs_key.Add(static_cast<u32>(sdata.multisampling.rasterizationSamples));
+        fs_key.Add(static_cast<u32>(sdata.multisampling.sampleShadingEnable));
+        fs_key.Add(static_cast<u32>(key.z_format));
+        fs_key.Add(static_cast<u32>(key.stencil_format));
+        add_render(fs_key);
+
+        // Fragment output: the blend state, the multisampling and the rendering info.
+        GplKey fo_key;
+        add_common(fo_key);
+        fo_key.Add(static_cast<u32>(sdata.multisampling.rasterizationSamples));
+        fo_key.Add(static_cast<u32>(sdata.multisampling.sampleShadingEnable));
+        fo_key.Add(static_cast<u32>(color_blending.logicOpEnable));
+        fo_key.Add(static_cast<u32>(color_blending.logicOp));
+        fo_key.Add(color_blending.attachmentCount);
+        for (u32 i = 0; i < color_blending.attachmentCount; ++i) {
+            fo_key.Add(attachments[i]);
+        }
+        add_render(fo_key);
+
+        // Stages split by part: the fragment module is the fragment part, the rest pre-rasterization.
+        boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
+            pre_stages, fs_stages;
+        for (const auto& stage : shader_stages) {
+            (stage.stage == vk::ShaderStageFlagBits::eFragment ? fs_stages : pre_stages)
+                .push_back(stage);
+        }
+
+        const auto get_library = [&](GplLibraryCache::Part part, const std::string& lib_key,
+                                     const vk::GraphicsPipelineCreateInfo& ci) -> vk::Pipeline {
+            bool built = false;
+            const vk::Pipeline lib = gpl->GetOrBuild(part, lib_key, built, [&] {
+                auto [result, handle] = device.createGraphicsPipelineUnique(pipeline_cache, ci);
+                if (result != vk::Result::eSuccess) {
+                    LOG_WARNING(Render_Vulkan, "Pipeline library {} failed to build: {}",
+                                static_cast<u32>(part), vk::to_string(result));
+                    return vk::UniquePipeline{};
+                }
+                return std::move(handle);
+            });
+            if (lib && built) {
+                g_gpl_counters.lib_built[part].fetch_add(1, std::memory_order_relaxed);
+            } else if (lib) {
+                g_gpl_counters.lib_reused[part].fetch_add(1, std::memory_order_relaxed);
+            }
+            return lib;
+        };
+
+        vk::GraphicsPipelineLibraryCreateInfoEXT vi_lib{
+            .flags = vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface,
+        };
+        const vk::GraphicsPipelineCreateInfo vi_ci = {
+            .pNext = &vi_lib,
+            .flags = lib_flags,
+            .pVertexInputState =
+                !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
+            .pInputAssemblyState = &input_assembly,
+            .pDynamicState = &dynamic_info,
+            .layout = layout,
+        };
+        const vk::Pipeline vi_handle =
+            get_library(GplLibraryCache::VertexInput, vi_key.bytes, vi_ci);
+
+        vk::GraphicsPipelineLibraryCreateInfoEXT pre_lib{
+            .flags = vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders,
+        };
+        const vk::GraphicsPipelineCreateInfo pre_ci = {
+            .pNext = &pre_lib,
+            .flags = lib_flags,
+            .stageCount = static_cast<u32>(pre_stages.size()),
+            .pStages = pre_stages.data(),
+            .pTessellationState = &tessellation_state,
+            .pViewportState = &viewport_info,
+            .pRasterizationState = &raster_chain.get(),
+            .pDynamicState = &dynamic_info,
+            .layout = layout,
+        };
+        const vk::Pipeline pre_handle =
+            get_library(GplLibraryCache::PreRaster, pre_key.bytes, pre_ci);
+
+        vk::GraphicsPipelineLibraryCreateInfoEXT fs_lib{
+            .pNext = &pipeline_rendering_ci,
+            .flags = vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader,
+        };
+        const vk::GraphicsPipelineCreateInfo fs_ci = {
+            .pNext = &fs_lib,
+            .flags = lib_flags,
+            .stageCount = static_cast<u32>(fs_stages.size()),
+            .pStages = fs_stages.data(),
+            .pMultisampleState = &sdata.multisampling,
+            .pDepthStencilState =
+                !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
+            .pDynamicState = &dynamic_info,
+            .layout = layout,
+        };
+        const vk::Pipeline fs_handle =
+            get_library(GplLibraryCache::Fragment, fs_key.bytes, fs_ci);
+
+        vk::GraphicsPipelineLibraryCreateInfoEXT fo_lib{
+            .pNext = &pipeline_rendering_ci,
+            .flags = vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface,
+        };
+        const vk::GraphicsPipelineCreateInfo fo_ci = {
+            .pNext = &fo_lib,
+            .flags = lib_flags,
+            .pMultisampleState = &sdata.multisampling,
+            .pColorBlendState = &color_blending,
+            .pDynamicState = &dynamic_info,
+            .layout = layout,
+        };
+        const vk::Pipeline fo_handle =
+            get_library(GplLibraryCache::FragmentOutput, fo_key.bytes, fo_ci);
+
+        const std::array<vk::Pipeline, 4> libraries = {vi_handle, pre_handle, fs_handle,
+                                                       fo_handle};
+        if (std::ranges::any_of(libraries, [](vk::Pipeline lib) { return !lib; })) {
+            LOG_WARNING(Render_Vulkan, "Pipeline libraries of {} not built, not linked",
+                        debug_str);
+            g_gpl_counters.link_failed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        const vk::PipelineLibraryCreateInfoKHR link_libraries = {
+            .libraryCount = static_cast<u32>(libraries.size()),
+            .pLibraries = libraries.data(),
+        };
+        const vk::GraphicsPipelineCreateInfo link_ci = {
+            .pNext = &link_libraries,
+            .flags = pipeline_flags,
+            .pDynamicState = &dynamic_info,
+            .layout = layout,
+        };
+        const auto link_start = std::chrono::steady_clock::now();
+        auto [link_result, link_pipe] =
+            device.createGraphicsPipelineUnique(pipeline_cache, link_ci);
+        g_gpl_counters.link_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - link_start)
+                .count(),
+            std::memory_order_relaxed);
+        if (link_result != vk::Result::eSuccess) {
+            LOG_WARNING(Render_Vulkan, "Fast link of graphics pipeline {} failed: {}", debug_str,
+                        vk::to_string(link_result));
+            g_gpl_counters.link_failed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        g_gpl_counters.links.fetch_add(1, std::memory_order_relaxed);
+        pipeline = std::move(link_pipe);
+        linked = true;
+        SetObjectName(device, *pipeline, "Graphics Pipeline (fast linked) {}", debug_str);
+        return;
+    }
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);

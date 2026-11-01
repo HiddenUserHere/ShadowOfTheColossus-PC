@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../../sotc/pc_ring.h" // sotc: SOTC_PC_RING submit epoch
+#include "../../../../sotc/label_honest.h" // sotc: SOTC_FRAME_AHEAD requires honest labels
+#include "../../../../sotc/pc_ring.h"       // sotc: SOTC_PC_RING submit epoch
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 
 #include "common/assert.h"
@@ -155,6 +158,77 @@ static u64 CpAheadFrames() {
     return frames;
 }
 
+// sotc: SOTC_FRAME_AHEAD=1 (default off): the command processor runs one closed frame ahead of the
+// draw thread. It uses the frame tickets of SOTC_CP_AHEAD=2 with the lag fixed at one frame
+// (SOTC_CP_AHEAD_FRAMES is ignored while this is active), so at the first submit of frame K the
+// draw thread has recorded frame K-2 and may still run K-1. Liverpool creates the tickets when
+// SOTC_FRAME_AHEAD=1 is set (liverpool.cpp, frame_tickets). Only taken when SotcLabels::Honest()
+// holds at the first submit: the decision is latched once, so one run never mixes gates. Otherwise
+// it is logged once and the gate stays as SOTC_CP_AHEAD selects.
+//
+// Why one frame is only safe with honest labels and a reuse distance of three frames (2026-11-01
+// analysis, not verified in the game): the frame tickets order the guest's submits, not its CPU
+// writes. The game writes frame K+2's command buffers and constants while the draw thread may still
+// run frame K, because the gate at K+2's first submit waits for K only (and K+1 may be open). So a
+// buffer the game reuses two frames later (double buffering) can be rewritten while K still reads
+// it. Reuse at three frames is safe. SotC's own reuse distance is not measured yet; that is the
+// first thing to check before turning this on. Labels: a guest that waits for a label of frame K
+// reads GPU results (readbacks, XPR masks) only once the GPU has produced them; with early labels
+// that is not so, which is the reason for the Honest() requirement.
+//
+// Guest-visible ordering this relies on (each holds for SOTC_FRAME_AHEAD=1):
+// 1. Labels, interrupts, WRITE_DATA and flips are produced by the draw thread in stream order, after
+//    it ran the earlier ops. A lead of one frame only delays them; none comes earlier.
+// 2. Guest memory read by an op is read when the draw thread records it (staging), so a frame
+//    recorded before the guest reuses its memory is safe. The exception is HOST_SHARED memory the
+//    host GPU reads in place: it needs the honest labels (Honest()) for its completion ordering.
+// 3. Command buffers and constants: the command processor parses a frame's submits before its
+//    frame ticket, and the ticket needs the draw thread to have recorded it. A buffer is reused only
+//    after its frame is recorded (the lag 1 gate), so the parse always precedes the reuse.
+// 4. The game's own fences (labels it waits on) stay valid: a label is only seen after the draw
+//    thread recorded the op that writes it (item 1).
+// 5. submission_lock is not used in this mode: GpuIdle IRQs are ignored by the tickets, as in
+//    SOTC_CP_AHEAD=2.
+static bool FrameAheadRequested() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_FRAME_AHEAD");
+        return v && std::atoi(v) == 1;
+    }();
+    return on;
+}
+
+static bool FrameAheadActive() {
+    static const bool active = [] {
+        if (!FrameAheadRequested()) {
+            return false;
+        }
+        if (!SotcLabels::Honest()) {
+            LOG_WARNING(Lib_GnmDriver, "SOTC_FRAME_AHEAD=1 ignored: SotcLabels::Honest() is false, "
+                                       "the submit gate stays as SOTC_CP_AHEAD selects");
+            return false;
+        }
+        LOG_INFO(Lib_GnmDriver, "SOTC_FRAME_AHEAD=1: command processor one frame ahead");
+        return true;
+    }();
+    return active;
+}
+
+// The submit gate of every site: 2 = frame tickets, 0 or 1 = the SOTC_CP_AHEAD gate as before.
+static int GateMode() {
+    return FrameAheadActive() ? 2 : Liverpool::CpAheadMode();
+}
+
+// sotc: SOTC_FRAME_AHEAD counters (read by ReportFrameAhead every report window, under
+// m_submit_lock except the waits, which are atomics anyway). fa_frame_start is set by SubmitDone and
+// cleared by the first gate call of the next frame, which samples the lead before it waits.
+static std::atomic<u64> fa_frames{0};        // frame starts sampled
+static std::atomic<u64> fa_ahead{0};         // frame starts with a closed frame still in flight
+static std::atomic<u64> fa_lead[4]{};        // lead at frame start: 0, 1, 2, 3 or more
+static std::atomic<u64> fa_waits{0};         // gate calls that blocked
+static std::atomic<u64> fa_wait_ns{0};       // time blocked in those calls
+static std::atomic<u64> fa_wait_max_ns{0};   // longest such call
+static bool fa_frame_start{true};            // under m_submit_lock
+
 static void WaitSubmitGate() {
     static const bool cp_ahead = Liverpool::CpAheadMode() == 1;
     if (!cp_ahead) {
@@ -175,11 +249,32 @@ static void WaitSubmitGate() {
 // the frame tickets. Called under m_submit_lock.
 static void GateWait(int site) {
     const u64 start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
-    if (Liverpool::CpAheadMode() == 2) {
+    if (GateMode() == 2) {
         const u64 marked = liverpool->FramesMarked();
-        const u64 lag = CpAheadFrames();
+        const bool fa = FrameAheadActive(); // sotc: SOTC_FRAME_AHEAD (one frame lead)
+        const u64 lag = fa ? 1 : CpAheadFrames();
+        if (fa && fa_frame_start && site != 2) {
+            // Lead before this frame waits: closed frames the draw thread has not recorded yet.
+            const u64 lead = marked - liverpool->FramesRecorded();
+            fa_frame_start = false;
+            fa_frames.fetch_add(1, std::memory_order_relaxed);
+            if (lead > 0) {
+                fa_ahead.fetch_add(1, std::memory_order_relaxed);
+            }
+            fa_lead[std::min<u64>(lead, 3)].fetch_add(1, std::memory_order_relaxed);
+        }
         if (marked > lag) {
-            liverpool->WaitFramesRecorded(marked - lag);
+            const u64 target = marked - lag;
+            if (fa && liverpool->FramesRecorded() < target) {
+                const u64 t0 = SotcStats::NowNs();
+                liverpool->WaitFramesRecorded(target);
+                const u64 ns = SotcStats::NowNs() - t0;
+                fa_waits.fetch_add(1, std::memory_order_relaxed);
+                fa_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+                SotcStats::GateStoreMax(fa_wait_max_ns, ns);
+            } else {
+                liverpool->WaitFramesRecorded(target);
+            }
         }
     } else if (site == 0) {
         WaitSubmitGate();
@@ -195,6 +290,39 @@ static void GateWait(int site) {
             SotcStats::GateStoreMax(SotcStats::gate_max_ns[site], ns);
         }
     }
+}
+
+// sotc: SOTC_FRAME_AHEAD report line for the window since the last call (driver.cpp report). Adds
+// nothing while the switch is off. Lead 0/1/2/3+ is the number of closed frames the draw thread had
+// not recorded yet when a frame's first submit came in; "run ahead" counts frames with lead 1 or more.
+void ReportFrameAhead(std::string& out) {
+    if (!FrameAheadActive()) {
+        return;
+    }
+    const u64 frames = fa_frames.exchange(0);
+    const u64 ahead = fa_ahead.exchange(0);
+    u64 lead[4];
+    for (int k = 0; k < 4; ++k) {
+        lead[k] = fa_lead[k].exchange(0);
+    }
+    const u64 waits = fa_waits.exchange(0);
+    const u64 wait_ns = fa_wait_ns.exchange(0);
+    const u64 wait_max_ns = fa_wait_max_ns.exchange(0);
+    if (frames == 0) {
+        return;
+    }
+    char line[320];
+    std::snprintf(line, sizeof line,
+                  "SOTC FRAME AHEAD: frames %llu, run ahead %llu (%.0f%%), lead 0/1/2/3+ "
+                  "%llu/%llu/%llu/%llu, gate waits %llu (%.2f ms, max %.2f ms)\n",
+                  static_cast<unsigned long long>(frames), static_cast<unsigned long long>(ahead),
+                  100.0 * static_cast<double>(ahead) / static_cast<double>(frames),
+                  static_cast<unsigned long long>(lead[0]),
+                  static_cast<unsigned long long>(lead[1]),
+                  static_cast<unsigned long long>(lead[2]),
+                  static_cast<unsigned long long>(lead[3]),
+                  static_cast<unsigned long long>(waits), wait_ns / 1e6, wait_max_ns / 1e6);
+    out += line;
 }
 
 // Write a special ending NOP packet with N DWs data block
@@ -2483,7 +2611,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
     GateWait(2); // sotc: SOTC_CP_AHEAD (WaitGpuIdle unless =2), SOTC_FPS accounting
-    if (Liverpool::CpAheadMode() != 2) {
+    if (GateMode() != 2) {
         if (!liverpool->IsGpuIdle()) {
             submission_lock = true;
         }
@@ -2502,6 +2630,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
         }
     }
     liverpool->SubmitDone();
+    fa_frame_start = true; // sotc: SOTC_FRAME_AHEAD: the next gate call starts a frame
     send_init_packet = true;
     ++frames_submitted;
     DebugState.IncGnmFrameNum();

@@ -10,6 +10,7 @@
 
 #include "common/types.h"
 #include "video_core/buffer_cache/region_manager.h"
+#include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA granule generations
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_trace.h" // sotc: SOTC_TRACE (redirty instants)
 
@@ -409,6 +410,9 @@ public:
         IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
             manager->template ChangeRegionState<StateOp::Set, StateOp::None>(offset, size);
         });
+        // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA. The bit stores above bumped the granules that
+        // changed; this covers the range as a whole (a page already CPU-set bumps nothing).
+        SotcGen::Bump(cpu_addr, size);
     }
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
@@ -442,6 +446,7 @@ public:
             should_flush |= modified;
             manager->Unlock(bounds);
         });
+        SotcGen::Bump(cpu_addr, size); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA, after the state change
         if (should_flush) {
             // sotc: SOTC_FPS: time the readback of a write fault ("SOTC FAULTS" line, readback)
             SotcStats::FaultStat::Scope flush_scope{&SotcStats::FaultStat::Tl::flush_ns};
@@ -715,6 +720,7 @@ public:
             }
             manager->Unlock(bounds);
         });
+        SotcGen::Bump(cpu_addr, size); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA, after the state change
         return true;
     }
 

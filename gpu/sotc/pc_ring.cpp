@@ -202,6 +202,15 @@ std::atomic<uint64_t> g_hot_mismatch{0};      // pages where the delta state and
 // the others count one report window.
 std::atomic<uint64_t> g_h_blocks{0};
 std::atomic<uint64_t> g_h_block_bytes{0};
+// sotc: SOTC_PC_RING8_HEAPS_MODE=2 counters (gauges are stored, the rest are per window).
+std::atomic<uint64_t> g_hp_runs{0};        // gauge: served heap runs of the last collect
+std::atomic<uint64_t> g_hp_bytes{0};       // gauge: their bytes
+std::atomic<uint64_t> g_hp_gpu_left{0};    // gauge: runs left out (GPU-modified) by the last collect
+std::atomic<uint64_t> g_hp_joins{0};       // gap joins, this window
+std::atomic<uint64_t> g_hp_capped{0};      // runs dropped by the cap, this window
+std::atomic<uint64_t> g_hp_add_runs{0};    // add-only changes: ranges ringed incrementally
+std::atomic<uint64_t> g_hp_add_bytes{0};
+std::atomic<uint64_t> g_hp_full[3]{};      // full re-applies: removal, import refused, periodic
 std::atomic<uint64_t> g_h_binds{0};
 std::atomic<uint64_t> g_h_bytes{0};
 std::atomic<uint64_t> g_h_written{0};
@@ -1581,6 +1590,33 @@ void NoteHostBlocks(uint64_t count, uint64_t bytes) {
     g_h_block_bytes.store(bytes, std::memory_order_relaxed);
 }
 
+int Ring8HeapsMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_PC_RING8_HEAPS_MODE");
+        return v && v[0] == '2' ? 2 : 1;
+    }();
+    return mode;
+}
+
+void NoteHeapRuns(uint64_t runs, uint64_t bytes, uint64_t joined, uint64_t capped, uint64_t gpu_left) {
+    g_hp_runs.store(runs, std::memory_order_relaxed);
+    g_hp_bytes.store(bytes, std::memory_order_relaxed);
+    g_hp_gpu_left.store(gpu_left, std::memory_order_relaxed);
+    g_hp_joins.fetch_add(joined, std::memory_order_relaxed);
+    g_hp_capped.fetch_add(capped, std::memory_order_relaxed);
+}
+
+void NoteHostAdd(uint64_t runs, uint64_t bytes) {
+    g_hp_add_runs.fetch_add(runs, std::memory_order_relaxed);
+    g_hp_add_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void NoteHostFull(int reason) {
+    if (reason >= 0 && reason < 3) {
+        g_hp_full[reason].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void NoteHostBind(uint64_t bytes, bool written) {
     g_h_binds.fetch_add(1, std::memory_order_relaxed);
     g_h_bytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -1700,6 +1736,13 @@ void ReportHost(std::string& out, double seconds) {
     const uint64_t forced = g_h_labels_forced.exchange(0, std::memory_order_relaxed);
     const uint64_t marked = g_h_mark.exchange(0, std::memory_order_relaxed);
     const uint64_t skipped = g_h_mark_skip.exchange(0, std::memory_order_relaxed);
+    const uint64_t hp_joins = g_hp_joins.exchange(0, std::memory_order_relaxed);
+    const uint64_t hp_capped = g_hp_capped.exchange(0, std::memory_order_relaxed);
+    const uint64_t hp_add_runs = g_hp_add_runs.exchange(0, std::memory_order_relaxed);
+    const uint64_t hp_add_bytes = g_hp_add_bytes.exchange(0, std::memory_order_relaxed);
+    const uint64_t hp_full_removal = g_hp_full[0].exchange(0, std::memory_order_relaxed);
+    const uint64_t hp_full_refused = g_hp_full[1].exchange(0, std::memory_order_relaxed);
+    const uint64_t hp_full_period = g_hp_full[2].exchange(0, std::memory_order_relaxed);
     const double mib = 1024.0 * 1024.0;
     char line[480];
     std::snprintf(line, sizeof line,
@@ -1731,6 +1774,21 @@ void ReportHost(std::string& out, double seconds) {
                   static_cast<unsigned long long>(forced),
                   static_cast<double>(marked) / mib, static_cast<double>(skipped) / mib);
     out += line;
+    if (Ring8HeapsMode() == 2) { // sotc: SOTC_PC_RING8_HEAPS_MODE=2 (heap runs, incremental adds)
+        std::snprintf(line, sizeof line,
+                      "SOTC PC RING host heaps (mode 2): runs %llu (%llu MiB), GPU-modified left out %llu, "
+                      "gap joins %llu, capped %llu; add-only ringed %llu runs (%.2f MiB); full re-applies "
+                      "removal %llu, refused %llu, periodic %llu\n",
+                      static_cast<unsigned long long>(g_hp_runs.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(g_hp_bytes.load(std::memory_order_relaxed) >> 20),
+                      static_cast<unsigned long long>(g_hp_gpu_left.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(hp_joins), static_cast<unsigned long long>(hp_capped),
+                      static_cast<unsigned long long>(hp_add_runs),
+                      static_cast<double>(hp_add_bytes) / mib, static_cast<unsigned long long>(hp_full_removal),
+                      static_cast<unsigned long long>(hp_full_refused),
+                      static_cast<unsigned long long>(hp_full_period));
+        out += line;
+    }
     if (Ring8FlipWaitOn()) { // sotc: the flip wait (BufferCache::PcHostFlipWait)
         const uint64_t fw_calls = g_fw_calls.exchange(0, std::memory_order_relaxed);
         const uint64_t fw_waits = g_fw_waits.exchange(0, std::memory_order_relaxed);

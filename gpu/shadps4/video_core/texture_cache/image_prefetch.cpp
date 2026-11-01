@@ -53,9 +53,12 @@ u64 MaxBytesLimit() {
 } // namespace
 
 bool AsyncImageCreateEnabled() {
+    // sotc: SOTC_IMG_CREATE_AHEAD=1 turns the same path on (the prefetcher is the one switch the
+    // texture cache, the command processor and the report read).
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_ASYNC_IMAGE_CREATE");
-        return v && v[0] == '1';
+        const char* ahead = std::getenv("SOTC_IMG_CREATE_AHEAD");
+        return (v && v[0] == '1') || (ahead && ahead[0] == '1');
     }();
     return enabled;
 }

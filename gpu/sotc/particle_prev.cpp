@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: particle-system count readback, plan C7 (docs/re-stutters/reports2/07-readback-consumers.md,
 // section 2.3). The hook changes no guest state; with SOTC_RB_CLASS=1 it also asks the buffer cache
-// for copies of the count arrays (SotcRbClass::RequestCopy).
+// for copies of the count arrays (SotcRbClass::RequestCopy). With SOTC_RB_HOST (rb_host.h, R1) the
+// same dispatched arrays are also registered as host runs (SotcRbHost::NoteStatsRange).
 //
 // Slot timeline of ParticleSystemPool::ProcessStats (eboot 0x1018c0), checked against the
 // disassembly. Let k be the pool counter (pool+0x64) before call k. The call increments it.
@@ -47,6 +48,7 @@
 #include "hooks.h"
 #include "particle_prev.h"
 #include "rb_class.h" // sotc: SOTC_RB_CLASS (stats ring arrays)
+#include "rb_host.h"  // sotc: SOTC_RB_HOST (stats arrays as host runs)
 
 extern "C" {
 // runtime_memory.c: the unprotected backing view of a guest address (null when unmapped).
@@ -273,6 +275,8 @@ void RequestDispatched(uint64_t pool, uint64_t slot, uint64_t desc) {
     SotcRbClass::RequestCopy(base, entries * 4); // zero entries: counted as empty, nothing queued
     if (entries != 0) {
         Remember(pool, slot, base, entries);
+        // sotc: SOTC_RB_HOST (R1): the same array becomes a host run, so this dispatch writes it in place.
+        SotcRbHost::NoteStatsRange(base, entries * 4);
     }
 }
 
@@ -311,11 +315,16 @@ HookAction OnCountRead(GuestRegs& regs, void*) {
     // sotc: SOTC_RB_CLASS. The slot this call dispatched, D = (read + 2) % 3, is read in call k+2;
     // ask for its array now, after the dispatch. The read here is checked against the request
     // made two calls ago.
-    if (SotcRbClass::On()) {
+    // sotc: SOTC_RB_HOST (rb_host.h) needs the dispatched array too; RequestCopy itself is inert
+    // unless SOTC_RB_CLASS is on, and the check of the read is class-only.
+    const bool class_on = SotcRbClass::On();
+    if (class_on) {
         uint64_t read_base = 0;
         if (ArrayAddress(read_desc, &read_base)) {
             CheckRead(pool, read_slot, read_base);
         }
+    }
+    if (class_on || SotcRbHost::On()) {
         const uint64_t dispatch_slot = (read_slot + 2) % 3;
         RequestDispatched(pool, dispatch_slot, pool + kPoolRing + dispatch_slot * kSlotStride);
     }

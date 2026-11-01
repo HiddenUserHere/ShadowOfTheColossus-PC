@@ -61,6 +61,15 @@ std::atomic<u64> present_lock_ns{0}, present_lock_count{0}; ///< present thread:
 std::atomic<u64> present_under_lock_ns{0};           ///< present thread: time under submit_mutex
 std::atomic<u64> depth_wait_ns{0}, depth_wait_count{0}, depth_wait_timeouts{0}; ///< WaitPresentDepth
 std::atomic<u32> present_ring{0};                    ///< C6: presentation frames in the ring
+// sotc: SOTC_FLIP_OFFTHREAD=1 (off by default), see Presenter::RefillReadyFrames. Read once.
+const bool kFlipOffthread = [] {
+    const char* v = std::getenv("SOTC_FLIP_OFFTHREAD");
+    return v && v[0] == '1';
+}();
+// Counters of the switch (SOTC_FPS only, like the ones above). Reset by ReportFlipWait.
+std::atomic<u64> offthread_moves{0};  ///< frames the present thread moved to ready_queue
+std::atomic<u64> offthread_takes{0};  ///< GetRenderFrame calls served from ready_queue (no wait)
+std::atomic<u64> offthread_dropped{0}; ///< frames lost by GetRenderFrame (RecreateFrame failed)
 } // namespace
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
@@ -612,6 +621,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     if (const char* v = std::getenv("SOTC_CP_FLIP_PACE"); v && v[0] == '1') {
         cp_pacer = this;
     }
+    // sotc: SOTC_FLIP_OFFTHREAD: the first frame is ready before the first flip (its fence is
+    // signalled at creation). Does nothing when the switch is off.
+    RefillReadyFrames();
 
     fsr_settings.enable = EmulatorSettings.IsFsrEnabled();
     fsr_settings.use_rcas = EmulatorSettings.IsRcasEnabled();
@@ -1773,11 +1785,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                     }
                 }
             }
+            // sotc: SOTC_DRAW_WORK: the draw thread's ops of this frame; taken every frame so the count restarts.
+            const SotcStats::FrameDrawOps frame_ops = SotcStats::TakeFrameDrawOps();
             if (last_us >= 0 && now_us - last_us > stall_us) {
                 std::fprintf(stderr,
                              "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
                              "(%.0f ms), images %llu (%.0f ms: query %.0f, alloc %.0f, %llu dedicated), "
-                             "readbacks %llu (%.0f ms)%s\n",
+                             "readbacks %llu (%.0f ms), ops %llu (draws %llu, dispatches %llu)%s\n",
                              static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
                              static_cast<unsigned long long>(cur[0] - last[0]), (cur[1] - last[1]) / 1e6,
                              static_cast<unsigned long long>(cur[2] - last[2]), (cur[3] - last[3]) / 1e6,
@@ -1786,6 +1800,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                              static_cast<unsigned long long>(cur[10] - last[10]),
                              static_cast<unsigned long long>(cur[6] >= last[6] ? cur[6] - last[6] : cur[6]),
                              (cur[7] >= last[7] ? cur[7] - last[7] : cur[7]) / 1e6,
+                             static_cast<unsigned long long>(frame_ops.draws + frame_ops.dispatches),
+                             static_cast<unsigned long long>(frame_ops.draws),
+                             static_cast<unsigned long long>(frame_ops.dispatches),
                              account_text);
             }
             last_us = now_us;
@@ -1965,7 +1982,8 @@ void Presenter::PaceFlip() {
         // flip handler registered) still counts down when the draw thread reaches it; the
         // deadline only guards against waiting for good.
         const auto deadline = start + std::chrono::seconds{1};
-        while (static_cast<s32>(free_queue.size()) <=
+        // sotc: a ready frame (SOTC_FLIP_OFFTHREAD) is free for the next flip too.
+        while (static_cast<s32>(free_queue.size() + ready_queue.size()) <=
                pending_flips.load(std::memory_order_acquire)) {
             if (free_cv.wait_until(lock, std::min(deadline, std::chrono::steady_clock::now() +
                                                                 std::chrono::milliseconds{1})) ==
@@ -1989,7 +2007,7 @@ void Presenter::PaceFlip() {
 void Presenter::WaitFreeFrame() {
     std::unique_lock lock{free_mutex};
     while (!free_cv.wait_for(lock, std::chrono::microseconds{200},
-                             [this] { return !free_queue.empty(); })) {
+                             [this] { return !free_queue.empty() || !ready_queue.empty(); })) {
         lock.unlock();
         wait_service();
         lock.lock();
@@ -2002,21 +2020,37 @@ Frame* Presenter::GetRenderFrame() {
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
+        // sotc: SOTC_FLIP_OFFTHREAD: a ready frame counts as available. With the switch off
+        // ready_queue stays empty and this is the old predicate.
+        const auto frame_available = [this] {
+            return !free_queue.empty() || !ready_queue.empty();
+        };
         // sotc: SOTC_FPS (B5, C6): a wait for a free frame is timed on its own.
-        if (SotcStats::kFpsLog && free_queue.empty()) {
+        if (SotcStats::kFpsLog && !frame_available()) {
             const u64 start = SotcStats::NowNs();
-            free_cv.wait(lock, [this] { return !free_queue.empty(); });
+            free_cv.wait(lock, frame_available);
             flip_free_ns.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
             flip_free_waits.fetch_add(1, std::memory_order_relaxed);
             ring_waits.fetch_add(1, std::memory_order_relaxed);
         } else {
-            free_cv.wait(lock, [this] { return !free_queue.empty(); });
+            free_cv.wait(lock, frame_available);
         }
-        LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
+        LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}",
+                  free_queue.size() + ready_queue.size() - 1);
 
-        // Take the frame from the queue
-        frame = free_queue.front();
-        free_queue.pop();
+        // sotc: a ready frame first: the present thread moved it here with its fence signalled
+        // (RefillReadyFrames), so the fence wait below returns at once. Otherwise the front of
+        // free_queue, as before.
+        if (!ready_queue.empty()) {
+            frame = ready_queue.front();
+            ready_queue.pop();
+            if (SotcStats::kFpsLog) {
+                offthread_takes.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            frame = free_queue.front();
+            free_queue.pop();
+        }
     }
 
     const vk::Device device = instance.GetDevice();
@@ -2051,12 +2085,42 @@ Frame* Presenter::GetRenderFrame() {
             // fail here (RecreateFrame aborts for the others).
             const u32 left = present_ring.fetch_sub(1, std::memory_order_relaxed) - 1;
             LOG_WARNING(Render_Vulkan, "Presentation ring capped at {} frames", left);
+            if (SotcStats::kFpsLog) { // sotc: SOTC_FLIP_OFFTHREAD report: frames lost (must be 0)
+                offthread_dropped.fetch_add(1, std::memory_order_relaxed);
+            }
             return GetRenderFrame();
         }
     }
     frame->hudless = nullptr;
 
     return frame;
+}
+
+void Presenter::RefillReadyFrames() {
+    if (!kFlipOffthread) {
+        return;
+    }
+    // Called by the present thread once per tick. It never waits: a frame whose present_done fence
+    // is not signalled yet (its present is still on the GPU) stays in free_queue for the next tick.
+    // Only the present thread moves frames here, and a frame moved here is not presented or
+    // recorded by anyone until a GetRenderFrame takes it, so no frame is in two places at once.
+    // Frame order is untouched: ready_queue is taken in the order free_queue is filled, one frame
+    // at a time, and the draw thread still records its copy at the point of the flip.
+    const vk::Device device = instance.GetDevice();
+    std::scoped_lock lock{free_mutex};
+    if (!ready_queue.empty() || free_queue.empty()) {
+        return;
+    }
+    Frame* front = free_queue.front();
+    if (device.getFenceStatus(front->present_done) != vk::Result::eSuccess) {
+        return;
+    }
+    free_queue.pop();
+    ready_queue.push(front);
+    if (SotcStats::kFpsLog) {
+        offthread_moves.fetch_add(1, std::memory_order_relaxed);
+    }
+    free_cv.notify_all();
 }
 
 void ReportFlipWait(std::string& out, double seconds) {
@@ -2108,6 +2172,20 @@ void ReportFlipWait(std::string& out, double seconds) {
         khr_n ? ms(khr_ns) / static_cast<double>(khr_n) : 0.0, ms(khr_max_ns),
         static_cast<unsigned long long>(khr_n));
     out += line;
+    // sotc: SOTC_FLIP_OFFTHREAD: the handoff counters. The draw thread's wait is the flip wait
+    // above (no free frame, present_done fence); "served from ready" is the part that had none.
+    const u64 moves = offthread_moves.exchange(0, std::memory_order_relaxed);
+    const u64 takes = offthread_takes.exchange(0, std::memory_order_relaxed);
+    const u64 dropped = offthread_dropped.exchange(0, std::memory_order_relaxed);
+    char offthread_line[256];
+    std::snprintf(offthread_line, sizeof(offthread_line),
+                  "SOTC FLIP OFFTHREAD (%.1f s, %s): %llu frames handed off to ready, %llu frame "
+                  "requests served from ready of %llu (the rest waited for a frame), %llu frames "
+                  "dropped\n",
+                  seconds, kFlipOffthread ? "on" : "off", static_cast<unsigned long long>(moves),
+                  static_cast<unsigned long long>(takes), static_cast<unsigned long long>(frames),
+                  static_cast<unsigned long long>(dropped));
+    out += offthread_line;
 }
 
 void ReportPresent(std::string& out, double seconds) {

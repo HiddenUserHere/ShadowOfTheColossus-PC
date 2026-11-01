@@ -145,6 +145,32 @@ Quick wins from the draw-thread design (reports3/draw/DRAW-THREAD-DESIGN.md), 1 
   SOTC_REC_SPIN_US=0 (qw-recspin): 29.2 / 58.2 / 141.5 — no gain. Neither changed defaults.
 - Not done: wire static class mode 3; save the exe next to each profile.
 
+Draw-thread phases, wave 1 (launched 1 Nov): 11 Haiku agents, file-disjoint, every change behind a new switch
+(off by default), syntax-checked only, reports in docs/re-stutters/reports3/draw/wave1/<id>.md (rules: BRIEF.md
+there). Ids and owned areas: m0 (draw-work metric, sotc_stats.h, pcmem_matrix.py, profile archive), l1 (honest
+labels incl. ReleaseMem/EOS, liverpool.*, new gpu/sotc/label_honest.*; SOTC_LABELS_HONEST), f1 (flip wait off the
+draw thread, vk_presenter/vk_swapchain/videoout driver; SOTC_FLIP_OFFTHREAD), m1 (heap serving v2, pc_ring*,
+mem_classes*, probe_*; SOTC_PC_RING8_HEAPS_MODE=2), v1buf (generation API sotc_generation.*, bind memo, static
+class 3, DMA sweeps, buffer_cache.*/memory_tracker.h/region_manager.h; SOTC_GEN_BIND), texbind (texture identity
+memo + RT class, texture_cache.*/image_view.*/rt_class.*; SOTC_GEN_TEX, SOTC_RT_MAXEXTENT), t1 (image churn,
+image.*/image_prefetch.*/image_info.*; SOTC_IMG_POOLED, SOTC_IMG_CREATE_AHEAD), r1 (GPU-to-CPU results in host
+memory, rb_class/particle_prev/probe_xprmem, new rb_host.*; SOTC_RB_HOST), p1 (pipeline keys from dirty registers
++ GPL, vk_pipeline_cache/vk_graphics_pipeline/vk_compute_pipeline; SOTC_PIPE_DIRTY, SOTC_PIPE_GPL), d1 (BDA
+groundwork, shader_recompiler + new vk_bda_table.*; SOTC_BDA), f2 (frame pipelining, gnmdriver.*; SOTC_FRAME_AHEAD).
+Wave 2 after integration: W1 resolve workers (vk_rasterizer.cpp, draw_prep.h) and the call-site snippets.
+Integration state (1 Nov, no game run: the user must authorize in-game tests): every wave-1 agent and w1 finished;
+their snippets are applied (docs/re-stutters/reports3/draw/wave1/PENDING.md). Builds clean except files still being
+edited by p1b (GPL fast-link, SOTC_PIPE_GPL) and t1b (SOTC_RT_MAXEXTENT). Integration fixes by me: SotcGen::Bump is
+a no-op unless SOTC_GEN_BIND or SOTC_GEN_DMA is set (call sites on hot paths); R1 mode-2 mirror copies wired
+(Rasterizer::FlushRbMirrors after dispatch/dispatchIndirect); D1 cache compat (a 64-byte Profile cache keeps
+matching with bda_buffers off). Known gaps in the agents' reports: F1 does not remove the no-free-frame wait;
+texbind's memo hit still takes the texture-cache mutex and its epoch is global; SOTC_BDA is unsafe with ring8
+(borrowed imports have no device address); SOTC_FRAME_AHEAD has an unmeasured double-buffer reuse risk; T1
+pre-staging at loader completion not done (hook in game code; SOTC_AREA_PREWARM=3 is the existing route).
+Per-switch first test order (all one round, user/routes/tests.json): verify modes first (SOTC_GEN_BIND=2,
+SOTC_GEN_TEX=2, SOTC_PR_GEN=2 with SOTC_PARALLEL_RECORD=1, SOTC_PIPE_DIRTY=2, SOTC_RB_HOST=2, SOTC_BDA=2 with
+SOTC_PC_RING=0), mismatches must be 0; then the =1 modes against default with SOTC_STALE_CHECK=16 in a separate run.
+
 ## Next
 Fix ring8 vertices, combined matrix (several rounds), long play test, AMD/Intel, enable proven switches by default,
 CHANGELOG (Portuguese) and docs, commit. Progress estimate ~74%.

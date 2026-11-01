@@ -139,6 +139,19 @@ std::vector<GranuleRange> SnapshotGranules(uint64_t& version);
 // only when it moved). Any thread; takes g_mutex.
 std::vector<std::pair<uint64_t, uint64_t>> CollectHostServe(const char* pool_name, uint64_t& version);
 
+// sotc: SOTC_PC_RING8_HEAPS_MODE=2 (pc_ring_copy.cpp CollectHeapRuns). Every granule of the heap named pool_name,
+// in address order, with two flags: bound (the GPU bound it) and clean (never excluded: no GPU-marked page
+// sampled, no read fault, no image overlap, not shared with another heap). The caller builds whole-region runs
+// from them; gap joins need the tracker's GPU bits, so the caller checks those outside g_mutex.
+// version: g_version at the collect. Any thread; takes g_mutex.
+struct HostGranule {
+    uint64_t addr;
+    uint64_t size;
+    bool bound;
+    bool clean;
+};
+std::vector<HostGranule> CollectHostGranules(const char* pool_name, uint64_t& version);
+
 // A guest range classified CPU-only (addr/size match VideoCore::SotcUntrack::Range's fields) and the
 // index of its pool (< kMaxPools).
 struct Range {

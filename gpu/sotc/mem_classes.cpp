@@ -1202,6 +1202,35 @@ std::vector<std::pair<uint64_t, uint64_t>> CollectHostServe(const char* pool_nam
     return runs;
 }
 
+// sotc: SOTC_PC_RING8_HEAPS_MODE=2 (see CollectHostGranules in mem_classes.h). Same pool lookup as CollectHostServe.
+std::vector<HostGranule> CollectHostGranules(const char* pool_name, uint64_t& version) {
+    std::vector<HostGranule> out;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    version = g_version.load(std::memory_order_acquire);
+    uint32_t pool = kMaxPools;
+    for (uint32_t i = 0; i < g_pool_count; ++i) {
+        if (std::strncmp(g_pool_names[i].data(), pool_name, kNameMax) == 0) {
+            pool = i;
+            break;
+        }
+    }
+    if (pool == kMaxPools) {
+        return out;
+    }
+    for (uint32_t i = 0; i < g_granule_count; ++i) {
+        const GranuleInfo& info = g_granule_info[i];
+        if (info.pool.load(std::memory_order_relaxed) != pool) {
+            continue;
+        }
+        out.push_back(HostGranule{info.base, info.size,
+                                  g_gr_bound[i].load(std::memory_order_relaxed) != 0,
+                                  g_gr_excluded[i].load(std::memory_order_relaxed) == 0});
+    }
+    std::sort(out.begin(), out.end(),
+              [](const HostGranule& a, const HostGranule& b) { return a.addr < b.addr; });
+    return out;
+}
+
 // sotc: a memtype granule (probe_memtype.cpp), in both modes. Granules are never freed and never enter
 // the allocator tables, so an allocator block with the same base is unaffected. Same bounds as OnAlloc;
 // a granule past kMaxGranuleEntries is skipped and counted.

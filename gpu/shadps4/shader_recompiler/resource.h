@@ -109,6 +109,9 @@ enum class BufferType : u8 {
     SharedMemory,
     ClipPlanes,
     LodFeedback, ///< sotc: finest mip each texture counter bank was sampled at (sotc_lod_stats.h)
+    /// sotc: SOTC_BDA: one slot per info.buffers entry, four u32 each: device address (low, high),
+    /// size in bytes, unused. Slot i describes info.buffers[i]; written by the host per draw.
+    BdaBlockTable,
 };
 
 struct BufferResource {

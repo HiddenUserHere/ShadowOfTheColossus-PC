@@ -305,7 +305,7 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
-        vk::PhysicalDeviceFaultFeaturesEXT>();
+        vk::PhysicalDeviceFaultFeaturesEXT, vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -397,6 +397,23 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    // sotc: SOTC_PIPE_GPL=1 (off by default): a cold graphics pipeline is fast-linked from four
+    // libraries (vk_graphics_pipeline.cpp). Needs VK_KHR_pipeline_library, added first; nothing
+    // is enabled unless the feature is supported.
+    {
+        const char* gpl_env = std::getenv("SOTC_PIPE_GPL");
+        const bool gpl_wanted = gpl_env && gpl_env[0] == '1';
+        const bool gpl_feature =
+            feature_chain.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
+                .graphicsPipelineLibrary;
+        graphics_pipeline_library =
+            gpl_wanted && gpl_feature && add_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+            add_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        if (gpl_wanted && !graphics_pipeline_library) {
+            LOG_WARNING(Render_Vulkan, "SOTC_PIPE_GPL=1 but VK_EXT_graphics_pipeline_library with "
+                                       "graphicsPipelineLibrary is not available");
+        }
+    }
     // Games excessively leave restart enabled with lists when it isn't actually needed, and it
     // slows down KosmicKrisp due to unrolling. Revisit if KosmicKrisp moves this to mesh shaders.
     list_restart = driver_id != vk::DriverId::eMesaKosmickrisp &&
@@ -958,6 +975,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{
             .vertexInputDynamicState = true,
         },
+        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT{
+            .graphicsPipelineLibrary = true, // sotc: SOTC_PIPE_GPL, see above
+        },
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT{
             .primitiveTopologyListRestart = list_restart_features.primitiveTopologyListRestart,
             .primitiveTopologyPatchListRestart =
@@ -1031,6 +1051,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     }
     if (!vertex_input_dynamic_state) {
         device_chain.unlink<vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT>();
+    }
+    if (!graphics_pipeline_library) {
+        device_chain.unlink<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
     }
     if (!list_restart) {
         device_chain.unlink<vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT>();

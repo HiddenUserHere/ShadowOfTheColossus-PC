@@ -28,6 +28,8 @@
 #include "../../../sotc/mem_classes.h"  // sotc: SOTC_CLASS_TRACK (plan step 6)
 #include "../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE bind evidence
 #include "../../../sotc/pc_ring.h"      // sotc: SOTC_PC_RING shadow
+#include "../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST (L1)
+#include "../../../sotc/rb_host.h"      // sotc: SOTC_RB_HOST (R1)
 #include <xxhash.h>                     // sotc: SOTC_PC_RING=8 verify (XXH3, as stale_check.cpp)
 #include "video_core/buffer_cache/pc_ring_copy.h"      // sotc: SOTC_PC_RING=8 (HostMaintain)
 #include "video_core/renderer_vulkan/sotc_guest_memory.h" // sotc: SOTC_PC_RING=8 (LookupGuestView)
@@ -55,6 +57,8 @@ extern "C" uintptr_t runtime_sotc_heap_table(void);
 
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM
 #include "../../../sotc/stale_check.h" // sotc: SOTC_STALE_CHECK
+#include "../../../sotc/static_class.h" // sotc: SOTC_STATIC_CLASS=3 (TrySkip / NoteClean)
+#include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
 
 namespace VideoCore {
 
@@ -702,6 +706,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
         guest_fault);
     // sotc: SOTC_RB_EXACT: see the top.
     RbxSettleWritePages(device_addr, size, assume_locks);
+    SotcGen::Bump(device_addr, size); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA (after the state change)
 }
 
 void BufferCache::RbxSettleWritePages(VAddr addr, u64 size, bool assume_locks) {
@@ -5682,6 +5687,14 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             // region lock, so a write fault in between waits instead of being overwritten (the
             // game's resource loader crashed asking for 59 GiB once, 24 Oct: a size it had just
             // read from a file, replaced by stale GPU bytes).
+            // sotc: SOTC_RB_HOST=2 (rb_host.h, R1): the bytes the guest pages hold before this readback
+            // applies them (the GPU mirror) against the bytes the readback brings.
+            if (SotcRbHost::Mode() == 2) {
+                std::vector<u8> before;
+                if (SotcRbHost::SnapshotBefore(dst_addr, copy.size, before)) {
+                    SotcRbHost::CompareApplied(dst_addr, before, src);
+                }
+            }
             const auto write_pages = [&](VAddr start, u64 size, auto&& write) {
                 if (!item.hot) {
                     write(start, size);
@@ -5883,6 +5896,28 @@ u64 BufferCache::WarmRange(VAddr addr, u64 size) {
     return tl_sync_bytes - before; // bytes uploaded: 0 when the range was already clean
 }
 
+namespace {
+// sotc: SOTC_GEN_BIND bind memo (BufferCache::ObtainBuffer). A clean read binding of [addr, +size)
+// stores the arena it was bound in, with the SotcGen::Sum and BindVersion loaded BEFORE the sync
+// that found it clean. A later bind with the same Sum and version is answered from the slot.
+// Thread-local and direct-mapped like the slots above; a collision only costs the full path.
+struct BindMemoSlot {
+    VAddr addr{};
+    u64 gen{};          // SotcGen::Sum over the range, before the clean sync
+    u64 bind_version{}; // BindVersion() before the clean sync
+    const Buffer* arena{};
+    u64 offset{};
+    u32 size{}; // 0: empty
+};
+constexpr u64 BindMemoSlotBits = 12;
+thread_local std::array<BindMemoSlot, 1ULL << BindMemoSlotBits> bind_memo_slots{};
+
+BindMemoSlot& BindMemoSlotFor(VAddr addr, u32 size) {
+    const u64 key = addr ^ (u64(size) << 40);
+    return bind_memo_slots[(key * 0x9E3779B97F4A7C15ull) >> (64 - BindMemoSlotBits)];
+}
+} // namespace
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer,
                                                         u32 mark_offset, u32 mark_size) {
@@ -5928,6 +5963,33 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (hrr && hrr->NoteBinding(device_addr, size, is_written)) { // sotc: SOTC_HRR dry run
         hrr->NoteImageOverlap(device_addr, size, texture_cache.HasImageInRange(device_addr, size));
     }
+    // sotc: SOTC_GEN_BIND. The bind memo: a clean read binding whose range Sum and BindVersion are
+    // unchanged since its last clean sync is answered here with no residency check, no page scan
+    // and no lock. The Sum and the version are loaded before anything below can change them
+    // (EnsureResident, the sync), so a store made from them is conservative. BindVersion moves
+    // whenever a resident range is released (a handle or offset may have moved), and every
+    // invalidation of guest memory bumps the Sum (sotc_generation.h).
+    const bool memo_on = !is_written && !is_texel_buffer && BindMemoEligible(device_addr, size);
+    bool verify_hit = false;
+    u64 memo_gen = 0;
+    u64 memo_bv = 0;
+    if (memo_on) {
+        const BindMemoSlot& slot = BindMemoSlotFor(device_addr, size);
+        memo_gen = SotcGen::Sum(device_addr, size);
+        memo_bv = BindVersion();
+        if (slot.size == size && slot.addr == device_addr && slot.gen == memo_gen &&
+            slot.bind_version == memo_bv) {
+            SotcGen::Count(SotcGen::Stat::BindHit);
+            if (!SotcGen::Verify()) {
+                NoteBindUse(device_addr, size); // the eviction stamp a residency check would set
+                return {slot.arena, slot.offset};
+            }
+            verify_hit = true; // SOTC_GEN_BIND=2: the full path below runs and is compared
+        } else {
+            SotcGen::Count(SotcGen::Stat::BindMiss);
+        }
+    }
+    const u64 verify_bytes_before = tl_sync_bytes;
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
@@ -5957,6 +6019,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         const SyncReason sync_reason{tl_sync_reason == 5 ? 5u : 1u};
         SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     }
+    if (memo_on) { // sotc: SOTC_GEN_BIND, store (or void the slot) after the sync
+        if (verify_hit && tl_sync_bytes != verify_bytes_before) {
+            SotcGen::Count(SotcGen::Stat::BindVerifyMismatch); // a bump the hit did not see
+        }
+        BindMemoSlot& slot = BindMemoSlotFor(device_addr, size);
+        if (memory_tracker->IsSyncClean(device_addr, size, false)) {
+            slot = {device_addr, memo_gen, memo_bv, arena, arena->Offset(device_addr), size};
+        } else {
+            slot.size = 0;
+        }
+    }
     if (is_texel_buffer && !is_written && SotcStats::kOptOff) {
         SynchronizeMemoryFromImage(arena, device_addr, size);
     }
@@ -5973,6 +6046,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 }
 
 u64 BufferCache::AddGpuModified(VAddr addr, u64 size) {
+    // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA: a GPU write invalidates the bind memo of its range (the
+    // memo never reads GPU bits, so this is conservative). Before any early return below.
+    SotcGen::Bump(addr, size);
     // sotc: SOTC_PC_RING=4/5 coverage input: every GPU write into the arena, before any early
     // return below (the range may already be marked). Lock-free; no-op in the other modes.
     if ((SotcPcRing::FullRingMode() == 4 || SotcPcRing::FullRingMode() == 5) &&
@@ -6588,6 +6664,7 @@ bool BufferCache::OwedIntersects(VAddr addr, u64 size) const {
 }
 
 void BufferCache::BumpSyncGeneration(VAddr addr, u64 size) {
+    SotcGen::Bump(addr, size); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA (a write that set no CPU bit)
     if (!SotcBufBindFast::kGenStamps) {
         return;
     }
@@ -7006,6 +7083,9 @@ void BufferCache::SynchronizeDmaBuffers() {
                 dma_runs.emplace_back(device_addr, size);
             }
             dma_full_pending = true;
+            // sotc: SOTC_GEN_DMA. The runs changed: no run has a clean-sweep record any more.
+            dma_run_gen.assign(dma_runs.size(), 0);
+            dma_run_valid.assign(dma_runs.size(), false);
         }
         // sotc: incremental sweep (SOTC_DMA_INCR=0: every run, every time). Only the 256 KiB
         // words where a CPU bit rose since the last sweep can need an upload
@@ -7025,8 +7105,7 @@ void BufferCache::SynchronizeDmaBuffers() {
             // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
             for (size_t i = 0; i < dma_runs.size(); ++i) {
                 const auto [device_addr, size] = dma_runs[i];
-                SynchronizeMemory(address_space[device_addr >> ARENA_PAGE_BITS], device_addr,
-                                  static_cast<u32>(size), false, false);
+                SweepDmaRun(i, device_addr, size, device_addr, size); // sotc: SOTC_GEN_DMA
             }
             ranges = dma_runs_ranges;
         } else {
@@ -7049,8 +7128,7 @@ void BufferCache::SynchronizeDmaBuffers() {
                     hi = std::max(hi, std::min(run_end, dma_spans[k].first + dma_spans[k].second));
                 }
                 if (lo < hi) {
-                    SynchronizeMemory(address_space[run_start >> ARENA_PAGE_BITS], lo,
-                                      static_cast<u32>(hi - lo), false, false);
+                    SweepDmaRun(i, run_start, run_size, lo, hi - lo); // sotc: SOTC_GEN_DMA
                     ++ranges;
                 }
             }
@@ -7076,6 +7154,42 @@ void BufferCache::SynchronizeDmaBuffers() {
     } else {
         SotcStats::dma_sweep_idle_ns.fetch_add(sweep_ns, std::memory_order_relaxed);
     }
+}
+
+// sotc: SOTC_GEN_DMA. One run of the DMA sweep: [sync_addr, +sync_len) is synced (the whole run, or
+// the hull of its dirty words) unless the run's generation Sum is unchanged since a sweep that found
+// the whole run clean. A changed Sum always comes with the bump of the CPU bit that the sweep would
+// have seen, so an unchanged Sum means the sweep has nothing to upload here. Returns false when
+// the sync was skipped.
+bool BufferCache::SweepDmaRun(size_t i, VAddr run_addr, u64 run_size, VAddr sync_addr,
+                              u64 sync_len) {
+    const bool gen_on = SotcGen::DmaOn() && i < dma_run_valid.size() &&
+                        SotcGen::Covered(run_addr, run_size);
+    u64 gen0 = 0;
+    bool hit = false;
+    if (gen_on) {
+        gen0 = SotcGen::Sum(run_addr, run_size); // loaded before the sync below
+        hit = dma_run_valid[i] && dma_run_gen[i] == gen0;
+        if (hit && !SotcGen::DmaVerify()) {
+            SotcGen::Count(SotcGen::Stat::DmaRunSkip);
+            return false;
+        }
+    }
+    const u64 bytes_before = tl_sync_bytes;
+    SynchronizeMemory(address_space[sync_addr >> ARENA_PAGE_BITS], sync_addr,
+                      static_cast<u32>(sync_len), false, false);
+    if (gen_on) {
+        if (hit) {
+            if (tl_sync_bytes != bytes_before) {
+                SotcGen::Count(SotcGen::Stat::DmaVerifyMismatch); // a bump the skip did not see
+            }
+        } else {
+            SotcGen::Count(SotcGen::Stat::DmaRunSync);
+        }
+        dma_run_valid[i] = memory_tracker->IsSyncClean(run_addr, run_size, false);
+        dma_run_gen[i] = gen0;
+    }
+    return true;
 }
 
 const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
@@ -7357,6 +7471,7 @@ SyncFastSlot& SyncFastSlotFor(VAddr addr, u32 size, bool is_written) {
     const u64 key = addr ^ (u64(size) << 40) ^ (u64(is_written) << 63);
     return sync_fast_slots[(key * 0x9E3779B97F4A7C15ull) >> (64 - SyncFastSlotBits)];
 }
+
 } // namespace
 
 // sotc: SOTC_PC_RING full ring (pc_ring_copy.cpp, draw thread). Forwarders to the tracker, which
@@ -7379,6 +7494,23 @@ void BufferCache::PcRingDelta(VAddr addr, u64 size, bool on) { // sotc: SOTC_PC_
 }
 
 // sotc: SOTC_PC_RING=8 (host arena binds). See pc_ring.h (mode 8) and HostMaintain (pc_ring_copy.cpp).
+// sotc: SOTC_PC_RING8_HEAPS_MODE=2 (pc_ring_copy.cpp HostAddOnly, M1): an add-only change of the served set.
+// The new ranges replace the old ones they contain and are ringed alone (AddRingRange), not the whole set.
+void BufferCache::PcHostAddRing(const std::vector<SotcPcRing::RingExtent>& added) {
+    {
+        std::scoped_lock lock{pc_host_mutex};
+        std::erase_if(pc_host_blocks, [&added](const SotcPcRing::RingExtent& old) {
+            return std::any_of(added.begin(), added.end(), [&old](const SotcPcRing::RingExtent& a) {
+                return old.addr >= a.addr && old.addr + old.size <= a.addr + a.size;
+            });
+        });
+        pc_host_blocks.insert(pc_host_blocks.end(), added.begin(), added.end());
+    }
+    for (const auto& range : added) {
+        memory_tracker->AddRingRange(range.addr, range.size);
+    }
+}
+
 void BufferCache::PcHostApply(const std::vector<SotcPcRing::RingExtent>& blocks) {
     // Pages that leave the ring go back to normal tracking, but their CPU writes while ringed were
     // never seen (no fault, no ring copy in mode 8): the tracker would take a stale device copy for
@@ -7413,6 +7545,15 @@ void BufferCache::PcHostApply(const std::vector<SotcPcRing::RingExtent>& blocks)
     PcRingApply(blocks);
     for (const auto& range : left) {
         memory_tracker->MarkRegionAsCpuModified(range.addr, range.size);
+    }
+    // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA. Host-served ranges take no memo and their CPU writes
+    // bump nothing: the ranges that leave the ring were written without a fault, and a range that
+    // enters it must not keep an older memo answer. Bumped after the marks above.
+    for (const auto& range : left) {
+        SotcGen::Bump(range.addr, range.size);
+    }
+    for (const auto& range : blocks) {
+        SotcGen::Bump(range.addr, range.size);
     }
     static int logged = 0;
     for (const auto& range : left) {
@@ -7747,7 +7888,11 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostBind(VAddr devic
         slot = std::make_unique<Buffer>(view.cpu_base, view.buffer_size, view.buffer);
     }
     SotcPcRing::NoteHostBind(size, is_written);
+    SotcLabels::NoteSharedTouch(); // sotc: SOTC_LABELS_HONEST: GPU work on host-served memory (L1)
     PcHostRecordBind(device_addr, size, is_written);
+    if (is_written) {
+        SotcRbHost::NoteServedWrite(device_addr, size); // sotc: SOTC_RB_HOST (R1): labels wait for it (mode 1)
+    }
     return std::pair<const Buffer*, u64>{slot.get(), view.offset};
 }
 
@@ -7766,6 +7911,16 @@ static SotcStale::Oracle StaleOracle(MemoryTracker* tracker) {
         [](void* ctx, uint64_t addr, uint64_t size) {
             return static_cast<MemoryTracker*>(ctx)->IsRegionGpuModified(addr, size);
         }};
+}
+
+// sotc: SOTC_GEN_BIND. Whether the bind memo may answer this range. The memo skips the per-bind
+// diagnostics of SynchronizeMemory (stale check, ring verify), so those modes keep the full path.
+bool BufferCache::BindMemoEligible(VAddr device_addr, u32 size) const {
+    if (!SotcGen::On() || !SotcGen::Covered(device_addr, size) || SotcStale::On()) {
+        return false;
+    }
+    const int ring = SotcPcRing::FullRingMode();
+    return ring != 4 && ring != 5 && ring != 7;
 }
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
@@ -7825,6 +7980,15 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                    ? SynchronizeMemoryFromImage(arena, device_addr, size)
                    : false;
     }
+    // sotc: SOTC_STATIC_CLASS=3 (static_class.h). A read of a static mesh range that a clean sync
+    // armed, and whose region generation sum is unchanged, needs no scan. Behind the slot above:
+    // with SOTC_GEN_BIND the bind memo answers first, so this only adds the static ranges whose
+    // slot was evicted. Stores the slot like the clean branches below.
+    if (!is_written && SotcStaticClass::TrySkip(device_addr, size, gen0)) {
+        slot = {device_addr, gen0, size, is_written};
+        return is_texel_buffer && !is_written ? SynchronizeMemoryFromImage(arena, device_addr, size)
+                                              : false;
+    }
     // sotc: SOTC_SYNC_PRECHECK=1 (off by default). On a slot miss, a range that is already clean
     // (IsSyncClean: no CPU bit, and for a written binding every GPU bit set) needs no upload: the
     // full path below would find no copies, and its tail is the same texel branch. So the slot is
@@ -7849,6 +8013,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     // the look as before. =2 always takes the look and counts the disagreements.
     if (SotcStats::kSyncPipe && scan_clean && !SotcStats::kSyncPipeVerify) {
         slot = {device_addr, gen0, size, is_written};
+        if (!is_written) { // sotc: SOTC_STATIC_CLASS=3 arm (no-op otherwise)
+            SotcStaticClass::NoteClean(device_addr, size, gen0);
+        }
         return result;
     }
     const bool clean_after = memory_tracker->IsSyncClean(device_addr, size, is_written);
@@ -7858,6 +8025,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     // A slot left stale (range not clean now) cannot match again: its sum only grows.
     if (clean_after) {
         slot = {device_addr, gen0, size, is_written};
+        if (!is_written) { // sotc: SOTC_STATIC_CLASS=3 arm (no-op otherwise)
+            SotcStaticClass::NoteClean(device_addr, size, gen0);
+        }
     }
     return result;
 }
@@ -8780,6 +8950,8 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     });
     resident_ranges.Subtract(first_block, end_block);
     ++resident_version; // sotc: invalidates the merged DMA runs
+    // sotc: SOTC_GEN_BIND. The released blocks: memo answers for them are void.
+    SotcGen::Bump(first_block << block_shift, (end_block - first_block) << block_shift);
     {
         std::unique_lock gpu_modified_lock{gpu_modified_mutex};
         gpu_modified_ranges.Subtract(first_block << block_shift,

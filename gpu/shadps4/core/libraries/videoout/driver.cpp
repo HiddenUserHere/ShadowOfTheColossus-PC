@@ -27,6 +27,7 @@
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/gnmdriver/gnmdriver.h" // sotc: SOTC_FRAME_AHEAD report
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
@@ -35,8 +36,10 @@
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "bbport_overlay.h"
 #include "bbport_threads.h"
+#include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA report
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_fps_cap.h"
+#include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND report
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_event.h"
 #include "video_core/buffer_cache/hrr.h"
@@ -50,7 +53,10 @@
 #include "../../../../sotc/probes.h"     // sotc: engine probe report lines
 #include "../../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK report (plan step 6)
 #include "../../../../sotc/pc_ring.h"     // sotc: SOTC_PC_RING report
+#include "../../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST report
 #include "../../../../sotc/rb_class.h"    // sotc: SOTC_RB_CLASS report
+#include "../../../../sotc/rb_host.h"     // sotc: SOTC_RB_HOST report
+#include "video_core/texture_cache/image.h" // sotc: SOTC_IMG_POOLED / SOTC_IMG_CREATE_AHEAD report
 #include "../../../../sotc/stale_check.h" // sotc: SOTC_STALE_CHECK report
 #include "../../../../sotc/static_class.h" // sotc: SOTC_STATIC_CLASS report
 #include "../../../../sotc/rt_class.h"     // sotc: SOTC_RT_CLASS report
@@ -86,6 +92,8 @@ namespace Vulkan {
 void SotcTinyAsyncNoteDisplayBuffer(u64 address, u64 size);
 void SotcTinyAsyncReport(std::string& out, double seconds);
 void ReportPipeMemo(std::string& out, double seconds); // sotc: SOTC_PIPE_MEMO
+void ReportPipeDirty(std::string& out, double seconds); // sotc: SOTC_PIPE_DIRTY
+void ReportPipeGpl(std::string& out, double seconds); // sotc: SOTC_PIPE_GPL
 } // namespace Vulkan
 // sotc: src/runtime_kernel.c, SOTC USLEEP line (usleep histogram, SOTC_USLEEP_YIELD).
 extern "C" void runtime_usleep_stats(char* out, size_t size, double seconds);
@@ -1732,6 +1740,8 @@ void VideoOutDriver::Flip(const Request& req) {
                 ReportPrintf(report, "SOTC CP flip pacing: %.2f ms per frame\n",
                              pace_ns / 1e6 / flips);
             }
+            // sotc: SOTC_FRAME_AHEAD (gnmdriver.cpp ReportFrameAhead): frames run ahead, lead, gate waits.
+            Libraries::GnmDriver::ReportFrameAhead(report);
             // sotc: SOTC_CP_AHEAD submit gate (gnmdriver.cpp GateWait) and compute rings too full
             // for the game's next submit (Liverpool::NoteAscDoorbell), since the last report.
             if (flips) {
@@ -1803,6 +1813,7 @@ void VideoOutDriver::Flip(const Request& req) {
                                  static_cast<unsigned long long>(reads));
                 }
             }
+            VideoCore::ImageChurnReport(); // sotc: SOTC_IMG_POOLED / SOTC_IMG_CREATE_AHEAD (stderr, self-throttled)
             // sotc: SOTC_ASYNC_IMAGE_CREATE, totals (image_prefetch.h).
             if (const uint64_t n = SotcStats::async_image_requested.load(std::memory_order_relaxed)) {
                 const auto get = [](const std::atomic<uint64_t>& c) {
@@ -1988,8 +1999,10 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcProbes::ReportXprMem(report, seconds);
             SotcPcRing::Report(report, seconds); // sotc: SOTC_PC_RING
             SotcRbClass::Report(report, seconds); // sotc: SOTC_RB_CLASS
+            SotcRbHost::Report(report, seconds);  // sotc: SOTC_RB_HOST
             SotcStale::Report(report, seconds);   // sotc: SOTC_STALE_CHECK
             SotcStaticClass::Report(report, seconds); // sotc: SOTC_STATIC_CLASS
+            SotcGen::Report(report, seconds); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
             SotcRtClass::Report(report, seconds);     // sotc: SOTC_RT_CLASS
             SotcPcPool::Report(report, seconds);      // sotc: SOTC_PC_POOL
             SotcRamReport::Report(report, presenter.get()); // sotc: SOTC_RAM_REPORT
@@ -2019,7 +2032,10 @@ void VideoOutDriver::Flip(const Request& req) {
             // sotc: Wave C optimizations, each prints only while its switch is on.
             SotcAreaPrewarm::ReportAreaPrewarm(report, seconds); // SOTC_AREA_PREWARM >= 2
             Vulkan::ReportPipeMemo(report, seconds);              // SOTC_PIPE_MEMO
+            Vulkan::ReportPipeDirty(report, seconds); // SOTC_PIPE_DIRTY
+            Vulkan::ReportPipeGpl(report, seconds); // SOTC_PIPE_GPL
             AmdGpu::ReportCpLabelSkip(report, seconds);           // SOTC_CP_LABEL_SKIP
+            SotcLabels::ReportLabels(report, seconds);            // SOTC_LABELS_HONEST
             // sotc: Wave D probes and optimizations (docs/re-stutters/reports2/00-PLAN.md); each
             // prints only while its switch is on.
             SotcBuildSync::ReportBuildSyncProbe(report, seconds);      // SOTC_BUILDSYNC_PROBE
@@ -2029,6 +2045,8 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcDecommitBudget::ReportDecommitBudget(report, seconds); // SOTC_DECOMMIT_BUDGET
             SotcMipBudget::ReportMipBudget(report, seconds);          // SOTC_MIP_BUDGET
             VideoCore::TextureCache::ReportImageFrees(report, seconds); // B4 (SOTC_FPS)
+            VideoCore::TextureCache::ReportTexIdentity(report, seconds); // sotc: SOTC_GEN_TEX
+            VideoCore::TextureCache::ReportRtMaxExtent(report, seconds); // sotc: SOTC_RT_MAXEXTENT
             VideoCore::TextureCache::ReportUnmapPark(report, seconds);  // SOTC_UNMAP_PARK
             Vulkan::ReportFlipWait(report, seconds);                  // B5 (SOTC_FPS)
             Vulkan::ReportPresent(report, seconds);                   // SOTC_PRESENT_FRAMES / SOTC_FPS
@@ -2134,6 +2152,16 @@ void VideoOutDriver::Flip(const Request& req) {
                 const double parse_ms = SotcStats::cp_parse_ns.exchange(0) / 1e6;
                 std::fprintf(stderr, "SOTC threads per frame: draw busy %.2f ms, command parse %.2f ms\n",
                              (seconds * 1000.0 - idle_ms) / flips, parse_ms / flips);
+                // sotc: SOTC_DRAW_WORK: the draw thread's work per frame (sotc_stats.h DrawWorkReport).
+                if (const std::string work = SotcStats::DrawWorkReport(flips, idle_ms); !work.empty()) {
+                    std::fprintf(stderr, "%s\n", work.c_str());
+                }
+                // sotc: SOTC_BDA: block-table draws, slots, nulls, missing addresses (vk_bda_table.h).
+                if (const char* bda = std::getenv("SOTC_BDA"); bda && bda[0] && bda[0] != '0') {
+                    char bda_line[256];
+                    Vulkan::BdaTableReport(bda_line, sizeof bda_line);
+                    std::fprintf(stderr, "%s", bda_line);
+                }
             }
             // sotc: on-CPU time of the GPU threads and what the draw thread, the command
             // processor and the recorder waited for (SotcStats::FrameAccount), per frame.
@@ -2675,6 +2703,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     while (!token.stop_requested()) {
         timer.Start();
+        // sotc: SOTC_FLIP_OFFTHREAD: the present thread moves a frame whose present is done to the
+        // draw thread's ready queue (vk_presenter.cpp RefillReadyFrames). Non-blocking; off by default.
+        // The presenter may not exist yet when this thread starts (gnmdriver RegisterLib creates it).
+        if (presenter) {
+            presenter->RefillReadyFrames();
+        }
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();

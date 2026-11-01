@@ -38,6 +38,7 @@ const unsigned char* runtime_memory_backing_pointer(uintptr_t address);
 const unsigned char* runtime_memory_backing_view(uint64_t* size);
 }
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
@@ -151,6 +152,8 @@ public:
     // sotc: SOTC_PC_RING=8 (host arena binds). Draw thread. Rings the imported arena blocks (never
     // protected) and remembers them; PcHostBind serves the binds inside them from host memory.
     void PcHostApply(const std::vector<SotcPcRing::RingExtent>& blocks);
+    // sotc: SOTC_PC_RING8_HEAPS_MODE=2 (M1). Draw thread. Adds ranges to the served set and rings only them.
+    void PcHostAddRing(const std::vector<SotcPcRing::RingExtent>& added);
     // sotc: SOTC_PC_RING=8. Draw thread, at each submit start (OnSubmitStart): reports the unique
     // bytes of the previous submit's served binds and rechecks its verify samples.
     void PcHostSubmitStart();
@@ -340,6 +343,11 @@ public:
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
+    /// sotc: SOTC_GEN_DMA. Syncs [sync_addr, +sync_len) for run i of dma_runs, unless the run's
+    /// generation Sum is unchanged since its last clean sweep. Returns false when it skipped.
+    bool SweepDmaRun(size_t i, VAddr run_addr, u64 run_size, VAddr sync_addr, u64 sync_len);
+    /// sotc: SOTC_GEN_BIND. Bind memo of ObtainBuffer (read, non-texel): see buffer_cache.cpp.
+    bool BindMemoEligible(VAddr device_addr, u32 size) const;
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
@@ -938,6 +946,10 @@ private:
     /// merged into runs of (device address, bytes). Only rebuilt at the top of a sweep.
     std::vector<std::pair<VAddr, u64>> dma_runs;
     bool dma_full_pending{}; // sotc: the next DMA sweep visits every run (see SynchronizeDmaBuffers)
+    /// sotc: SOTC_GEN_DMA. Per dma_runs entry: the generation Sum loaded before the last sweep that
+    /// found the run clean, valid while dma_run_valid is set. Reset with dma_runs.
+    std::vector<u64> dma_run_gen;
+    std::vector<bool> dma_run_valid;
     u64 untrack_applied{0};  // sotc: SOTC_UNTRACK_AUTO, the published list version applied last
     u64 class_shadow_version{0}; // sotc: SOTC_CLASS_TRACK=2, the classified version counted last
     u64 class_shadow_tick{0};    // sotc: SOTC_CLASS_TRACK=2, periodic recount counter

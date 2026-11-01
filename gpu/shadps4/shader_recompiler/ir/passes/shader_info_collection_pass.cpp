@@ -215,11 +215,31 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         LOG_ERROR(Render, "Enabling DMA for shader {:#x}", info.pgm_hash);
     }
 
+    // sotc: SOTC_BDA (Profile::bda_buffers): the guest buffers that are not texel buffers are
+    // addressed through a block table, one slot per info.buffers entry. The table is pushed last,
+    // so the binding of every other buffer keeps its number. Needs 64-bit addresses, and a free
+    // entry in info.buffers (a shader with NUM_BUFFERS of them keeps the descriptors).
+    if (profile.bda_buffers && profile.support_int64 && !info.HasBdaBlockTable() &&
+        info.buffers.size() < NUM_BUFFERS) {
+        bool has_guest = false;
+        for (const auto& buffer : info.buffers) {
+            has_guest |= buffer.buffer_type == BufferType::Guest && !buffer.is_formatted;
+        }
+        if (has_guest) {
+            info.buffers.push_back({
+                .used_types = IR::Type::U32,
+                .buffer_type = BufferType::BdaBlockTable,
+                .is_written = false,
+            });
+        }
+    }
+
     // sotc: whether the SPIR-V needs 64-bit integers. GPUs without shaderInt64 (Intel Iris Xe)
     // must not get the Int64 capability, and most shaders keep no 64-bit value after the
     // optimization passes: a ballot whose uses are all 32-bit unpacks or BallotFindLsb is
     // emitted as a uvec2 instead (EmitBallot).
-    info.uses_int64 = info.uses_dma || info.readconst_types != Info::ReadConstType::None ||
+    info.uses_int64 = info.uses_dma || info.HasBdaBlockTable() ||
+                      info.readconst_types != Info::ReadConstType::None ||
                       info.uses_buffer_int64_atomics ||
                       info.uses_shared_int64_atomics || True(info.shared_types & IR::Type::U64);
     for (IR::Block* const block : program.post_order_blocks) {

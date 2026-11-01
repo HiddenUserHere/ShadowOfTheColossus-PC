@@ -249,6 +249,12 @@ public:
         return vertex_input_dynamic_state;
     }
 
+    /// sotc: true when SOTC_PIPE_GPL=1 and VK_EXT_graphics_pipeline_library (with
+    /// graphicsPipelineLibrary) is enabled. Read once in CreateDevice.
+    bool IsGraphicsPipelineLibrary() const {
+        return graphics_pipeline_library;
+    }
+
     /// Returns true when VK_KHR_fragment_shader_barycentric is supported.
     bool IsFragmentShaderBarycentricSupported() const {
         return fragment_shader_barycentric;
@@ -796,6 +802,7 @@ private:
     bool dynamic_state_3{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};
+    bool graphics_pipeline_library{}; // sotc: SOTC_PIPE_GPL
     bool list_restart{};
     bool provoking_vertex{};
     bool shader_stencil_export{};

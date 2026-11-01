@@ -36,6 +36,7 @@
 
 #include "hooks.h"
 #include "probes.h"
+#include "rb_host.h"                // sotc: SOTC_RB_HOST (mask pointers host-served count)
 #include "video_core/sotc_trace.h" // image bounds (SotcTrace::ImageBase/ImageSize)
 
 extern "C" {
@@ -188,6 +189,19 @@ void ReadMasks(uintptr_t owner, uintptr_t set) {
     }
 
     g_mask_calls.fetch_add(1, std::memory_order_relaxed);
+    // sotc: SOTC_RB_HOST (R1): are the masks this owner wrote last inside a host-served run? Bytes as in
+    // probe_xpr.cpp RecordMask: 4 * ceil(n / 32), n = u16 at set+0x64. Counted only; nothing is served here.
+    if (SotcRbHost::On()) {
+        uint16_t count = 0;
+        if (ReadGuest(set + 0x64, &count, sizeof count) && count != 0) {
+            const uint64_t bytes = 4ull * ((static_cast<uint64_t>(count) + 31) / 32);
+            for (size_t j = 0; j < 4; ++j) {
+                if (masks[j] != 0) {
+                    SotcRbHost::NoteMaskPointer(masks[j], bytes);
+                }
+            }
+        }
+    }
     for (size_t j = 0; j < 4; ++j) {
         const uint64_t m = masks[j];
         if (m == 0) {

@@ -124,6 +124,18 @@ public:
     /// the flip is done, so they run as they would between two operations.
     inline static void (*wait_service)() = nullptr;
 
+    /// sotc: SOTC_FLIP_OFFTHREAD=1 (off by default), the handoff from the present thread. The
+    /// present thread (its tick, see PresentThread) moves one presentation frame whose present_done
+    /// fence has already signalled from free_queue to ready_queue, without waiting for any fence.
+    /// GetRenderFrame takes a ready frame first, so the draw thread's PrepareFrame finds a frame
+    /// with no wait (no free-frame wait, no fence wait) in the usual case. Frame order is kept:
+    /// the copy is still recorded by the draw thread at the same point of its stream, and the
+    /// early VO label release (driver.cpp SubmitFlipInternal) still follows it. A frame is never
+    /// dropped: a ready frame goes to the draw thread or the present thread, never back. When no
+    /// ready frame exists, the draw thread waits for a free frame as before (counted in SOTC FLIP
+    /// WAIT and in SOTC FLIP OFFTHREAD).
+    void RefillReadyFrames();
+
     /// sotc: SOTC_CP_FLIP_PACE=1 (off by default). The presenter the command processor paces its
     /// flips with, null when off. Before it queues a flip for the draw thread, the command
     /// processor waits (PaceFlip) until more presentation frames are free than flips it queued
@@ -225,6 +237,9 @@ private:
     /// it may be dropped when VRAM is short.
     u32 ring_default_frames{};
     std::queue<Frame*> free_queue;
+    /// sotc: SOTC_FLIP_OFFTHREAD: frames the present thread moved from free_queue, fence signalled.
+    /// Guarded by free_mutex, like free_queue; a frame is in exactly one of the two queues or in use.
+    std::queue<Frame*> ready_queue;
     Frame* last_submit_frame;
     std::mutex free_mutex;
     std::condition_variable free_cv;

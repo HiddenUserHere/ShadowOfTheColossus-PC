@@ -240,6 +240,17 @@ uint64_t HostWriteSeq();
 /// Mode 8 heap serving (SOTC_PC_RING8_HEAPS): the heap granule runs served like arena blocks, replacing the
 /// previous set (ArenaBlocks and ArenaRelation include them; the block version bumps when they change).
 void SetHostExtras(std::vector<RingExtent> runs);
+/// sotc: SOTC_PC_RING8_HEAPS_MODE, read once: 1 (default) = as measured 1 Nov (granule runs, full re-apply on
+/// every change); 2 = whole heap regions (gap joins, at most 64 runs), add-only changes ring just the new
+/// ranges (BufferCache::PcHostAddRing), removals and refused imports take the full path. Other values read as 1.
+int Ring8HeapsMode();
+/// Mode 8 heap runs, mode 2 counters: the collected runs (gauge), gap joins, runs dropped by the cap, runs
+/// left out because the GPU wrote them (gauge: runs and bytes of the last collect).
+void NoteHeapRuns(uint64_t runs, uint64_t bytes, uint64_t joined, uint64_t capped, uint64_t gpu_left);
+/// Mode 8 heap mode 2: an add-only change ringed incrementally (runs and bytes of the new ranges).
+void NoteHostAdd(uint64_t runs, uint64_t bytes);
+/// Mode 8 heap mode 2: a full re-apply, by reason: 0 removal, 1 import refused or grouping, 2 periodic.
+void NoteHostFull(int reason);
 /// Mode 8: a windowed read-only bind clipped to the end of its imported run (PcHostClipLimited).
 void NoteHostClip();
 void NoteHostUnique(uint64_t read_bytes, uint64_t write_bytes);

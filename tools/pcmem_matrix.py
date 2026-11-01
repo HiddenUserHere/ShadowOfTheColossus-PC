@@ -59,6 +59,10 @@ COMMON_ENV = {
     # the GPU index-buffer culling on (~2100 extra dispatches a frame, 1 Nov).
     'SOTC_CVARS': 'skipSplash=1 nointro doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0',
     'SOTC_FPS': '1',
+    # sotc: the "SOTC DRAW WORK" column needs the draw thread timers (SOTC_DRAW_SPLIT, sotc_stats.h); they add
+    # a clock read per op, so the draw busy numbers of these runs are not comparable with runs from before 1 Nov 2026.
+    'SOTC_DRAW_SPLIT': '1',
+    'SOTC_DRAW_WORK': '1',
 }
 
 
@@ -188,6 +192,7 @@ ROUTE_RE = re.compile(r'SOTC LAB ROUTE done: (\d+) frames, p50 ([\d.]+) ms, p99 
                       r'max ([\d.]+) ms, hitches >33 ms (\d+), >50 ms (\d+), >100 ms (\d+)')
 FPS_RE = re.compile(r'SOTC FPS ([\d.]+) at ([\d.]+)s;')
 DRAW_RE = re.compile(r'SOTC threads per frame: draw busy ([\d.]+) ms')
+DRAW_WORK_RE = re.compile(r'SOTC DRAW WORK: ([\d.]+) ms/frame')  # sotc: SOTC_DRAW_WORK, printed before the FPS line
 DMA_RE = re.compile(r'SOTC DMA sweeps ([\d.]+)/s,.*?; ([\d.]+) ms/s')
 FAULTS_RE = re.compile(r'SOTC WRITE FAULTS: eboot ([\d.]+)/s, bpe heap ([\d.]+)/s, host module ([\d.]+)/s')
 READBACK_RE = re.compile(r'SOTC READBACK RIPS: ([\d.]+) readbacks/s')  # waited for the GPU
@@ -267,6 +272,7 @@ def parse_log(text):
               'warnings': 0, 'warning_samples': [], 'crash': []}
     window = None
     pending_draw = None  # "threads per frame" is printed before the FPS line of its window
+    pending_draw_work = None  # sotc: "SOTC DRAW WORK" likewise
     pool_block = None    # the PC POOL report being read (None before the first one)
     for raw in text.splitlines():
         line = raw.strip()
@@ -283,13 +289,19 @@ def parse_log(text):
         match = FPS_RE.search(line)
         if match:
             window = {'t': float(match.group(2)), 'fps': float(match.group(1)), 'draw': pending_draw,
-                      'dma_ms': None, 'readbacks': None, 'eboot': None, 'bpe': None, 'host': None}
+                      'draw_work': pending_draw_work, 'dma_ms': None, 'readbacks': None, 'eboot': None,
+                      'bpe': None, 'host': None}
             record['windows'].append(window)
             pending_draw = None
+            pending_draw_work = None
             continue
         match = DRAW_RE.search(line)
         if match:
             pending_draw = float(match.group(1))
+            continue
+        match = DRAW_WORK_RE.search(line)
+        if match:
+            pending_draw_work = float(match.group(1))
             continue
         if window is not None:
             match = DMA_RE.search(line)
@@ -334,7 +346,7 @@ def run_stats(record):
     """Averages of one run over its windows after boot."""
     steady = [w for w in record['windows'] if w['t'] > BOOT_WINDOW_S]
     stats = {'windows': len(steady)}
-    for key in ('fps', 'draw', 'dma_ms', 'readbacks', 'eboot', 'bpe', 'host'):
+    for key in ('fps', 'draw', 'draw_work', 'dma_ms', 'readbacks', 'eboot', 'bpe', 'host'):
         stats[key] = mean_or_none([w[key] for w in steady])
     return stats
 
@@ -456,6 +468,7 @@ def aggregate(runs, order):
         row['bpe'] = mean_or_none([r['stats']['bpe'] for r in valid])
         row['host'] = mean_or_none([r['stats']['host'] for r in valid])
         row['draw'] = mean_or_none([r['stats']['draw'] for r in valid])
+        row['draw_work'] = mean_or_none([r['stats']['draw_work'] for r in valid])
         for key in ('div', 'no_extent', 'pool_matches', 'pool_mismatches', 'native_calls', 'would_crash',
                     'committed_mib'):
             row[key] = mean_or_none([r['record']['metrics'][key] for r in valid])
@@ -471,19 +484,22 @@ def summary_markdown(runs, configs, title, notes):
     lines += notes + ['',
                       'Means over the valid runs (the route finished). FPS, readbacks, write faults and '
                       'draw busy average the windows after boot (t > 5 s). p99 and max are the route '
-                      'values, averaged over the runs. Warnings count "SOTC CLASS TRIP" and "disabled '
+                      'values, averaged over the runs. Draw work is the "SOTC DRAW WORK" line (ms per frame, '
+                      'the windows after boot). Warnings count "SOTC CLASS TRIP" and "disabled '
                       'native" lines over every attempt.', '']
     lines += ['## Per configuration', '',
               '| config | valid runs | mean FPS | p99 ms | max ms | readbacks waited/s | '
-              'write faults/s (eboot / bpe heap / host) | draw busy ms | crashes | warnings |',
-              '|---|---|---|---|---|---|---|---|---|---|']
+              'write faults/s (eboot / bpe heap / host) | draw busy ms | draw work ms/frame | crashes | '
+              'warnings |',
+              '|---|---|---|---|---|---|---|---|---|---|---|']
     rows = aggregate(runs, order)
     for row in rows:
         status = f'{row["valid"]}/{row["total"]}' if row['valid'] else f'0/{row["total"]} (route did not run)'
         faults = f'{fmt(row["eboot"], 0)} / {fmt(row["bpe"], 0)} / {fmt(row["host"], 0)}'
         lines.append(f'| {row["config"]} | {status} | {fmt(row["fps"])} | {fmt(row["p99"], 2)} | '
                      f'{fmt(row["max"])} | {fmt(row["readbacks"], 0)} | {faults} | '
-                     f'{fmt(row["draw"], 2)} | {row["crashes"]} | {row["warnings"]} |')
+                     f'{fmt(row["draw"], 2)} | {fmt(row["draw_work"], 2)} | {row["crashes"]} | '
+                     f'{row["warnings"]} |')
     lines += ['', '## Switch metrics (means over the valid runs)', '',
               '| config | valid runs | ring divergent | ring no-extent share % | pool matches | '
               'pool mismatches | native calls (eligible) | would-crash kills | committed MiB | '
@@ -543,10 +559,11 @@ def summary_markdown(runs, configs, title, notes):
 
 
 def window_table(record):
-    lines = ['| t s | FPS | draw ms | DMA ms/s | readbacks/s | eboot/s | bpe heap/s | host module/s |',
-             '|---|---|---|---|---|---|---|---|']
+    lines = ['| t s | FPS | draw ms | draw work ms/frame | DMA ms/s | readbacks/s | eboot/s | bpe heap/s | host module/s |',
+             '|---|---|---|---|---|---|---|---|---|']
     for w in record['windows']:
-        lines.append(f'| {w["t"]:g} | {fmt(w["fps"])} | {fmt(w["draw"], 2)} | {fmt(w["dma_ms"])} | '
+        lines.append(f'| {w["t"]:g} | {fmt(w["fps"])} | {fmt(w["draw"], 2)} | {fmt(w["draw_work"], 2)} | '
+                     f'{fmt(w["dma_ms"])} | '
                      f'{fmt(w["readbacks"], 0)} | {fmt(w["eboot"], 0)} | {fmt(w["bpe"], 0)} | '
                      f'{fmt(w["host"], 0)} |')
     return '\n'.join(lines)

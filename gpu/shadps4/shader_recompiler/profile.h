@@ -60,6 +60,11 @@ struct Profile {
     /// StageDescriptorSet), bindings numbered from 0 in every stage. Sits in the padding byte
     /// after barycentric_via_gs, so the profile keeps its size; the cache check normalizes it.
     bool stage_bindings{};
+    /// sotc: SOTC_BDA: guest buffers that are neither texel nor coherent are read and written
+    /// through physical addresses from BufferType::BdaBlockTable, not through descriptors. Last
+    /// member: it grows the profile to 68 bytes, so the cache check reads a 64-byte profile from
+    /// an older cache as this flag off (vk_pipeline_serialization.cpp).
+    bool bda_buffers{};
 
     bool operator==(const Profile&) const = default;
 };

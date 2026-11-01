@@ -39,6 +39,8 @@
 #include "video_core/sotc_live.h"
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_write_extent.h"
+#include "../../../sotc/rb_host.h" // sotc: SOTC_RB_HOST mirror copies
+#include "video_core/sotc_generation.h" // sotc: SOTC_PR_GEN (per-64 KiB generation sums)
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
@@ -2304,6 +2306,8 @@ struct DirectDispatchGuard {
 } // namespace
 
 void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
+    rb_mirrors.clear(); // sotc: SOTC_RB_HOST=2: collect this dispatch's written result binds
+    rb_mirror_collect = SotcRbHost::Mode() == 2;
     RENDERER_TRACE;
     const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     MdiBreak(); // sotc: SOTC_MDI_STATS
@@ -2468,6 +2472,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    FlushRbMirrors(cmdbuf); // sotc: SOTC_RB_HOST=2
     DebugState.IncDispatch();
     MaybeDumpImages(cs.pgm_hash);
 
@@ -2480,6 +2485,8 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved,
                                   bool use_resolved) {
+    rb_mirrors.clear(); // sotc: SOTC_RB_HOST=2: collect this dispatch's written result binds
+    rb_mirror_collect = SotcRbHost::Mode() == 2;
     RENDERER_TRACE;
     const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDispatchIndirect}; // sotc: SOTC_OP_PHASES
@@ -2550,6 +2557,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    FlushRbMirrors(cmdbuf); // sotc: SOTC_RB_HOST=2
     DebugState.IncDispatch();
     runtime.AccessBuffer(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
                          vk::AccessFlagBits2::eIndirectCommandRead);
@@ -2769,6 +2777,32 @@ static bool SotcPrResolveOn() {
     return on;
 }
 
+// sotc: SOTC_PR_GEN (default 0; 1 use the prepared values while their generation sums hold, 2 also
+// run the inline path and count disagreements). Needs SOTC_PARALLEL_RECORD=1 (the prepared data is
+// produced on the GpuPrep threads) and the generation API (sotc_generation.h) on: without it the
+// sums are meaningless, so the mode is refused. Replaces the runtime-table generation as the
+// per-range validity test; the table generation still gates as well (conservative).
+static u32 SotcPrGenMode() {
+    static const u32 mode = [] {
+        const char* v = std::getenv("SOTC_PR_GEN");
+        const u32 m = v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0u;
+        if (m == 0) {
+            return 0u;
+        }
+        if (m > 2 || !SotcGen::On()) {
+            std::fprintf(stderr, "SOTC_PR_GEN: off, %s\n",
+                         m > 2 ? "the mode is 1 or 2" : "the generation API is not on");
+            return 0u;
+        }
+        return m;
+    }();
+    return mode;
+}
+
+// sotc: SOTC_PR_GEN. A descriptor range longer than this is not prepared (the owner computes it):
+// the draw thread's sum check walks every granule of the range.
+static constexpr u64 kPrGenMaxSpan = 64ULL << 20;
+
 // sotc: SOTC_PR_RESOLVE. FlatForBind rewrites the flat buffer of these stages (TAA resolve, tonemap
 // vignette, vegetation scales, grass patch LOD), so their V#s and T#s are read inline. Keep in sync
 // with FlatForBind; SOTC_PR_VERIFY recomputes the prepared values and catches a drift.
@@ -2804,6 +2838,14 @@ static PrBuffer PrResolveBuffer(const Shader::Info& stage, const Shader::BufferR
     const auto vsharp = desc.GetSharp(stage);
     out.base = vsharp.base_address;
     out.vsize = vsharp.GetSize();
+    if (SotcPrGenMode() != 0) {
+        // sotc: SOTC_PR_GEN: the sum is read before the mapping read below, so a change that lands
+        // after it makes the draw thread's sum differ. Over-long ranges stay with the owner.
+        if (out.vsize > kPrGenMaxSpan) {
+            return out;
+        }
+        out.gen_sum = SotcGen::Sum(out.base, out.vsize);
+    }
     u64 size = 0;
     if (out.base != 0 && out.vsize != 0) {
         size = mem->ClampRangeSize(out.base, out.vsize);
@@ -2838,8 +2880,14 @@ static PrImage PrResolveImage(const Shader::Info& stage, const Shader::ImageReso
     const auto num_fmt = out.tsharp.GetNumberFmt();
     if (out.tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
         out.verdict = 2;
-    } else if (!mem->IsValidGpuMapping(out.tsharp.Address(), 0) ||
-               !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
+        return out;
+    }
+    // sotc: SOTC_PR_GEN: the sum is read before the mapping check (verdicts 1 and 3 use it).
+    if (SotcPrGenMode() != 0) {
+        out.gen_sum = SotcGen::Sum(out.tsharp.Address(), 1);
+    }
+    if (!mem->IsValidGpuMapping(out.tsharp.Address(), 0) ||
+        !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
         out.verdict = 3;
     } else {
         out.verdict = 1;
@@ -2878,6 +2926,57 @@ static bool SamePreparedResources(const PreparedResources& a, const PreparedReso
     }
     return true;
 }
+
+// sotc: SOTC_PR_GEN. True when every range the prep thread recorded still has the sum it read, now
+// (the same arguments; a descriptor the prep thread did not compute has no sum to check).
+static bool PrGenSumsUnchanged(const PreparedResources& pr) {
+    for (u32 i = 0; i < pr.num_buffers; ++i) {
+        const PrBuffer& b = pr.buffers[i];
+        if (b.computed && SotcGen::Sum(b.base, b.vsize) != b.gen_sum) {
+            return false;
+        }
+    }
+    for (u32 i = 0; i < pr.num_images; ++i) {
+        const PrImage& im = pr.images[i];
+        if ((im.verdict == 1 || im.verdict == 3) &&
+            SotcGen::Sum(im.tsharp.Address(), 1) != im.gen_sum) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// sotc: SOTC_PR_GEN counters (draw thread only: BindResources). hits: the prepared values were used.
+// needs_owner: the draw resolved inline because a sum moved or the table generation did (table_gen
+// counts the second case). mismatches: SOTC_PR_GEN=2 only, the prepared values were valid by sum but
+// differ from the owner's computation. Printed every 5 s while the mode is on.
+namespace {
+struct PrGenState {
+    u64 hits{}, needs_owner{}, table_gen{}, mismatches{};
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+PrGenState g_pr_gen;
+void PrGenNote(u32 mode, bool hit, bool needs_owner, bool table_gen, bool mismatch) {
+    auto& s = g_pr_gen;
+    s.hits += hit;
+    s.needs_owner += needs_owner;
+    s.table_gen += table_gen;
+    s.mismatches += mismatch;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s.last < std::chrono::seconds(5)) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "SOTC PR GEN (mode %u): prepared hits %llu, needs-owner %llu (table generation "
+                 "%llu), verify mismatches %llu\n",
+                 mode, static_cast<unsigned long long>(s.hits),
+                 static_cast<unsigned long long>(s.needs_owner),
+                 static_cast<unsigned long long>(s.table_gen),
+                 static_cast<unsigned long long>(s.mismatches));
+    s = PrGenState{};
+    s.last = now;
+}
+} // namespace
 
 // sotc: SOTC_BIND_DIFF=1 (off by default; a measurement). For every fast-bind-eligible draw that
 // misses the fast bind, which of its conditions failed, as a bit mask: the 6-8 most frequent masks
@@ -3200,10 +3299,32 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // sotc: SOTC_PR_RESOLVE: the prepared resource inputs, when they were computed under the table
     // generation this bind sees. Null: every stage resolves inline, as before.
     const PreparedResources* resolved = nullptr;
-    if (prepared && SotcPrResolveOn() && !pr_verify_off) {
+    const u32 pr_gen = SotcPrGenMode(); // sotc: SOTC_PR_GEN (0 off)
+    if (prepared && (SotcPrResolveOn() || pr_gen != 0) && !pr_verify_off) {
         const u64 gen = runtime_memory_generation();
-        if (!(gen & 1) && prepared->resolved.runtime_gen == gen) {
+        const bool table_ok = !(gen & 1) && prepared->resolved.runtime_gen == gen;
+        if (pr_gen == 0) {
+            if (table_ok) {
+                resolved = &prepared->resolved;
+            }
+        } else if (!table_ok) {
+            PrGenNote(pr_gen, false, true, true, false); // sotc: SOTC_PR_GEN: needs-owner
+        } else if (!PrGenSumsUnchanged(prepared->resolved)) {
+            PrGenNote(pr_gen, false, true, false, false); // sotc: a sum moved: needs-owner
+        } else if (pr_gen == 1) {
             resolved = &prepared->resolved;
+            PrGenNote(pr_gen, true, false, false, false);
+        } else {
+            // sotc: SOTC_PR_GEN=2: the owner's own computation is what gets used; the prepared
+            // values are compared with it (both computed from the same sums).
+            PreparedResources fresh{};
+            PrepareResources(static_cast<const GraphicsPipeline*>(pipeline), fresh);
+            const bool same = SamePreparedResources(fresh, prepared->resolved);
+            static std::atomic<u32> shown_gen{0};
+            if (!same && shown_gen.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr, "SOTC PR GEN verify mismatch: the owner resolves inline\n");
+            }
+            PrGenNote(pr_gen, true, false, false, !same);
         }
     }
     for (const auto* stage : pipeline->GetStages()) {
@@ -5200,6 +5321,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data, u32 set, const PreparedResources* pr,
                              const PrStage* pr_stage) {
     const u64 alignment = instance.StorageMinAlignment();
+    // sotc: SOTC_BDA: a stage compiled with the block table gets one per draw (vk_bda_table.h).
+    const bool bda_stage = stage.HasBdaBlockTable();
+    if (bda_stage) {
+        bda_table.Begin(static_cast<u32>(stage.buffers.size()),
+                        buffer_cache.GetStreamBuffer().BufferDeviceAddress());
+        bind_cache_uncacheable = true; // the table is per draw
+    }
     for (const auto& desc : stage.buffers) {
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
@@ -5264,6 +5392,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 std::memset(data, 0, lds_size);
                 lds_buffer.Commit();
                 buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
+            } else if (desc.buffer_type == Shader::BufferType::BdaBlockTable) {
+                // sotc: SOTC_BDA: the stage's block table, last of its buffers, after every guest slot.
+                auto& vk_buffer = buffer_cache.GetStreamBuffer();
+                const u32 table_bytes = static_cast<u32>(bda_table.Bytes());
+                const u64 offset = vk_buffer.Copy(bda_table.Words(), table_bytes, alignment);
+                buffer_infos.emplace_back(vk_buffer.Handle(), offset, table_bytes);
             } else {
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
@@ -5456,8 +5590,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 stage.pgm_hash);
                 }
                 push_data.AddOffset(binding.buffer, adjust);
+                if (bda_stage) { // sotc: SOTC_BDA: exact offset and size, not the aligned ones
+                    bda_table.SetBlock(buf_index,
+                                       buffer->HasBufferDeviceAddress() ? buffer->BufferDeviceAddress() : 0,
+                                       buffer->SizeBytes(), offset, size);
+                }
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
+                if (rb_mirror_collect && desc.is_written && SotcRbHost::Covers(vbase, size)) {
+                    rb_mirrors.push_back({buffer->Handle(), offset, vbase, size}); // sotc: SOTC_RB_HOST=2
+                }
                 if (bind_cache_recording) { // sotc: SOTC_BIND_CACHE checks it is still clean
                     bind_cache_ranges_rec.emplace_back(vbase, size);
                     if (SotcStats::kBindCacheFrame && desc.is_formatted) {
@@ -6222,7 +6364,19 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
                 desc.view_info.range.extent.levels = 1;
             }
 
-            image_id = texture_cache.FindImage(desc);
+            // sotc: SOTC_GEN_TEX (texture_cache FindTextureIdentity): a sampled texture whose T# words,
+            // binding bits, image and guest range generation are as at its last clean bind skips the
+            // FindImage lookup, the overlap scan and the refresh.
+            static_assert(sizeof(tsharp) == 4 * sizeof(u64));
+            VideoCore::TextureCache::TexIdentityKey tkey{};
+            std::memcpy(tkey.words.data(), &tsharp, sizeof(tsharp));
+            tkey.extra = u64{image_desc.is_depth} | u64{image_desc.is_atomic} << 1 |
+                         u64{image_desc.is_array} << 2 | u64{image_desc.is_r128} << 3 |
+                         u64{image_desc.constant_mip_index} << 8 |
+                         u64(image_desc.mip_fallback_mode) << 16 | u64(image_desc.post_op) << 24;
+            image_id = desc.type == VideoCore::TextureCache::BindingType::Texture
+                           ? texture_cache.FindTextureIdentity(tkey, desc).image_id
+                           : texture_cache.FindImage(desc);
             // sotc: SOTC_LOAD_WARM: record the plain single-binding sampled textures for the next
             // load of this area (load_warm.h); storage and mip-fallback binds are not replayed.
             if (SotcLoadWarm::TexturesEnabled() && num_bindings == 1 &&
@@ -7073,6 +7227,16 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     return boost::icl::contains(mapped_ranges, range);
 }
 
+// sotc: SOTC_RB_HOST=2: the GPU copies of this dispatch's written result ranges into their imported guest
+// runs, recorded right after the dispatch; collection stops until the next dispatch binds.
+void Rasterizer::FlushRbMirrors(vk::CommandBuffer cmdbuf) {
+    for (const RbMirror& m : rb_mirrors) {
+        SotcRbHost::RecordMirrorCopy(cmdbuf, m.src, m.src_offset, m.addr, m.size);
+    }
+    rb_mirrors.clear();
+    rb_mirror_collect = false;
+}
+
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
     map_epoch.fetch_add(1, std::memory_order_acq_rel); // sotc: SOTC_PARALLEL_RECORD
     buffer_cache.OnMappingChanged();
@@ -7080,6 +7244,7 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
+    SotcGen::Bump(addr, size); // sotc: SOTC_GEN_BIND / SOTC_PR_GEN: a mapping change moves the generation
 }
 
 void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
@@ -7125,6 +7290,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
+    SotcGen::Bump(addr, size); // sotc: SOTC_GEN_BIND / SOTC_PR_GEN: a mapping change moves the generation
 }
 
 void Rasterizer::PrepareDraw(const AmdGpu::Regs& regs, const Pipeline* resolved, bool is_indexed,
@@ -7173,8 +7339,9 @@ void Rasterizer::PrepareDraw(const AmdGpu::Regs& regs, const Pipeline* resolved,
         }
     }
     out.valid = true;
-    if (SotcPrResolveOn()) {
-        // sotc: SOTC_PR_RESOLVE: after setup_stages (this op's flat copy) and MapEpoch (PrepLoop).
+    if (SotcPrResolveOn() || SotcPrGenMode() != 0) {
+        // sotc: SOTC_PR_RESOLVE / SOTC_PR_GEN: after setup_stages (this op's flat copy) and MapEpoch
+        // (PrepLoop).
         PrepareResources(pipeline, out.resolved);
     }
 }

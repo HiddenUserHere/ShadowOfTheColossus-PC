@@ -29,6 +29,7 @@
 #include "video_core/amdgpu/op_footprint.h" // sotc: SOTC_OP_OVERLAP
 #include "video_core/amdgpu/regs.h"
 #include "video_core/sotc_stats.h" // sotc: SOTC_DROP_FAST counters (CmdRanges::AddNested)
+#include "../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST (label kinds, counters)
 
 namespace Vulkan {
 class Rasterizer;
@@ -974,6 +975,9 @@ private:
         // sotc: SOTC_RB_EXACT=publish latency stamps (stat: a CS_DONE label, see EventWriteEop).
         bool stat{};
         u64 t_cp{}, t_draw{}, t_sub{}, t_gpu{};
+        // sotc: SOTC_LABELS_HONEST / SOTC_PC_RING8_LABELS: the label kind, for the forced counter.
+        // Set where the job is tracked (Ring8Track callers).
+        SotcLabels::Kind label_kind{SotcLabels::Kind::Eop};
     };
     /// Queues a label write (write is the whole SignalFence: value and interrupt) as a scheduler
     /// deferred operation. shadow32/shadow64 publish its value for the CP's own waits. t_cp /
@@ -1019,6 +1023,23 @@ private:
     // such a label queues Ring8Service (ring8_service_requested), which submits the open buffer
     // once when ring8_want_flush is set, lands what the GPU finished, and runs the watchdog.
     bool ring8_labels{};
+    // sotc: SOTC_LABELS_HONEST=1 (needs the draw thread). labels_honest: the switch is on and the
+    // draw thread runs. label_machinery: the deferral rule is live for this process (ring8_labels
+    // and mode 8, or labels_honest). Both read once in the constructor.
+    bool labels_honest{};
+    bool label_machinery{};
+    // Draw thread only (the labels run there). Per queue (0 graphics, 1 compute): HostWriteSeq and
+    // SotcLabels::SharedSeq at the queue's previous label.
+    std::array<u64, 2> label_ring_seq{};
+    std::array<u64, 2> label_shared_seq{};
+    struct LabelDecision {
+        bool defer{};       ///< write the label on the GPU timeline (QueueDeferredLabel)
+        bool pending{};     ///< a rule applied (served write, shared touch, or an outstanding label)
+        bool waited{};      ///< pending and waited on (submit lookahead or learned CP wait): not deferred
+        bool honest_only{}; ///< deferred only because of the shared-touch rule
+    };
+    /// Draw thread. The deferral rule for one label of kind on queue q (liverpool.cpp).
+    LabelDecision LabelDecide(SotcLabels::Kind kind, u32 q, VAddr label, bool waited);
     std::mutex ring8_mutex;
     std::vector<std::shared_ptr<RbxJob>> ring8_jobs;
     std::atomic<bool> ring8_service_requested{false};

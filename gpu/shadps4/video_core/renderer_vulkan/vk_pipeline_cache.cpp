@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 #include "common/elf_info.h"
@@ -32,6 +33,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA profile flag
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -462,6 +464,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // sotc: only with a set per stage fitting the device (MaxStageDescriptorSets).
         .stage_bindings = Shader::StageBindingsEnabled() &&
                           instance.GetMaxBoundDescriptorSets() >= Shader::MaxStageDescriptorSets,
+        .bda_buffers = BdaTableMode(instance) != 0, // sotc: SOTC_BDA (block table, vk_bda_table.h)
     };
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
     // the loading screen on meanwhile.
@@ -889,6 +892,22 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
     }
 }
 
+bool PipelineCache::TryFastLink(std::unique_ptr<GraphicsPipeline>& slot) {
+    if (!GraphicsPipeline::FastLinkable(graphics_key, infos, runtime_infos, profile)) {
+        g_gpl_counters.unlinkable.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    GraphicsPipeline::SerializationSupport sdata{};
+    auto pipe = std::make_unique<GraphicsPipeline>(
+        instance, scheduler, desc_heap, layout_cache, profile, graphics_key, *pipeline_cache,
+        infos, runtime_infos, fetch_shader, modules, sdata, false, false, &gpl_libs);
+    if (!pipe->IsLinked()) {
+        return false;
+    }
+    slot = std::move(pipe);
+    return true;
+}
+
 void PipelineCache::CollectAsyncPipelines() {
     std::vector<std::unique_ptr<AsyncPipelineJob>> done;
     {
@@ -906,6 +925,18 @@ void PipelineCache::CollectAsyncPipelines() {
             continue;
         }
         if (it.value()) {
+            // sotc: SOTC_PIPE_GPL: the optimized build replaces the fast-linked pipeline the draws
+            // were using. The linked one is destroyed once the GPU is past the current tick.
+            if (!job->preloaded && job->pipeline && it.value()->IsLinked()) {
+                auto linked = std::move(it.value());
+                it.value() = std::move(job->pipeline);
+                last_graphics_pipeline = nullptr; // the memo may point at the replaced one
+                RegisterPipelineData(job->key, job->hash, job->sdata);
+                ++num_new_pipelines;
+                g_gpl_counters.replaced.fetch_add(1, std::memory_order_relaxed);
+                scheduler.DeferOperation([p = linked.release()] { delete p; });
+                continue;
+            }
             // A full-screen pass built it on the command processor meanwhile (that one may be
             // in use): the worker's copy is dropped. A remapped job leaves its old blob alone:
             // nothing here checked the pipeline the entry holds.
@@ -1423,6 +1454,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     // built made shadows blink after loads, so they are never skipped: they build here, like the
     // full-screen passes. Their shaders are trivial, so building inline is cheap.
     const bool depth_only = depth_sync && IsDepthOnlyDraw();
+    // sotc: SOTC_PIPE_GPL: a draw that finds no built pipeline is served by a fast-linked one.
+    const bool gpl_on = instance.IsGraphicsPipelineLibrary();
     // sotc: finished translations must be installed before the stages are looked up.
     if (async_done_count.load(std::memory_order_acquire) != 0) {
         CollectAsyncPipelines();
@@ -1454,6 +1487,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         if (memo_mode != 0) {
             g_pipe_memo.graphics_hits.fetch_add(1, std::memory_order_relaxed);
         }
+        if (last_graphics_pipeline->IsLinked()) {
+            g_gpl_counters.linked_served.fetch_add(1, std::memory_order_relaxed);
+        }
         return last_graphics_pipeline;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -1467,8 +1503,20 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     // full-screen pass is not skipped: it builds the pipeline here, and the worker's copy is
     // dropped when collected.
     const bool queued = !is_new && !it->second;
+    if (gpl_on && (is_new || queued)) {
+        g_gpl_counters.cold_misses.fetch_add(1, std::memory_order_relaxed);
+    }
     if (queued && liverpool->regs.num_indices > 6 && !depth_only) {
-        return nullptr;
+        // sotc: SOTC_PIPE_GPL: the draw runs on a fast-linked pipeline; the queued build replaces it
+        // when it is collected (CollectAsyncPipelines).
+        if (!gpl_on || !TryFastLink(it.value())) {
+            return nullptr;
+        }
+        std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
+        last_graphics_pipeline = it->second.get();
+        last_graphics_size = graphics_pipelines.size();
+        g_gpl_counters.linked_served.fetch_add(1, std::memory_order_relaxed);
+        return it->second.get();
     }
     if (is_new || queued) {
         const bool eligible = AsyncPipelineEligible();
@@ -1540,7 +1588,16 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         // freeze on first sight).
         if (!async_workers.empty() && !tiny_draw && !depth_only && eligible && !queued) {
             QueueAsyncPipeline(pipeline_hash, nullptr, depth_draw);
-            return nullptr; // the draws that need it are skipped until it is ready
+            // sotc: SOTC_PIPE_GPL: the draw runs on a fast-linked pipeline now (not registered here:
+            // the optimized build registers when it replaces it).
+            if (!gpl_on || !TryFastLink(it.value())) {
+                return nullptr; // the draws that need it are skipped until it is ready
+            }
+            std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
+            last_graphics_pipeline = it->second.get();
+            last_graphics_size = graphics_pipelines.size();
+            g_gpl_counters.linked_served.fetch_add(1, std::memory_order_relaxed);
+            return it->second.get();
         }
         // sotc: SOTC_TINY_ASYNC. Mode 2 only counts and logs what mode 1 would defer. Mode 1
         // queues a new pipeline at the front of the tiny run (a queued one returned above).
@@ -1690,10 +1747,118 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return result;
 }
 
-bool PipelineCache::RefreshGraphicsKey() {
-    std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
+// sotc: SOTC_PIPE_DIRTY. Unset or 0: the register part of the graphics key is rebuilt on every
+// draw, as before. 1: it is rebuilt only when the registers it reads changed (PipeKeyRegs), else
+// taken from the cached copy. 2: the same, and a draw that would take the cached copy rebuilds it
+// too and counts a different result (the rebuilt key is used).
+static int PipeDirtyMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_PIPE_DIRTY");
+        return v && v[0] == '1' ? 1 : v && v[0] == '2' ? 2 : 0;
+    }();
+    return mode;
+}
+
+namespace {
+// sotc: counters of SOTC_PIPE_DIRTY, printed by ReportPipeDirty.
+struct PipeDirtyStats {
+    std::atomic<u64> key_rebuilt{};    ///< register parts built (mode 1/2)
+    std::atomic<u64> key_skipped{};    ///< register parts taken from the cached copy
+    std::atomic<u64> mismatch_key{};   ///< =2: the cached register part differed from a rebuild
+    std::atomic<u64> flat_refresh{};   ///< flat buffer refreshes of an existing program
+    std::atomic<u64> flat_unchanged{}; ///< of those, the words after the refresh were the same
+    std::atomic<u64> flat_words{};     ///< flat buffer words refreshed (sum)
+};
+PipeDirtyStats g_pipe_dirty;
+} // namespace
+
+// sotc: each register member is copied whole, so its bytes equal the registers' own bytes and a
+// byte compare of the members is exact.
+static_assert(std::is_trivially_copyable_v<PipeKeyRegs>);
+
+template <typename T>
+static bool SameBytes(const T& a, const T& b) {
+    return std::memcmp(&a, &b, sizeof(T)) == 0;
+}
+
+static bool PipeKeyRegsMatch(const AmdGpu::Regs& regs, const PipeKeyRegs& s) {
+    return SameBytes(regs.depth_buffer, s.depth_buffer) &&
+           SameBytes(regs.depth_render_override, s.depth_render_override) &&
+           SameBytes(regs.clipper_control, s.clipper_control) &&
+           SameBytes(regs.polygon_control, s.polygon_control) &&
+           SameBytes(regs.primitive_type, s.primitive_type) &&
+           SameBytes(regs.stage_enable, s.stage_enable) &&
+           SameBytes(regs.ls_hs_config, s.ls_hs_config) &&
+           SameBytes(regs.color_control, s.color_control) &&
+           SameBytes(regs.color_shader_mask, s.color_shader_mask) &&
+           SameBytes(regs.color_target_mask, s.color_target_mask) &&
+           SameBytes(regs.color_export_format, s.color_export_format) &&
+           std::memcmp(regs.color_buffers, s.color_buffers.data(), sizeof(s.color_buffers)) == 0 &&
+           SameBytes(regs.blend_control, s.blend_control);
+}
+
+static void PipeKeyRegsCapture(const AmdGpu::Regs& regs, PipeKeyRegs& s) {
+    std::memcpy(&s.depth_buffer, &regs.depth_buffer, sizeof(s.depth_buffer));
+    std::memcpy(&s.depth_render_override, &regs.depth_render_override,
+                sizeof(s.depth_render_override));
+    std::memcpy(&s.clipper_control, &regs.clipper_control, sizeof(s.clipper_control));
+    std::memcpy(&s.polygon_control, &regs.polygon_control, sizeof(s.polygon_control));
+    std::memcpy(&s.primitive_type, &regs.primitive_type, sizeof(s.primitive_type));
+    std::memcpy(&s.stage_enable, &regs.stage_enable, sizeof(s.stage_enable));
+    std::memcpy(&s.ls_hs_config, &regs.ls_hs_config, sizeof(s.ls_hs_config));
+    std::memcpy(&s.color_control, &regs.color_control, sizeof(s.color_control));
+    std::memcpy(&s.color_shader_mask, &regs.color_shader_mask, sizeof(s.color_shader_mask));
+    std::memcpy(&s.color_target_mask, &regs.color_target_mask, sizeof(s.color_target_mask));
+    std::memcpy(&s.color_export_format, &regs.color_export_format,
+                sizeof(s.color_export_format));
+    std::memcpy(s.color_buffers.data(), regs.color_buffers, sizeof(s.color_buffers));
+    std::memcpy(&s.blend_control, &regs.blend_control, sizeof(s.blend_control));
+}
+
+// sotc: writes a report line for the 5 s report: counts since the previous call, for
+// SOTC_PIPE_DIRTY=1/2. Prints nothing while the switch is off or the window had no work. One
+// thread only.
+void ReportPipeDirty(std::string& out, double seconds) {
+    if (PipeDirtyMode() == 0) {
+        return;
+    }
+    const std::array<const std::atomic<u64>*, 6> counters{
+        &g_pipe_dirty.key_rebuilt,   &g_pipe_dirty.key_skipped,   &g_pipe_dirty.mismatch_key,
+        &g_pipe_dirty.flat_refresh,  &g_pipe_dirty.flat_unchanged, &g_pipe_dirty.flat_words,
+    };
+    static std::array<u64, counters.size()> prev{};
+    std::array<u64, counters.size()> d{};
+    for (std::size_t i = 0; i < d.size(); ++i) {
+        const u64 now = counters[i]->load(std::memory_order_relaxed);
+        d[i] = now - prev[i];
+        prev[i] = now;
+    }
+    const u64 keys = d[0] + d[1];
+    if (keys == 0 && d[3] == 0) {
+        return;
+    }
+    const auto pct = [](u64 part, u64 whole) {
+        return whole ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+    };
+    char line[480];
+    std::snprintf(
+        line, sizeof(line),
+        "SOTC pipe dirty: mode %d, graphics key register part rebuilt %llu, skipped %llu "
+        "(%.0f%%), mismatches %llu; flat buf refreshed %llu, unchanged %llu (%.0f%%), %.0f words "
+        "each, %.1f refreshes/s\n",
+        PipeDirtyMode(), static_cast<unsigned long long>(d[0]),
+        static_cast<unsigned long long>(d[1]), pct(d[1], keys),
+        static_cast<unsigned long long>(d[2]), static_cast<unsigned long long>(d[3]),
+        static_cast<unsigned long long>(d[4]), pct(d[4], d[3]),
+        d[3] ? static_cast<double>(d[5]) / static_cast<double>(d[3]) : 0.0,
+        seconds > 0.0 ? static_cast<double>(d[3]) / seconds : 0.0);
+    out += line;
+}
+
+// sotc: the register part of the graphics key: everything RefreshGraphicsKey derives from the
+// registers before the shader stages are bound. Reads no guest memory and no shader state.
+void PipelineCache::RefreshGraphicsKeyRegs(GraphicsPipelineKey& key) const {
     const auto& regs = liverpool->regs;
-    auto& key = graphics_key;
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
 
@@ -1742,6 +1907,46 @@ bool PipelineCache::RefreshGraphicsKey() {
             bc.color_src_factor == AmdGpu::BlendControl::BlendFactor::SrcColor &&
             bc.color_dst_factor == AmdGpu::BlendControl::BlendFactor::DstColor;
     }
+}
+
+// sotc: SOTC_PIPE_DIRTY=1/2: fills the register part of graphics_key. The cached copy is used
+// while PipeKeyRegs matches the registers; a rebuild refreshes both the copy and the snapshot.
+void PipelineCache::RefreshGraphicsKeyRegsDirty(int mode) {
+    const auto& regs = liverpool->regs;
+    if (pipe_dirty_valid && PipeKeyRegsMatch(regs, pipe_dirty_regs)) {
+        std::memcpy(&graphics_key, &pipe_dirty_key, sizeof(GraphicsPipelineKey));
+        g_pipe_dirty.key_skipped.fetch_add(1, std::memory_order_relaxed);
+        if (mode == 2) {
+            GraphicsPipelineKey fresh{};
+            RefreshGraphicsKeyRegs(fresh);
+            if (std::memcmp(&fresh, &graphics_key, sizeof(GraphicsPipelineKey)) != 0) {
+                g_pipe_dirty.mismatch_key.fetch_add(1, std::memory_order_relaxed);
+                std::memcpy(&graphics_key, &fresh, sizeof(GraphicsPipelineKey));
+                std::memcpy(&pipe_dirty_key, &fresh, sizeof(GraphicsPipelineKey));
+            }
+        }
+        return;
+    }
+    std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
+    RefreshGraphicsKeyRegs(graphics_key);
+    g_pipe_dirty.key_rebuilt.fetch_add(1, std::memory_order_relaxed);
+    PipeKeyRegsCapture(regs, pipe_dirty_regs);
+    std::memcpy(&pipe_dirty_key, &graphics_key, sizeof(GraphicsPipelineKey));
+    pipe_dirty_valid = true;
+}
+
+bool PipelineCache::RefreshGraphicsKey() {
+    const auto& regs = liverpool->regs;
+    auto& key = graphics_key;
+    if (const int dirty_mode = PipeDirtyMode(); dirty_mode != 0) {
+        RefreshGraphicsKeyRegsDirty(dirty_mode);
+    } else {
+        std::memset(&key, 0, sizeof(GraphicsPipelineKey));
+        RefreshGraphicsKeyRegs(key);
+    }
+    const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
+    const bool skip_cb_binding =
+        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
 
     // Compile and bind shader stages
     if (!RefreshGraphicsStages()) {
@@ -2037,7 +2242,22 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     auto& info = program->info;
     info.PgmBase() = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.UserData() = params.user_data;
-    info.RefreshFlatBuf();
+    if (PipeDirtyMode() == 0) {
+        info.RefreshFlatBuf();
+    } else {
+        // sotc: SOTC_PIPE_DIRTY=1/2 counts what the refresh does. The refresh still runs in full:
+        // the flat buffer also holds SRT and sharp table words read from guest memory, which no
+        // register write announces, so a skip needs the memory generation (DRAW-THREAD-DESIGN V1).
+        thread_local std::vector<u32> flat_before;
+        flat_before.assign(info.FlatBuf().begin(), info.FlatBuf().end());
+        info.RefreshFlatBuf();
+        const auto& flat_now = info.FlatBuf();
+        g_pipe_dirty.flat_refresh.fetch_add(1, std::memory_order_relaxed);
+        g_pipe_dirty.flat_words.fetch_add(flat_now.size(), std::memory_order_relaxed);
+        if (std::ranges::equal(flat_before, flat_now)) {
+            g_pipe_dirty.flat_unchanged.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     // sotc: SOTC_PIPE_MEMO=1/2. The flattened buffer, the user data and the fetch code are the
     // memo's inputs. A hit skips the specialization and the search below; the bindings, the fetch
@@ -2261,4 +2481,57 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
     file.Read(code);
     return code;
 }
+// sotc: writes a report line for the 5 s report: counts since the previous call, for
+// SOTC_PIPE_GPL. Prints nothing while the switch is off or the window had no work. One thread only.
+void ReportPipeGpl(std::string& out, double seconds) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_PIPE_GPL");
+        return v && v[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    using L = GplLibraryCache;
+    const auto take = [](const std::atomic<u64>& c, u64& prev) {
+        const u64 now = c.load(std::memory_order_relaxed);
+        const u64 d = now - prev;
+        prev = now;
+        return d;
+    };
+    static u64 p_cold{}, p_unlink{}, p_served{}, p_links{}, p_failed{}, p_link_ns{}, p_repl{};
+    static u64 p_built[L::NumParts]{}, p_reused[L::NumParts]{};
+    const u64 cold = take(g_gpl_counters.cold_misses, p_cold);
+    const u64 unlink = take(g_gpl_counters.unlinkable, p_unlink);
+    const u64 served = take(g_gpl_counters.linked_served, p_served);
+    const u64 links = take(g_gpl_counters.links, p_links);
+    const u64 failed = take(g_gpl_counters.link_failed, p_failed);
+    const u64 link_ns = take(g_gpl_counters.link_ns, p_link_ns);
+    const u64 repl = take(g_gpl_counters.replaced, p_repl);
+    u64 built[L::NumParts]{}, reused[L::NumParts]{};
+    for (u32 i = 0; i < L::NumParts; ++i) {
+        built[i] = take(g_gpl_counters.lib_built[i], p_built[i]);
+        reused[i] = take(g_gpl_counters.lib_reused[i], p_reused[i]);
+    }
+    if (cold == 0 && served == 0 && repl == 0 && failed == 0) {
+        return;
+    }
+    char line[480];
+    std::snprintf(
+        line, sizeof(line),
+        "SOTC pipe gpl: cold misses %llu (not linkable %llu), linked draws %llu, links %llu "
+        "(failed %llu, avg %.2f ms), optimized replacements %llu; libraries built vi %llu pr %llu "
+        "fs %llu fo %llu, reused vi %llu pr %llu fs %llu fo %llu\n",
+        static_cast<unsigned long long>(cold), static_cast<unsigned long long>(unlink),
+        static_cast<unsigned long long>(served), static_cast<unsigned long long>(links),
+        static_cast<unsigned long long>(failed),
+        links ? static_cast<double>(link_ns) / 1e6 / static_cast<double>(links) : 0.0,
+        static_cast<unsigned long long>(repl), static_cast<unsigned long long>(built[0]),
+        static_cast<unsigned long long>(built[1]), static_cast<unsigned long long>(built[2]),
+        static_cast<unsigned long long>(built[3]), static_cast<unsigned long long>(reused[0]),
+        static_cast<unsigned long long>(reused[1]), static_cast<unsigned long long>(reused[2]),
+        static_cast<unsigned long long>(reused[3]));
+    out += line;
+    (void)seconds; // the counts are per window; a rate is the reader's division by the window
+}
+
 } // namespace Vulkan

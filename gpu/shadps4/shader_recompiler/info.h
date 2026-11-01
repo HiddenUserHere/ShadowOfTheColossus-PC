@@ -202,6 +202,16 @@ struct Info : InfoPersistent {
         return data;
     }
 
+    /// sotc: SOTC_BDA: the guest buffers of this shader go through the block table (BdaBlockTable).
+    bool HasBdaBlockTable() const noexcept {
+        for (const auto& buffer : buffers) {
+            if (buffer.buffer_type == BufferType::BdaBlockTable) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// `bindless_samplers`: the samplers come from the heap (UsesBindlessSamplers), so they take no
     /// binding numbers. Must match what the SPIR-V emitter advances the counter by.
     void AddBindings(Backend::Bindings& bnd, bool bindless_samplers = false) const {

@@ -391,6 +391,11 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
 template <u32 N, PointerType alias>
 static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
+    if (spv_buffer.bda) { // sotc: SOTC_BDA
+        const auto& data_types = alias == PointerType::U32 ? ctx.U32 : ctx.F32;
+        const Id zero = alias == PointerType::U32 ? ctx.u32_zero_value : ctx.f32_zero_value;
+        return ctx.BdaLoad(handle, address, 4, data_types[1], zero, data_types[N], N);
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -411,6 +416,9 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
 
 Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
+    if (spv_buffer.bda) { // sotc: SOTC_BDA
+        return ctx.BdaLoad(handle, address, 1, ctx.U8, ctx.u8_zero_value, ctx.U8, 1);
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -422,6 +430,9 @@ Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
 
 Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
+    if (spv_buffer.bda) { // sotc: SOTC_BDA
+        return ctx.BdaLoad(handle, address, 2, ctx.U16, ctx.u16_zero_value, ctx.U16, 1);
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -449,6 +460,9 @@ Id EmitLoadBufferU32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address)
 
 Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
+    if (spv_buffer.bda) { // sotc: SOTC_BDA
+        return ctx.BdaLoad(handle, address, 8, ctx.U64, ctx.u64_zero_value, ctx.U64, 1);
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -482,6 +496,11 @@ template <u32 N, PointerType alias>
 static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address,
                                  Id value) {
     const auto& spv_buffer = ctx.buffers[handle];
+    if (spv_buffer.bda) { // sotc: SOTC_BDA
+        const auto& data_types = alias == PointerType::U32 ? ctx.U32 : ctx.F32;
+        ctx.BdaStore(handle, address, 4, data_types[1], value, N);
+        return;
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -498,6 +517,10 @@ static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, I
 
 void EmitStoreBufferU8(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id value) {
     const auto& spv_buffer = ctx.buffers[handle];
+    if (spv_buffer.bda) { // sotc: SOTC_BDA
+        ctx.BdaStore(handle, address, 1, ctx.U8, value, 1);
+        return;
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -508,6 +531,10 @@ void EmitStoreBufferU8(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id v
 
 void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id value) {
     const auto& spv_buffer = ctx.buffers[handle];
+    if (spv_buffer.bda) { // sotc: SOTC_BDA
+        ctx.BdaStore(handle, address, 2, ctx.U16, value, 1);
+        return;
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -534,6 +561,10 @@ void EmitStoreBufferU32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 
 void EmitStoreBufferU64(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id value) {
     const auto& spv_buffer = ctx.buffers[handle];
+    if (spv_buffer.bda) { // sotc: SOTC_BDA
+        ctx.BdaStore(handle, address, 8, ctx.U64, value, 1);
+        return;
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }

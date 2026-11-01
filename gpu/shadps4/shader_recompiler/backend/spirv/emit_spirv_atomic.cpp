@@ -75,6 +75,18 @@ Id BufferAtomicU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id 
                    Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id)) {
     const auto& buffer = ctx.buffers[handle];
     const Id type = is_float ? ctx.F32[1] : ctx.U32[1];
+    if (buffer.bda) { // sotc: SOTC_BDA: out of range, the atomic is skipped and yields zero
+        const auto [byte_address, valid] = ctx.BdaAddress(handle, address, 4, 1);
+        const Id header = ctx.last_label;
+        const Id merge = ctx.BdaBeginIf(valid);
+        const Id ptr = ctx.BdaPointer(byte_address, type);
+        const auto [scope, semantics]{AtomicArgs(ctx)};
+        const Id result = (ctx.*atomic_func)(type, ptr, scope, semantics, value);
+        const Id then_end = ctx.last_label;
+        ctx.BdaEndIf(merge);
+        return ctx.OpPhi(type, result, then_end, is_float ? ctx.f32_zero_value : ctx.u32_zero_value,
+                         header);
+    }
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -87,6 +99,17 @@ Id BufferAtomicU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id 
 Id BufferAtomicU32IncDec(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address,
                          Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id)) {
     const auto& buffer = ctx.buffers[handle];
+    if (buffer.bda) { // sotc: SOTC_BDA
+        const auto [byte_address, valid] = ctx.BdaAddress(handle, address, 4, 1);
+        const Id header = ctx.last_label;
+        const Id merge = ctx.BdaBeginIf(valid);
+        const Id ptr = ctx.BdaPointer(byte_address, ctx.U32[1]);
+        const auto [scope, semantics]{AtomicArgs(ctx)};
+        const Id result = (ctx.*atomic_func)(ctx.U32[1], ptr, scope, semantics);
+        const Id then_end = ctx.last_label;
+        ctx.BdaEndIf(merge);
+        return ctx.OpPhi(ctx.U32[1], result, then_end, ctx.u32_zero_value, header);
+    }
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -100,6 +123,18 @@ Id BufferAtomicU32CmpSwap(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
                           Id cmp_value,
                           Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id, Id, Id)) {
     const auto& buffer = ctx.buffers[handle];
+    if (buffer.bda) { // sotc: SOTC_BDA
+        const auto [byte_address, valid] = ctx.BdaAddress(handle, address, 4, 1);
+        const Id header = ctx.last_label;
+        const Id merge = ctx.BdaBeginIf(valid);
+        const Id ptr = ctx.BdaPointer(byte_address, ctx.U32[1]);
+        const auto [scope, semantics]{AtomicArgs(ctx)};
+        const Id result =
+            (ctx.*atomic_func)(ctx.U32[1], ptr, scope, semantics, semantics, value, cmp_value);
+        const Id then_end = ctx.last_label;
+        ctx.BdaEndIf(merge);
+        return ctx.OpPhi(ctx.U32[1], result, then_end, ctx.u32_zero_value, header);
+    }
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -112,6 +147,17 @@ Id BufferAtomicU32CmpSwap(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 Id BufferAtomicU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
                    Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id)) {
     const auto& buffer = ctx.buffers[handle];
+    if (buffer.bda) { // sotc: SOTC_BDA
+        const auto [byte_address, valid] = ctx.BdaAddress(handle, address, 8, 1);
+        const Id header = ctx.last_label;
+        const Id merge = ctx.BdaBeginIf(valid);
+        const Id ptr = ctx.BdaPointer(byte_address, ctx.U64);
+        const auto [scope, semantics]{AtomicArgs(ctx)};
+        const Id result = (ctx.*atomic_func)(ctx.U64, ptr, scope, semantics, value);
+        const Id then_end = ctx.last_label;
+        ctx.BdaEndIf(merge);
+        return ctx.OpPhi(ctx.U64, result, then_end, ctx.u64_zero_value, header);
+    }
     if (const Id offset = buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }

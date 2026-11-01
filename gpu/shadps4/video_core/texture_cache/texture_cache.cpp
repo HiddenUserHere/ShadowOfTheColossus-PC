@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_adaptive.h"
+#include "video_core/sotc_generation.h" // sotc: SOTC_GEN_TEX (guest range generations)
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM (upload budget)
 #include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM (records and replay)
 #include "../../../sotc/rt_class.h" // sotc: SOTC_RT_CLASS (render targets in RTAllocator blocks)
@@ -210,9 +211,29 @@ void ReentrantMutex::AsymmetricBarrier() {
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
+// sotc: SOTC_GEN_TEX. The generation tracking is read once; every texture-side change of guest
+// memory or of an image's contents bumps it, so a guest range's Sum moves when the texture side
+// touches it (uploads, GPU writes into an image, unregistration, GPU write-back, invalidations).
+static bool GenOn() {
+    static const bool on = SotcGen::On();
+    return on;
+}
+static void GenBump(VAddr addr, u64 size) {
+    if (size != 0 && GenOn()) {
+        SotcGen::Bump(addr, size);
+    }
+}
+static void GenBumpImage(const Image& image) {
+    GenBump(image.info.guest_address, image.info.guest_size);
+}
+static u64 GenSumImage(const Image& image) {
+    return GenOn() ? SotcGen::Sum(image.info.guest_address, image.info.guest_size) : 0;
+}
+
 /// Writes downloaded image data back to guest memory, leaving out guest stack pages (never
 /// protected, the CPU may hold newer data there).
 static void WriteBackSkippingStacks(VAddr guest_address, const u8* data, u64 size) {
+    GenBump(guest_address, size); // sotc: SOTC_GEN_TEX, the GPU wrote this guest range
     ForEachNonStackRange(guest_address, size, [&](VAddr addr, u64 part) {
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(addr),
                                                   data + (addr - guest_address), part, 3);
@@ -236,6 +257,12 @@ static bool RtClassSkipTrack(const Image& image) {
            False(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty));
 }
 
+// sotc: SOTC_RT_CLASS=1: an image in an RTAllocator block is never downloaded (DownloadImageMemory
+// returns before the copy), so it is not queued for one either.
+static bool RtClassNeverDownloads(const Image& image) {
+    return SotcRtClass::Mode() == 1 && InRtBlock(image);
+}
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                            BufferCache& buffer_cache_, PageManager& tracker_)
@@ -254,6 +281,10 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     } else if (SotcAreaPrewarm::Mode() >= 3) {
         LOG_WARNING(Render_Vulkan, "SOTC_AREA_PREWARM=3 needs SOTC_ASYNC_IMAGE_CREATE=1: "
                                    "areas are recorded but not replayed");
+    }
+
+    if (TexIdentityMode() != 0) { // sotc: SOTC_GEN_TEX identity memo (FindTextureIdentity)
+        tex_id_memos = std::make_unique<std::array<TexIdMemo, NumTexIdMemos>>();
     }
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
@@ -457,6 +488,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
+        GenBumpImage(image); // sotc: SOTC_GEN_TEX, a guest write reached this image's range
         // sotc: SOTC_RT_CLASS: a CPU write reached a render target in an RTAllocator block (it should
         // not). The normal path below runs; mode 1 counts it as a fallback.
         if (InRtBlock(image)) {
@@ -526,6 +558,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         ForEachImageInRegion(address, max_size, [&](ImageId, Image& image) {
             if (image.Overlaps(address, max_size)) {
                 image.flags |= ImageFlagBits::GpuDirty;
+                GenBumpImage(image); // sotc: SOTC_GEN_TEX
             }
         });
         return;
@@ -541,6 +574,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        GenBumpImage(image); // sotc: SOTC_GEN_TEX
     });
 }
 
@@ -836,6 +870,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         // Size and resources are greater, expand the image.
         if (image_info.type == cache_image.info.type &&
             image_info.resources > cache_image.info.resources) {
+            // sotc: SOTC_RT_MAXEXTENT: a render or depth target expands to its family's layers.
+            if (RtMaxExtentMode() != 0 && IsRtTarget(binding)) {
+                return {ExpandRt(image_info, cache_image_id), -1, -1};
+            }
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -1178,6 +1216,113 @@ static bool ReplayRecordKnown(const SotcAreaPrewarm::ImageRecord& rec) {
     return std::find(misc_formats.begin(), misc_formats.end(), format) != misc_formats.end();
 }
 
+// sotc: SOTC_RT_MAXEXTENT (T1). The counters are per report window (ReportRtMaxExtent).
+static std::atomic<u64> rt_max_created{};   // images created with the family's layer count
+static std::atomic<u64> rt_expands{};       // render/depth target expansions (ExpandRt)
+static std::atomic<u64> rt_expand_avoided{}; // requests the old path would have expanded for
+static std::atomic<u64> rt_view_larger{};   // requests served by an image larger than them
+static std::atomic<u64> rt_fallbacks{};     // the table could not be applied: old path taken
+
+int TextureCache::RtMaxExtentMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_RT_MAXEXTENT");
+        return v && v[0] == '1' ? 1 : 0;
+    }();
+    return mode;
+}
+
+TextureCache::RtFamily TextureCache::RtFamilyOf(const ImageInfo& info) {
+    RtFamily f{};
+    f.address = info.guest_address;
+    f.stencil_addr = info.stencil_addr;
+    f.stencil_size = info.stencil_size;
+    f.pitch = info.pitch;
+    f.width = info.size.width;
+    f.height = info.size.height;
+    f.depth = info.size.depth;
+    f.levels = info.resources.levels;
+    f.num_bits = info.num_bits;
+    f.num_samples = info.num_samples;
+    f.flags = u32(info.props.is_volume) | u32(info.props.is_tiled) << 1 |
+              u32(info.props.is_pow2) << 2 | u32(info.props.is_block) << 3 |
+              u32(info.props.is_depth) << 4 | u32(info.props.has_stencil) << 5;
+    f.pixel_format = info.pixel_format;
+    f.type = info.type;
+    f.tile_mode = info.tile_mode;
+    f.array_mode = info.array_mode;
+    f.alt_tile = info.alt_tile;
+    return f;
+}
+
+ImageInfo TextureCache::RtRaiseLayers(const ImageInfo& info, bool& raised) {
+    raised = false;
+    const auto it = rt_extents.find(RtFamilyOf(info));
+    if (it == rt_extents.end() || it->second.max_layers <= info.resources.layers) {
+        return info;
+    }
+    // The render target constructors set guest_size to the slice size times the layers, so the
+    // scaled size is exact. Anything else is not proven: the request's own info.
+    const u32 layers = info.resources.layers;
+    if (layers == 0 || info.resources.levels != 1 || info.guest_size % layers != 0) {
+        rt_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return info;
+    }
+    ImageInfo out = info;
+    out.resources.layers = it->second.max_layers;
+    out.guest_size = info.guest_size / layers * out.resources.layers;
+    out.mips_layout[0].size = out.guest_size;
+    raised = true;
+    return out;
+}
+
+void TextureCache::RtNoteImage(const ImageInfo& request, u32 first_layers, u32 max_layers,
+                               ImageId image_id) {
+    const RtFamily family = RtFamilyOf(request);
+    auto it = rt_extents.find(family);
+    if (it == rt_extents.end()) {
+        if (rt_extents.size() >= MaxRtFamilies) {
+            rt_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        it = rt_extents.emplace(family, RtExtentEntry{}).first;
+    }
+    RtExtentEntry& entry = it->second;
+    entry.max_layers = std::max(entry.max_layers, max_layers);
+    entry.first_layers = first_layers;
+    entry.image_id = image_id;
+    entry.image_uid = slot_images[image_id].image_uid;
+}
+
+void TextureCache::RtNoteServed(const ImageInfo& info, ImageId image_id) {
+    const Image& image = slot_images[image_id];
+    if (image.info.guest_size > info.guest_size) {
+        rt_view_larger.fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto it = rt_extents.find(RtFamilyOf(info));
+    if (it == rt_extents.end()) {
+        return;
+    }
+    RtExtentEntry& entry = it->second;
+    if (entry.image_id != image_id || entry.image_uid != image.image_uid) {
+        return;
+    }
+    // The old path's image of this family has `first_layers` layers: a request with more would
+    // have expanded it once. Afterwards that image has the request's layers, as it does here.
+    if (info.resources.layers > entry.first_layers) {
+        rt_expand_avoided.fetch_add(1, std::memory_order_relaxed);
+        entry.first_layers = info.resources.layers;
+    }
+}
+
+ImageId TextureCache::ExpandRt(const ImageInfo& info, ImageId image_id) {
+    bool raised = false;
+    const ImageInfo expand_info = RtRaiseLayers(info, raised);
+    const ImageId expanded = ExpandImage(expand_info, image_id);
+    rt_expands.fetch_add(1, std::memory_order_relaxed);
+    RtNoteImage(info, info.resources.layers, expand_info.resources.layers, expanded);
+    return expanded;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     // sotc: SOTC_TRACE (kept when over 20 us: a new image, a resolve, an overlap)
@@ -1204,6 +1349,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         TouchImage(image);
         if (tail_candidate) {
             SetMipTailView(desc, -1);
+        }
+        if (RtMaxExtentMode() != 0 && IsRtTarget(desc.type)) { // sotc: SOTC_RT_MAXEXTENT
+            RtNoteServed(info, memo_id);
         }
         return memo_id;
     }
@@ -1286,7 +1434,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
     }
     // Create and register a new image
+    bool rt_created = false; // sotc: SOTC_RT_MAXEXTENT: this call created the image
     if (!image_id) {
+        rt_created = true;
         const SotcStats::ScopedTimer stall_timer{SotcStats::image_ns};
         // sotc: SOTC_UNMAP_PARK (C5): an image UnmapMemory parked at this address with the same
         // shape is re-armed instead (UnparkImage registers it); mode 2 only counts the match.
@@ -1298,8 +1448,21 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
         if (!image_id) {
             SotcStats::images_new.fetch_add(1, std::memory_order_relaxed);
-            image_id = slot_images.insert(instance, runtime, slot_image_views, info);
-            RegisterImage(image_id);
+            // sotc: SOTC_RT_MAXEXTENT: a render or depth target is created with the layers its
+            // family has been seen with (RtRaiseLayers); the request's own layers are noted.
+            if (RtMaxExtentMode() != 0 && IsRtTarget(desc.type)) {
+                bool raised = false;
+                const ImageInfo create_info = RtRaiseLayers(info, raised);
+                image_id = slot_images.insert(instance, runtime, slot_image_views, create_info);
+                RegisterImage(image_id);
+                RtNoteImage(info, info.resources.layers, create_info.resources.layers, image_id);
+                if (raised) {
+                    rt_max_created.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+                RegisterImage(image_id);
+            }
             // sotc: SOTC_LOAD_WARM + SOTC_TRACE: which first-frame textures the warm created.
             if (SotcLoadWarm::Enabled()) {
                 const bool warm = SotcLoadWarm::InWarm();
@@ -1327,6 +1490,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         TraceWarmTex("tex warm hit", image.info.guest_address, image.info.guest_size);
     }
 
+    if (!rt_created && RtMaxExtentMode() != 0 && IsRtTarget(desc.type)) { // sotc: SOTC_RT_MAXEXTENT
+        RtNoteServed(info, image_id);
+    }
+
     // If the image requested is a subresource of the image from cache record its location.
     if (tail_candidate) {
         SetMipTailView(desc, view_mip);
@@ -1338,6 +1505,220 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     return image_id;
+}
+
+// sotc: SOTC_GEN_TEX counters (FindTextureIdentity), reset by ReportTexIdentity.
+static std::atomic<u64> tid_lookups{};
+static std::atomic<u64> tid_bypass{};
+static std::atomic<u64> tid_hits{};
+static std::atomic<u64> tid_stores{};
+static std::atomic<u64> tid_not_stored{};
+static std::atomic<u64> tid_miss_key{};
+static std::atomic<u64> tid_miss_epoch{};
+static std::atomic<u64> tid_miss_state{};
+static std::atomic<u64> tid_miss_sum{};
+static std::atomic<u64> tid_verified{};
+static std::atomic<u64> tid_mismatch{};
+
+int TextureCache::TexIdentityMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_GEN_TEX");
+        const int m = v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+        if (m != 0 && !GenOn()) {
+            LOG_WARNING(Render_Vulkan, "SOTC_GEN_TEX={} ignored: the generation tracking is off", m);
+            return 0;
+        }
+        return m;
+    }();
+    return mode;
+}
+
+static u64 TexIdentityHash(const TextureCache::TexIdentityKey& key) {
+    u64 h = 0x9E3779B97F4A7C15ULL ^ key.extra;
+    for (const u64 word : key.words) {
+        h = (h ^ word) * 0xC2B2AE3D27D4EB4FULL;
+        h ^= h >> 29;
+    }
+    return h ^ (h >> 32);
+}
+
+TextureCache::TexBind TextureCache::FindTextureIdentity(const TexIdentityKey& key, ImageDesc& desc,
+                                                        bool exact_fmt) {
+    const int mode = TexIdentityMode();
+    if (mode == 0 || desc.type != BindingType::Texture || desc.rebase_mip != 0 || !tex_id_memos) {
+        if (mode != 0 && desc.type == BindingType::Texture) { // a mip-tail candidate: never memoized
+            tid_bypass.fetch_add(1, std::memory_order_relaxed);
+        }
+        const ImageId image_id = FindImage(desc, exact_fmt);
+        return {image_id, &FindTexture(image_id, desc)};
+    }
+    tid_lookups.fetch_add(1, std::memory_order_relaxed);
+    TexIdMemo& slot = (*tex_id_memos)[TexIdentityHash(key) % NumTexIdMemos];
+    // The view info as the caller built it: a caller may adjust it per binding (DynamicIndex mip
+    // fallback adds the binding index), which the key does not carry.
+    const ImageViewInfo pre_view_info = desc.view_info;
+
+    // 0: hit. 1: no entry for this key. 2: the image set or an ImageInfo moved (tex_epoch). 3: the
+    // image is not in a state the memo may answer for. 4: its guest range changed (Sum).
+    // Caller holds `mutex`.
+    const auto check = [&](const TexIdMemo& m) -> int {
+        if (!m.valid || !(m.key == key) || m.exact_fmt != exact_fmt ||
+            !(m.pre_view_info == pre_view_info)) {
+            return 1;
+        }
+        if (m.epoch != tex_epoch) {
+            return 2;
+        }
+        const Image& image = slot_images[m.image_id];
+        const VAddr begin = image.info.guest_address;
+        const u64 size = image.info.guest_size;
+        if (image.image_uid != m.image_uid || False(image.flags & ImageFlagBits::Registered) ||
+            True(image.flags & ImageFlagBits::Dirty) || image.sotc_warm_pending ||
+            image.info.sotc_first_mip || image.track_addr != begin ||
+            image.track_addr_end != begin + size) {
+            return 3;
+        }
+        return GenSumImage(image) == m.sum ? 0 : 4;
+    };
+    // The memo's answer, as FindImage + FindTexture give it: the view info the overlap resolution
+    // left, the image touched as a lookup touches it, and the bind's GPU-bind evidence (UpdateImage).
+    // Caller holds `mutex`.
+    const auto apply = [&](ImageDesc& d, const TexIdMemo& m) {
+        Image& image = slot_images[m.image_id];
+        FlushTexProtect(); // as the refresh on the full path does first
+        image.tick_prev_accessed = image.tick_accessed_last;
+        image.tick_accessed_last = scheduler.CurrentTick();
+        TouchImage(image);
+        if (SotcMemClasses::On() && SotcStats::t_draw_thread) {
+            SotcMemClasses::NoteGpuBind(image.info.guest_address, image.info.guest_size);
+        }
+        if (SotcPcPlaceGlue::On()) {
+            SotcPcPlaceGlue::Global().OnGpuBind(image.info.guest_address, image.info.guest_size);
+        }
+        d.view_info = m.view_info;
+        return TexBind{m.image_id, &image.FindView(d.view_info)};
+    };
+
+    TexIdMemo memo{};
+    int code = 1;
+    {
+        std::unique_lock lock{mutex, std::defer_lock};
+        LockCounted(lock);
+        code = check(slot);
+        if (code == 0) {
+            memo = slot; // a copy: the full path below may store over this entry
+        }
+    }
+    if (code == 0 && mode == 1) {
+        tid_hits.fetch_add(1, std::memory_order_relaxed);
+        std::unique_lock lock{mutex, std::defer_lock};
+        LockCounted(lock);
+        return apply(desc, memo);
+    }
+
+    TexBind predicted{};
+    ImageViewInfo predicted_view_info{};
+    if (code == 0) { // mode 2: the memo's answer on a copy, then the full path on `desc`
+        tid_hits.fetch_add(1, std::memory_order_relaxed);
+        tid_verified.fetch_add(1, std::memory_order_relaxed);
+        ImageDesc probe = desc;
+        std::unique_lock lock{mutex, std::defer_lock};
+        LockCounted(lock);
+        predicted = apply(probe, memo);
+        predicted_view_info = probe.view_info;
+    } else {
+        switch (code) {
+        case 1: tid_miss_key.fetch_add(1, std::memory_order_relaxed); break;
+        case 2: tid_miss_epoch.fetch_add(1, std::memory_order_relaxed); break;
+        case 3: tid_miss_state.fetch_add(1, std::memory_order_relaxed); break;
+        default: tid_miss_sum.fetch_add(1, std::memory_order_relaxed); break;
+        }
+    }
+
+    const ImageId image_id = FindImage(desc, exact_fmt);
+    ImageView& view = FindTexture(image_id, desc);
+    if (code == 0 && (predicted.image_id != image_id || predicted.view != &view ||
+                      predicted_view_info != desc.view_info)) {
+        tid_mismatch.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Store what the full path resolved, when the image is clean now: registered, fully tracked
+    // (so a CPU write still faults), not a warm or tail image. The Sum is taken after the refresh,
+    // which bumped it (RefreshImage); a CPU write during the refresh leaves the image dirty.
+    {
+        std::unique_lock lock{mutex, std::defer_lock};
+        LockCounted(lock);
+        const Image& image = slot_images[image_id];
+        const VAddr begin = image.info.guest_address;
+        const u64 size = image.info.guest_size;
+        if (False(image.flags & ImageFlagBits::Registered) ||
+            True(image.flags & ImageFlagBits::Dirty) || image.sotc_warm_pending ||
+            image.info.sotc_first_mip || image.track_addr != begin ||
+            image.track_addr_end != begin + size) {
+            tid_not_stored.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            slot.key = key;
+            slot.exact_fmt = exact_fmt;
+            slot.valid = true;
+            slot.image_id = image_id;
+            slot.image_uid = image.image_uid;
+            slot.pre_view_info = pre_view_info;
+            slot.view_info = desc.view_info;
+            slot.epoch = tex_epoch;
+            slot.sum = GenSumImage(image);
+            tid_stores.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return {image_id, &view};
+}
+
+void TextureCache::ReportTexIdentity(std::string& out, double seconds) {
+    const int mode = TexIdentityMode();
+    if (mode == 0) {
+        return;
+    }
+    const auto take = [](std::atomic<u64>& counter) {
+        return counter.exchange(0, std::memory_order_relaxed);
+    };
+    const u64 lookups = take(tid_lookups);
+    const u64 hits = take(tid_hits);
+    char line[700];
+    std::snprintf(
+        line, sizeof line,
+        "SOTC TEX IDENTITY: mode %d, over %.1f s: lookups %llu, hits %llu (%.1f%%), bypass %llu "
+        "(mip-tail candidates), stores %llu, not stored %llu; misses: no entry %llu, set moved "
+        "%llu, image state %llu, range changed %llu; verify %llu, mismatches %llu\n",
+        mode, seconds, static_cast<unsigned long long>(lookups),
+        static_cast<unsigned long long>(hits), lookups ? 100.0 * double(hits) / double(lookups) : 0.0,
+        static_cast<unsigned long long>(take(tid_bypass)),
+        static_cast<unsigned long long>(take(tid_stores)),
+        static_cast<unsigned long long>(take(tid_not_stored)),
+        static_cast<unsigned long long>(take(tid_miss_key)),
+        static_cast<unsigned long long>(take(tid_miss_epoch)),
+        static_cast<unsigned long long>(take(tid_miss_state)),
+        static_cast<unsigned long long>(take(tid_miss_sum)),
+        static_cast<unsigned long long>(take(tid_verified)),
+        static_cast<unsigned long long>(take(tid_mismatch)));
+    out += line;
+}
+
+void TextureCache::ReportRtMaxExtent(std::string& out, double seconds) {
+    if (RtMaxExtentMode() == 0) {
+        return;
+    }
+    const auto take = [](std::atomic<u64>& counter) {
+        return counter.exchange(0, std::memory_order_relaxed);
+    };
+    char line[400];
+    std::snprintf(line, sizeof line,
+                  "SOTC RT MAXEXTENT: mode 1, over %.1f s: max-extent creations %llu, expands "
+                  "%llu, expands avoided %llu, views from a larger image %llu, fallbacks %llu\n",
+                  seconds, static_cast<unsigned long long>(take(rt_max_created)),
+                  static_cast<unsigned long long>(take(rt_expands)),
+                  static_cast<unsigned long long>(take(rt_expand_avoided)),
+                  static_cast<unsigned long long>(take(rt_view_larger)),
+                  static_cast<unsigned long long>(take(rt_fallbacks)));
+    out += line;
 }
 
 // sotc: SOTC_LOAD_WARM + SOTC_TRACE instants (a = bytes, b = guest address): "tex new" (a real
@@ -1536,8 +1917,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         MarkWritten(image);
+        // sotc: SOTC_RT_CLASS=1: a render target's download is never done, so it is not queued.
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
-            image.info.guest_address != 0) {
+            image.info.guest_address != 0 && !RtClassNeverDownloads(image)) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
         }
@@ -1550,7 +1932,9 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
                                           bool update) {
     Image& image = slot_images[image_id];
     MarkWritten(image);
-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+    // sotc: SOTC_RT_CLASS=1: a render target's download is never done, so it is not queued.
+    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+        !RtClassNeverDownloads(image)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }
@@ -1751,6 +2135,7 @@ void TextureCache::RefreshImage(Image& image) {
         image.hash = hash;
     }
 
+    GenBumpImage(image); // sotc: SOTC_GEN_TEX, the image's contents are rewritten from guest memory
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
@@ -2285,6 +2670,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
         image_registers.fetch_add(1, std::memory_order_relaxed);
     }
     ++image_set_generation;
+    ++tex_epoch; // sotc: SOTC_GEN_TEX identity memo (the image set moved)
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     if (SotcStats::kBindCacheFrame) { // sotc: the range form of the generation, see ImageChangedSince
         image_stamps.Note(image.info.guest_address - image.info.sotc_dropped_bytes,
@@ -2311,6 +2697,8 @@ void TextureCache::UnregisterImage(ImageId image_id) {
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
     ++image_set_generation;
+    ++tex_epoch; // sotc: SOTC_GEN_TEX identity memo (the image set moved)
+    GenBumpImage(image); // sotc: SOTC_GEN_TEX, the image's range is no longer texture-side data
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     if (SotcStats::kBindCacheFrame) { // sotc: the range form of the generation, see ImageChangedSince
         image_stamps.Note(image.info.guest_address - image.info.sotc_dropped_bytes,
@@ -3075,6 +3463,7 @@ bool TextureCache::DecideRebase(ImageDesc& desc, bool exact_fmt) {
 }
 
 void TextureCache::MipTailCreated(ImageId image_id, const ImageDesc& desc) {
+    ++tex_epoch; // sotc: SOTC_GEN_TEX, a tail is an alias of its chain
     Image& image = slot_images[image_id];
     const ImageInfo& info = image.info;
     if (info.sotc_first_mip) {
@@ -3124,6 +3513,7 @@ void TextureCache::FreeRebased(ImageId image_id, std::atomic<std::uint64_t>& cou
 }
 
 void TextureCache::MarkWritten(Image& image) {
+    GenBumpImage(image); // sotc: SOTC_GEN_TEX, the GPU writes this image (every write, not the first)
     // sotc: the writer's FindImage freed the mip tails it overlapped, but another binding of the
     // same draw can create one after it. On an image's first GPU write over a tail, memoized
     // tail decisions are made again (they refuse GPU-written overlaps). Writes found otherwise
