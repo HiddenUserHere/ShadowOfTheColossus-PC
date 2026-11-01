@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: PC-native write announces (docs/re-stutters/native/PLAN.md N2, declarations in
-// scripts/hooks.d/native_writes.py, switch SOTC_NATIVE). Every hook is a Site hook placed after the
-// engine finished a write (or before a release), so the announce always follows the copy. Handlers only
-// read registers and the guest words they name, then call SotcNative::Announce / Release (native.h).
-// Every handler returns Continue: the displaced instruction runs next, unchanged.
+// scripts/hooks.d/native_writes.py, switch SOTC_NATIVE). Every hook sits after the engine finished a write (or
+// before a release): Entry hooks on submits and creators read the arguments the writer already filled, Wrap
+// hooks announce in the post phase, Site hooks sit after the store. Handlers only read registers and the guest
+// words they name, then call SotcNative::Announce / Release / NoteDescriptor (native.h). Every handler returns
+// Continue: the displaced instructions or the function body run next, unchanged.
 
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "../hooks.h"
 #include "native.h"
@@ -25,18 +28,84 @@ namespace {
 using SotcHooks::GuestRegs;
 using SotcHooks::HookAction;
 
-// Reads a guest u32; 0 when the address is unmapped (the announce is then skipped).
-uint32_t GuestU32(uint64_t address) {
+constexpr uint64_t kMaxRange = 64ull << 20; // a single announced range above this is treated as a bad read
+
+// Reads a guest word; 0 when the address is unmapped (the announce is then skipped).
+template <typename T>
+T GuestRead(uint64_t address) {
     const unsigned char* p = runtime_memory_backing_pointer(static_cast<uintptr_t>(address));
-    if (!p) {
-        return 0;
+    T value{};
+    if (p) {
+        std::memcpy(&value, p, sizeof(value));
     }
-    uint32_t value = 0;
-    std::memcpy(&value, p, sizeof(value));
     return value;
+}
+uint64_t GuestU64(uint64_t address) {
+    return GuestRead<uint64_t>(address);
+}
+uint32_t GuestU32(uint64_t address) {
+    return GuestRead<uint32_t>(address);
+}
+
+// Caller filters: image offsets (EU 1.01) of the functions whose calls the GPU reads. A call from any other
+// function is not announced (the 0x8c0d0 and 0x8be60 callers include many CPU-only users).
+struct Span {
+    uint32_t begin, end;
+};
+
+// Zero-copy (flag 0x800) creators: the per-frame particle and BPXPR builders, the 0x94fb0 draw buffers and the
+// 0x198bb0 writer (heaps.md 7.4).
+constexpr Span kZeroCopyCallers[] = {
+    {0xffe60, 0xfff9e},   {0x19b760, 0x19c193}, {0x19c1a0, 0x19c732}, {0x19c7e0, 0x19ce60},
+    {0x94fb0, 0x95313},   {0x198bb0, 0x19a1c4},
+};
+
+// The per-frame chunk writers of 0x8c0d0 (heaps.md 7.5: the 27 callers that memcpy into a chunk), the instance
+// writers 0x11c710 and 0x123410, and EndFrameView_WriteA 0x8b7f0 (struct stores into a chunk).
+constexpr Span kChunkCallers[] = {
+    {0xb6e20, 0xb8c58},   {0x1371e0, 0x13758b}, {0xdd7c0, 0xddadd},   {0xddc90, 0xddf77},
+    {0xdf300, 0xdf624},   {0xdf7e0, 0xdfad4},   {0x109ca0, 0x10a4fd}, {0x133fb0, 0x1342cb},
+    {0x17c6c0, 0x17caba}, {0x186df0, 0x187196}, {0x18d6f0, 0x18e10d}, {0x18e3d0, 0x18e920},
+    {0x18ed40, 0x18f823}, {0x18f8a0, 0x18fc6b}, {0x18fc70, 0x1905a9}, {0x190bc0, 0x19168a},
+    {0x191700, 0x191a88}, {0x191cb0, 0x19259b}, {0x194a00, 0x19500e}, {0x198bb0, 0x19a1c4},
+    {0x1a3e50, 0x1a42de}, {0x1a4800, 0x1a4b6d}, {0x1a4b70, 0x1a4ffe}, {0x1a5490, 0x1a57c8},
+    {0x1acb10, 0x1acdba}, {0x1acdc0, 0x1ad056}, {0xaaf80, 0xab309},   {0x11c710, 0x11cf37},
+    {0x123410, 0x12380a}, {0x8b7f0, 0x8b8da}, // EndFrameView_WriteA (heaps.md 7.5 chunk user, per frame)
+};
+
+bool InSpans(uint64_t image_offset, const Span* spans, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (image_offset >= spans[i].begin && image_offset < spans[i].end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The image offset of the caller of a function entered at a hook (Entry/Wrap: rsp points at the return
+// address). Returns false when the caller lies outside the image.
+bool CallerOffset(const GuestRegs& regs, uint64_t* offset) {
+    const uint64_t ret = GuestU64(regs.rsp);
+    const uint64_t base = static_cast<uint64_t>(SotcHooks::ImageBase());
+    if (ret == 0 || base == 0 || ret < base) {
+        return false;
+    }
+    *offset = ret - base;
+    return true;
 }
 
 // Per-window coverage counters (verify report: bytes announced per class per window).
+struct Counter {
+    std::atomic<uint64_t> n{0}, bytes{0};
+    void Add(uint64_t size) {
+        n.fetch_add(1, std::memory_order_relaxed);
+        bytes.fetch_add(size, std::memory_order_relaxed);
+    }
+    uint64_t Take(std::atomic<uint64_t>& a) {
+        return a.exchange(0, std::memory_order_relaxed);
+    }
+};
+
 struct Window {
     std::atomic<uint64_t> res_announces{0}, res_bytes{0};
     std::atomic<uint64_t> res_gpu_bytes{0}, res_cpu_bytes{0};
@@ -44,6 +113,9 @@ struct Window {
     std::atomic<uint64_t> mip_announces{0}, mip_bytes{0};
     std::atomic<uint64_t> mip_releases{0}, mip_release_bytes{0};
     std::atomic<uint64_t> skipped{0};
+    Counter dcb, ccb, chunk, zc, mat, blk, inst, part;
+    std::atomic<uint64_t> desc{0};
+    std::atomic<uint64_t> chunk_dropped{0};
 };
 Window g_window;
 
@@ -51,6 +123,265 @@ void Count(std::atomic<uint64_t>& announces, std::atomic<uint64_t>& bytes, uint6
     announces.fetch_add(1, std::memory_order_relaxed);
     bytes.fetch_add(size, std::memory_order_relaxed);
 }
+
+// Announces [begin, end) when it is a sane range, counting it in c.
+void AnnounceRange(uint64_t begin, uint64_t end, SotcNative::Kind kind, Counter& c) {
+    if (begin == 0 || end <= begin) {
+        return; // empty range: nothing was written (not a skip)
+    }
+    if (end - begin > kMaxRange) {
+        g_window.skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    SotcNative::Announce(begin, end - begin, kind);
+    c.Add(end - begin);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Chunk list: blocks returned by 0x8c0d0 to the chunk writers, announced PerFrame at the next submit.
+// The submit (0x91f80 / 0x16f100) is the one point where the GPU is about to read this frame's command
+// buffers, and every chunk the writers filled before it is already complete (0xd07c0 waits on the jobs first).
+struct ChunkBlock {
+    uint64_t addr;
+    uint32_t size;
+};
+std::mutex g_chunk_mutex;
+std::vector<ChunkBlock> g_chunks;
+constexpr size_t kChunkCap = 1u << 17;
+
+void ChunkPush(uint64_t addr, uint32_t size) {
+    std::lock_guard<std::mutex> lock(g_chunk_mutex);
+    if (g_chunks.size() >= kChunkCap) {
+        g_window.chunk_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_chunks.push_back(ChunkBlock{addr, size});
+}
+
+void FlushChunks() {
+    std::vector<ChunkBlock> batch;
+    {
+        std::lock_guard<std::mutex> lock(g_chunk_mutex);
+        batch.swap(g_chunks);
+    }
+    for (const ChunkBlock& b : batch) {
+        AnnounceRange(b.addr, b.addr + b.size, SotcNative::Kind::PerFrame, g_window.chunk);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Submits (Entry). The DCB thunk 0x91f80 gets rdi = [context slot]; the 8636e0 submit reads the context:
+// DCB base +0x00 and cursor +0x10, CCB base +0x40 and cursor +0x50, ACE base +0x80 and cursor +0x90.
+
+// 0x91f80, before 0x8636e0 submits the DCB context: the context is at [rdi] (the thunk loads it).
+HookAction DcbSubmit(GuestRegs& regs, void*) {
+    if (!SotcNative::On()) {
+        return HookAction::Continue;
+    }
+    const uint64_t ctx = GuestU64(regs.rdi);
+    if (ctx != 0) {
+        const uint64_t dcb_base = GuestU64(ctx + 0x00), dcb_cursor = GuestU64(ctx + 0x10);
+        AnnounceRange(dcb_base, dcb_cursor, SotcNative::Kind::PerFrame, g_window.dcb);
+        const uint64_t ccb_base = GuestU64(ctx + 0x40), ccb_cursor = GuestU64(ctx + 0x50);
+        AnnounceRange(ccb_base, ccb_cursor, SotcNative::Kind::PerFrame, g_window.ccb);
+        const uint64_t ace_base = GuestU64(ctx + 0x80), ace_cursor = GuestU64(ctx + 0x90);
+        AnnounceRange(ace_base, ace_cursor, SotcNative::Kind::PerFrame, g_window.ccb);
+    }
+    FlushChunks();
+    return HookAction::Continue;
+}
+
+// 0x16f100, before the CCB submit: the CCB object at rdi has 32-bit start (+0x10) and cursor (+0x20).
+HookAction CcbSubmit(GuestRegs& regs, void*) {
+    if (!SotcNative::On()) {
+        return HookAction::Continue;
+    }
+    const uint64_t ccb = regs.rdi;
+    if (ccb != 0) {
+        const uint32_t start = GuestU32(ccb + 0x10), cursor = GuestU32(ccb + 0x20);
+        if (cursor > start) {
+            AnnounceRange(start, static_cast<uint64_t>(cursor & ~3u), SotcNative::Kind::PerFrame, g_window.ccb);
+        }
+    }
+    FlushChunks();
+    return HookAction::Continue;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Zero-copy creator 0x8be60 (Entry): (rdi = resource, esi = type, edx = elem, ecx = count, r8 = flags,
+// r9 = backing). A zero-copy resource (0x800) uses the caller's backing as its storage; the caller filter
+// keeps the per-frame builders in.
+HookAction ZeroCopyCreate(GuestRegs& regs, void*) {
+    if (!SotcNative::On() || (regs.r8 & 0x800) == 0 || regs.r9 == 0) {
+        return HookAction::Continue;
+    }
+    uint64_t offset = 0;
+    if (!CallerOffset(regs, &offset) || !InSpans(offset, kZeroCopyCallers, sizeof(kZeroCopyCallers) / sizeof(Span))) {
+        return HookAction::Continue;
+    }
+    const uint64_t size = static_cast<uint64_t>(static_cast<uint32_t>(regs.rdx)) *
+                          static_cast<uint32_t>(regs.rcx);
+    AnnounceRange(regs.r9, regs.r9 + size, SotcNative::Kind::PerFrame, g_window.zc);
+    return HookAction::Continue;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Chunk allocator 0x8c0d0 (Wrap). Pre: rdi = handle (the result is stored into it), esi = size (0: handle[8]).
+// Post: the block is handle[0] | (handle[1] & 0xfff) << 32. Only the chunk writers' blocks are queued.
+struct ChunkCall {
+    uint64_t handle;
+    uint32_t size;
+    bool active;
+};
+thread_local ChunkCall t_chunk{};
+
+HookAction ChunkPre(GuestRegs& regs, void*) {
+    t_chunk.active = false;
+    if (!SotcNative::On()) {
+        return HookAction::Continue;
+    }
+    uint64_t offset = 0;
+    if (!CallerOffset(regs, &offset) || !InSpans(offset, kChunkCallers, sizeof(kChunkCallers) / sizeof(Span))) {
+        return HookAction::Continue;
+    }
+    uint32_t size = static_cast<uint32_t>(regs.rsi);
+    if (size == 0) {
+        size = GuestU32(regs.rdi + 0x20);
+    }
+    t_chunk = ChunkCall{regs.rdi, size, regs.rdi != 0 && size != 0};
+    return HookAction::Continue;
+}
+
+void ChunkPost(GuestRegs&, void*) {
+    if (!t_chunk.active) {
+        return;
+    }
+    t_chunk.active = false;
+    const uint64_t block = static_cast<uint64_t>(GuestU32(t_chunk.handle)) |
+                           (static_cast<uint64_t>(GuestU32(t_chunk.handle + 4) & 0xfffu) << 32);
+    if (block != 0) {
+        ChunkPush(block, t_chunk.size);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Rewriters (Wrap). Each pre stashes the object, the post reads what the function wrote into it.
+
+thread_local uint64_t t_object = 0;
+
+// 0xf5cd0 (MaterialParam sub-buffer): buffer at +0x08 (guest), size u32 at +0x38 (the memcpy and the loop fill
+// the whole size).
+HookAction MatParamPre(GuestRegs& regs, void*) {
+    t_object = SotcNative::On() ? regs.rdi : 0;
+    return HookAction::Continue;
+}
+void MatParamPost(GuestRegs&, void*) {
+    const uint64_t object = t_object;
+    t_object = 0;
+    if (object == 0) {
+        return;
+    }
+    const uint64_t buffer = GuestU64(object + 0x08);
+    const uint32_t size = GuestU32(object + 0x38);
+    if (buffer != 0 && size != 0) {
+        AnnounceRange(buffer, buffer + size, SotcNative::Kind::PerFrame, g_window.mat);
+    }
+}
+
+// 0xfef40: the block at +0x48 receives the memcpy of the source header (size u32 at source+4).
+void FefPost(GuestRegs&, void*) {
+    const uint64_t object = t_object;
+    t_object = 0;
+    if (object == 0) {
+        return;
+    }
+    const uint64_t block = GuestU64(object + 0x48);
+    const uint64_t source = GuestU64(object + 0x10);
+    const uint32_t size = source != 0 ? GuestU32(source + 4) : 0;
+    if (block != 0 && size != 0) {
+        AnnounceRange(block, block + size, SotcNative::Kind::PerFrame, g_window.blk);
+    }
+}
+HookAction FefPre(GuestRegs& regs, void*) {
+    t_object = SotcNative::On() ? regs.rdi : 0;
+    return HookAction::Continue;
+}
+
+// 0x121ed0 (Entry; Wrap is refused for it): rdi = the instance object, whose persistent block at +0x1d8 is
+// rewritten with 0x18 bytes each frame. Announced PerFrame before the body: the bytes are read at the next
+// submit, which comes after the job waits in 0xd07c0, so the announce is safe for PerFrame data.
+HookAction InstEntry(GuestRegs& regs, void*) {
+    if (!SotcNative::On() || regs.rdi == 0) {
+        return HookAction::Continue;
+    }
+    const uint64_t block = GuestU64(regs.rdi + 0x1d8);
+    if (block != 0) {
+        AnnounceRange(block, block + 0x18, SotcNative::Kind::PerFrame, g_window.inst);
+    }
+    return HookAction::Continue;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Descriptor encoders (Wrap). Pre: rdi = descriptor, rsi = base, the size (count or bytes) in rcx / rdx. Post:
+// the encoded word1 (stride in bits 16..29 for the buffer encoders) and word3 (format) are read back.
+struct DescCall {
+    uint64_t desc, base;
+    uint32_t arg, arg2;
+    bool active;
+};
+thread_local DescCall t_desc{};
+
+HookAction DescPre(GuestRegs& regs, void*) {
+    // The buffer encoders take count in rcx; the constant and image encoders take a byte size in rdx.
+    t_desc = DescCall{regs.rdi, regs.rsi, static_cast<uint32_t>(regs.rdx), static_cast<uint32_t>(regs.rcx),
+                      SotcNative::On() && regs.rdi != 0};
+    return HookAction::Continue;
+}
+
+// Buffer V#: byte size = stride * count (stride from word1 bits 16..29); count in arg2.
+void DescBufferPost(GuestRegs&, void*) {
+    if (!t_desc.active) {
+        return;
+    }
+    const uint32_t word1 = GuestU32(t_desc.desc + 4);
+    const uint64_t stride = (word1 >> 16) & 0x3fff;
+    const uint64_t size = stride != 0 ? stride * t_desc.arg2 : t_desc.arg2;
+    SotcNative::NoteDescriptor(t_desc.desc, t_desc.base, size, GuestU32(t_desc.desc + 12));
+    g_window.desc.fetch_add(1, std::memory_order_relaxed);
+    t_desc.active = false;
+}
+
+// Constant and image V#: byte size in arg (rdx).
+void DescSizePost(GuestRegs&, void*) {
+    if (!t_desc.active) {
+        return;
+    }
+    SotcNative::NoteDescriptor(t_desc.desc, t_desc.base, t_desc.arg, GuestU32(t_desc.desc + 12));
+    g_window.desc.fetch_add(1, std::memory_order_relaxed);
+    t_desc.active = false;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Particle record shift (Site at 0x101817, after the record writes of one record). r14 = source record base
+// (pool + r15), [rbp-0x30] = destination base (the memcpy target), r15 = offset of the record (stride * index),
+// rdi = the particle object (stride u32 at +0x74).
+HookAction ParticleShift(GuestRegs& regs, void*) {
+    if (!SotcNative::On()) {
+        return HookAction::Continue;
+    }
+    const uint32_t stride = GuestU32(regs.rdi + 0x74);
+    if (stride == 0) {
+        return HookAction::Continue;
+    }
+    const uint64_t source = regs.r14 + regs.r15;
+    const uint64_t dest = GuestU64(regs.rbp - 0x30) + regs.r15;
+    AnnounceRange(source, source + stride, SotcNative::Kind::Persistent, g_window.part);
+    AnnounceRange(dest, dest + stride, SotcNative::Kind::Persistent, g_window.part);
+    return HookAction::Continue;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Earlier batch: resource copies and mip streaming (unchanged).
 
 // 0x8bf50, inside the resource buffer wrapper 0x8be60 after `memcpy(r15, r14, [rbx+0x20])`.
 // r15 = the new block (the copy's destination), rbx = the resource object (size u32 at +0x20),
@@ -114,7 +445,7 @@ HookAction MipRelease(GuestRegs& regs, void*) {
 
 } // namespace
 
-// Report line for the 5 s window (SotcNative::Report prints the rest). Resets the counters.
+// Report lines for the 5 s window (SotcNative::Report prints the rest). Resets the counters.
 void Report(std::string& out, double seconds) {
     const auto take = [](std::atomic<uint64_t>& a) { return a.exchange(0, std::memory_order_relaxed); };
     const uint64_t ra = take(g_window.res_announces), rb = take(g_window.res_bytes);
@@ -124,7 +455,7 @@ void Report(std::string& out, double seconds) {
     const uint64_t mr = take(g_window.mip_releases), mrb = take(g_window.mip_release_bytes);
     const uint64_t sk = take(g_window.skipped);
     const double mib = 1024.0 * 1024.0;
-    char line[512];
+    char line[640];
     std::snprintf(line, sizeof(line),
                   "SOTC NATIVE WRITES res %llu announces %.2f MiB (gpu %.2f cpu %.2f) tex %llu %.2f MiB "
                   "mip %llu %.2f MiB rel %llu %.2f MiB skipped %llu per %.1f s\n",
@@ -133,14 +464,47 @@ void Report(std::string& out, double seconds) {
                   mb / mib, static_cast<unsigned long long>(mr), mrb / mib,
                   static_cast<unsigned long long>(sk), seconds);
     out += line;
+
+    const auto cls = [&](const char* name, Counter& c) {
+        const uint64_t n = c.Take(c.n), b = c.Take(c.bytes);
+        std::snprintf(line, sizeof(line), " %s %llu %.2f MiB", name, static_cast<unsigned long long>(n), b / mib);
+        return std::string(line);
+    };
+    out += "SOTC NATIVE WRITES PF";
+    out += cls("dcb", g_window.dcb);
+    out += cls("ccb", g_window.ccb);
+    out += cls("chunk", g_window.chunk);
+    out += cls("zc", g_window.zc);
+    out += cls("mat", g_window.mat);
+    out += cls("blk", g_window.blk);
+    out += cls("inst", g_window.inst);
+    out += cls("part", g_window.part);
+    std::snprintf(line, sizeof(line), " desc %llu dropped %llu\n",
+                  static_cast<unsigned long long>(take(g_window.desc)),
+                  static_cast<unsigned long long>(take(g_window.chunk_dropped)));
+    out += line;
 }
 
 void Register() {
-    SotcHooks::RegisterHandler("NATIVE_RES_COPY", {ResCopy, nullptr, nullptr});
-    SotcHooks::RegisterHandler("NATIVE_TEX_COPY", {TexCopy, nullptr, nullptr});
-    SotcHooks::RegisterHandler("NATIVE_TEX_TAIL_COPY", {TexTailCopy, nullptr, nullptr});
-    SotcHooks::RegisterHandler("NATIVE_MIP_COPY", {MipCopy, nullptr, nullptr});
-    SotcHooks::RegisterHandler("NATIVE_MIP_RELEASE", {MipRelease, nullptr, nullptr});
+    using SotcHooks::Handler;
+    SotcHooks::RegisterHandler("NATIVE_RES_COPY", Handler{ResCopy, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_TEX_COPY", Handler{TexCopy, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_TEX_TAIL_COPY", Handler{TexTailCopy, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_MIP_COPY", Handler{MipCopy, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_MIP_RELEASE", Handler{MipRelease, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_DCB_SUBMIT", Handler{DcbSubmit, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_CCB_SUBMIT", Handler{CcbSubmit, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_ZC_CREATE", Handler{ZeroCopyCreate, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_CHUNK", Handler{ChunkPre, ChunkPost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_MATPARAM", Handler{MatParamPre, MatParamPost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_FEF40_BLOCK", Handler{FefPre, FefPost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_INST_121ED0", Handler{InstEntry, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_DESC_865410", Handler{DescPre, DescBufferPost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_DESC_8655D0", Handler{DescPre, DescSizePost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_DESC_865600", Handler{DescPre, DescSizePost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_DESC_865500", Handler{DescPre, DescBufferPost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_PARTICLE_SHIFT", Handler{ParticleShift, nullptr, nullptr});
 }
 
 } // namespace SotcNativeHooks
+

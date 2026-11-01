@@ -1,117 +1,129 @@
 # N2 implementation: write announces (specialist: writes)
 
-Status: partial. Five persistent-write and mip sites are hooked and checked. The per-frame, descriptor and DCB/CCB
-sites of the N2 list are not hooked yet (section 4). Nothing committed; files are uncommitted in the worktree.
+Status: the N2 sites of the list are hooked except the ones in section 4. Nothing committed; the files are uncommitted
+in the worktree (base: main tree, branch re/pc-native, uncommitted native_hooks.cpp and native_writes.py).
 
 ## 1. Files
 
 | File | State | Content |
 |---|---|---|
-| `scripts/hooks.d/native_writes.py` | new | five Site hooks, switch `SOTC_NATIVE`, one group per write path |
-| `gpu/sotc/native/native_hooks.cpp` | new | handlers, coverage counters, `Report()`, `Register()` |
+| `scripts/hooks.d/native_writes.py` | changed | 17 declarations, switch `SOTC_NATIVE`, one group per write path |
+| `gpu/sotc/native/native_hooks.cpp` | changed | handlers, caller filters, chunk list, coverage counters, `Report()`, `Register()` |
 
-Syntax check: `native_hooks.cpp` passes `clang++ -fsyntax-only` (C++23, `-Wall -Wextra`), with `native.h` copied from
-the main tree to a scratch include directory (not into the worktree; the header is owned by the API agent).
+Syntax check: `native_hooks.cpp` passes `clang++ -fsyntax-only -Wall -Wextra` with the project flags of
+`gpu/sotc/native/` (from `out/gpu/compile_commands.json`, the `area_prewarm.cpp` line), the worktree's `gpu/` include
+dirs first, and a scratch copy of `native.h` (the header is owned by the API agent and is not in the worktree).
 
-Hook check: `tools/re/hooks_install_check.py` run from a scratch copy of the main tree's `scripts/` and `tools/`
-with the new file added, against `out/eboot.elf` (EU 1.01, fingerprint 72c1d4a9...): all five hooks accepted by the
-detour engine (`SOTC DETOUR NATIVE_* accepted mode=site`). The existing 53 hooks are unchanged in the main tree. The
-worktree's copy of `tools/re/` is older and lacks the checker, so the check was run from the scratch copy.
+Hook check: `tools/re/hooks_install_check.py` on a scratch copy of the main tree (`scripts/`, `tools/`, `out/eboot.elf`)
+with the worktree's `native_writes.py`: all 17 hooks `accepted`. The refused hooks and the CONFLICT lines in that run are
+all older declarations (XPR, PC_POOL, MEMTYPE), none of them native_writes. One change came from the check: the
+instance hook 0x121ed0 is refused as Wrap (indirect jump), so it is an Entry hook.
+
+`scripts/` unit tests (`python -m unittest discover -s tests`, scratch copy): 160 run, the 5 import errors are
+missing modules in the scratch copy (`paths`), not these files.
 
 ## 2. Hooks
 
-All are `mode='site'`, `switch='SOTC_NATIVE'`. Patterns are `eboot_re.py sig` output, unique in the text segment.
+Mode meanings: Entry = handler before the body; Wrap = pre stashes, post announces after the body; Site = one
+instruction inside a function. All hooks use `switch='SOTC_NATIVE'` and the handlers return Continue.
 
-| Hook | Group | Offset (EU) | Displaced | Handler | Action |
-|---|---|---|---|---|---|
-| NATIVE_RES_COPY | native_res | 0x8bf50 | 7 bytes | after the initial-data memcpy in the resource wrapper 0x8be60 | `Announce(r15, u32[rbx+0x20], Persistent)` |
-| NATIVE_TEX_COPY | native_tex | 0x96b59 | 7 bytes | after the single-block texel copy in 0x96680 (texture, particle texture) | `Announce(r14, rbx, Persistent)` |
-| NATIVE_TEX_TAIL_COPY | native_tex | 0x96b1b | 7 bytes | after the mip-tail texel copy in 0x96680 | `Announce(r13, r12, Persistent)` |
-| NATIVE_MIP_COPY | native_mip | 0x98d6c | 11 bytes | after the mip memcpy in the streamer 0x98ae0 | `Announce(r13, r14, Persistent)` |
-| NATIVE_MIP_RELEASE | native_mip | 0x98be0 | 5 bytes | before the mode-2 decommit call (0x98bf0) in 0x98ae0 | `Release(rdi, r14)` |
+First batch (unchanged): NATIVE_RES_COPY 0x8bf50 (Site, Persistent), NATIVE_TEX_COPY 0x96b59 (Site, Persistent),
+NATIVE_TEX_TAIL_COPY 0x96b1b (Site, Persistent), NATIVE_MIP_COPY 0x98d6c (Site, Persistent), NATIVE_MIP_RELEASE 0x98be0
+(Site, Release).
 
-### Register evidence (from `eboot_re.py dis` and the decompilation)
-- 0x8bf50: after `call memcpy` at 0x8bf4b, r15 = destination (set at 0x8bf0b/0x8bf3f), rbx = resource object, the size
-  is `[rbx+0x20]` (u32, the `imul` product), and the flags word is `[rbp-0x34]` (param_5). Callee-saved registers survive
-  the call; the size and flags are read from guest memory through `runtime_memory_backing_pointer`. This site is
-  reached only when `(flags & 0x800) == 0`, so zero-copy resources never announce here.
-- 0x96b59: `add [r15+0x1b0], ebx` directly follows `call 0x8de50` at 0x96b54 (dest r14 from 0x12820, size rbx).
-- 0x96b1b: `add [r15+0x1b0], r12d` follows `call 0x8de50` at 0x96b16 (dest r13 = uVar2 + uVar9). r12 is the accounted
-  size (the same value the decompilation adds as `lVar16`). The copy's own size is `[rbp-0x90]`; the announce uses
-  the accounted size, which covers it. **Verify this by reading the register assignments once more** (the mip-tail path
-  is the least direct of the five).
-- 0x98d6c: `mov rdi,r13 / mov rdx,r14` before `call memcpy` (0x98d67); r13 = pool destination, r14 = mip size.
-- 0x98be0: `mov edx,2` before `call 0x12950` (0x98bf0, mode 2 = decommit). rdi = pool base (`uVar7`), r14 = size
-  (`r13 - rdi`, set at 0x98bd4). The site is the instruction before the call, so it does not overlap the
-  `DECOMMIT_BEGIN` hook (0x98bf0) owned by `scripts/hooks.d/decommit.py`.
+N2 batch:
 
-### Corrections to the N0 inventory
-- The particle texture (0x10e9b0) calls 0x96680 with `&DAT_02dd9f80`, which is the **CPUMemory** category (loader.md
-  says GPUMemory). The announce is the same either way (the upload path does not depend on the heap), but the
-  category counts in the report say CPU for particle textures.
-- The memcpy in 0x8be60 writes with the scope or category of the flags. The heaps walk (heaps.md 7.4) says
-  flags 0x2 without 0x800 copy the initial data into RenderSingleFrameGPU. This is the same site and the same announce.
+| Hook | Group | Offset (EU) | Mode | Handler and announce |
+|---|---|---|---|---|
+| NATIVE_DCB_SUBMIT | native_submit | 0x91f80 | Entry | the submit thunk: `ctx = [rdi]` (the 0x8636e0 context). Announce DCB `[ctx+0x00, ctx+0x10)`, CCB `[+0x40, +0x50)`, ACE `[+0x80, +0x90)`, PerFrame. Then flush the chunk list. |
+| NATIVE_CCB_SUBMIT | native_submit | 0x16f100 | Entry | CCB object rdi: `[u32 +0x10, u32 +0x20)` (`& ~3`), PerFrame. Then flush. |
+| NATIVE_ZC_CREATE | native_zc | 0x8be60 | Entry | resource creator with flag 0x800 (zero-copy) and a backing r9, called from the zero-copy builders (section 2.1): `[r9, edx*ecx)` PerFrame. |
+| NATIVE_CHUNK | native_chunk | 0x8c0d0 | Wrap | pre: caller (retaddr at rsp) in the chunk-writer ranges, size esi (0: handle+0x20). post: block = handle[0] \| (handle[1] & 0xfff) << 32, queued. |
+| NATIVE_MATPARAM | native_mat | 0xf5cd0 | Wrap | post: `[u64 +0x08, u32 +0x38)` PerFrame (the MaterialParam sub-buffer). |
+| NATIVE_FEF40_BLOCK | native_mat | 0xfef40 | Wrap | post: block `[+0x48]`, size u32 at `[param_2+4]`, PerFrame (the memcpy target). |
+| NATIVE_INST_121ED0 | native_inst | 0x121ed0 | Entry | `[rdi+0x1d8]` 0x18 bytes, PerFrame (wrap refused: indirect jump). |
+| NATIVE_DESC_865410 | native_desc | 0x865410 | Wrap | buffer V#: post reads word1 stride (bits 16..29), word3 format; size = stride * count (rcx). |
+| NATIVE_DESC_8655D0 | native_desc | 0x8655d0 | Wrap | constant V#: size = edx bytes; format = word3. |
+| NATIVE_DESC_865600 | native_desc | 0x865600 | Wrap | image/buffer word encoder: size = edx bytes; format = word3. |
+| NATIVE_DESC_865500 | native_desc | 0x865500 | Wrap | buffer V# with stride and count (as 865410). |
+| NATIVE_PARTICLE_SHIFT | native_particle | 0x101817 | Site | after the record writes of ParticleRenderer_ShiftRecords: source `r14+r15` and destination `[rbp-0x30]+r15`, each stride bytes (u32 at this+0x74), Persistent. |
 
-## 3. Ordering and safety
+### 2.1 Caller filters and why they are needed
+- `NATIVE_ZC_CREATE` and `NATIVE_CHUNK` are funnels: 0x8be60 and 0x8c0d0 are called from about 100 and 153 functions, most
+  of them CPU-only. The handler reads the caller's return address (rsp at entry) and announces only the callers
+  listed in `gpu/sotc/native/native_hooks.cpp` (`kZeroCopyCallers`, `kChunkCallers`, image offsets from
+  `tools/re/eboot_re.py func`). Zero-copy callers: particles 0xffe60, BPXPR 0x19b760 / 0x19c1a0 / 0x19c7e0, the draw
+  buffers 0x94fb0 and 0x198bb0. Chunk callers: the 27 memcpy callers of heaps.md 7.5, the instance writers 0x11c710 and
+  0x123410, and EndFrameView_WriteA 0x8b7f0.
+- An unfiltered announce would upload every CPU-only chunk (CPUMemory allocations are about 700k calls per second) as
+  PerFrame fallback. The filter is what keeps the cost to the GPU-read data.
+- The filter ranges are for the EU 1.01 image (the same build as US 1.00). Another eboot resolves nothing (fingerprint),
+  so the filter cannot drift silently.
 
-- Every announce is placed after its copy has returned and before the function returns to the guest. The copy and
-  the announce run on the same guest thread, so the announce cannot precede the copy's data.
-- Persistent ranges are announced once per copy. Mip copies are announced when they land; mip drops `Release` the
-  pool range before the decommit, so the device copy is dropped before the memory goes away.
-- The `MIP_BUDGET_COPY` Wrap (scripts/hooks.d/mipbudget.py) sits at the entry of 0x98ae0; `NATIVE_MIP_COPY` and
-  `NATIVE_MIP_RELEASE` are later in the function and do not overlap it (`SOTC_NATIVE` and `SOTC_MIP_BUDGET` can be on
-  together). The decommit hooks (`DECOMMIT_BEGIN` at 0x98bf0, `DECOMMIT_END` at 0x98bf5) are untouched.
-- The publish hook (0x14d670) is not installed. The copies are announced when they land, which is before publish, so
-  publish needs no announce of its own. If the API agent wants a publish-time fallback, the entry hook is
-  `NATIVE_PUBLISH` at 0x14d670 (pattern from `eboot_re.py sig 0x14d670`, 28 bytes, unique).
-- Every handler returns Continue and reads only the registers and guest words named above. When `SotcNative::On()` is
-  false the handlers do nothing (the hooks are off anyway unless `SOTC_NATIVE` is set).
+### 2.2 Chunk list (one announce point for the chunk writers)
+- The post of 0x8c0d0 queues `(block, size)` for the chunk writers. `FlushChunks()` runs at every DCB and CCB submit
+  entry (0x91f80, 0x16f100), before the GPU reads the submitted command buffers, and announces everything queued as
+  PerFrame. The list is capped at 2^17 entries; overflow is counted (`dropped`).
+- Ordering: the chunk writers fill their chunks before the submit (0xd07c0 waits on the jobs first), so every
+  announce follows its writes. A chunk queued after a flush is announced at the next submit, which is the first submit
+  that can reference it.
 
-## 4. Not done (remaining N2 sites)
+### 2.3 Ordering of the Entry announces (PerFrame)
+- For the zero-copy creators that memcpy before the call (0x94fb0, 0x19c1a0, 0x19c7e0, 0x198bb0) the announce follows
+  the writes. For the particle and BPXPR builders (0xffe60, 0x19b760) the bytes are written after the call. PerFrame data
+  is read at the next submit (uploaded there when no window holds it), and each submit is preceded by the job waits of
+  0xd07c0, so the early announce is safe. This is the only place where the announce is before the writes; it is the
+  reason the verify mode checks PerFrame classes at submit, not at the announce.
 
-- **Per-frame writers** (rewriters, from heaps.md 7.4 and 7.5): the zero-copy particle buffers (`0xffe60`, slot 22,
-  per frame, three sites), BPXPR draw/instance buffers (`0x19b760`, `0x19c1a0`, `0x19c7e0`), MaterialParam sub-buffers
-  (`0xf5cd0`, `0xfef40`, and the 4 MiB copy in `0x117160`), and the 27 chunk memcpy callers of 0x8c0d0 (heaps.md 7.5).
-  Each needs a Site after its memcpy/memset; not written yet because each caller's register map has to be read first.
-- **UpdateGPUData 0x118100**: the dirty-span walk (renderer+0x210070) and the tail before the EOP at 0x92720. Not
-  hooked: the instance writers below are announced one by one instead.
-- **Instance writers** 0x123410, 0x11c710, 0x121ed0, 0x18aa20 and the view writers 0xbe1f0 / 0xcedf0 / 0x8b7f0:
-  the per-block announce belongs after each writer's last store. Not read in full yet (0x123410 is 210 lines; its tail
-  writes the block state back at `puVar42`).
-- **DCB and CCB**: announce `[start, cursor)` before each `sceGnmSubmitCommandBuffersForWorkload` (0x91f80, called
-  from 0xd07c0) and CCB at 0x16f100. Not hooked.
-- **Descriptor side records** (`NoteDescriptor`): entry hooks on the V#/T# encoders 0x865410, 0x8655d0, 0x865600,
-  0x865500 need their argument order read (not read yet).
-- **Particle record shift** 0x101720 (PERS, 96-byte shift): Site after its memmove. Not read.
-- **Verify counters per class** exist only for the hooked sites (section 5).
+## 3. Counters and verify
 
-## 5. Counters and verify
+`SotcNativeHooks::Report(std::string& out, double seconds)` appends two lines per 5 s window and resets:
+- `SOTC NATIVE WRITES res ... tex ... mip ... rel ... skipped ... per <s> s` (first batch, unchanged);
+- `SOTC NATIVE WRITES PF dcb <n> <MiB> ccb <n> <MiB> chunk <n> <MiB> zc <n> <MiB> mat <n> <MiB> blk <n> <MiB> inst <n>
+  <MiB> part <n> <MiB> desc <n> dropped <n>`: announced PerFrame bytes per class, and the particle record bytes
+  (Persistent). Divide the MiB by the frames in the window (30 FPS locked) for MiB per frame.
 
-`SotcNativeHooks::Report(std::string& out, double seconds)` appends one line per window and resets:
-`SOTC NATIVE WRITES res <announces> <MiB> (gpu <MiB> cpu <MiB>) tex <n> <MiB> mip <n> <MiB> rel <n> <MiB> skipped <n> per <s> s`.
+Verify mode (mode 2): the counters count what the hooks announced; the page tracker (the old path, still running in
+mode 2) counts the writes the announces missed. Once these sites exist, `unannounced` should fall for the classes above.
+The per-class totals here are the announced side of that comparison.
 
-Snippets for files this agent does not own:
+## 4. Not hooked (remaining N2 work)
 
-`gpu/sotc/hook_handlers.cpp`, add with the other declarations (before `namespace SotcHooks {`):
+- **0x117160 (MaterialParam 4 MiB copy per frame).** The copy is `memcpy(rbx, DAT_02ed2108, DAT_02ed2100)` at 0x11788a;
+  the return site 0x11788f has the destination in rbx and the size global in r12 (size = u32 at r12). The byte
+  signature of 0x11788f is not unique (`eboot_re.py sig` reports two matches within 80 bytes), so no Site yet.
+  Next step: a longer signature that includes the `lea rcx,[rip+...]` of 0x117876, checked with `sigfind`.
+- **UpdateGPUData 0x118100 tail.** Not hooked. The instance writers it calls are covered per writer (0x121ed0 Entry,
+  0x123410 and 0x11c710 through the chunk list). 0x18aa20 takes no arguments (the object is a global) and writes its
+  transform block only when `*(p+0xa8)` is set: not hooked.
+- **View writers 0xbe1f0 (SetViewParams) and 0xcedf0.** Their blocks come from FUN_0008c120 (a different allocator from
+  0x8c0d0), not from the chunk filter. Next step: hook 0x8c120 with the same chunk list, after reading its caller list.
+- **Particle destination.** `NATIVE_PARTICLE_SHIFT` announces the destination record from `[rbp-0x30]`, which is the
+  memcpy target (dest = param_2 of 0x101720). The memcpy size is assumed to be the stride (`rdx` before the call); not
+  verified in the disassembly.
+
+## 5. Snippets for files this agent does not own
+
+`gpu/sotc/hook_handlers.cpp`: already present in the main tree (`SotcNativeHooks::Register();` in
+`RegisterAllHandlers()`, declaration in the namespace block). No change.
+
+`gpu/shadps4/core/libraries/videoout/driver.cpp`: `SotcNativeHooks::Report(report, seconds);` is declared at line 60
+(`namespace SotcNativeHooks { void Report(std::string& out, double seconds); }`) but not called. Add it right after the
+existing `SotcNative::Report(report, seconds);` call (line 2023):
 ```cpp
-namespace SotcNativeHooks { void Register(); void Report(std::string& out, double seconds); }
+        SotcNative::Report(report, seconds);      // sotc: SOTC_NATIVE
+        SotcNativeHooks::Report(report, seconds); // sotc: SOTC_NATIVE write hooks (native_hooks.cpp)
 ```
-and in `RegisterAllHandlers()`, after `SotcCtl::StartIfEnabled();`:
-```cpp
-    SotcNativeHooks::Register(); // sotc: PC-native write announces (SOTC_NATIVE, native/native_hooks.cpp)
-```
-(`<string>` is already included through hooks.h.)
 
-Driver snippet (the 5 s report, next to the other reports): call `SotcNativeHooks::Report(out, seconds);` after the
-`SotcNative::Report` call, so the coverage line is printed with `SOTC_FPS` / `SOTC_VERIFY`.
-
-Verify mode (mode 2) checks the announce coverage against the page tracker only once the per-frame sites exist: the
-counters above count the persistent and mip bytes announced. The per-class frame counters for the rest are not in
-this report.
+`native.h` / `native.cpp`: `NoteDescriptor` is declared in `native.h` and defined in the main tree's `native.cpp`;
+the descriptor hooks call it with `(desc, base, size_bytes, format_word3)`. The `size` of the buffer encoders is
+`stride * count` (bytes); the API agent should treat `size` as bytes.
 
 ## 6. Open points
 
-1. `NATIVE_TEX_TAIL_COPY` needs one re-read of the register assignments before the first game run (section 2).
-2. The API agent's `Announce` must accept `Persistent` for ranges in CPUMemory (particle textures) and GPUMemory.
-3. The per-frame sites (section 4) decide whether the verify mode's "unannounced writes = 0" can pass; until they are
-   hooked, page tracking will count every per-frame write as unannounced.
+1. Register checks of the Entry/Wrap hooks (rdi, rsi, rcx, rdx, r8, r9 at the entry) follow the decompilation of the
+   callees; the first game run in mode 2 (once the user authorizes it) should confirm the DCB range matches the CP
+   submit (`S[0]` base and `S[2]` cursor), the CCB range `[+0x10, +0x20)`, and the chunk sizes.
+2. `NATIVE_DCB_SUBMIT` also announces the CCB (`+0x40`) and ACE (`+0x80`) ranges of the same context. These come from
+   the 0x8636e0 field use, not from a separate hook; a wrong offset would show as oversized `ccb` bytes in the report.
+3. The particle destination size (section 4) and the 0x117160 gap are the two sites with an assumption left open.
