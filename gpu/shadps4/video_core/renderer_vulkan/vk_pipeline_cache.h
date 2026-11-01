@@ -179,6 +179,9 @@ public:
     }
 
 private:
+    /// sotc: N5. The lookups; GetGraphicsPipeline and GetComputePipeline count the draws that bind.
+    const GraphicsPipeline* GetGraphicsPipelineLookup(const DrawIndirectParams params);
+    const ComputePipeline* GetComputePipelineLookup();
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
@@ -294,6 +297,8 @@ private:
         /// sotc: a pipeline of the boot preload (SOTC_ASYNC_PRELOAD): built from the cached
         /// state, and already in the cache (not registered again).
         bool preloaded{};
+        /// sotc: N5: the use count the blob was saved with (a boot prebuild job, QueueAsyncPipeline).
+        u32 uses{};
         /// sotc: SOTC_PIPE_REMAP: set for a preload whose key was remapped, to the name of the
         /// old key's blob. The new key is saved and the old blob removed only once it built.
         std::optional<std::string> remap_old_blob;
@@ -339,6 +344,13 @@ private:
                            Shader::Pools& worker_pools);
     void InstallTranslation(AsyncPipelineJob::Translate& job);
     void CollectAsyncPipelines();
+    /// sotc: N5 (SOTC_N5_PSO=1). Waits for the graphics pipelines of the boot prebuild (queued by
+    /// WarmUp), collecting them as they are built, up to SOTC_N5_PSO_WAIT_S seconds from start.
+    /// The rest is built on the workers while the game runs.
+    void WaitPreloadBoot(std::chrono::steady_clock::time_point start);
+    /// sotc: N5. Rewrites the use count of the pipeline blobs whose count changed this session.
+    /// Called from the destructor, as the driver cache is.
+    void SaveUseCounts();
     /// sotc: SOTC_PIPE_GPL. Builds the fast-linked pipeline of graphics_key into slot, when its
     /// state can be linked. Returns false (slot untouched) when it cannot. Command processor only.
     bool TryFastLink(std::unique_ptr<GraphicsPipeline>& slot);
@@ -392,6 +404,8 @@ private:
     /// sotc: compute pipelines of the boot preload built by the workers (SOTC_ASYNC_PRELOAD);
     /// WarmUp waits for them and drops the ones the driver refused, as it does when it builds
     /// them itself.
+    /// sotc: N5: the use count of the blob WarmUp is loading (0 outside the boot prebuild).
+    u32 warm_uses{};
     std::vector<ComputePipelineKey> preload_computes;
     /// sotc: preloaded compute pipelines the driver refused, out of the map but kept alive: their
     /// worker job may still be queued (it returns at once, the pipeline being claimed).
@@ -421,5 +435,19 @@ void ReportPipeDirty(std::string& out, double seconds);
 /// sotc: SOTC_PIPE_GPL counters (vk_pipeline_cache.cpp): appends one line for the 5 s report when the
 /// switch is on and the window had cold misses or libraries. Call from one thread.
 void ReportPipeGpl(std::string& out, double seconds);
+
+/// sotc: N5 (SOTC_N5_PSO=1 with SOTC_NATIVE on). The boot prebuild in WarmUp: every cached pipeline
+/// is built on the workers before the game needs it, in the order of its use count.
+bool N5PsoEnabled();
+/// sotc: N5. WarmUp brackets its work with this: its compiles (and the boot wait) are not stalls.
+void N5SetWarming(bool warming);
+/// sotc: N5. The use count stored in a pipeline key blob (0 when the blob has none: a cache written
+/// before N5, or with N5 off).
+u32 PipelineUseCount(const std::vector<u8>& blob);
+/// sotc: N5. Sets the use count of the pipeline key blob name (without extension) to uses.
+bool RewritePipelineUseCount(const std::string& name, u32 uses);
+/// sotc: N5 counters: boot prebuild progress and the sync compiles (command processor or draw
+/// thread) after SOTC_N5_PSO_GRACE_S seconds, per window. Appends one line each; call from one thread.
+void ReportN5Pso(std::string& out, double seconds);
 
 } // namespace Vulkan

@@ -100,6 +100,7 @@ uint64_t runtime_memory_chunk_opens_locked(void);
 namespace Vulkan {
 void SotcTinyAsyncNoteDisplayBuffer(u64 address, u64 size);
 void SotcTinyAsyncReport(std::string& out, double seconds);
+void ReportN5Pso(std::string& out, double seconds); // sotc: N5 (SOTC_N5_PSO=1)
 void ReportPipeMemo(std::string& out, double seconds); // sotc: SOTC_PIPE_MEMO
 void ReportPipeDirty(std::string& out, double seconds); // sotc: SOTC_PIPE_DIRTY
 void ReportPipeGpl(std::string& out, double seconds); // sotc: SOTC_PIPE_GPL
@@ -2014,6 +2015,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcHookStats::Report(report, seconds);
             SotcWriteDecl::Report(report, seconds);
             Vulkan::SotcTinyAsyncReport(report, seconds);
+            Vulkan::ReportN5Pso(report, seconds); // sotc: SOTC_N5_PSO
             // sotc: engine probes (plan step 0c); each prints only when its hook is on and saw
             // activity in the window.
             SotcProbes::ReportXpr(report, seconds);

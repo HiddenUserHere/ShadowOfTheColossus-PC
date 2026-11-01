@@ -71,6 +71,11 @@ public:
     /// worker started it yet). Handle() is then the result, null if the driver refused it.
     void WaitBuilt();
 
+    /// sotc: N5. Draws that bound this pipeline (command processor only), and the count its blob
+    /// holds (saved_use_count), as for GraphicsPipeline.
+    mutable u32 use_count{};
+    u32 saved_use_count{};
+
 private:
     void CreatePipeline();
 

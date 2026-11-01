@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -187,6 +188,56 @@ void RemapBuilt(const std::string& old_blob) {
 
 } // namespace
 
+namespace {
+// sotc: N5 use count. A pipeline key blob may end with a trailer: kUseCountMagic and the use count
+// (8 bytes), written only with N5 on. A blob without it (an older cache, or N5 off) reads as count
+// 0, and the loaders stop at the end of the pipeline data, so both kinds load under either setting.
+constexpr u32 kUseCountMagic = 0x4E355543; // 'CU5N' in memory order
+constexpr size_t kUseCountTrailer = 2 * sizeof(u32);
+
+bool HasUseCountTrailer(const std::vector<u8>& blob) {
+    if (blob.size() < kUseCountTrailer) {
+        return false;
+    }
+    u32 magic{};
+    std::memcpy(&magic, blob.data() + blob.size() - kUseCountTrailer, sizeof(u32));
+    return magic == kUseCountMagic;
+}
+
+void WriteUseCount(Serialization::Writer& pldata, u32 uses) {
+    if (!N5PsoEnabled()) {
+        return;
+    }
+    pldata.Write(kUseCountMagic);
+    pldata.Write(uses);
+}
+} // namespace
+
+u32 PipelineUseCount(const std::vector<u8>& blob) {
+    if (!HasUseCountTrailer(blob)) {
+        return 0;
+    }
+    u32 uses{};
+    std::memcpy(&uses, blob.data() + blob.size() - sizeof(u32), sizeof(u32));
+    return uses;
+}
+
+bool RewritePipelineUseCount(const std::string& name, u32 uses) {
+    std::vector<u8> blob;
+    Storage::DataBase::Instance().Load(Storage::BlobType::PipelineKey, name, blob);
+    if (blob.empty()) {
+        return false;
+    }
+    if (HasUseCountTrailer(blob)) {
+        blob.resize(blob.size() - kUseCountTrailer);
+    }
+    const u32 trailer[2] = {kUseCountMagic, uses};
+    const auto* bytes = reinterpret_cast<const u8*>(trailer);
+    blob.insert(blob.end(), bytes, bytes + sizeof(trailer));
+    return Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey, name,
+                                              std::move(blob));
+}
+
 // sotc: returns false when nothing was queued for saving (not opened, or a collided permutation).
 bool RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -202,6 +253,7 @@ bool RegisterPipelineData(const ComputePipelineKey& key,
 
     key.Serialize(ar);
     sdata.Serialize(ar);
+    WriteUseCount(pldata, 1);
 
     return Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey,
                                               fmt::format("c_{:#018x}", key.value), ar.TakeOff());
@@ -227,6 +279,7 @@ bool RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
 
     key.Serialize(ar);
     sdata.Serialize(ar);
+    WriteUseCount(pldata, 1);
 
     return Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey,
                                               fmt::format("g_{:#018x}", hash), ar.TakeOff());
@@ -383,6 +436,8 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, true, deferred);
+        it.value()->use_count = warm_uses;
+        it.value()->saved_use_count = warm_uses;
         if (deferred) {
             auto job = std::make_unique<AsyncPipelineJob>();
             job->compute = it.value().get();
@@ -535,6 +590,10 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     modules.fill(nullptr);
     fetch_shader = nullptr;
 
+    if (!async && it.value()) {
+        it.value()->use_count = warm_uses;
+        it.value()->saved_use_count = warm_uses;
+    }
     if (async) {
         return true; // a refused one is dropped when collected (CollectAsyncPipelines)
     }
@@ -648,6 +707,15 @@ void PipelineCache::WarmUp() {
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return;
     }
+    // sotc: N5. The compiles of the warm-up (and its boot prebuild) are not stalls of the game.
+    struct WarmingScope {
+        WarmingScope() {
+            N5SetWarming(true);
+        }
+        ~WarmingScope() {
+            N5SetWarming(false);
+        }
+    } warming_scope;
 
     Storage::DataBase::Instance().Open();
 
@@ -711,53 +779,79 @@ void PipelineCache::WarmUp() {
         std::memory_order_relaxed);
 
     remap_totals = {};
-    Storage::DataBase::Instance().ForEachNamedBlob(
-        Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data, const std::string& name) {
-            ++num_total_pipelines;
-            SotcStats::warmup_done.fetch_add(1, std::memory_order_relaxed);
-            last_key_remap = KeyRemap::Plain;
-            current_blob_name = name;
+    // sotc: one blob is loaded by load_blob (its use count is the N5 order, 0 without N5).
+    const auto load_blob = [&](std::vector<u8>&& data, const std::string& name, u32 uses) {
+        ++num_total_pipelines;
+        SotcStats::warmup_done.fetch_add(1, std::memory_order_relaxed);
+        last_key_remap = KeyRemap::Plain;
+        current_blob_name = name;
+        warm_uses = uses;
 
-            bool result{};
-            try {
-                Serialization::Archive ar{std::move(data)};
-                Serialization::Reader pldata{ar};
+        bool result{};
+        try {
+            Serialization::Archive ar{std::move(data)};
+            Serialization::Reader pldata{ar};
 
-                u32 version{};
-                pldata.Read(version);
-                if (version != Serialization::PipelineKeyVersion) {
-                    return;
-                }
-
-                u32 is_compute{};
-                pldata.Read(is_compute);
-                if (is_compute) {
-                    result = LoadComputePipeline(ar);
-                } else {
-                    result = LoadGraphicsPipeline(ar);
-                }
-            } catch (const Serialization::CorruptedData&) {
-                // A truncated entry (e.g. from a killed session) is just skipped.
-                infos.fill(nullptr);
-                modules.fill(nullptr);
-                fetch_shader = nullptr;
-                result = false;
+            u32 version{};
+            pldata.Read(version);
+            if (version != Serialization::PipelineKeyVersion) {
+                return;
             }
 
-            // sotc: SOTC_PIPE_REMAP=1: the key was remapped to a pipeline that is loaded already,
-            // so nothing is built or saved for it and the old blob goes now. A remapped key that
-            // is built waits for its build (RemapBuilt, CollectAsyncPipelines).
-            if (last_key_remap == KeyRemap::RemappedDuplicate) {
-                ++remap_totals.duplicates;
-                if (Storage::DataBase::Instance().Remove(Storage::BlobType::PipelineKey, name)) {
-                    ++remap_totals.removed;
-                }
+            u32 is_compute{};
+            pldata.Read(is_compute);
+            if (is_compute) {
+                result = LoadComputePipeline(ar);
+            } else {
+                result = LoadGraphicsPipeline(ar);
             }
+        } catch (const Serialization::CorruptedData&) {
+            // A truncated entry (e.g. from a killed session) is just skipped.
+            infos.fill(nullptr);
+            modules.fill(nullptr);
+            fetch_shader = nullptr;
+            result = false;
+        }
 
-            if (result) {
-                ++num_pipelines;
+        // sotc: SOTC_PIPE_REMAP=1: the key was remapped to a pipeline that is loaded already,
+        // so nothing is built or saved for it and the old blob goes now. A remapped key that
+        // is built waits for its build (RemapBuilt, CollectAsyncPipelines).
+        if (last_key_remap == KeyRemap::RemappedDuplicate) {
+            ++remap_totals.duplicates;
+            if (Storage::DataBase::Instance().Remove(Storage::BlobType::PipelineKey, name)) {
+                ++remap_totals.removed;
             }
-        });
+        }
+
+        if (result) {
+            ++num_pipelines;
+        }
+    };
+    if (N5PsoEnabled()) {
+        // sotc: N5 boot order. Every blob is read first and loaded by its use count, most used
+        // first, so the workers build the pipelines the last session needed first. Equal counts
+        // keep the store's order.
+        struct BootBlob {
+            u32 uses;
+            std::string name;
+            std::vector<u8> data;
+        };
+        std::vector<BootBlob> blobs;
+        Storage::DataBase::Instance().ForEachNamedBlob(
+            Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data, const std::string& name) {
+                blobs.push_back({PipelineUseCount(data), name, std::move(data)});
+            });
+        std::stable_sort(blobs.begin(), blobs.end(),
+                         [](const BootBlob& a, const BootBlob& b) { return a.uses > b.uses; });
+        for (auto& blob : blobs) {
+            load_blob(std::move(blob.data), blob.name, blob.uses);
+        }
+    } else {
+        Storage::DataBase::Instance().ForEachNamedBlob(
+            Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data, const std::string& name) {
+                load_blob(std::move(data), name, 0);
+            });
+    }
 
     // sotc: the compute pipelines the workers built (SOTC_ASYNC_PRELOAD); the graphics ones
     // are still being built while the game starts.
@@ -786,6 +880,11 @@ void PipelineCache::WarmUp() {
     }
     preload_computes.clear();
     pending_compute_remaps.clear();
+
+    // sotc: N5 boot prebuild: waits for the graphics pipelines queued above (WaitPreloadBoot).
+    if (N5PsoEnabled()) {
+        WaitPreloadBoot(warmup_start);
+    }
 
     LOG_INFO(Render,
              "Preloaded {} pipelines in {} ms (SPIR-V reads {} ms, shader modules {} ms, "

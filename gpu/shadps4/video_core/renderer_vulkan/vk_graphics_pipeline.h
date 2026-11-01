@@ -159,6 +159,11 @@ public:
         return key;
     }
 
+    /// sotc: N5. Draws that bound this pipeline (command processor only), and the count its blob
+    /// holds (saved_use_count), so SaveUseCounts rewrites only the blobs that changed.
+    mutable u32 use_count{};
+    u32 saved_use_count{};
+
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,

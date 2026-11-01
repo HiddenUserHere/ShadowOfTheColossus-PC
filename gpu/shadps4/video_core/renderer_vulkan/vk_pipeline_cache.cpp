@@ -360,6 +360,100 @@ static bool AsyncComputeEnabled() {
     return enabled;
 }
 
+// sotc: N5 (SOTC_N5_PSO=1, with SOTC_NATIVE). The boot prebuild (WarmUp, WaitPreloadBoot), the
+// use counts saved at teardown (SaveUseCounts) and the counters of the compiles that stall the command
+// processor or the draw thread (ReportN5Pso).
+bool N5PsoEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_N5_PSO");
+        return SotcNative::On() && v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+namespace {
+using N5Clock = std::chrono::steady_clock;
+// Initialized at static initialization: the start of the process, for the grace period.
+const N5Clock::time_point g_n5_t0 = N5Clock::now();
+
+enum class N5Kind : u32 { Graphics, Compute, Link, Shader, Count };
+constexpr size_t kN5Kinds = static_cast<size_t>(N5Kind::Count);
+
+struct N5Stats {
+    std::atomic<u64> boot_total{};    ///< graphics pipelines the boot prebuild queued
+    std::atomic<u64> boot_built{};    ///< ... and the workers built
+    std::atomic<bool> boot_closed{};  ///< WaitPreloadBoot runs: no more are queued
+    std::atomic<s64> boot_start_ns{}; ///< WarmUp start
+    std::atomic<s64> boot_end_ns{};   ///< every queued one built (0: not yet)
+    std::atomic<bool> warming{};      ///< WarmUp runs
+    std::atomic<u64> grace{};         ///< sync compiles inside WarmUp or the grace period
+    std::array<std::atomic<u64>, kN5Kinds> kind{}; ///< sync compiles after it, by kind
+    std::atomic<u64> ns{};            ///< their time
+    std::atomic<u64> max_ns{};        ///< the longest in the window (reset by the report)
+};
+N5Stats g_n5;
+/// Notified, under async_mutex, when a graphics pipeline of the boot prebuild is built.
+std::condition_variable_any g_preload_cv;
+
+s64 N5NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(N5Clock::now().time_since_epoch())
+        .count();
+}
+
+double N5GraceSeconds() {
+    static const double seconds = [] {
+        const char* v = std::getenv("SOTC_N5_PSO_GRACE_S");
+        return v ? std::atof(v) : 30.0;
+    }();
+    return seconds;
+}
+
+// sotc: a pipeline or shader compiled on the command processor (or the draw thread) stalls it. Counted
+// per kind after the grace period; the ones inside it are counted apart.
+void N5NoteSyncCompile(N5Kind kind, N5Clock::time_point start) {
+    if (!N5PsoEnabled()) {
+        return;
+    }
+    if (g_n5.warming.load(std::memory_order_relaxed) ||
+        std::chrono::duration<double>(start - g_n5_t0).count() < N5GraceSeconds()) {
+        g_n5.grace.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const u64 ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(N5Clock::now() - start).count());
+    g_n5.kind[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+    g_n5.ns.fetch_add(ns, std::memory_order_relaxed);
+    u64 prev = g_n5.max_ns.load(std::memory_order_relaxed);
+    while (ns > prev && !g_n5.max_ns.compare_exchange_weak(prev, ns, std::memory_order_relaxed)) {
+    }
+}
+
+// sotc: N5. A boot prebuild graphics pipeline is built. Called under async_mutex.
+void N5NoteBootBuilt() {
+    const u64 built = g_n5.boot_built.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (g_n5.boot_closed.load(std::memory_order_relaxed) &&
+        built >= g_n5.boot_total.load(std::memory_order_relaxed)) {
+        g_n5.boot_end_ns.store(N5NowNs(), std::memory_order_relaxed);
+    }
+}
+
+// sotc: N5. Times one compile on the command processor (CompileModule, when no worker pools are given).
+struct N5SyncScope {
+    N5Kind kind;
+    N5Clock::time_point start;
+    bool on;
+    ~N5SyncScope() {
+        if (on) {
+            N5NoteSyncCompile(kind, start);
+        }
+    }
+};
+} // namespace
+
+void N5SetWarming(bool warming) {
+    g_n5.warming.store(warming, std::memory_order_relaxed);
+}
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -553,6 +647,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 }
 
 PipelineCache::~PipelineCache() {
+    SaveUseCounts(); // sotc: N5 (no-op without SOTC_N5_PSO)
     if (driver_cache_saver.joinable()) {
         driver_cache_saver.request_stop();
         driver_cache_saver.join();
@@ -788,6 +883,8 @@ void PipelineCache::QueueAsyncPipeline(u64 hash,
     if (preloaded) {
         job->preloaded = true;
         job->sdata = *preloaded; // the cached vertex layout the pipeline is built from
+        job->uses = warm_uses; // sotc: N5, the blob's use count
+        g_n5.boot_total.fetch_add(1, std::memory_order_relaxed);
     }
     job->remap_old_blob = std::move(remap_old_blob); // sotc: SOTC_PIPE_REMAP (nullopt otherwise)
     job->infos = infos;
@@ -889,12 +986,18 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             job->sdata, job->preloaded, true);
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         std::scoped_lock lock{async_mutex};
+        const bool boot = job->preloaded; // sotc: N5
         async_done.push_back(std::move(job));
         async_done_count.fetch_add(1, std::memory_order_release);
+        if (boot) {
+            N5NoteBootBuilt();
+        }
+        g_preload_cv.notify_all();
     }
 }
 
 bool PipelineCache::TryFastLink(std::unique_ptr<GraphicsPipeline>& slot) {
+    const N5Clock::time_point link_start = N5Clock::now(); // sotc: N5
     if (!GraphicsPipeline::FastLinkable(graphics_key, infos, runtime_infos, profile)) {
         g_gpl_counters.unlinkable.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -906,6 +1009,7 @@ bool PipelineCache::TryFastLink(std::unique_ptr<GraphicsPipeline>& slot) {
     if (!pipe->IsLinked()) {
         return false;
     }
+    N5NoteSyncCompile(N5Kind::Link, link_start); // sotc: N5
     slot = std::move(pipe);
     return true;
 }
@@ -953,6 +1057,8 @@ void PipelineCache::CollectAsyncPipelines() {
             // it compiles it, as when WarmUp builds it itself and it fails.
             if (job->pipeline->Handle()) {
                 it.value() = std::move(job->pipeline);
+                it.value()->use_count = job->uses; // sotc: N5
+                it.value()->saved_use_count = job->uses;
                 if (job->remap_old_blob) {
                     // sotc: SOTC_PIPE_REMAP: the remapped key built. It is saved under its new
                     // hash, then the old blob goes; a save that is not queued keeps the old one.
@@ -974,6 +1080,85 @@ void PipelineCache::CollectAsyncPipelines() {
         RegisterPipelineData(job->key, job->hash, job->sdata);
         ++num_new_pipelines;
     }
+}
+
+// sotc: N5. The graphics pipelines of the boot prebuild are built by the workers in the order WarmUp
+// queued them (most used first). This waits for them on the loading screen, up to the cap, and
+// installs each as it is built. Past the cap it returns: the rest is collected by the draws as before.
+void PipelineCache::WaitPreloadBoot(N5Clock::time_point start) {
+    static const double cap_s = [] {
+        const char* v = std::getenv("SOTC_N5_PSO_WAIT_S");
+        const double s = v ? std::atof(v) : 15.0;
+        return s < 0.0 ? 0.0 : s;
+    }();
+    const auto deadline =
+        start + std::chrono::duration_cast<N5Clock::duration>(std::chrono::duration<double>(cap_s));
+    g_n5.boot_start_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count(),
+        std::memory_order_relaxed);
+    g_n5.boot_closed.store(true, std::memory_order_relaxed);
+    bool capped = false;
+    for (;;) {
+        CollectAsyncPipelines();
+        const u64 total = g_n5.boot_total.load(std::memory_order_relaxed);
+        const u64 built = g_n5.boot_built.load(std::memory_order_relaxed);
+        SotcStats::warmup_total.store(static_cast<u32>(total), std::memory_order_relaxed);
+        SotcStats::warmup_done.store(static_cast<u32>(built), std::memory_order_relaxed);
+        if (built >= total && async_done_count.load(std::memory_order_acquire) == 0) {
+            break;
+        }
+        std::unique_lock lock{async_mutex};
+        if (!g_preload_cv.wait_until(lock, deadline, [this] {
+                return async_done_count.load(std::memory_order_acquire) != 0 ||
+                       g_n5.boot_built.load(std::memory_order_relaxed) >=
+                           g_n5.boot_total.load(std::memory_order_relaxed);
+            })) {
+            capped = true;
+            break;
+        }
+    }
+    const u64 total = g_n5.boot_total.load(std::memory_order_relaxed);
+    const u64 built = g_n5.boot_built.load(std::memory_order_relaxed);
+    if (built >= total) {
+        g_n5.boot_end_ns.store(N5NowNs(), std::memory_order_relaxed);
+    }
+    std::fprintf(stderr,
+                 "SOTC N5 PSO boot: %llu of %llu graphics pipelines built in %.0f ms%s\n",
+                 static_cast<unsigned long long>(built), static_cast<unsigned long long>(total),
+                 static_cast<double>(N5NowNs() - g_n5.boot_start_ns.load()) / 1e6,
+                 capped ? " (cap reached, the rest builds in the background)" : "");
+}
+
+// sotc: N5. Rewrites the use count of each pipeline blob whose count changed this session. Only with
+// N5 on; a process that is killed keeps the counts of its last clean exit (as the driver cache).
+void PipelineCache::SaveUseCounts() {
+    if (!N5PsoEnabled() || !Storage::DataBase::Instance().IsOpened()) {
+        return;
+    }
+    const auto start = N5Clock::now();
+    u32 written = 0;
+    for (auto& [key, pipeline] : graphics_pipelines) {
+        if (!pipeline || pipeline->use_count == pipeline->saved_use_count) {
+            continue;
+        }
+        const auto name = fmt::format("g_{:#018x}", std::hash<GraphicsPipelineKey>{}(key));
+        if (RewritePipelineUseCount(name, pipeline->use_count)) {
+            pipeline->saved_use_count = pipeline->use_count;
+            ++written;
+        }
+    }
+    for (auto& [key, pipeline] : compute_pipelines) {
+        if (!pipeline || pipeline->use_count == pipeline->saved_use_count) {
+            continue;
+        }
+        const auto name = fmt::format("c_{:#018x}", key.value);
+        if (RewritePipelineUseCount(name, pipeline->use_count)) {
+            pipeline->saved_use_count = pipeline->use_count;
+            ++written;
+        }
+    }
+    std::fprintf(stderr, "SOTC N5 PSO: use counts saved for %u pipelines in %.0f ms\n", written,
+                 std::chrono::duration<double, std::milli>(N5Clock::now() - start).count());
 }
 
 void PipelineCache::QueueAsyncTranslate(HwStage hw_stage, SwStage sw_stage,
@@ -1441,7 +1626,16 @@ bool PipelineCache::IsDepthOnlyDraw() const {
     return true;
 }
 
+// sotc: N5. Counts the draws that bind each pipeline (its use count, saved at teardown).
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    const GraphicsPipeline* pipeline = GetGraphicsPipelineLookup(params);
+    if (pipeline) {
+        ++pipeline->use_count;
+    }
+    return pipeline;
+}
+
+const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookup(const DrawIndirectParams params) {
     draw_indirect_params = params;
     // sotc: SOTC_DEPTH_SYNC_PIPE=1 builds depth-only (shadow) pipelines on this thread so their
     // draws are never skipped. Off by default since 2026-10-27: each build took ~36 ms and an
@@ -1647,6 +1841,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                                                   : "not eligible",
                         sync_start, infos[3] ? infos[3]->pgm_hash : 0, // vertex
                         infos[0] ? infos[0]->pgm_hash : 0);              // fragment
+        N5NoteSyncCompile(N5Kind::Graphics, sync_start); // sotc: N5
 
         if (tiny_draw) { // sotc: SOTC_TINY_ASYNC counters (every mode), for the 5 s report
             g_tiny_stats.sync_builds.fetch_add(1, std::memory_order_relaxed);
@@ -1676,7 +1871,16 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return it->second.get();
 }
 
+// sotc: N5. Counts the dispatches that bind each pipeline (its use count, saved at teardown).
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    const ComputePipeline* pipeline = GetComputePipelineLookup();
+    if (pipeline) {
+        ++pipeline->use_count;
+    }
+    return pipeline;
+}
+
+const ComputePipeline* PipelineCache::GetComputePipelineLookup() {
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -1728,6 +1932,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         } else {
             LogSyncPipeline("compute", async_workers.empty() ? "async off" : "not deferred",
                             sync_start, infos[0]->pgm_hash, 0);
+            N5NoteSyncCompile(N5Kind::Compute, sync_start); // sotc: N5
         }
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
@@ -1753,7 +1958,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 // draw, as before. 1: it is rebuilt only when the registers it reads changed (PipeKeyRegs), else
 // taken from the cached copy. 2: the same, and a draw that would take the cached copy rebuilds it
 // too and counts a different result (the rebuilt key is used).
-// sotc: N5 (SOTC_N5_PSO): unset with SOTC_NATIVE on, the default is 1; an explicit SOTC_PIPE_DIRTY
+// sotc: N5: unset with SOTC_NATIVE on, the default is 1; an explicit SOTC_PIPE_DIRTY
 // (0, 1 or 2) always wins.
 static int PipeDirtyMode() {
     static const int mode = [] {
@@ -2147,6 +2352,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
                                               Shader::Backend::Bindings& binding,
                                               Shader::Pools* worker_pools,
                                               std::vector<u32>* spv_out) {
+    // sotc: N5. A shader translated on the command processor is a stall (not on a worker).
+    const N5SyncScope n5_scope{N5Kind::Shader, N5Clock::now(), !worker_pools};
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     // sotc: the frame columns are command-processor time; worker time is counted apart.
@@ -2539,6 +2746,63 @@ void ReportPipeGpl(std::string& out, double seconds) {
         static_cast<unsigned long long>(reused[3]));
     out += line;
     (void)seconds; // the counts are per window; a rate is the reader's division by the window
+}
+
+// sotc: N5 counters, per 5 s window (SOTC_N5_PSO=1): the boot prebuild's progress, and the compiles on
+// the command processor or the draw thread after the grace period. Call from one thread only.
+void ReportN5Pso(std::string& out, double seconds) {
+    if (!N5PsoEnabled()) {
+        return;
+    }
+    static bool done_printed{};
+    const u64 total = g_n5.boot_total.load(std::memory_order_relaxed);
+    if (total != 0 && !done_printed) {
+        const u64 built = g_n5.boot_built.load(std::memory_order_relaxed);
+        const s64 end = g_n5.boot_end_ns.load(std::memory_order_relaxed);
+        const s64 start = g_n5.boot_start_ns.load(std::memory_order_relaxed);
+        const s64 at = end ? end : N5NowNs();
+        char boot[200];
+        std::snprintf(boot, sizeof(boot),
+                      "SOTC N5 PSO boot: %llu of %llu graphics pipelines built, %.0f ms%s\n",
+                      static_cast<unsigned long long>(built),
+                      static_cast<unsigned long long>(total),
+                      static_cast<double>(at - start) / 1e6, end ? " (done)" : "");
+        out += boot;
+        done_printed = end != 0; // one line after the boot is done, then none
+    }
+    static std::array<u64, kN5Kinds> prev_kind{};
+    static u64 prev_grace{};
+    u64 window[kN5Kinds]{};
+    u64 window_total = 0;
+    for (size_t i = 0; i < kN5Kinds; ++i) {
+        const u64 now = g_n5.kind[i].load(std::memory_order_relaxed);
+        window[i] = now - prev_kind[i];
+        prev_kind[i] = now;
+        window_total += window[i];
+    }
+    const u64 grace = g_n5.grace.load(std::memory_order_relaxed);
+    const u64 window_grace = grace - prev_grace;
+    prev_grace = grace;
+    const u64 max_ns = g_n5.max_ns.exchange(0, std::memory_order_relaxed);
+    const u64 sum_ns = g_n5.ns.load(std::memory_order_relaxed);
+    static u64 prev_sum_ns{};
+    const u64 window_ns = sum_ns - prev_sum_ns;
+    prev_sum_ns = sum_ns;
+    if (window_total == 0 && window_grace == 0) {
+        return;
+    }
+    char line[400];
+    std::snprintf(
+        line, sizeof(line),
+        "SOTC N5 PSO sync compiles after %.0f s: graphics %llu, compute %llu, link %llu, "
+        "shader %llu (%.0f/s, %.1f ms, max %.1f ms); during warm-up or the grace period %llu\n",
+        N5GraceSeconds(), static_cast<unsigned long long>(window[0]),
+        static_cast<unsigned long long>(window[1]), static_cast<unsigned long long>(window[2]),
+        static_cast<unsigned long long>(window[3]),
+        seconds > 0.0 ? static_cast<double>(window_total) / seconds : 0.0,
+        static_cast<double>(window_ns) / 1e6, static_cast<double>(max_ns) / 1e6,
+        static_cast<unsigned long long>(window_grace));
+    out += line;
 }
 
 } // namespace Vulkan
