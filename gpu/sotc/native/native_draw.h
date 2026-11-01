@@ -1,21 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 sotc-pc port
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: the draw-thread side of the native memory model (native.cpp). The contract is native.h; these
-// are the hand-offs BufferCache uses at its submit start and in ObtainBuffer. Nothing else includes this.
+// are the hand-offs BufferCache uses at its submit start. Nothing else includes this.
 #pragma once
 
 #include <cstdint>
-#include <vector>
 
 #include "native.h"
 
 namespace SotcNative {
-
-/// A guest range (windows, uploads).
-struct Range {
-    uint64_t addr;
-    uint64_t size;
-};
 
 /// An announced range waiting for the draw thread (Announce, Persistent or PerFrame; at most 64 MiB each).
 struct PendingUpload {
@@ -26,10 +19,6 @@ struct PendingUpload {
 
 /// Draw thread. Pops the oldest pending upload. False when none is queued.
 bool TakeUpload(PendingUpload& out);
-/// Draw thread. Windows registered since the previous call (they must be ringed once).
-void TakeNewWindows(std::vector<Range>& out);
-/// Every registered window (the ring set of the tracker, re-applied whenever the ring set is rebuilt).
-std::vector<Range> WindowRanges();
 
 /// The frame ticket's backend, set once by the rasterizer owner (BufferCache): the frame counter of the
 /// guest (SubmitDone calls) and the GPU ticket recorded for each frame.
@@ -42,7 +31,6 @@ struct FrameBackend {
 void SetFrameBackend(const FrameBackend& backend);
 
 /// Counters (draw thread or any thread, relaxed).
-void NoteBind(bool served);            ///< a bind inside a window: served from the import, or refused
 void NoteUploaded(uint64_t bytes);     ///< a persistent range uploaded by the draw thread (0: already clean)
 void NoteMarked(uint64_t bytes);       ///< a per-frame range marked CPU-modified (fallback)
 void NoteDroppedUpload();              ///< a queue overflow: nothing else can be done for the range

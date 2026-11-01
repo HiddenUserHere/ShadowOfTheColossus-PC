@@ -1,5 +1,7 @@
 # Native allocator windows: hook wiring (winhooks)
 
+**Deleted (1 Nov).** The window hooks (NATIVE_WINDOW_RELEASE, NATIVE_WINDOW_SETUP), the window handlers in the allocator and memtype probes, and `HookAction::SkipOriginal` (its only user was the window reuse) were removed. See `impl-windows.md`. The text below is the history of that wiring.
+
 Wires the window entry points of `gpu/sotc/pc_pool.cpp` (SetupWindows, BindRenderTargets, SetHeapKey, ClearHeapKey,
 WindowRelease, WindowReuse) into the running game, all behind `SOTC_NATIVE`. Uncommitted, in the worktree
 `agent-adbbd730768836158`. Built nothing and ran nothing: syntax-only compile and the install check.

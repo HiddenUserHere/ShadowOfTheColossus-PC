@@ -483,9 +483,8 @@ Prediction Predict(const Pools& pre, const Request& req, const PhysMap* map, Poo
     const uint64_t pages = AlignUp(req.size, kPageBytes) / kPageBytes;
     const uint64_t bytes = pages * kPageBytes;
 
-    // Step 1: kind 1 tries the flexible set first, with the 64 KiB alignment. sotc: a window route (force_fresh) takes
-    // its VA from the window, so the free-VA search of steps 1 and 3 is skipped (pc_pool_windows.h).
-    if (req.kind == 1 && !req.force_fresh) {
+    // Step 1: kind 1 tries the flexible set first, with the 64 KiB alignment.
+    if (req.kind == 1) {
         uint64_t start = 0;
         const int idx = FindRun(pre.set[0], bytes, align64, &start);
         if (idx >= 0) {
@@ -515,7 +514,7 @@ Prediction Predict(const Pools& pre, const Request& req, const PhysMap* map, Poo
     const int F = 3 - P;
     const uint64_t align1 = AlignUp(align64, kMiB);
     uint64_t start = 0;
-    const int idx = req.force_fresh ? -1 : FindRun(pre.set[P], bytes, align1, &start);
+    const int idx = FindRun(pre.set[P], bytes, align1, &start);
     if (idx >= 0) {
         p.path = HitPath(pre.set[P], static_cast<size_t>(idx), start, bytes, false);
         TakeRun(&post->set[P], static_cast<size_t>(idx), start, bytes, pages);
@@ -936,8 +935,7 @@ Route Controller::Run(Host& host, const Request& req, uint64_t* node) {
     Prediction pred;
     Pools predicted;
     host.Predict(pre, req, &pred, &predicted);
-    // sotc: a window route is eligible on the fresh paths whatever the path mask says (pc_pool_windows.h).
-    if (!Eligible(pred, req.force_fresh ? (mask_ | kFreshPathMask) : mask_)) {
+    if (!Eligible(pred, mask_)) {
         host.ReleaseLock();
         ++stats_.fallback[static_cast<int>(Fallback::Ineligible)];
         expect_valid_ = false;
@@ -1036,9 +1034,6 @@ Route Controller::Run(Host& host, const Request& req, uint64_t* node) {
 #include "pc_pool_native_dispatch.h" // SotcPcPoolDispatch: writer dispatch, PredictCall, InModelled (native path)
 #include "pc_pool_native_primary.h" // SotcPcPoolNative::ApplyPrimaryNodeHit, PrimaryLastWriteSet
 #include "video_core/sotc_trace.h" // image bounds (SotcTrace::ImageBase/ImageSize)
-#include "native/native.h"          // SotcNative::On (the windows are native-mode only)
-#include "native/native_windows.h"  // SotcNativeWindows::ModeOn, RegisterRange
-#include "pc_pool_windows.h"        // SotcPcPoolWindows::Table, WindowFreshHost (the window routes)
 
 extern "C" {
 // runtime_memory.c: the unprotected backing view of a guest address, and the mapped region of one.
@@ -1855,71 +1850,9 @@ public:
     }
 };
 
-// sotc: the windows of the native path (pc_pool_windows.h). The table is the process's; it is used under g_mutex.
-// Offsets of the owner (family object) and of the node as 0x479a0 and 0x476f0 use them (decompile 00004/000479a0.c,
-// 000476f0.c): owner+0x30 bytes, +0x38 the list sentinel, +0x48 the list head, +0x58 the count (i32).
-constexpr uint64_t kArenaKind2Global = 0x2dfb2b8; ///< the GPU arena object (window A's owner), read at SetupWindows
-constexpr uint64_t kArenaKind1Global = 0x2dfb2c0; ///< the CPU arena object (window B's owner)
-constexpr int64_t kNoHeapKey = -2;                ///< no heap-slot scope on this thread
-constexpr uint64_t kOwnerBytes = 0x30;
-constexpr uint64_t kOwnerListSentinel = 0x38;
-constexpr uint64_t kOwnerListHead = 0x48;
-constexpr uint64_t kOwnerCount = 0x58;
-constexpr uint64_t kNodeLinkPrev = 0x08;
-constexpr uint64_t kNodeLinkNext = 0x10;
-constexpr uint64_t kNodeOwnerList = 0x18;
-
-thread_local int64_t t_heap_key = kNoHeapKey;
-
-// The host side of a block: imported at its commit (the writer has backed it), dropped when the pool frees it.
-SotcPcPoolWindows::Table& WindowTable() {
-    static SotcPcPoolWindows::Table table(
-        [](uint64_t va, uint64_t bytes) { return SotcNativeWindows::ImportBlock(va, bytes); },
-        [](uint64_t va, uint64_t bytes) { SotcNativeWindows::DropBlock(va, bytes); });
-    return table;
-}
-
-bool WindowsOn() {
-    return NativeActive() && SotcNativeWindows::ModeOn();
-}
-
-// Reserves window `slot` from the pool host and registers it. Failures are printed once per slot (boot path only).
-bool ReserveSlot(int slot) {
-    PoolFreshHost host;
-    std::string why;
-    const SotcPcPoolWindows::RegisterFn reg = [](uint64_t base, uint64_t size, const char* name) {
-        return SotcNativeWindows::RegisterRange(base, size, name);
-    };
-    if (WindowTable().Reserve(slot, host, reg, &why)) {
-        return true;
-    }
-    std::fprintf(stderr, "SOTC PC POOL WINDOWS: %s not reserved (%s)\n", SotcPcPoolWindows::Spec(slot).name,
-                 why.c_str());
-    return false;
-}
-
-const char* OutcomeName(Outcome outcome) {
-    switch (outcome) {
-    case Outcome::Predicted:
-        return "predicted";
-    case Outcome::Null:
-        return "null";
-    case Outcome::WouldCrash:
-        return "would-crash";
-    case Outcome::Unmodelled:
-        return "unmodelled";
-    }
-    return "?";
-}
-
-// NativeHost (below) takes its VA from the window host when a window route is set on the call.
+// The glue side of Native::Host. One instance per call; the controller holds the game's pool lock while it runs.
 class NativeHost final : public Native::Host {
 public:
-    explicit NativeHost(int window_slot = -1) : window_host_(fresh_host_, WindowTable()), window_slot_(window_slot) {}
-
-    // The window VA the fresh writer took in this call (0: none). NativeEntry commits it after a native return.
-    uint64_t window_va() const { return window_host_.last_va(); }
-
     bool TakeLock() override {
         lock_word_ = TakeGameLock();
         if (lock_word_ == nullptr) {
@@ -1957,34 +1890,6 @@ public:
             *p = SotcPcPoolDispatch::PredictCall(pre, req, &g_map, predicted, count_pre, refill, &refill_block);
         }
         st_.refill_block = refill_block;
-        // sotc: a window route records where it ends (WhyNotServed). Eligibility is the controller's own test, with the
-        // fresh paths added for a forced-fresh call (Controller::Run).
-        if (req.force_fresh) {
-            predicted_ = true;
-            outcome_ = p->outcome;
-            path_ = p->path;
-            reason_ = p->reason;
-            eligible_ = Eligible(*p, PathMask() | kFreshPathMask);
-        }
-    }
-
-    // sotc: the stage a routed call ended at without a window block (SotcPcPoolWindows::Table::NoteNotServed).
-    std::string WhyNotServed() {
-        if (!predicted_) {
-            return "no prediction (killed, lock busy or snapshot failed)";
-        }
-        if (!eligible_) {
-            std::string why = std::string("ineligible ") + PathName(path_) + " " + OutcomeName(outcome_);
-            if (reason_ != nullptr && *reason_ != '\0') {
-                why += std::string(": ") + reason_;
-            }
-            return why;
-        }
-        const char* refusal = RefusalReason();
-        if (refusal != nullptr && *refusal != '\0') {
-            return std::string("writer refused: ") + refusal;
-        }
-        return "eligible, no window VA";
     }
 
     // sotc: diagnostic text for a kill (the writer that ran, its touched nodes).
@@ -2013,17 +1918,7 @@ public:
         st_.refill = RefillSwitch();
         st_.overhead_addr = SotcPcPoolNodes::OverheadAddr(SotcTrace::ImageBase());
         st_.map = FreshMap();
-        // sotc: a window route (req.force_fresh) takes the fresh block's VA from its window. A refused call gives the
-        // VA back: nothing was committed, so the window's block is free again.
-        if (!req.force_fresh) {
-            return SotcPcPoolDispatch::Apply(mem, fresh_host_, &st_, pre, p, req);
-        }
-        window_host_.Select(window_slot_);
-        const uint64_t node = SotcPcPoolDispatch::Apply(mem, window_host_, &st_, pre, p, req);
-        if (node == 0 && window_host_.last_va() != 0 && SotcPcPoolDispatch::LastWriteSet(st_).empty()) {
-            WindowTable().GiveVa(window_slot_, window_host_.last_va(), window_host_.last_bytes());
-        }
-        return node;
+        return SotcPcPoolDispatch::Apply(mem, fresh_host_, &st_, pre, p, req);
     }
 
     std::vector<std::pair<uint64_t, size_t>> LastWriteSet() override { return SotcPcPoolDispatch::LastWriteSet(st_); }
@@ -2079,13 +1974,6 @@ private:
     uint64_t* lock_word_ = nullptr;
     SotcPcPoolDispatch::State st_; ///< the call's dispatch state (pc_pool_native_dispatch.h)
     PoolFreshHost fresh_host_;
-    SotcPcPoolWindows::WindowFreshHost window_host_; ///< sotc: the fresh VA source of a window route
-    int window_slot_ = -1;                           ///< sotc: the window of this call (-1: a normal call)
-    bool predicted_ = false;                         ///< sotc: Predict ran on a window route (WhyNotServed)
-    Outcome outcome_ = Outcome::Unmodelled;
-    Path path_ = Path::Unmodelled;
-    const char* reason_ = "";
-    bool eligible_ = false;
 };
 
 Native::Controller& NativeController() {
@@ -2177,23 +2065,11 @@ HookAction NativeEntry(GuestRegs& regs, void*) {
     req.align = static_cast<uint32_t>(regs.rdx);
     req.kind = static_cast<int32_t>(regs.rcx);
     req.obj = regs.rdi;
-    // sotc: a window route (pc_pool_windows.h). Full or unbound windows leave the call on the normal path (counted).
-    const int slot = WindowsOn() ? WindowTable().Route(req.obj, req.kind, t_heap_key, req.size, req.align) : -1;
-    req.force_fresh = slot >= 0;
-    NativeHost host(slot);
+    NativeHost host;
     uint64_t node = 0;
     if (NativeController().Run(host, req, &node) == Native::Route::Native) {
         regs.rax = node;
-        if (slot >= 0 && host.window_va() != 0) {
-            WindowTable().Commit(slot, host.window_va(), req.size, node);
-        } else if (slot >= 0) {
-            WindowTable().NoteNotServed(slot, "native, no window VA");
-        }
         return HookAction::Return;
-    }
-    // sotc: a routed call that ran the original is counted with the stage it ended at (the window did not place it).
-    if (slot >= 0) {
-        WindowTable().NoteNotServed(slot, host.WhyNotServed());
     }
     return HookAction::Continue;
 }
@@ -2246,136 +2122,9 @@ void ReportNative(std::string& out) {
                       static_cast<unsigned long long>(count));
         out += line;
     }
-    if (SotcNativeWindows::ModeOn()) {
-        SotcPcPoolWindows::ReportTable(WindowTable(), out);
-    }
 }
 
 } // namespace
-
-// ---- windows: the hook entry points (pc_pool.h). Each is inert outside native mode. --------------------------------
-
-void SetupWindows() {
-    if (!WindowsOn()) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    static bool done = false; // once per session: the arenas are created once
-    if (done) {
-        return;
-    }
-    done = true;
-    uint64_t arena_a = 0;
-    uint64_t arena_b = 0;
-    if (ReadAny(SotcTrace::ImageBase() + kArenaKind2Global, &arena_a, 8) && arena_a != 0 &&
-        ReserveSlot(static_cast<int>(SotcPcPoolWindows::Slot::GpuArena))) {
-        WindowTable().Bind(static_cast<int>(SotcPcPoolWindows::Slot::GpuArena), arena_a, SotcPcPoolWindows::kAnyKey);
-    }
-    if (ReadAny(SotcTrace::ImageBase() + kArenaKind1Global, &arena_b, 8) && arena_b != 0 &&
-        ReserveSlot(static_cast<int>(SotcPcPoolWindows::Slot::MaskHeap))) {
-        WindowTable().Bind(static_cast<int>(SotcPcPoolWindows::Slot::MaskHeap), arena_b,
-                           SotcPcPoolWindows::kMaskKey);
-    }
-}
-
-void BindRenderTargets(uint64_t rt_obj) {
-    if (!WindowsOn() || rt_obj == 0) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    const int slot = static_cast<int>(SotcPcPoolWindows::Slot::RenderTargets);
-    if (WindowTable().bound(slot) || !ReserveSlot(slot)) {
-        return; // bound once per session (the first render-target allocator); the window stays for its block
-    }
-    WindowTable().Bind(slot, rt_obj, SotcPcPoolWindows::kAnyKey);
-}
-
-void SetHeapKey(int64_t key) {
-    t_heap_key = key;
-}
-
-void ClearHeapKey() {
-    t_heap_key = kNoHeapKey;
-}
-
-bool WindowRelease(uint64_t owner, uint64_t node) {
-    if (!WindowsOn() || owner == 0 || node == 0) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    // Reads first: a failed read leaves the call to the original.
-    uint64_t va = 0;
-    uint64_t size = 0;
-    uint64_t backed = 0;
-    uint64_t prev = 0;
-    uint64_t next = 0;
-    int32_t count = 0;
-    uint64_t bytes = 0;
-    if (!ReadU64(node + kNodeBaseOff, &va) || !ReadU64(node + kNodeSizeOff, &size) ||
-        !ReadU64(node + kNodeBackedOff, &backed) || !ReadU64(node + kNodeLinkPrev, &prev) ||
-        !ReadU64(node + kNodeLinkNext, &next) || !ReadI32(owner + kOwnerCount, &count) ||
-        !ReadU64(owner + kOwnerBytes, &bytes)) {
-        return false;
-    }
-    if (!WindowTable().Release(node, va, size)) {
-        // An ordinary free: the original runs 0x476f0 with its VA return, and the pool unmaps the block. A window block
-        // is then no longer backed by the game, so its import goes too (Table::Forget; a no-op outside the windows).
-        WindowTable().Forget(va);
-        return false;
-    }
-    // The stores of 0x476f0 before its call to 0x1b0e0 (the unlink, the count and the bytes), and then the return
-    // without that call. The VA stays in use in the pool (the parked node) and its phys stays mapped.
-    PoolGuestMem mem;
-    const uint64_t zero = 0;
-    const int32_t count_after = count - 1;
-    const uint64_t bytes_after = bytes - backed;
-    mem.Write(node + kNodeOwnerList, &zero, 8);                 // node+0x18 := 0
-    mem.Write(node, &zero, 8);                                  // node+0 := 0
-    mem.Write(prev + kNodeLinkNext, &next, 8);                  // prev->next := next (the list's [lVar2+0x10])
-    mem.Write(next + kNodeLinkPrev, &prev, 8);                  // next->prev := prev
-    mem.Write(node + kNodeLinkNext, &node, 8);                  // node's links point at itself
-    mem.Write(node + kNodeLinkPrev, &node, 8);
-    mem.Write(owner + kOwnerCount, &count_after, 4);            // owner count -1
-    mem.Write(owner + kOwnerBytes, &bytes_after, 8);            // owner bytes -= backed (0x476f0 reads node+0x50)
-    return true;
-}
-
-bool WindowReuse(uint64_t owner, uint64_t size, uint64_t* node_out) {
-    if (!WindowsOn() || owner == 0 || size == 0 || node_out == nullptr) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    // Reads of the owner's list and of the node's size, before the table gives the node up.
-    uint64_t old_head = 0;
-    int32_t count = 0;
-    uint64_t bytes = 0;
-    if (!ReadU64(owner + kOwnerListHead, &old_head) || !ReadI32(owner + kOwnerCount, &count) ||
-        !ReadU64(owner + kOwnerBytes, &bytes)) {
-        return false;
-    }
-    uint64_t node = 0;
-    if (!WindowTable().Reuse(owner, t_heap_key, size, &node)) {
-        return false;
-    }
-    uint64_t node_size = 0;
-    ReadU64(node + kNodeSizeOff, &node_size);
-    // The stores of 0x479a0 for a node it returns (lines after the 0x19ae0 call): the node into the owner's list,
-    // count +1, bytes += node size.
-    PoolGuestMem mem;
-    const uint64_t sentinel = owner + kOwnerListSentinel;
-    const int32_t count_after = count + 1;
-    const uint64_t bytes_after = bytes + node_size;
-    mem.Write(node, &node, 8);                                  // node+0 := node
-    mem.Write(node + kNodeLinkPrev, &sentinel, 8);              // node+8 := owner+0x38
-    mem.Write(node + kNodeLinkNext, &old_head, 8);              // node+0x10 := old head
-    mem.Write(owner + kOwnerListHead, &node, 8);                // owner list head := node
-    mem.Write(old_head + kNodeLinkPrev, &node, 8);              // old head+8 := node
-    mem.Write(owner + kOwnerCount, &count_after, 4);            // owner count +1
-    mem.Write(node + kNodeOwnerList, &sentinel, 8);             // node+0x18 := owner+0x38
-    mem.Write(owner + kOwnerBytes, &bytes_after, 8);            // owner bytes += node size
-    *node_out = node;
-    return true;
-}
 
 void Register() {
     // Refusal of both switches is printed here, once, at install time.

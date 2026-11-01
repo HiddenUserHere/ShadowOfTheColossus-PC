@@ -42,8 +42,6 @@
 #include "mem_classes.h" // SotcMemClasses::OnGranule / OnGranuleShared (granule claims)
 #include "probes.h"
 #include "native/native.h"               // sotc: SOTC_NATIVE switch (SotcNative::On)
-#include "native/native_windows_hooks.h" // sotc: heap key of the native windows (window B)
-#include "pc_pool_windows.h"                // sotc: kMaskKey (memtype 17, RenderSingleFrameCPU)
 
 namespace SotcNativeHooks { // sotc: gpu/sotc/native/native_hooks.cpp
 void NoteFrameBlock(uint64_t addr, uint64_t size);
@@ -283,6 +281,8 @@ struct PendingAlloc {
 };
 thread_local std::array<PendingAlloc, kPendingDepth> t_pending{};
 thread_local uint32_t t_pending_depth = 0;
+// The memtype whose blocks are RenderSingleFrameCPU's (the per-frame CPU arena): NoteFrameBlock announces them.
+constexpr int64_t kRenderSingleFrameCpuSlot = 17;
 bool g_post_on = false; // the post phase is registered: SOTC_MEMTYPE_CLASSES, the placement glue or SOTC_NATIVE
 bool g_post_granules = false; // the post phase also claims granules: SOTC_MEMTYPE_CLASSES or the placement glue
 
@@ -293,10 +293,6 @@ HookAction AllocPre(GuestRegs& regs, void*) {
     if (raw_slot >= kSlots) {
         idx = kSlots - 1;
         g_slot_clamped.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (SotcNative::On()) {
-        // sotc: the heap key of this call (window B is keyed by memtype 17); cleared by the post phase.
-        SotcNativeWindowHooks::MemtypePre(raw_slot);
     }
     if (g_post_on) {
         // sotc: SOTC_PC_PLACE: this call is the heap context of every pool block its refill hands out.
@@ -476,9 +472,6 @@ void NoteAllocGranules(uint64_t base, uint64_t size, uint32_t slot) {
 
 // Post phase of MEMTYPE_ALLOC (registered with SOTC_MEMTYPE_CLASSES=1 or the placement glue): rax = returned pointer.
 void AllocPost(GuestRegs& regs, void*) {
-    if (SotcNative::On()) {
-        SotcNativeWindowHooks::MemtypePost(); // sotc: clears the heap key on every return path (a wrap's post)
-    }
     if (t_pending_depth == 0) {
         return; // no matching pre phase on this thread (cannot happen while the hook is installed)
     }
@@ -489,7 +482,7 @@ void AllocPost(GuestRegs& regs, void*) {
         NoteAllocGranules(regs.rax, call.size, call.slot);
     }
     // sotc: SOTC_NATIVE: a RenderSingleFrameCPU block is announced PerFrame at the next submit.
-    if (SotcNative::On() && static_cast<int64_t>(call.slot) == SotcPcPoolWindows::kMaskKey && regs.rax != 0) {
+    if (SotcNative::On() && static_cast<int64_t>(call.slot) == kRenderSingleFrameCpuSlot && regs.rax != 0) {
         SotcNativeHooks::NoteFrameBlock(regs.rax, call.size);
     }
 }
@@ -566,8 +559,8 @@ void RegisterMemtype() {
     g_classes_on = classes && *classes && std::strtol(classes, nullptr, 10) != 0;
     // sotc: SOTC_PC_PLACE needs the same post phase (granule carves and the heap context), with or without classes.
     g_post_granules = g_classes_on || SotcPcPlaceGlue::On();
-    // sotc: SOTC_NATIVE needs the post phase too (the heap key is cleared there); the post phase then runs
-    // without the granule claims unless the classes mode or the glue asks for them (g_post_granules).
+    // sotc: SOTC_NATIVE needs the post phase too (NoteFrameBlock runs there); the post phase then runs without the
+    // granule claims unless the classes mode or the glue asks for them (g_post_granules).
     g_post_on = g_post_granules || SotcNative::On();
 
     SotcHooks::Handler alloc;

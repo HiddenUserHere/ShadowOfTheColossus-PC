@@ -5856,14 +5856,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         stream_buffer.Commit();
         return {&stream_buffer, offset};
     }
-    // sotc: SOTC_NATIVE: a range inside a registered window is served from its imported run, as the
-    // ring8 host binds below (no sync, no tracking). A block not imported yet makes NativeBind refuse
-    // (counted, the normal path with the bytes marked CPU-modified).
-    if (SotcNative::On() && SotcNative::InWindow(device_addr, size)) {
-        if (auto host = NativeBind(device_addr, size, is_written)) {
-            return *host;
-        }
-    }
     // sotc: SOTC_PC_RING=8 (host arena binds): a range inside one imported arena run is read, and
     // written, in the imported host memory. No sync and no GPU tracking for it (pc_ring.h, mode 8).
     if (SotcPcRing::Mode() == 8) {
@@ -7371,11 +7363,6 @@ void BufferCache::PcRingApply(const std::vector<SotcPcRing::RingExtent>& blocks)
     for (const auto& block : blocks) {
         ranges.push_back(SotcUntrack::Range{block.addr, block.size});
     }
-    if (SotcNative::On()) { // sotc: SOTC_NATIVE windows stay ringed whatever the ring set is
-        for (const auto& w : SotcNative::WindowRanges()) {
-            ranges.push_back(SotcUntrack::Range{w.addr, w.size});
-        }
-    }
     memory_tracker->ApplyRing(ranges);
 }
 
@@ -7808,29 +7795,8 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostServe(
     return std::pair<const Buffer*, u64>{slot.get(), view.offset};
 }
 
-// sotc: SOTC_NATIVE. Draw thread. The window's bytes are ringed (never protected), so a bind that cannot be
-// served from one imported run marks them CPU-modified first: the normal path then uploads their current bytes.
-std::optional<std::pair<const Buffer*, u64>> BufferCache::NativeBind(VAddr device_addr, u32 size,
-                                                                      bool is_written) {
-    Vulkan::SotcGuestMemory::GuestView view{};
-    if (!Vulkan::SotcGuestMemory::LookupGuestView(device_addr, size, &view)) {
-        SotcNative::NoteBind(false);
-        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
-        SotcNative::NoteMarked(size);
-        return std::nullopt;
-    }
-    SotcNative::NoteBind(true);
-    return PcHostServe(device_addr, size, is_written, view);
-}
-
-// sotc: SOTC_NATIVE. Draw thread, once per submit. Windows are ringed first, so the uploads below never
-// see them; an announced range found inside a window is served by its bind and needs no upload.
+// sotc: SOTC_NATIVE. Draw thread, once per submit: performs the queued announced uploads.
 void BufferCache::NativeDrain(u64 budget) {
-    std::vector<SotcNative::Range> windows;
-    SotcNative::TakeNewWindows(windows);
-    for (const auto& w : windows) {
-        memory_tracker->AddRingRange(w.addr, w.size);
-    }
     u64 spent = 0;
     SotcNative::PendingUpload up{};
     while (spent < budget && SotcNative::TakeUpload(up)) {

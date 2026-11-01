@@ -1,5 +1,7 @@
 # Native allocator windows (impl-windows)
 
+**Deleted (1 Nov).** The windows were removed completely: they registered but never served (`impl-gaps-round2.md`, "Windows" section), and their data is covered elsewhere (ring8 imports the arena blocks, memtype 17 blocks are announced by `NoteFrameBlock`, render targets are GPU-written). Deleted: `gpu/sotc/pc_pool_windows.*`, `gpu/sotc/tests/pc_pool_windows_test.cpp`, `gpu/sotc/native/native_windows*`, `scripts/hooks.d/native_windows.py` (hooks NATIVE_WINDOW_RELEASE and NATIVE_WINDOW_SETUP), the window API of `native.h` (RegisterWindow, ImportWindowBlock, DropWindowBlock, InWindow, InWindowBlock, TakeNewWindows, WindowRanges, NoteBind), `NativeBind` in the buffer cache, `DropGuestRange` in `sotc_guest_memory`, the window routes of `pc_pool` (SetupWindows, BindRenderTargets, heap keys, WindowRelease, WindowReuse) and `SkipOriginal` in the hook engine. The rest of this document describes the removed design and is kept as history only.
+
 Implementation of the window layout of `allocators.md` (sections 5 to 7): per-owner VA windows A (GPU arena, 128 MiB), B (XPR mask heap, 16 MiB), C (render targets, 352 MiB). D (GPU static) keeps its per-chunk import, no window. Uncommitted, in the worktree `agent-ae2dd1c5f784935d9`. Built and tested with the MSYS2 CLANG64 toolchain (unit tests only; the game was not run).
 
 ## Files

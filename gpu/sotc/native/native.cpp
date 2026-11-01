@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 sotc-pc port
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: the PC-native memory model, the API of native.h. See docs/re-stutters/native/PLAN.md.
-// Windows are registered at boot and their blocks imported as the pool commits them, then served in place;
-// announced uploads are queued here and performed by the draw thread (BufferCache::NativeDrain); the frame
+// Announced uploads are queued here and performed by the draw thread (BufferCache::NativeDrain); the frame
 // ticket is a backend supplied by BufferCache.
 #include "native.h"
 #include "native_draw.h"
@@ -14,11 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
-#include <memory>
 #include <mutex>
 #include <unordered_map>
-
-#include "video_core/renderer_vulkan/sotc_guest_memory.h"
 
 namespace SotcNative {
 namespace {
@@ -34,12 +30,9 @@ struct Counters {
     std::atomic<uint64_t> announce_persistent{};
     std::atomic<uint64_t> announce_per_frame{};
     std::atomic<uint64_t> announce_gpu_written{};
-    std::atomic<uint64_t> announce_in_window{};
     std::atomic<uint64_t> announce_dropped{};
     std::atomic<uint64_t> announce_released{};
     std::atomic<uint64_t> announce_rejected{}; // outside the guest address space (kGuestLimit)
-    std::atomic<uint64_t> binds_served{};
-    std::atomic<uint64_t> binds_refused{};
     std::atomic<uint64_t> uploaded_bytes{};
     std::atomic<uint64_t> uploads{};
     std::atomic<uint64_t> uploads_clean{};
@@ -51,26 +44,12 @@ struct Counters {
     std::atomic<uint64_t> verify_unannounced{};
     std::atomic<uint64_t> verify_gpu_read{};
     std::atomic<uint64_t> verify_gpu_wait{};
-    std::atomic<uint64_t> blocks_imported{};
-    std::atomic<uint64_t> blocks_refused{};
-    std::atomic<uint64_t> blocks_dropped{};
 };
 Counters g_c;
 std::atomic<uint64_t> g_submitted_local{}; // frame counter when no backend is set
 std::atomic<size_t> g_pending_count{};     // size of g_pending (lock-free look)
 
-// Windows: an immutable sorted table, published atomically. Tables are kept for the life of the process, so a
-// reader that loaded one can use it without a lock. A table is replaced on each window or block change (a few
-// per session: windows at boot, blocks at their first commit and their give-back).
-struct Table {
-    std::vector<Range> windows; // registered windows, sorted by addr, disjoint
-    std::vector<Range> blocks;  // imported blocks of the windows, sorted by addr, disjoint
-};
-std::atomic<const Table*> g_table{nullptr};
-
-std::mutex g_mutex; // writers of the table, the pending queue, the new-window list, the descriptor map
-std::vector<std::unique_ptr<const Table>> g_tables;
-std::vector<Range> g_new_windows;  // registered, not yet ringed by the draw thread
+std::mutex g_mutex; // the pending queue and the descriptor map
 std::deque<PendingUpload> g_pending;
 
 struct DescRecord {
@@ -87,45 +66,6 @@ std::atomic<bool> g_backend_set{false};
 
 bool Overlaps(uint64_t a, uint64_t as, uint64_t b, uint64_t bs) {
     return a < b + bs && b < a + as;
-}
-
-// The list is sorted by addr and disjoint.
-bool OverlapsAny(const std::vector<Range>& list, uint64_t addr, uint64_t size) {
-    for (const Range& r : list) {
-        if (Overlaps(addr, size, r.addr, r.size)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// True when [addr, addr + size) lies inside one entry of the sorted, disjoint list.
-bool InsideAny(const std::vector<Range>& list, uint64_t addr, uint64_t size) {
-    if (size == 0) {
-        return false;
-    }
-    // The last entry starting at or before addr.
-    auto it = std::upper_bound(list.begin(), list.end(), addr,
-                               [](uint64_t a, const Range& r) { return a < r.addr; });
-    if (it == list.begin()) {
-        return false;
-    }
-    --it;
-    const uint64_t off = addr - it->addr;
-    return off <= it->size && size <= it->size - off;
-}
-
-// Caller holds g_mutex.
-void PublishTable(std::vector<Range> windows, std::vector<Range> blocks) {
-    const auto by_addr = [](const Range& a, const Range& b) { return a.addr < b.addr; };
-    std::sort(windows.begin(), windows.end(), by_addr);
-    std::sort(blocks.begin(), blocks.end(), by_addr);
-    auto table = std::make_unique<Table>();
-    table->windows = std::move(windows);
-    table->blocks = std::move(blocks);
-    const Table* raw = table.get();
-    g_tables.push_back(std::move(table));
-    g_table.store(raw, std::memory_order_release);
 }
 
 // SOTC_NATIVE: 0 off (default), 1 on, 2 on plus verify. Anything else reads as 0.
@@ -193,13 +133,8 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
         g_c.announce_persistent.fetch_add(1, std::memory_order_relaxed);
     } else {
         g_c.announce_per_frame.fetch_add(1, std::memory_order_relaxed);
-        if (InWindowBlock(addr, size)) {
-            g_c.announce_in_window.fetch_add(1, std::memory_order_relaxed);
-            return; // host-shared: the bind serves it in place
-        }
-        // A window block not imported yet (or refused) is uploaded like any other range.
     }
-    // Outside a window, PerFrame is uploaded like Persistent (the draw thread marks it CPU-modified).
+    // PerFrame is queued like Persistent; the draw thread marks it CPU-modified instead of uploading it.
     std::scoped_lock lock{g_mutex};
     for (uint64_t at = addr; at < addr + size;) {
         const uint64_t piece = std::min<uint64_t>(kMaxUploadChunk, addr + size - at);
@@ -243,92 +178,6 @@ void Release(uint64_t addr, uint64_t size) {
     }
     g_pending.swap(kept);
     g_pending_count.store(g_pending.size(), std::memory_order_release);
-}
-
-bool RegisterWindow(uint64_t addr, uint64_t size, const char* name) {
-    if (g_mode == 0 || size == 0) {
-        return false;
-    }
-    const char* label = name ? name : "?";
-    std::scoped_lock lock{g_mutex};
-    const Table* old = g_table.load(std::memory_order_acquire);
-    if (old && OverlapsAny(old->windows, addr, size)) {
-        std::fprintf(stderr, "SOTC NATIVE window %s refused: overlaps a registered window\n", label);
-        return false;
-    }
-    std::vector<Range> windows = old ? old->windows : std::vector<Range>{};
-    windows.push_back(Range{addr, size});
-    PublishTable(std::move(windows), old ? old->blocks : std::vector<Range>{});
-    g_new_windows.push_back(Range{addr, size});
-    std::fprintf(stderr, "SOTC NATIVE window %s registered: %#llx +%llu KiB (blocks import as committed)\n", label,
-                 static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size >> 10));
-    return true;
-}
-
-bool ImportWindowBlock(uint64_t addr, uint64_t size) {
-    if (g_mode == 0 || size == 0) {
-        return false;
-    }
-    std::scoped_lock lock{g_mutex};
-    const Table* old = g_table.load(std::memory_order_acquire);
-    if (!old || !InsideAny(old->windows, addr, size)) {
-        return false; // not in a window: the caller's range is not a block of one
-    }
-    if (InsideAny(old->blocks, addr, size)) {
-        return true;
-    }
-    // A block that partly overlaps an imported one is not a block of its own: refused, not imported twice.
-    if (OverlapsAny(old->blocks, addr, size) ||
-        !Vulkan::SotcGuestMemory::ImportGuestRange(addr, size)) {
-        g_c.blocks_refused.fetch_add(1, std::memory_order_relaxed);
-        static std::atomic<uint64_t> logged{};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-            std::fprintf(stderr, "SOTC NATIVE window block %#llx +%llu KiB refused (not backed or import failed)\n",
-                         static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size >> 10));
-        }
-        return false;
-    }
-    std::vector<Range> blocks = old->blocks;
-    blocks.push_back(Range{addr, size});
-    PublishTable(old->windows, std::move(blocks));
-    g_c.blocks_imported.fetch_add(1, std::memory_order_relaxed);
-    static std::atomic<uint64_t> logged{};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-        std::fprintf(stderr, "SOTC NATIVE window block %#llx +%llu KiB imported\n",
-                     static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size >> 10));
-    }
-    return true;
-}
-
-void DropWindowBlock(uint64_t addr, uint64_t size) {
-    if (g_mode == 0 || size == 0) {
-        return;
-    }
-    std::scoped_lock lock{g_mutex};
-    const Table* old = g_table.load(std::memory_order_acquire);
-    if (!old) {
-        return;
-    }
-    std::vector<Range> blocks = old->blocks;
-    const auto it = std::find_if(blocks.begin(), blocks.end(),
-                                 [&](const Range& r) { return r.addr == addr && r.size == size; });
-    if (it == blocks.end()) {
-        return; // not imported (refused, or never committed)
-    }
-    blocks.erase(it);
-    PublishTable(old->windows, std::move(blocks));
-    Vulkan::SotcGuestMemory::DropGuestRange(addr, size);
-    g_c.blocks_dropped.fetch_add(1, std::memory_order_relaxed);
-}
-
-bool InWindow(uint64_t addr, uint64_t size) {
-    const Table* t = g_table.load(std::memory_order_acquire);
-    return t && InsideAny(t->windows, addr, size);
-}
-
-bool InWindowBlock(uint64_t addr, uint64_t size) {
-    const Table* t = g_table.load(std::memory_order_acquire);
-    return t && InsideAny(t->blocks, addr, size);
 }
 
 uint64_t FrameSubmitted() {
@@ -396,27 +245,10 @@ void VerifyGpuWait(uint64_t label_addr, uint64_t rip) {
 }
 
 void Report(std::string& out, double seconds) {
-    uint64_t windows = 0;
-    uint64_t win_bytes = 0;
-    uint64_t blocks = 0;
-    uint64_t block_bytes = 0;
-    if (const Table* t = g_table.load(std::memory_order_acquire)) {
-        windows = t->windows.size();
-        for (const Range& w : t->windows) {
-            win_bytes += w.size;
-        }
-        blocks = t->blocks.size();
-        for (const Range& b : t->blocks) {
-            block_bytes += b.size;
-        }
-    }
     const auto take = [](std::atomic<uint64_t>& c) { return c.exchange(0, std::memory_order_relaxed); };
-    const uint64_t served = take(g_c.binds_served);
-    const uint64_t refused = take(g_c.binds_refused);
     const uint64_t ann_p = take(g_c.announce_persistent);
     const uint64_t ann_f = take(g_c.announce_per_frame);
     const uint64_t ann_g = take(g_c.announce_gpu_written);
-    const uint64_t ann_w = take(g_c.announce_in_window);
     const uint64_t dropped = take(g_c.announce_dropped);
     const uint64_t released = take(g_c.announce_released);
     const uint64_t rejected = g_c.announce_rejected.load(std::memory_order_relaxed); // session total
@@ -428,9 +260,6 @@ void Report(std::string& out, double seconds) {
     const uint64_t wait_ns = take(g_c.frame_wait_ns);
     const uint64_t wait_max = take(g_c.frame_wait_max_ns);
     const uint64_t fences = take(g_c.reuse_fences);
-    const uint64_t blk_in = take(g_c.blocks_imported);
-    const uint64_t blk_refused = take(g_c.blocks_refused);
-    const uint64_t blk_dropped = take(g_c.blocks_dropped);
     size_t pending = 0;
     size_t desc = 0;
     uint64_t desc_noted = 0;
@@ -444,21 +273,11 @@ void Report(std::string& out, double seconds) {
     }
     char line[512];
     std::snprintf(line, sizeof(line),
-                  "SOTC NATIVE mode %d (%.1f s): windows %llu (%llu MiB) binds served %llu refused %llu; "
-                  "announce persistent %llu per-frame %llu (in window %llu) gpu-written %llu dropped %llu "
-                  "released %llu rejected %llu (session)\n",
-                  g_mode, seconds, static_cast<unsigned long long>(windows),
-                  static_cast<unsigned long long>(win_bytes >> 20), static_cast<unsigned long long>(served),
-                  static_cast<unsigned long long>(refused), static_cast<unsigned long long>(ann_p),
-                  static_cast<unsigned long long>(ann_f), static_cast<unsigned long long>(ann_w),
+                  "SOTC NATIVE mode %d (%.1f s): announce persistent %llu per-frame %llu gpu-written %llu "
+                  "dropped %llu released %llu rejected %llu (session)\n",
+                  g_mode, seconds, static_cast<unsigned long long>(ann_p), static_cast<unsigned long long>(ann_f),
                   static_cast<unsigned long long>(ann_g), static_cast<unsigned long long>(dropped),
                   static_cast<unsigned long long>(released), static_cast<unsigned long long>(rejected));
-    out += line;
-    std::snprintf(line, sizeof(line),
-                  "SOTC NATIVE window blocks: live %llu (%llu MiB), imported %llu, refused %llu, dropped %llu\n",
-                  static_cast<unsigned long long>(blocks), static_cast<unsigned long long>(block_bytes >> 20),
-                  static_cast<unsigned long long>(blk_in), static_cast<unsigned long long>(blk_refused),
-                  static_cast<unsigned long long>(blk_dropped));
     out += line;
     std::snprintf(line, sizeof(line),
                   "SOTC NATIVE uploads %llu (clean %llu) %llu KiB, marked %llu KiB, queued %zu; descriptors "
@@ -496,27 +315,12 @@ bool TakeUpload(PendingUpload& out) {
     return true;
 }
 
-void TakeNewWindows(std::vector<Range>& out) {
-    std::scoped_lock lock{g_mutex};
-    out.insert(out.end(), g_new_windows.begin(), g_new_windows.end());
-    g_new_windows.clear();
-}
-
-std::vector<Range> WindowRanges() {
-    const Table* t = g_table.load(std::memory_order_acquire);
-    return t ? t->windows : std::vector<Range>{};
-}
-
 void SetFrameBackend(const FrameBackend& backend) {
     std::scoped_lock lock{g_mutex};
     g_backend_set.store(false, std::memory_order_release);
     g_backend = backend;
     g_backend_set.store(backend.ctx != nullptr && backend.submitted && backend.wait && backend.completed,
                         std::memory_order_release);
-}
-
-void NoteBind(bool served) {
-    (served ? g_c.binds_served : g_c.binds_refused).fetch_add(1, std::memory_order_relaxed);
 }
 
 void NoteUploaded(uint64_t bytes) {

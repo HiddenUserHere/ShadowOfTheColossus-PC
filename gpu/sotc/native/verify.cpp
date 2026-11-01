@@ -57,7 +57,7 @@ struct Pending {
 };
 Pending g_pending[kPendingSlots];
 std::atomic<uint64_t> g_pending_dropped{0};
-std::atomic<uint64_t> g_faults_win{0}; // write faults recorded (outside windows), this window
+std::atomic<uint64_t> g_faults_win{0}; // write faults recorded, this window
 
 // Unannounced writes waiting to be taken by the GPU (one per page, the latest; direct mapped).
 struct Suspect {
@@ -221,10 +221,6 @@ void NoteWriteFault(uint64_t addr, uint64_t size, uint64_t rip) {
         lw.rip.store(rip, std::memory_order_relaxed);
     }
     if (!native) {
-        return;
-    }
-    // A write inside a host-shared window is covered by the window (no announce needed).
-    if (SotcNative::InWindow(addr, size)) {
         return;
     }
     g_faults_win.fetch_add(1, std::memory_order_relaxed);

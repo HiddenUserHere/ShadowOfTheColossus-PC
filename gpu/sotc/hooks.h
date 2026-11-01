@@ -37,10 +37,6 @@ enum class HookAction : uint32_t {
     /// the original runs next). Without a pending SetGuestCall, or outside the pre phase, the
     /// dispatcher turns it into Continue. Not preserved: MXCSR and the x87 state.
     CallGuest = 2,
-    /// sotc: Wrap pre phase only: skip the original and run the post phase with the handler's regs.rax /
-    /// rdx / xmm0 as its return values (the wrapped function is not called). Entry: the same as Return.
-    /// Site and Time: Continue. Wrap ignores Return (as before), so a wrap that means "skip" says so with this.
-    SkipOriginal = 3,
 };
 
 /// A handler runs on the host stack (runtime_call_on_host_stack), on the guest thread.

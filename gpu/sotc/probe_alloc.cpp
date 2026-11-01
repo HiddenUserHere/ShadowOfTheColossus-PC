@@ -40,8 +40,6 @@
 #include "mem_classes.h" // sotc: step 6 feed (CPU-only ranges) and the PC memory model owner feed
 #include "probes.h"
 #include "video_core/sotc_trace.h" // image bounds (SotcTrace::ImageBase/ImageSize)
-#include "native/native.h"                // sotc: SOTC_NATIVE switch (SotcNative::On)
-#include "native/native_windows_hooks.h"  // sotc: native windows (reuse, RT bind), gpu/sotc/native/
 
 extern "C" {
 // runtime_memory.c: the unprotected backing view of a guest address, and the mapped region of one.
@@ -345,11 +343,6 @@ HookAction AllocPre(GuestRegs& regs, void*) {
     f.req_size = regs.rsi;
     f.align = regs.rdx;
     f.fwd_kind = static_cast<int32_t>(static_cast<uint32_t>(regs.rcx));
-    // sotc: SOTC_NATIVE windows. The frame is pushed first, so the post phase pops it also when the native
-    // hook answers SkipOriginal (a parked node served without the call).
-    if (SotcNative::On()) {
-        return SotcNativeWindowHooks::AllocPre(regs);
-    }
     return HookAction::Continue;
 }
 
@@ -492,14 +485,14 @@ void AllocPost(GuestRegs& regs, void*) {
     }
 }
 
-// The probe's bookkeeping of a free: the node leaves the live table and its block is counted as freed. Used by
-// FREE_BLOCK and by a parked window release (NoteWindowRelease), which must not run the pool's free check.
-void ForgetNode(uint64_t node) {
+HookAction FreePre(GuestRegs& regs, void*) {
+    const uint64_t node = regs.rdi;
+    SotcPcPool::OnFreeNode(node); // sotc: SOTC_PC_POOL=2 free check (reads the node; before the lock)
     std::lock_guard<std::mutex> lock(g_mutex);
     NodeEntry e;
     if (!NodeRemove(node, &e)) {
         g_missed_frees.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return HookAction::Continue;
     }
     SotcMemClasses::OnFree(e.base); // sotc: step 6 (no-op for ranges it never tracked)
     SotcPcPlaceGlue::Global().OnFreeObserved(e.base, e.size); // sotc: SOTC_PC_PLACE
@@ -522,12 +515,6 @@ void ForgetNode(uint64_t node) {
     if (e.base) {
         g_freed[FreedSlot(e.base)] = e.base; // a later allocation at this base counts as VA reuse
     }
-}
-
-HookAction FreePre(GuestRegs& regs, void*) {
-    const uint64_t node = regs.rdi;
-    SotcPcPool::OnFreeNode(node); // sotc: SOTC_PC_POOL=2 free check (reads the node; before the lock)
-    ForgetNode(node);
     return HookAction::Continue;
 }
 
@@ -547,13 +534,6 @@ const char* KindName(int32_t kind) {
 }
 
 } // namespace
-
-// sotc: a block released to a native window (0x476f0 returns before 0x1b0e0, so FREE_BLOCK never sees it). It is
-// not in use by the game any more, so the probe forgets it as a free would; the pool's free check is not run, since
-// the pool keeps the block in use (pc_pool_windows.h).
-void NoteWindowRelease(uint64_t node) {
-    ForgetNode(node);
-}
 
 void RegisterAlloc() {
     // Registered unconditionally: a hook that is off never dispatches to its handler.

@@ -280,8 +280,8 @@ public:
     u64 DrainRange(VAddr addr, u64 size);
 
     // sotc: SOTC_NATIVE (gpu/sotc/native). Draw thread, once per submit (cheap when nothing is queued):
-    // rings the windows registered since the last call, then performs queued announced uploads (Persistent
-    // through DrainRange, PerFrame outside a window as CPU-modified) until budget bytes are uploaded.
+    // performs queued announced uploads (Persistent through DrainRange, PerFrame as CPU-modified) until
+    // budget bytes are uploaded.
     void NativeDrain(u64 budget = u64{64} << 20);
 
     /// sotc: the arena holding [addr, addr + size) when the whole range is resident in one
@@ -863,14 +863,9 @@ private:
     [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> PcHostBind(VAddr device_addr,
                                                                           u32 size, bool is_written);
     /// sotc: serves [device_addr, +size) from the imported run view (the host view slot of its guest
-    /// base, the ring8 counters and the served-write record). Shared by PcHostBind and NativeBind.
+    /// base, the ring8 counters and the served-write record). Used by PcHostBind.
     [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> PcHostServe(
         VAddr device_addr, u32 size, bool is_written, const Vulkan::SotcGuestMemory::GuestView& view);
-    /// sotc: SOTC_NATIVE. A bind inside a registered window (SotcNative::InWindow) served from its
-    /// imported run, with no sync and no tracking. nullopt: the run lookup failed; the bytes are then
-    /// marked CPU-modified and the caller takes the normal path.
-    [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> NativeBind(VAddr device_addr, u32 size,
-                                                                          bool is_written);
     /// sotc: SOTC_NATIVE frame ticket backend (SotcNative::SetFrameBackend), set in the constructor.
     static u64 NativeFrameSubmitted(void* ctx);
     static void NativeFrameWait(void* ctx, u64 frame);

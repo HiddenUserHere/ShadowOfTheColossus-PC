@@ -667,10 +667,8 @@ void HostMaintain(BufferCache& cache) {
 }
 
 void OnSubmitStart(Vulkan::Rasterizer& rasterizer) {
-    // sotc: SOTC_NATIVE: ring the windows registered since the last submit and drain the announced uploads,
-    // on the draw thread, before any bind of this submit. No import happens here (RegisterWindow only records
-    // the windows; a block is imported when the pool commits it); the HostMaintain hang noted below came from
-    // importing/holding at submit start.
+    // sotc: SOTC_NATIVE: drain the announced uploads, on the draw thread, before any bind of this submit. No
+    // import happens here; the HostMaintain hang noted below came from importing/holding at submit start.
     if (SotcNative::On()) {
         rasterizer.GetBufferCache().NativeDrain();
     }

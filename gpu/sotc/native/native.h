@@ -6,12 +6,9 @@
 //
 // Contract (every caller relies on it):
 // - Announce(addr, size, kind): the engine finished writing [addr, addr + size) and the GPU may read it from
-//   the next submit on. Persistent data is uploaded once (upload workers, budgeted per frame); per-frame data
-//   lives in a host-shared window and needs no upload. A CPU write after the announce of persistent data is
-//   a bug the verify mode counts (VerifyUnannouncedWrite).
-// - Host-shared windows (RegisterWindow): guest ranges the GPU reads and writes in place, imported as host
-//   memory block by block (ImportWindowBlock, when the pool commits the block). The engine's own double/triple
-//   buffering plus the frame ticket order the reuse. Memory pinned by an import is only the committed blocks.
+//   the next submit on. Persistent data is uploaded once (upload workers, budgeted per frame). Per-frame data
+//   is marked CPU-modified at the next submit, so the bind that reads it uploads its current bytes. A CPU
+//   write after the announce of persistent data is a bug the verify mode counts (VerifyUnannouncedWrite).
 // - The CPU never reads GPU-written memory. GPU-result consumers are patched away (gpuresults.md); the
 //   verify mode counts any CPU read of a GPU-written range (VerifyGpuRead).
 // - The only CPU wait on the GPU is the frame ticket (FrameWait): the engine's frame-ring label spin
@@ -37,33 +34,16 @@ bool Verify();
 /// What an announced range holds (decides the mechanism).
 enum class Kind : uint8_t {
     Persistent, ///< written once (resource build, mip stream), then read-only for the GPU: upload once
-    PerFrame,   ///< rewritten every frame (instances, constants, material params, DCB payloads): host-shared
+    PerFrame,   ///< rewritten every frame (instances, constants, material params, DCB payloads): bind uploads
     GpuWritten, ///< the GPU writes it (render targets, compute outputs): GPU-private, never uploaded
 };
 
 /// The engine finished writing [addr, addr + size). Persistent: queued for upload, the next submit that
-/// reads it waits for the upload. PerFrame outside a window: uploaded at the next submit (fallback).
+/// reads it waits for the upload. PerFrame: queued too, and marked CPU-modified by the draw thread (the bind
+/// then uploads the current bytes). GpuWritten: nothing queued.
 void Announce(uint64_t addr, uint64_t size, Kind kind);
 /// The engine freed or decommitted [addr, addr + size): drop its device copy and any pending upload.
 void Release(uint64_t addr, uint64_t size);
-
-/// A guest range the engine uses for per-frame or GPU-shared data (a window), registered once. Only the range
-/// is recorded here: its memory is not backed yet, so nothing is imported. Its blocks are imported one by one
-/// with ImportWindowBlock when the pool commits them. False when the range overlaps a registered window.
-bool RegisterWindow(uint64_t addr, uint64_t size, const char* name);
-/// Imports one block [addr, addr + size) of a registered window as host memory (VK external host memory), once
-/// its backing exists. From then on the block is served in place (InWindowBlock). False when the import was
-/// refused: the block falls back to announced uploads, and its binds take the normal path (counted).
-bool ImportWindowBlock(uint64_t addr, uint64_t size);
-/// The block was given back or decommitted: drops its import. The buffer is destroyed once the GPU has
-/// finished the last frame that could read it.
-void DropWindowBlock(uint64_t addr, uint64_t size);
-/// True when [addr, addr + size) lies inside one registered window, imported or not (lock-free). The verify
-/// mode counts a CPU write there as covered; a bind there is served only when InWindowBlock holds for it.
-bool InWindow(uint64_t addr, uint64_t size);
-/// True when [addr, addr + size) lies inside one imported window block (bind fast path; lock-free). An
-/// announce inside such a block needs no upload.
-bool InWindowBlock(uint64_t addr, uint64_t size);
 
 /// Frame ticket: FrameSubmitted is called by the port when the engine's frame N is fully submitted
 /// (sceGnmSubmitDone); FrameWait(N) returns when the GPU finished frame N. Only the frame-ring reuse and

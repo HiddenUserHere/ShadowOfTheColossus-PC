@@ -367,8 +367,9 @@ def main():
     if env['SOTC_PC_RING'] == '8':
         env.setdefault('SOTC_HOOK_ALLOC_PROBE', '1')
         env.setdefault('SOTC_HOOK_FRAME_FLIP', '1')
-    # The native windows (gpu/sotc/native/native_windows_hooks.cpp) run in the allocator probe's 0x479a0 wrap
-    # and the memtype probe's 0x12820 wrap. SOTC_PC_RING_DISPATCH hooks 0x12820 too: do not set both.
+    # SOTC_NATIVE: the allocator probe stays on for its FREE_BLOCK entry (SOTC_PC_POOL_NATIVE's controller needs it,
+    # gpu/sotc/pc_pool.cpp NativeEntry); the memtype probe's post phase announces the RenderSingleFrameCPU blocks
+    # (gpu/sotc/probe_memtype.cpp, NoteFrameBlock). SOTC_PC_RING_DISPATCH hooks 0x12820 too: do not set both.
     if env.get('SOTC_NATIVE', '0') not in ('', '0'):
         env.setdefault('SOTC_HOOK_ALLOC_PROBE', '1')
         env.setdefault('SOTC_HOOK_MEMTYPE_PROBE', '1')

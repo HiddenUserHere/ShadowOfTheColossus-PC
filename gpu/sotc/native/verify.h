@@ -5,8 +5,8 @@
 //
 // Parts:
 //  1. VerifyAll() and FeatureMode(): the single switch and the per-reader rule "=2 if the feature is on".
-//  2. Coverage oracle (native mode 2, page tracker fault path): every guest write fault outside a
-//     host-shared window is pending until the next submit; an Announce of the range clears it. A pending
+//  2. Coverage oracle (native mode 2, page tracker fault path): every guest write fault is pending
+//     until the next submit; an Announce of the range clears it. A pending
 //     fault left at the submit is an unannounced write and is reported through
 //     SotcNative::VerifyUnannouncedWrite (aggregated per guest RIP, eboot offsets). Faults are not
 //     reported at fault time: the engine writes first and announces after, so a fault-time report would
@@ -40,8 +40,7 @@ inline int FeatureMode(int mode) {
 
 /// Page tracker, guest write fault (HandleGuestFault write branch), called when
 /// SotcNative::Verify() or VerifyAll(). Writes the last-write record of the page (VerifyAll) and, under
-/// SotcNative::Verify(), a pending record unless [addr, addr + size) lies in a registered window.
-/// Lock-free, no allocation.
+/// SotcNative::Verify(), a pending record. Lock-free, no allocation.
 void NoteWriteFault(uint64_t addr, uint64_t size, uint64_t rip);
 
 /// The engine announced [addr, addr + size) (SotcNative::Announce) or released it (Release): pending
