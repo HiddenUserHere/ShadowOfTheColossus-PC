@@ -68,6 +68,12 @@ Block g_blocks[kMaxBlocks];
 std::atomic<size_t> g_block_count{0}; // slots filled (published after the slot's arrays)
 std::mutex g_block_mutex;             // writers only
 
+// Mode 8 heap serving (SetHostExtras): sorted, non-overlapping runs of heap granules served like arena
+// blocks. Published as an immutable snapshot; old snapshots are kept (a lock-free reader may still hold
+// one) and are few: a new one only when the run set changes.
+std::atomic<const std::vector<RingExtent>*> g_extras{nullptr};
+std::vector<std::unique_ptr<const std::vector<RingExtent>>> g_extras_kept; // under g_block_mutex
+
 std::atomic<uint32_t> g_epoch{1}; // frame epoch; starts at 1 so 0 means "never"
 
 // Window counters.
@@ -489,13 +495,24 @@ void SetFlipWait(FlipWaitFn fn, void* ctx) {
     g_flip_fn.store(fn, std::memory_order_release);
 }
 
-bool Ring8FlipWaitOn() {
-    static const bool on = [] {
-        // sotc: off by default: it cost ~6 FPS and was not the vertex cause (1 Nov, PcHostClipLimited was).
+int Ring8FlipWaitMode() {
+    // sotc: 1 = the drain wait (WaitGpuIdle at every flip; ~6 FPS, 1 Nov). 2 = the precise wait: the
+    // GPU tick of the frame that used the half is recorded when its frame end reaches the draw thread,
+    // and only that tick is waited for (no drain). Default 2 since 1 Nov (the half reuse race showed on
+    // every flip: avg 8.3 ms of GPU lag); 0 disables.
+    static const int mode = [] {
         const char* v = std::getenv("SOTC_PC_RING8_FLIPWAIT");
-        return v && v[0] == '1';
+        if (!v || !v[0]) {
+            return 2;
+        }
+        const int m = std::atoi(v);
+        return (m == 1 || m == 2) ? m : 0;
     }();
-    return Mode() == 8 && on;
+    return Mode() == 8 ? mode : 0;
+}
+
+bool Ring8FlipWaitOn() {
+    return Ring8FlipWaitMode() != 0;
 }
 
 void NoteFlipWait(uint64_t ns, bool waited, unsigned halves) {
@@ -1013,7 +1030,40 @@ std::vector<RingExtent> ArenaBlocks(uint64_t& version) {
                                       b.size.load(std::memory_order_relaxed)});
         }
     }
+    // Mode 8 heap runs. A run that overlaps an arena block is left out (the block covers it).
+    if (const auto* extras = g_extras.load(std::memory_order_acquire)) {
+        const size_t blocks = live.size();
+        for (const RingExtent& e : *extras) {
+            bool overlaps = false;
+            for (size_t i = 0; i < blocks && !overlaps; ++i) {
+                overlaps = e.addr < live[i].addr + live[i].size && live[i].addr < e.addr + e.size;
+            }
+            if (!overlaps) {
+                live.push_back(e);
+            }
+        }
+    }
     return live;
+}
+
+void SetHostExtras(std::vector<RingExtent> runs) {
+    std::sort(runs.begin(), runs.end(),
+              [](const RingExtent& a, const RingExtent& b) { return a.addr < b.addr; });
+    std::lock_guard<std::mutex> lock(g_block_mutex);
+    const auto* now = g_extras.load(std::memory_order_relaxed);
+    if (now && now->size() == runs.size() &&
+        std::equal(runs.begin(), runs.end(), now->begin(), [](const RingExtent& a, const RingExtent& b) {
+            return a.addr == b.addr && a.size == b.size;
+        })) {
+        return;
+    }
+    if (!now && runs.empty()) {
+        return;
+    }
+    auto next = std::make_unique<const std::vector<RingExtent>>(std::move(runs));
+    g_extras.store(next.get(), std::memory_order_release);
+    g_extras_kept.push_back(std::move(next));
+    g_block_version.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool InArena(uint64_t addr, uint64_t size) {
@@ -1481,6 +1531,24 @@ int ArenaRelation(uint64_t addr, uint64_t size) {
         return 0;
     }
     int relation = 0;
+    // Mode 8 heap runs (SetHostExtras): sorted and disjoint, so the run holding addr is the last one
+    // starting at or below it, and a run after it overlaps the bind only when it starts before end.
+    if (const auto* extras = g_extras.load(std::memory_order_acquire); extras && !extras->empty()) {
+        auto it = std::upper_bound(extras->begin(), extras->end(), addr,
+                                   [](uint64_t a, const RingExtent& e) { return a < e.addr; });
+        if (it != extras->begin()) {
+            const RingExtent& e = *std::prev(it);
+            if (addr < e.addr + e.size) {
+                if (end <= e.addr + e.size) {
+                    return 1;
+                }
+                relation = 2;
+            }
+        }
+        if (it != extras->end() && it->addr < end) {
+            relation = 2;
+        }
+    }
     const size_t n = g_block_count.load(std::memory_order_acquire);
     for (size_t i = 0; i < n; ++i) {
         const Block& b = g_blocks[i];

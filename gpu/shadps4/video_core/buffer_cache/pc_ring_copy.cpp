@@ -5,9 +5,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <span>
+#include <string>
 #include <vector>
 
+#include "../../../sotc/mem_classes.h" // sotc: SOTC_PC_RING8_HEAPS (heap granule runs)
 #include "../../../sotc/pc_ring.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
@@ -293,10 +296,72 @@ void ProtectThenCopy(Vulkan::Rasterizer& rasterizer, BufferCache& cache, int mod
 
 } // namespace
 
+// sotc: SOTC_PC_RING8_HEAPS=<memtype heap names, comma separated, e.g. CPUMemory> (off by default; needs
+// SOTC_HOOK_MEMTYPE_PROBE=1, SOTC_MEMTYPE_CLASSES=1 and SOTC_CLASS_TRACK=2 for the granules and their
+// binds). The granules of those heaps that the GPU binds and never writes are served like arena blocks:
+// imported, ringed (no protection) and read by the GPU in host memory. Granule faults measured 1 Nov: the
+// write faults sit on CPU-written, GPU-read memory (memtype:CPUMemory about 2400/s), not on CPU-only memory.
+// A run with GPU-modified pages in the tracker is left out: its newest bytes are in the device copy.
+// Recollected at most every kHeapEvery submits, and only when the class state moved.
+static void CollectHeapRuns(BufferCache& cache, uint32_t epoch) {
+    static const std::vector<std::string> heaps = [] {
+        std::vector<std::string> out;
+        const char* v = std::getenv("SOTC_PC_RING8_HEAPS");
+        std::string s = v ? v : "";
+        size_t at = 0;
+        while (at < s.size()) {
+            const size_t comma = s.find(',', at);
+            const std::string name = s.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+            if (!name.empty()) {
+                out.push_back("memtype:" + name);
+            }
+            at = comma == std::string::npos ? s.size() : comma + 1;
+        }
+        return out;
+    }();
+    constexpr uint32_t kHeapEvery = 32;
+    constexpr size_t kMaxRuns = 1024; // imports per heap set (each run is one vkAllocateMemory)
+    static uint32_t last_epoch = 0;
+    static uint64_t last_version = ~uint64_t{0};
+    if (heaps.empty() || epoch - last_epoch < kHeapEvery ||
+        SotcMemClasses::Version() == last_version) {
+        return;
+    }
+    last_epoch = epoch;
+    std::vector<SotcPcRing::RingExtent> runs;
+    uint64_t version = 0;
+    uint64_t gpu_modified = 0;
+    for (const std::string& heap : heaps) {
+        for (const auto& [addr, size] : SotcMemClasses::CollectHostServe(heap.c_str(), version)) {
+            if (cache.IsRegionGpuModified(addr, size)) {
+                ++gpu_modified;
+                continue;
+            }
+            if (runs.size() < kMaxRuns) {
+                runs.push_back({addr, size});
+            }
+        }
+    }
+    last_version = version;
+    static int logged = 0;
+    if (logged++ < 32) {
+        u64 bytes = 0;
+        for (const auto& r : runs) {
+            bytes += r.size;
+        }
+        std::fprintf(stderr,
+                     "SOTC PC RING8 heaps: %zu runs (%llu MiB) served, %llu runs left out (GPU-modified)\n",
+                     runs.size(), static_cast<unsigned long long>(bytes >> 20),
+                     static_cast<unsigned long long>(gpu_modified));
+    }
+    SotcPcRing::SetHostExtras(std::move(runs));
+}
+
 void HostMaintain(BufferCache& cache) {
     if (SotcPcRing::Mode() != 8) {
         return;
     }
+    CollectHeapRuns(cache, SotcPcRing::SubmitEpoch());
     // Once per submit epoch, and whenever the arena block set changed. The epoch is read first: a
     // block that appears after it is seen at the next submit.
     static uint32_t seen_epoch = 0;

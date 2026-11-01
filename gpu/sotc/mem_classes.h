@@ -67,7 +67,7 @@ constexpr uint32_t kMaxPools = 64; ///< distinct pool names; later ones share th
 // sotc: distinct owners (allocator objects) of the all-blocks table; later ones share the last slot.
 constexpr uint32_t kMaxOwners = 128;
 // sotc: granules of the granule table (memtype probe). A granule past this cap is skipped and counted.
-constexpr uint32_t kMaxGranuleEntries = 32768;
+constexpr uint32_t kMaxGranuleEntries = 131072; // sotc: = kMaxGranules (probe_memtype.cpp)
 
 // 0 off, 1 apply, 2 shadow. Read once from SOTC_CLASS_TRACK. Mode 1 is refused (returns 0) when
 // SOTC_UNTRACK_AUTO=1 or SOTC_CP_AHEAD is set.
@@ -131,6 +131,13 @@ struct GranuleRange {
 // every 250 ms, so one full pass takes about 16 s. Without this feed no granule is ever sampled, so none
 // is CPU_ONLY and mode 1 publishes no granule ranges (the safe default).
 std::vector<GranuleRange> SnapshotGranules(uint64_t& version);
+
+// sotc: SOTC_PC_RING=8 heap serving (SOTC_PC_RING8_HEAPS, pc_ring_copy.cpp HostMaintain). The granules of
+// the heap named pool_name (as OnGranule got it, e.g. "memtype:CPUMemory") that the GPU bound and that
+// are not excluded (no GPU-marked pages sampled, no read fault, not shared with another heap), merged into
+// runs of adjacent granules, in address order. version: g_version at the collect (the caller recollects
+// only when it moved). Any thread; takes g_mutex.
+std::vector<std::pair<uint64_t, uint64_t>> CollectHostServe(const char* pool_name, uint64_t& version);
 
 // A guest range classified CPU-only (addr/size match VideoCore::SotcUntrack::Range's fields) and the
 // index of its pool (< kMaxPools).

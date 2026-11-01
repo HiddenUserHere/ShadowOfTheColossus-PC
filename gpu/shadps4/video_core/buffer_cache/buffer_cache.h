@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <shared_mutex>
+#include <condition_variable>
 #include <deque>
 #include <map>
 #include <memory>
@@ -157,6 +158,9 @@ public:
     // per frame at the frame boundary (SotcPcRing::SetFlipWait). Waits until the GPU has completed
     // the work that used the heap half the game is about to reuse (pc_host_half_tick).
     void PcHostFlipWait();
+    // sotc: SOTC_PC_RING8_FLIPWAIT=2. Draw thread, right after the frame-end Flush: every frame up to
+    // SubmitDone number seq is recorded, and the flushed buffer's tick covers its work.
+    void PcHostNoteFrameRecorded(u64 seq);
     // sotc: SOTC_PC_RING=8 clip (SOTC_PC_RING8_CLIP, default on; 0 disables). A read-only bind whose
     // size the rasterizer limited (unbounded V#, SHADPS4_UNBOUNDED_BUFFER_MB window) and that starts
     // in an imported arena run but runs past its end: returns the size clipped to the run end, so
@@ -859,6 +863,13 @@ private:
     /// is the one that was current before the previous flip, so its tick is the one to wait for.
     u64 pc_host_flip_count{};
     u64 pc_host_half_tick[2]{};
+    /// sotc: SOTC_PC_RING8_FLIPWAIT=2. (SubmitDone seq, tick) of the last frame ends the draw thread
+    /// recorded, oldest first (pc_host_frames_mutex); the SubmitDone seq at the previous flip boundary
+    /// (game render thread only).
+    std::mutex pc_host_frames_mutex;
+    std::condition_variable pc_host_frames_cv;
+    std::deque<std::pair<u64, u64>> pc_host_frames;
+    u64 pc_host_prev_boundary_seq{};
     /// sotc: SOTC_PC_RING=8. True when buffer is one of the host views (pc_host_views).
     [[nodiscard]] bool PcHostIsView(const Buffer* buffer);
     /// sotc: SOTC_PC_RING=8. Caller holds pc_host_mutex. Records a served bind: its span for the

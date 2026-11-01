@@ -1166,6 +1166,42 @@ void OnAllocOwner(uint64_t base, uint64_t size, uint64_t owner, int kind, const 
     g_owner_dirty.store(true, std::memory_order_release);
 }
 
+std::vector<std::pair<uint64_t, uint64_t>> CollectHostServe(const char* pool_name, uint64_t& version) {
+    std::vector<std::pair<uint64_t, uint64_t>> runs;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    version = g_version.load(std::memory_order_acquire);
+    uint32_t pool = kMaxPools;
+    for (uint32_t i = 0; i < g_pool_count; ++i) {
+        if (std::strncmp(g_pool_names[i].data(), pool_name, kNameMax) == 0) {
+            pool = i;
+            break;
+        }
+    }
+    if (pool == kMaxPools) {
+        return runs;
+    }
+    for (uint32_t i = 0; i < g_granule_count; ++i) {
+        const GranuleInfo& info = g_granule_info[i];
+        if (info.pool.load(std::memory_order_relaxed) != pool ||
+            g_gr_bound[i].load(std::memory_order_relaxed) == 0 ||
+            g_gr_excluded[i].load(std::memory_order_relaxed) != 0) {
+            continue;
+        }
+        runs.emplace_back(info.base, info.size);
+    }
+    std::sort(runs.begin(), runs.end());
+    size_t out = 0;
+    for (size_t i = 0; i < runs.size(); ++i) {
+        if (out != 0 && runs[out - 1].first + runs[out - 1].second == runs[i].first) {
+            runs[out - 1].second += runs[i].second;
+        } else {
+            runs[out++] = runs[i];
+        }
+    }
+    runs.resize(out);
+    return runs;
+}
+
 // sotc: a memtype granule (probe_memtype.cpp), in both modes. Granules are never freed and never enter
 // the allocator tables, so an allocator block with the same base is unaffected. Same bounds as OnAlloc;
 // a granule past kMaxGranuleEntries is skipped and counted.

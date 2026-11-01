@@ -237,6 +237,9 @@ void NoteHostFallback();
 uint64_t HostWriteSeq();
 /// Mode 8. Draw thread, at each submit start: unique bytes (overlapping binds merged) of the read
 /// and of the written served binds of the submit that ended.
+/// Mode 8 heap serving (SOTC_PC_RING8_HEAPS): the heap granule runs served like arena blocks, replacing the
+/// previous set (ArenaBlocks and ArenaRelation include them; the block version bumps when they change).
+void SetHostExtras(std::vector<RingExtent> runs);
 /// Mode 8: a windowed read-only bind clipped to the end of its imported run (PcHostClipLimited).
 void NoteHostClip();
 void NoteHostUnique(uint64_t read_bytes, uint64_t write_bytes);
@@ -267,6 +270,8 @@ void NoteHostVerify(bool written, uint64_t bytes, bool changed);
 using FlipWaitFn = void (*)(void* ctx);
 void SetFlipWait(FlipWaitFn fn, void* ctx);
 bool Ring8FlipWaitOn();
+/// Mode 8 flip wait mode: 0 off, 1 drain wait, 2 precise wait (default). See Ring8FlipWaitMode in pc_ring.cpp.
+int Ring8FlipWaitMode();
 /// One flip wait: its time, whether it waited on a tick, and how many of the two halves hold a tick.
 void NoteFlipWait(uint64_t ns, bool waited, unsigned halves);
 

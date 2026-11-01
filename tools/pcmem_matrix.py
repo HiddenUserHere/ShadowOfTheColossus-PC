@@ -136,6 +136,20 @@ SWITCHES = {
     'rbahead': {'SOTC_RB_OWNER': '1', 'SOTC_RB_MATERIALIZE': '1', 'SOTC_RB_CLASS': '1',
                 'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_HOOK_XPR_PROBE': '1',
                 'SOTC_RB_CLASS_AHEAD': '1'},
+    # Pieces written by the 1 Nov agents and not yet run in game: native node-pool refill on top of
+    # poolfull, the texture protect batch (rasterizer scope), and the leaked-VA quarantine (counts only).
+    'poolrefill': {'SOTC_PC_POOL_NATIVE': '1', 'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PC_POOL_REFILL': '1',
+                   'SOTC_PC_POOL_PATHS': 'flex-exact,primary-exact,flex-node,primary-node,fresh-plain,'
+                                         'fresh-spill,fresh-reserve,fresh-poolfix'},
+    'texbatch': {'SOTC_TEX_PROTECT_BATCH': '1'},
+    'recycle1': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_MEMTYPE_PROBE': '1', 'SOTC_PC_RECYCLE': '1'},
+    # ring8 heap serving: CPUMemory granules the GPU binds are served from host memory like the arena.
+    # ring8probe is the control (the same probes and class shadow, no heap serving).
+    'ring8probe': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_FRAME_FLIP': '1', 'SOTC_PC_RING': '8',
+                   'SOTC_HOOK_MEMTYPE_PROBE': '1', 'SOTC_MEMTYPE_CLASSES': '1', 'SOTC_CLASS_TRACK': '2'},
+    'ring8heaps': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_FRAME_FLIP': '1', 'SOTC_PC_RING': '8',
+                   'SOTC_HOOK_MEMTYPE_PROBE': '1', 'SOTC_MEMTYPE_CLASSES': '1', 'SOTC_CLASS_TRACK': '2',
+                   'SOTC_PC_RING8_HEAPS': 'CPUMemory'},
     # Every draw-thread switch, plus the RAM breakdown.
     'drawall': {'SOTC_TEX_BIND_FAST': '1', 'SOTC_BUF_BIND_FAST': '1', 'SOTC_VK_POOL': '1',
                 'SOTC_PROTECT_BATCH': '1', 'SOTC_PRESENT_UNLOCKED': '1', 'SOTC_UD_SWAP': '1',

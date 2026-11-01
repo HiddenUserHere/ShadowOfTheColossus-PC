@@ -242,11 +242,15 @@ void FinishFrame() {
 
 constexpr uint64_t kGranuleShift = 16;                   // 64 KiB granules
 constexpr uint64_t kGranuleSize = uint64_t{1} << kGranuleShift;
-constexpr size_t kMaxGranules = 32768;                   // claimed granules, all slots
-constexpr size_t kGranuleTable = 65536;                  // open addressing, twice the claim cap
+// sotc: 131072 granules (8 GiB) since 1 Nov: 32768 filled at boot (CPUMemory 14398 + GPUMemory 12760 + slot20 5160)
+// and left ~3.6M touches per session unattributed. Must match kMaxGranuleEntries (mem_classes.h).
+constexpr size_t kMaxGranules = 131072;                  // claimed granules, all slots
+constexpr size_t kGranuleTableBits = 18;
+constexpr size_t kGranuleTable = size_t{1} << kGranuleTableBits; // open addressing, twice the claim cap
 constexpr size_t kPendingDepth = 8;                      // nested MEMTYPE_ALLOC pre phases kept
 static_assert((kGranuleTable & (kGranuleTable - 1)) == 0, "kGranuleTable must be a power of two");
 static_assert(kMaxGranules * 2 <= kGranuleTable, "the table must stay at most half full");
+static_assert(kMaxGranules == SotcMemClasses::kMaxGranuleEntries, "the granule caps must match");
 
 // One claimed granule. word = (granule index + 1) << 8 | owner slot, 0 = empty; set by one CAS, so
 // the owner is never observed half-written. foreign: bit s set when slot s touched the granule
@@ -398,7 +402,7 @@ void RelabelResolved() {
 // One granule touched by a call of slot. Lock-free unless the granule is new (then one CAS, and the
 // owner registration of the claim path).
 void NoteGranule(uint64_t gidx, uint32_t slot) {
-    const size_t start = static_cast<size_t>((gidx * 0x9E3779B97F4A7C15ull) >> (64 - 16)) & (kGranuleTable - 1);
+    const size_t start = static_cast<size_t>((gidx * 0x9E3779B97F4A7C15ull) >> (64 - kGranuleTableBits)) & (kGranuleTable - 1);
     const uint64_t want = ((gidx + 1) << 8) | slot;
     for (size_t probe = 0; probe < kGranuleTable; ++probe) {
         GranuleEntry& e = g_granules[(start + probe) & (kGranuleTable - 1)];

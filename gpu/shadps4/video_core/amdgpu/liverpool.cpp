@@ -3213,10 +3213,15 @@ void Liverpool::Process(std::stop_token stoken) {
         } else if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
+                // sotc: SOTC_PC_RING8_FLIPWAIT=2: the CP is idle, so every submit of the frames ended
+                // so far (seq SubmitDone calls) is parsed; the Flush below closes the buffer that holds
+                // the last of their work, and its tick is what a wait for those frames needs.
+                const u64 seq = submit_done_seq.load(std::memory_order_acquire);
                 BackOrRun(
-                    [this] {
+                    [this, seq] {
                         rasterizer->OnSubmit();
                         rasterizer->Flush();
+                        rasterizer->GetBufferCache().PcHostNoteFrameRecorded(seq);
                     },
                     false);
             }

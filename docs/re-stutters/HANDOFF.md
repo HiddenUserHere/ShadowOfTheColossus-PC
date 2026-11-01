@@ -95,6 +95,38 @@ pages that leave CPU-modified (log "SOTC PC RING8 left the ring"). Run 20261101-
 base too), so captures are only good for the first ~100 frames. One ring8 run (070721) ended at 11 s with no crash
 log; the rerun was fine.
 
+Committed 6ef9c26 (everything up to the loading-glitch fix).
+Untested-pieces matrix 20261101-071620 (one round): base 27.8 FPS; cpuonly1 27.1 (publishes 488.6 MiB now, faults
+unchanged, 4 bind trips retracked; faults sit in memtype:CPUMemory 1198/s, unpublished: granule cap); place2 28.0
+(signals arrive now: 28.7M binds, 138k writes, 33559 carves all "unruled" -> no rules, verify checked 4 blocks);
+rbclass1 29.1 / 597 readbacks/s vs rbahead 28.4 / 527 (-12% readbacks, no FPS gain, stats mismatch 0);
+poolrefill 28.5, 6453/6453 native verified, 0 kills, but no refill counter line (unknown whether a refill ran);
+texbatch 27.6 (deferred ~500 of 3M flush points: no effect); recycle1 retires 0: Glue::OnFlushDone is only called
+by the unit tests (needs the PC_POOL_MAP hook, native pool on, and placement stage 3 to be useful).
+RAM report fixed: the mimalloc line used mi_process_info (= OS process commit); now mi_stats_get: 678 MiB.
+Private remainder ~5.2 GB; new line "SOTC RAM private largest allocations" (top 8 ~2.1 GB: mimalloc 678,
+0x36070000 656, 0x7ff0000 256, three 128 MiB, loader 77, 64): the rest is many smaller allocations.
+
+Granule cap raised 32768 -> 131072 (probe_memtype.cpp kMaxGranules/kGranuleTableBits, mem_classes.h
+kMaxGranuleEntries, static_assert ties them). Run 20261101-072816 (cpuonly1, SOTC_CLASS_WARMUP_S=5): 90991 granules
+claimed, overflow 0. Full fault attribution (write faults/s): memtype:CPUMemory 2415, RenderSingleFrameGPU 1835,
+GPUMemory 1559, slot22 288, slot21 23; never-GPU-bound only ~33/s. Conclusion: CPU_ONLY publishing cannot cut
+faults (the port protects only GPU-read pages, so a CPU-only page never faults); cpuonly1 costs ~1.8 FPS
+(26.4 vs 28.2, draw busy 38.1 vs 35.6) and trips 20 times. Drop CPU_ONLY as a fault lever. The faults are CPU
+writes to GPU-read memory: RenderSingleFrameGPU (83.5 MiB, likely the per-frame arena ring8 already serves) and
+bound CPUMemory granules (935 bound of 32797): the next lever is serving those from host memory like ring8.
+Warm-up is not why granules stay "warming": NoteWarmup runs only from the draw thread's sample feed
+(NoteGranuleGpuPages), which never reaches most granules.
+
+Precise flip wait (SOTC_PC_RING8_FLIPWAIT=2, now the default in mode 8; 1 = old drain wait, 0 = off): the
+idle frame-end path in liverpool.cpp records (SubmitDone seq, flushed tick) through
+BufferCache::PcHostNoteFrameRecorded; at a flip the game thread waits only for the tick of the frames that ended
+before the previous boundary (no WaitGpuIdle drain; 200 ms cap). Run 20261101-074045: ring8 27.5 FPS vs base 26.7,
+max 84 vs 176 ms, flip wait ~1 us avg. Verify run 074212: ~0.1% of sampled read binds changed before the next
+submit (inflated by clipped binds that reach the block end). Vertices with this build: waiting for the user.
+Heap serving (SOTC_PC_RING8_HEAPS=CPUMemory, off by default; mem_classes CollectHostServe, pc_ring
+SetHostExtras, pc_ring_copy CollectHeapRuns): written and built, not yet run.
+
 ## Next
 Fix ring8 vertices, combined matrix (several rounds), long play test, AMD/Intel, enable proven switches by default,
 CHANGELOG (Portuguese) and docs, commit. Progress estimate ~74%.

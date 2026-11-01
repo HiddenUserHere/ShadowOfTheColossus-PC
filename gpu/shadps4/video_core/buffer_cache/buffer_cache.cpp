@@ -7593,8 +7593,64 @@ void BufferCache::PcHostSubmitStart() {
 // Deadlock argument: the calls below only wait for the command processor, the draw thread and the
 // GPU. None of them waits for the game thread, which is the only thread that calls this (the frame
 // boundary). WaitGpuIdle is the wait SubmitDone already does on that thread in the default gate.
+void BufferCache::PcHostNoteFrameRecorded(u64 seq) {
+    if (SotcPcRing::Ring8FlipWaitMode() != 2) {
+        return;
+    }
+    // After the frame-end Flush, CurrentTick is the next (empty) buffer: the flushed one is the tick
+    // before it, and it covers every op recorded so far (a Flush with nothing recorded leaves the
+    // previous buffer's tick, which covers it too).
+    const u64 tick = scheduler.CurrentTick() - 1;
+    {
+        std::scoped_lock lock{pc_host_frames_mutex};
+        if (!pc_host_frames.empty() && pc_host_frames.back().first >= seq) {
+            pc_host_frames.back().second = tick; // the same frames again: the later tick covers them
+        } else {
+            pc_host_frames.emplace_back(seq, tick);
+        }
+        while (pc_host_frames.size() > 64) {
+            pc_host_frames.pop_front();
+        }
+    }
+    pc_host_frames_cv.notify_all();
+}
+
 void BufferCache::PcHostFlipWait() {
     if (!SotcPcRing::Ring8FlipWaitOn()) {
+        return;
+    }
+    if (SotcPcRing::Ring8FlipWaitMode() == 2) {
+        // Precise wait. The half the game makes current now was current before the previous flip
+        // boundary, so every frame that used it had ended (SubmitDone) by then: target is the
+        // SubmitDone count at that boundary. Wait until the draw thread recorded those frame ends
+        // (usually done already; it lags behind the game by about a frame), then for the GPU tick
+        // of the first recorded frame end that covers them. No drain: nothing waits for work the
+        // game submitted after that boundary. Deadlock argument as for mode 1 (only the CP, the
+        // draw thread and the GPU are waited for), plus a 200 ms cap on the draw-thread wait (the
+        // CP may stay busy and never take the idle frame-end path; counted as a wait without tick).
+        const u64 t0 = SotcStats::NowNs();
+        const u64 now_seq = liverpool ? liverpool->SubmitDoneSeq() : 0;
+        const u64 target = pc_host_prev_boundary_seq;
+        pc_host_prev_boundary_seq = now_seq;
+        ++pc_host_flip_count;
+        u64 wait_tick = 0;
+        if (target != 0) {
+            std::unique_lock lock{pc_host_frames_mutex};
+            const auto find = [&] {
+                for (const auto& [seq, tick] : pc_host_frames) {
+                    if (seq >= target) {
+                        wait_tick = tick;
+                        return true;
+                    }
+                }
+                return false;
+            };
+            pc_host_frames_cv.wait_for(lock, std::chrono::milliseconds(200), find);
+        }
+        if (wait_tick != 0) {
+            scheduler.Wait(wait_tick); // flushed already (tick < CurrentTick): no Flush from here
+        }
+        SotcPcRing::NoteFlipWait(SotcStats::NowNs() - t0, wait_tick != 0, target != 0 ? 2u : 0u);
         return;
     }
     const u64 t0 = SotcStats::NowNs();

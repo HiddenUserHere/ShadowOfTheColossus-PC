@@ -24,7 +24,7 @@
 //        thread (src/runtime_thread.c, noted by host_start). Their reserved size is printed too.
 //      process heaps: HeapSummary over GetProcessHeaps (the ucrt malloc heap and any other heap),
 //        committed and allocated bytes (src/compat_win.c, sotc_heap_summary).
-//      mimalloc: mi_process_info current_commit, bb-probe built with BB_MIMALLOC (else 0).
+//      mimalloc: mi_stats_get committed.current, bb-probe built with BB_MIMALLOC (else 0).
 //      remainder: private minus the four lines above. Vulkan driver host memory, the shader
 //        compiler, other allocators. Expected to be the bulk of what is still unexplained.
 //  - host structures: byte counters kept by the owners (no sweep):
@@ -58,6 +58,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -115,7 +116,10 @@ struct Sweep {
     uint64_t image_commit{};
     uint64_t private_loader{}; // committed private memory inside the eboot reservation
     uint64_t private_stacks{}; // committed private memory inside a live guest thread stack
+    // Committed private bytes per allocation (AllocationBase), the largest kTopAllocs kept for the report.
+    std::vector<std::pair<uint64_t, uint64_t>> top_allocs; // (bytes, allocation base), largest first
 };
+constexpr size_t kTopAllocs = 8;
 
 // stacks: stack_count (low, high) pairs of the live guest thread stacks.
 Sweep SweepAddressSpace(uintptr_t eboot_base, uintptr_t eboot_end, const uintptr_t (*stacks)[2],
@@ -125,6 +129,19 @@ Sweep SweepAddressSpace(uintptr_t eboot_base, uintptr_t eboot_end, const uintptr
     GetSystemInfo(&si);
     const uintptr_t end = reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress);
     uintptr_t at = 0;
+    uint64_t cur_alloc = 0, cur_bytes = 0;
+    const auto close_alloc = [&] {
+        if (cur_bytes == 0) {
+            return;
+        }
+        auto& top = s.top_allocs;
+        top.emplace_back(cur_bytes, cur_alloc);
+        std::sort(top.begin(), top.end(), std::greater<>());
+        if (top.size() > kTopAllocs) {
+            top.pop_back();
+        }
+        cur_bytes = 0;
+    };
     while (at < end) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(reinterpret_cast<LPCVOID>(at), &mbi, sizeof mbi)) {
@@ -137,6 +154,12 @@ Sweep SweepAddressSpace(uintptr_t eboot_base, uintptr_t eboot_end, const uintptr
         if (mbi.State == MEM_COMMIT) {
             if (mbi.Type == MEM_PRIVATE) {
                 const uint64_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                const uint64_t alloc = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+                if (alloc != cur_alloc) {
+                    close_alloc();
+                    cur_alloc = alloc;
+                }
+                cur_bytes += mbi.RegionSize;
                 s.private_commit += mbi.RegionSize;
                 s.private_loader += Overlap(base, next, eboot_base, eboot_end);
                 for (size_t i = 0; i < stack_count; ++i) {
@@ -150,6 +173,7 @@ Sweep SweepAddressSpace(uintptr_t eboot_base, uintptr_t eboot_end, const uintptr
         }
         at = next;
     }
+    close_alloc();
     return s;
 }
 
@@ -385,6 +409,15 @@ void Report(std::string& out, Vulkan::Presenter* presenter) {
                   "SOTC RAM private mimalloc: %.1f MiB committed (BB_MIMALLOC builds; 0 otherwise)\n",
                   Mib(mimalloc_committed));
     out += line;
+    // The largest private allocations (committed bytes per AllocationBase): the remainder has no owner
+    // API, so the addresses are the clue (mimalloc segments, driver heaps, guest-side reservations).
+    out += "SOTC RAM private largest allocations:";
+    for (const auto& [bytes, base] : sweep.top_allocs) {
+        std::snprintf(line, sizeof line, " %#llx %.1f MiB;", static_cast<unsigned long long>(base),
+                      Mib(bytes));
+        out += line;
+    }
+    out += "\n";
     std::snprintf(line, sizeof line,
                   "SOTC RAM private remainder: %.1f MiB = private - the four lines above (driver "
                   "and Vulkan host memory, shader compiler, untracked allocations)\n",

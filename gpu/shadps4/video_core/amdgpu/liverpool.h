@@ -113,6 +113,7 @@ public:
         if (frame_tickets) {
             PushFrameMark(); // sotc: SOTC_CP_AHEAD=2
         }
+        submit_done_seq.fetch_add(1, std::memory_order_release); // sotc: SOTC_PC_RING8_FLIPWAIT=2
         submit_done = true;
         submit_cv.notify_one();
         NotifyCpWait();
@@ -162,6 +163,10 @@ public:
         return frames_marked.load(std::memory_order_acquire);
     }
     /// sotc: SOTC_CP_AHEAD=2: frames whose every operation the draw thread has run (any thread).
+    /// sotc: SOTC_PC_RING8_FLIPWAIT=2. SubmitDone calls so far (the guest's frame ends).
+    u64 SubmitDoneSeq() const noexcept {
+        return submit_done_seq.load(std::memory_order_acquire);
+    }
     u64 FramesRecorded() const noexcept {
         return frames_recorded.load(std::memory_order_acquire);
     }
@@ -590,6 +595,7 @@ private:
     std::atomic<u64> frame_mark_epoch{0};          ///< bumped by PushFrameMark
     u64 fm_seen_epoch{}, fm_seen_done{};           ///< command processor: last check
     std::atomic<u64> frames_marked{0};
+    std::atomic<u64> submit_done_seq{0}; ///< sotc: SubmitDone calls (SOTC_PC_RING8_FLIPWAIT=2)
     std::atomic<u64> frames_recorded{0};
     std::mutex frames_mutex;
     std::condition_variable frames_cv;

@@ -44,18 +44,21 @@ static unsigned char *image;
  * attribution log are relative to it. 0 before the image is mapped. */
 uintptr_t sotc_arena_image_base(void) { return (uintptr_t)image; }
 /* sotc: SOTC_RAM_REPORT (gpu/sotc/ram_report.cpp): mimalloc's committed bytes, the operator new
- * heap of bb-probe (BB_MIMALLOC, CMake). 0 when the build does not use mimalloc. The prototype is
- * local: mimalloc.h is not on the include path of this file. */
+ * heap of bb-probe (BB_MIMALLOC, CMake). 0 when the build does not use mimalloc. mi_stats_get, not
+ * mi_process_info: the latter returns the OS commit of the whole process (1 Nov: the line equalled
+ * the commit charge and the remainder went negative). */
 #ifdef BB_MIMALLOC
-void mi_process_info(size_t *elapsed_msecs, size_t *user_msecs, size_t *system_msecs,
-                     size_t *current_rss, size_t *peak_rss, size_t *current_commit,
-                     size_t *peak_commit, size_t *page_faults);
+#include <mimalloc-stats.h>
 #endif
 uint64_t sotc_mimalloc_committed_bytes(void) {
 #ifdef BB_MIMALLOC
-    size_t elapsed, user_ms, sys_ms, rss, peak_rss, commit, peak_commit, faults;
-    mi_process_info(&elapsed, &user_ms, &sys_ms, &rss, &peak_rss, &commit, &peak_commit, &faults);
-    return (uint64_t)commit;
+    static mi_stats_t stats; /* large (size bins): not on the stack; the report thread only */
+    stats.size = sizeof stats;
+    stats.version = MI_STAT_VERSION;
+    if (!mi_stats_get(&stats) || stats.committed.current < 0) {
+        return 0;
+    }
+    return (uint64_t)stats.committed.current;
 #else
     return 0;
 #endif
