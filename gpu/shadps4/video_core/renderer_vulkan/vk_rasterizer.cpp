@@ -40,7 +40,7 @@
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_write_extent.h"
 #include "../../../sotc/rb_host.h" // sotc: SOTC_RB_HOST mirror copies
-#include "../../../sotc/native/native_particles.h" // sotc: SOTC_NATIVE_PARTICLES copies
+#include "../../../sotc/native/native_copies.h" // sotc: PC-native GPU result copies
 #include "video_core/sotc_generation.h" // sotc: SOTC_PR_GEN (per-64 KiB generation sums)
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -173,11 +173,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             VideoCore::MemoryType::HostCached, "SotC LOD Feedback Download");
         runtime.FillBuffer(sotc_lod_feedback.get(), 0u, SotcLodFeedbackBytes, ~0u);
     }
-    // sotc: SOTC_NATIVE_PARTICLES=prev: host-readable ring of the particle count copies.
-    if (SotcNativeParticles::Armed()) {
-        sotc_particle_copies = std::make_unique<VideoCore::Buffer>(
-            instance, 0, SotcNativeParticles::kCopyRingBytes, VideoCore::MemoryType::HostCached, "SotC Particle Stats Copies");
-        SotcNativeParticles::Attach(sotc_particle_copies.get());
+    // sotc: PC-native GPU result copies (native_copies.h): the host-readable ring.
+    if (SotcNativeCopies::Armed()) {
+        sotc_result_copies = std::make_unique<VideoCore::Buffer>(
+            instance, 0, SotcNativeCopies::kRingBytes, VideoCore::MemoryType::HostCached, "SotC GPU Result Copies");
+        SotcNativeCopies::Attach(sotc_result_copies.get());
     }
 }
 
@@ -256,7 +256,7 @@ void Rasterizer::SotcLodFeedbackCycle() {
 }
 
 Rasterizer::~Rasterizer() {
-    SotcNativeParticles::Attach(nullptr); // sotc: before sotc_particle_copies goes
+    SotcNativeCopies::Attach(nullptr); // sotc: before sotc_result_copies goes
     for (auto& [address, image] : hudless_images) {
         DestroyHudless(image);
     }
@@ -2515,7 +2515,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     FlushRbMirrors(cmdbuf); // sotc: SOTC_RB_HOST=2
-    CopyParticleStats(cmdbuf); // sotc: SOTC_NATIVE_PARTICLES=prev
+    CopyGpuResults(cmdbuf); // sotc: PC-native GPU result copies (native_copies.h)
     DebugState.IncDispatch();
     MaybeDumpImages(cs.pgm_hash);
 
@@ -2601,7 +2601,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     FlushRbMirrors(cmdbuf); // sotc: SOTC_RB_HOST=2
-    CopyParticleStats(cmdbuf); // sotc: SOTC_NATIVE_PARTICLES=prev
+    CopyGpuResults(cmdbuf); // sotc: PC-native GPU result copies (native_copies.h)
     DebugState.IncDispatch();
     runtime.AccessBuffer(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
                          vk::AccessFlagBits2::eIndirectCommandRead);
@@ -7472,16 +7472,16 @@ void Rasterizer::FlushRbMirrors(vk::CommandBuffer cmdbuf) {
     rb_mirror_collect = false;
 }
 
-// sotc: SOTC_NATIVE_PARTICLES=prev: the dispatch's written buffers go to the particle stats copies
-// (native_particles.h), which copy the ranges of the registered count arrays. bound_buffers holds the
+// sotc: PC-native GPU result copies: the dispatch's written buffers go to native_copies.h, which copies the
+// ranges registered by its clients (particle counts, XPR masks). bound_buffers holds the
 // written binds of a full bind and of a bind-cache hit alike.
-void Rasterizer::CopyParticleStats(vk::CommandBuffer cmdbuf) {
-    if (!sotc_particle_copies || !SotcNativeParticles::Watching()) {
+void Rasterizer::CopyGpuResults(vk::CommandBuffer cmdbuf) {
+    if (!sotc_result_copies || !SotcNativeCopies::Watching()) {
         return;
     }
     for (const auto& bound : bound_buffers) {
         if (bound.is_written && bound.buffer->CpuAddr() != 0) {
-            SotcNativeParticles::NoteWrittenBind(cmdbuf, bound.buffer->Handle(), bound.offset,
+            SotcNativeCopies::NoteWrittenBind(cmdbuf, bound.buffer->Handle(), bound.offset,
                                                  bound.buffer->CpuAddr() + bound.offset, bound.size);
         }
     }

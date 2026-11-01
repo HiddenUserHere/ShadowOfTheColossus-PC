@@ -88,7 +88,8 @@ PSTATS_STORE = (0x501ae4, bytes.fromhex('890c98'), bytes.fromhex('0f1f00'))
 POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
             bytes.fromhex('41c7467400000000' '31c0' 'e9c1feffff'))
 # sotc: PC-native GPU-result consumers (docs/re-stutters/native/impl-results.md). The XPR label spins: each skip
-# branch jumps to the continuation (2-byte short jumps). SOTC_NATIVE_MASKS=all only (the masks are all visible then).
+# branch jumps to the continuation (2-byte short jumps). SOTC_NATIVE_MASKS=all only (the masks are all visible then);
+# SOTC_NATIVE_MASKS=prev keeps the spins and ends them at record time (gpu/sotc/native/native_masks.cpp).
 NATIVE_SPINS = [
     (BASE + 0x11e1e2, bytes.fromhex('742c'), bytes.fromhex('eb35')),  # RenderXPRDecals: je 0x11e210 -> jmp 0x11e219
     (BASE + 0x11dc49, bytes.fromhex('7425'), bytes.fromhex('eb2e')),  # IndexCullXPRObjects: je 0x11dc70 -> jmp 0x11dc79
@@ -260,6 +261,7 @@ def native_result_patches(elf, ph, supported, log=print):
             log('Native: XPR label spins removed (masks all visible)')
         else:
             log('Native: spin bytes differ, not applied')
+
     if native == '1':
         if holds(elf, ph, NATIVE_WATER[0], NATIVE_WATER[1]):
             groups.append([patch_entry(*NATIVE_WATER)])

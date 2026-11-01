@@ -29,6 +29,7 @@
 
 #include "../guest_mem.h"
 #include "../hooks.h"
+#include "native_masks.h" // sotc: SOTC_NATIVE_MASKS=prev (the last completed masks)
 #include "native.h" // sotc: SotcNative::Verify / VerifyGpuWait
 
 // src/runtime_memory.c: a guest-visible block in the low range (the image and the stacks live there too).
@@ -167,6 +168,18 @@ HookAction OnMaskConsume(GuestRegs& regs, void* user) {
     const int which = static_cast<int>(reinterpret_cast<uintptr_t>(user));
     ConsumerCounters& c = g_masks[which];
     c.calls++;
+    // sotc: SOTC_NATIVE_MASKS=prev: the main-scene consumers read the last completed copy (native_masks.h).
+    if (SotcNativeMasks::Prev() && (which == kVis || which == kVisInd)) {
+        uint64_t count = 0;
+        if (ReadCount(which, regs.rdi, &count) && count != 0) {
+            regs.rsi = SotcNativeMasks::Serve(regs.rsi, count);
+            if (which == kVisInd) {
+                regs.rdx = SotcNativeMasks::Serve(regs.rdx, count);
+            }
+            c.swapped++;
+        }
+        return HookAction::Continue;
+    }
     const bool verify = VerifyOn();
     if (!MasksAll() && !verify) {
         return HookAction::Continue;
@@ -273,6 +286,7 @@ void Register() {
     water.post = nullptr;
     water.user = nullptr;
     SotcHooks::RegisterHandler("NATIVE_WATER_STORE", water);
+    SotcNativeMasks::Register(); // sotc: NATIVE_MASK_PRODUCE (SOTC_NATIVE_MASKS=prev)
 }
 
 void Report(std::string& out, double seconds) {
@@ -285,9 +299,10 @@ void Report(std::string& out, double seconds) {
     }
     char line[512];
     std::snprintf(line, sizeof line, "SOTC NATIVE_RESULTS mode=%d masks=%s window=%.1fs", SotcHooks::HookMode(kConsumerHook[kVis]),
-                  MasksAll() ? "all" : "gpu", seconds);
+                  MasksAll() ? "all" : SotcNativeMasks::Prev() ? "prev" : "gpu", seconds);
     out += line;
     out += '\n';
+    SotcNativeMasks::Report(out, seconds);
     for (int i = 0; i < kConsumers; ++i) {
         ConsumerCounters& c = g_masks[i];
         if (!SotcHooks::IsInstalled(kConsumerHook[i])) {

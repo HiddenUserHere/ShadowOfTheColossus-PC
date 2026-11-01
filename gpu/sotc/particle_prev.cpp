@@ -286,12 +286,10 @@ void RequestDispatched(uint64_t pool, uint64_t slot, uint64_t desc) {
 
 // Mode 3: hands the call's arrays to the native serving (native/native_particles.h). An unreadable
 // descriptor or pool keeps the exact read.
-HookAction ServeNative(GuestRegs& regs, uint64_t pool, uint64_t read_desc, uint64_t dispatch_desc) {
+HookAction ServeNative(GuestRegs& regs, uint64_t pool, uint64_t dispatch_desc) {
     uint32_t counter = 0;
-    uint64_t read_base = 0;
     uint64_t extent = 0;
-    if (!ReadGuest(pool + kPoolCounter, &counter, 4) || !ArrayAddress(read_desc, &read_base) ||
-        !ActiveExtent(pool, &extent)) {
+    if (!ReadGuest(pool + kPoolCounter, &counter, 4) || !ActiveExtent(pool, &extent)) {
         return HookAction::Continue;
     }
     uint64_t dispatch_base = 0;
@@ -300,7 +298,7 @@ HookAction ServeNative(GuestRegs& regs, uint64_t pool, uint64_t read_desc, uint6
         dispatch_base = 0;
         dispatched = 0;
     }
-    return SotcNativeParticles::OnStatsRead(regs, pool, counter, read_base, dispatch_base, dispatched, extent);
+    return SotcNativeParticles::OnStatsRead(regs, pool, counter, dispatch_base, dispatched, extent);
 }
 
 HookAction OnCountRead(GuestRegs& regs, void*) {
@@ -335,7 +333,7 @@ HookAction OnCountRead(GuestRegs& regs, void*) {
 
     // sotc: SOTC_NATIVE_PARTICLES=prev (sotc.py sets mode 3): the last completed copy, no observation.
     if (mode == 3) {
-        return ServeNative(regs, pool, read_desc, pool + kPoolRing + ((read_slot + 2) % 3) * kSlotStride);
+        return ServeNative(regs, pool, pool + kPoolRing + ((read_slot + 2) % 3) * kSlotStride);
     }
 
     g_calls.fetch_add(1, std::memory_order_relaxed);

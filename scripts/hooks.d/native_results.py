@@ -97,6 +97,50 @@ HOOKS = [
         pattern='48 8b 04 24',
         expected={EU_FINGERPRINT: 0x11db19},
     ),
+    # SOTC_NATIVE_MASKS=prev (gpu/sotc/native/native_masks.cpp): BPXPR_BuildSetDraws right after its cull dispatch
+    # (call 0x86b9e0 at 0x19c0f1). r15 = the owner (u32 +0x148 = set entry index, +0x18 = set record with the u16
+    # object count at +0x64); the four mask pointers are at [rsp+0x140..+0x158], stored into the entry just after.
+    # Displaced: mov eax,[r15+0x148] (7 bytes, no RIP or rel32 operand); no branch targets 0x19c0f6..0x19c0fc.
+    dict(
+        name='NATIVE_MASK_PRODUCE',
+        switch='SOTC_NATIVE',
+        group='native_mask_produce',
+        mode='site',
+        pattern='41 8b 87 48 01 00 00 49',
+        expected={EU_FINGERPRINT: 0x19c0f6},
+    ),
+    # The shadow mask producer sub_19c1a0 (from XPRRunFragmentCullShaderShadowScenes 0xc6bd0), right after its
+    # cull dispatch (call 0x86b9e0 at 0x19c6ac): r12 = the owner, the two masks at [rbp-0x368] / [rbp-0x360], the
+    # slot index at [rbp-0x348]. Displaced: mov eax,[r12+0x148] (8 bytes); no branch targets 0x19c6b1..0x19c6b8.
+    dict(
+        name='NATIVE_MASK_PRODUCE_SHADOW',
+        switch='SOTC_NATIVE',
+        group='native_mask_produce',
+        mode='site',
+        pattern='41 8b 84 24 48 01 00 00 48 8b 8d',
+        expected={EU_FINGERPRINT: 0x19c6b1},
+    ),
+    # SOTC_NATIVE_MASKS=prev: the CPU ordering the removed RecordMaskedDraws spins gave. XPRPreRender (0xca6d0)
+    # resets the two cull labels (mov [rax+0x40],0; mov [rax+0x68],0, rax = obj) before it queues
+    # BPXPR_RunCullPasses; the site is the next instruction (mov [rbp-0x148],rcx, 7 bytes, no RIP operand).
+    dict(
+        name='NATIVE_CULL_RESET',
+        switch='SOTC_NATIVE',
+        group='native_cull_sync',
+        mode='site',
+        pattern='48 89 8d b8 fe ff ff 48 8d 0d ?? ?? ?? ?? c5 fa',
+        expected={EU_FINGERPRINT: 0xca9ab},
+    ),
+    # BPGnm_WriteCsDoneLabel (0x925c0, rsi = the label): the cull job recorded the cull of that label. The same
+    # bytes as XPR_CS_DONE_LABEL (scripts/hooks.d/xpr.py); sotc.py turns the XPR probe off under SOTC_NATIVE.
+    dict(
+        name='NATIVE_CULL_RECORDED',
+        switch='SOTC_NATIVE',
+        group='native_cull_sync',
+        mode='entry',
+        pattern='55 48 89 e5 48 8b 3f 48 89 f0 be 28',
+        expected={EU_FINGERPRINT: 0x925c0},
+    ),
     # Verify of the water ring read (0xe48b0): the store of the value the read produced. The read is
     # kept in mode 2 (no byte patch there), so this counts how often the value changes; no consumer reads
     # +0x11c (gpuresults.md, Q1). Old value at [r14+0x11c], new value in eax (rax).
