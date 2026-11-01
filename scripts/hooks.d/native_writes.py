@@ -266,6 +266,30 @@ HOOKS = [
         pattern='4c 89 e0 48 8d 65 d8 5b 41 5c 41 5d 41 5e 41 5f 5d c3 e8 ?? ?? ?? ?? 90 90 55 48 89',
         expected={EU_FINGERPRINT: 0x1b3f97},
     ),
+    # --- impl-writes6: the CPU-written user-data block of the cull dispatch, and the 0x117930 material copy ---
+    dict(
+        name='NATIVE_CULL_DISPATCH_BLK',
+        switch='SOTC_NATIVE',
+        group='native_cull',
+        mode='entry',
+        # BPGnm_DispatchWithLabelWait 0x92b50 (args: rdi ctx, rsi buffer, rdx count, rcx block, r8 dword count). The
+        # first call 0x928f0 binds rcx as a buffer V# of r8 elements, so the GPU reads the block through user data.
+        # Announced only from BPXPR_IndexCullObjects (0x11dbe0), which writes the block just before the call
+        # (native_hooks.cpp CullDispatchEntry, caller span kCullDispatchCallers). Unique (sigfind) at 0x92b50.
+        pattern='55 48 89 e5 41 56 53 49 89 fe e8 ?? ?? ?? ?? 49 8b 3e be 08',
+        expected={EU_FINGERPRINT: 0x92b50},
+    ),
+    dict(
+        name='NATIVE_MAT_COPY_STREAM',
+        switch='SOTC_NATIVE',
+        group='native_strm',
+        mode='site',
+        # 0x117930 (the second Material Param Update path, reached when the job's [1] is 0 via 0xd0710 -> 0x117140),
+        # after memcpy(rbx, DAT_02ed2108, [r12]) at 0x11805a. The DMA-like call is 0x928f0 (rel32 6d a8 f7 ff here, which
+        # makes the pattern unique: the NATIVE_MAT_COPY pattern at 0x11788f has its own call rel32).
+        pattern='48 8d 05 ?? ?? ?? ?? 41 8b 14 24 4c 8b 64 24 08 48 89 d9 48 8b 30 c1 ea 02 4c 89 e7 41 89 d0 e8 6d a8 f7 ff',
+        expected={EU_FINGERPRINT: 0x11805f},
+    ),
 ]
 
 

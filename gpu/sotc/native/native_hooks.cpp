@@ -62,6 +62,10 @@ constexpr Span kZeroCopyCallers[] = {
     {0xffe60, 0xfff9e},   {0x19b760, 0x19c193}, {0x19c1a0, 0x19c732}, {0x19c7e0, 0x19ce60},
     {0x94fb0, 0x95313},   {0x198bb0, 0x19a1c4},
     {0xafcc0, 0xb0100},   {0xb0100, 0xb056e},   {0x1af960, 0x1afc33},
+    // impl-writes6 item 5: 0xfedc0 creates the same two 0x804 buffers as the per-frame builder 0xffe60 (obj+0x28:
+    // 0x70 per element, obj+0x50: 4 x 9 per element). No static caller (indirect); live status unknown. The span is
+    // a superset (a PerFrame announce is harmless when the buffers are written once); the zc class shows if it runs.
+    {0xfedc0, 0xfee84},
 };
 
 // The per-frame chunk writers of 0x8c0d0 (heaps.md 7.5: the 27 callers that memcpy into a chunk), the instance
@@ -177,7 +181,7 @@ struct Window {
     std::atomic<uint64_t> mip_announces{0}, mip_bytes{0};
     std::atomic<uint64_t> mip_releases{0}, mip_release_bytes{0};
     std::atomic<uint64_t> skipped{0};
-    Counter dcb, ccb, chunk, zc, mat, blk, inst, part, view;
+    Counter dcb, ccb, chunk, zc, mat, blk, inst, part, view, strm, cull;
     std::atomic<uint64_t> desc{0};
     std::atomic<uint64_t> chunk_dropped{0};
 };
@@ -548,6 +552,42 @@ HookAction BuildXprExit(GuestRegs& regs, void*) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// impl-writes6: cull dispatch block (Entry on 0x92b50 BPGnm_DispatchWithLabelWait; args rdi ctx, rsi buffer, rdx count,
+// rcx block, r8 dword count). The call 0x928f0 (first in 0x92b50, unchanged) binds rcx as a buffer V# of r8 elements, so
+// the GPU reads the block through user data. Only the caller span of BPXPR_IndexCullObjects (0x11dbe0..0x11e181, the one
+// function that writes the block: lines 109-110 of its decompilation, right before the call) is announced. The other
+// 15 call sites (SetViewParams, sub_ab630, ...) pass object fields whose writers were not verified, so they are not
+// announced. The 0xceae0 thunk tail-jumps into 0x11dbe0 (impl-writes5's "twin" was wrong), so it needs no span.
+constexpr Span kCullDispatchCallers[] = {{0x11dbe0, 0x11e181}};
+HookAction CullDispatchEntry(GuestRegs& regs, void*) {
+    if (!SotcNative::On() || regs.rcx == 0) {
+        return HookAction::Continue;
+    }
+    uint64_t offset = 0;
+    if (!CallerOffset(regs, &offset) ||
+        !InSpans(offset, kCullDispatchCallers, sizeof(kCullDispatchCallers) / sizeof(Span))) {
+        return HookAction::Continue;
+    }
+    const uint64_t size = static_cast<uint64_t>(static_cast<uint32_t>(regs.r8)) * 4; // dword count (5 = 0x14 bytes)
+    AnnounceRange(regs.rcx, regs.rcx + size, SotcNative::Kind::PerFrame, g_window.cull);
+    return HookAction::Continue;
+}
+
+// impl-writes6: 0x117930 (UpdateTextureStreamingGPUData, a second Material Param Update path), Site after
+// `memcpy(rbx, DAT_02ed2108, [r12])` at 0x11805a: rbx = the 0x12820 block just filled, [r12] = its size (r12 still holds
+// the 0x2ed2100 global). Same contract as MatCopy (0x11788f), with its own counter (strm) so a run shows whether the path
+// is live: it is reached only through sub_117140 -> sub_d0710 (job UpdateTextureStreamingGPUData) when the job's [1] is 0.
+HookAction MatCopyStream(GuestRegs& regs, void*) {
+    if (!SotcNative::On() || regs.rbx == 0) {
+        return HookAction::Continue;
+    }
+    const uint32_t size = GuestU32(regs.r12);
+    if (size != 0) {
+        AnnounceRange(regs.rbx, regs.rbx + size, SotcNative::Kind::PerFrame, g_window.strm);
+    }
+    return HookAction::Continue;
+}
+
 // Earlier batch: resource copies and mip streaming (unchanged).
 
 // 0x8bf50, inside the resource buffer wrapper 0x8be60 after `memcpy(r15, r14, [rbx+0x20])`.
@@ -647,6 +687,8 @@ void Report(std::string& out, double seconds) {
     out += cls("inst", g_window.inst);
     out += cls("part", g_window.part);
     out += cls("view", g_window.view);
+    out += cls("strm", g_window.strm);
+    out += cls("cull", g_window.cull);
     std::snprintf(line, sizeof(line), " desc %llu dropped %llu\n",
                   static_cast<unsigned long long>(take(g_window.desc)),
                   static_cast<unsigned long long>(take(g_window.chunk_dropped)));
@@ -677,6 +719,8 @@ void Register() {
     SotcHooks::RegisterHandler("NATIVE_VIEW_TABLE", Handler{ViewTable, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_INST_18AA20", Handler{InstClass2Entry, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_BUILDXPR_ZC", Handler{BuildXprExit, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_CULL_DISPATCH_BLK", Handler{CullDispatchEntry, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_MAT_COPY_STREAM", Handler{MatCopyStream, nullptr, nullptr});
 }
 
 } // namespace SotcNativeHooks
