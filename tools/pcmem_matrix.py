@@ -88,18 +88,18 @@ SWITCHES = {
     'dp_pr': {'SOTC_PARALLEL_RECORD': '1', 'SOTC_GEN_BIND': '1', 'SOTC_PR_GEN': '1'},
     'dp_pipe': {'SOTC_PIPE_DIRTY': '1', 'SOTC_PIPE_GPL': '1'},
     'dp_img': {'SOTC_IMG_POOLED': '1', 'SOTC_IMG_CREATE_AHEAD': '1', 'SOTC_RT_MAXEXTENT': '1'},
-    'dp_class': {'SOTC_STATIC_CLASS': '3', 'SOTC_RT_CLASS': '1', 'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1',
+    'dp_class': {'SOTC_STATIC_CLASS': '3', 'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1',
                  'SOTC_RB_MATERIALIZE': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_FLIP_OFFTHREAD': '1'},
     # The groups that cost nothing in the bisect (1 Nov), together; no resolve workers (dp_pr cost ~3 ms).
     'drawbest': {'SOTC_GEN_BIND': '1', 'SOTC_GEN_DMA': '1', 'SOTC_GEN_TEX': '1', 'SOTC_PIPE_DIRTY': '1',
                  'SOTC_PIPE_GPL': '1', 'SOTC_IMG_POOLED': '1', 'SOTC_IMG_CREATE_AHEAD': '1', 'SOTC_RT_MAXEXTENT': '1',
-                 'SOTC_STATIC_CLASS': '3', 'SOTC_RT_CLASS': '1', 'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1',
+                 'SOTC_STATIC_CLASS': '3', 'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1',
                  'SOTC_RB_MATERIALIZE': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_FLIP_OFFTHREAD': '1'},
     # The draw-thread phases that ran clean on 1 Nov, on top of the defaults (no honest labels and what
     # needs them: SOTC_FRAME_AHEAD, SOTC_RB_HOST, heap serving; no SOTC_BDA, unsafe with ring8).
     'drawphases': {'SOTC_RAM_REPORT': '1', 'SOTC_FLIP_OFFTHREAD': '1', 'SOTC_GEN_BIND': '1', 'SOTC_GEN_DMA': '1',
                    'SOTC_GEN_TEX': '1', 'SOTC_PARALLEL_RECORD': '1', 'SOTC_PR_GEN': '1', 'SOTC_STATIC_CLASS': '3',
-                   'SOTC_RT_CLASS': '1', 'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1', 'SOTC_RB_MATERIALIZE': '1',
+                   'SOTC_RB_CLASS': '1', 'SOTC_RB_OWNER': '1', 'SOTC_RB_MATERIALIZE': '1',
                    'SOTC_PARTICLE_PREV': '1', 'SOTC_IMG_POOLED': '1', 'SOTC_IMG_CREATE_AHEAD': '1',
                    'SOTC_RT_MAXEXTENT': '1', 'SOTC_PIPE_DIRTY': '1', 'SOTC_PIPE_GPL': '1'},
     # Current configurations.
@@ -107,7 +107,7 @@ SWITCHES = {
                'SOTC_PC_POOL': '2', 'SOTC_CLASS_TRACK': '2', 'SOTC_HOOK_MEMTYPE_PROBE': '1',
                'SOTC_MEMTYPE_CLASSES': '1', 'SOTC_RB_OWNER': '1', 'SOTC_RB_MATERIALIZE': '1',
                'SOTC_RB_CLASS': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_STATIC_CLASS': '2',
-               'SOTC_RT_CLASS': '2', 'SOTC_COMMIT_CHUNKS': '2'},
+               'SOTC_COMMIT_CHUNKS': '2'},
     'ring5': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_FRAME_FLIP': '1', 'SOTC_PC_RING': '5'},
     'chunks2': {'SOTC_COMMIT_CHUNKS': '2'},
     # The allocator probe alone: several pieces need it, so its own cost is measured apart.
@@ -118,14 +118,6 @@ SWITCHES = {
                  'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PARTICLE_PREV': '1'},
     'heaps': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_MEMTYPE_PROBE': '1', 'SOTC_MEMTYPE_CLASSES': '1',
               'SOTC_CLASS_TRACK': '1', 'SOTC_CLASS_POOLS': ''},
-    # rb2 serves only exact XPR mask bytes now; the mask spans come from the XPR consumer hooks.
-    'rb2': {'SOTC_RB_OWNER': '1', 'SOTC_RB_MATERIALIZE': '1', 'SOTC_RB_CLASS': '2',
-            'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_HOOK_XPR_PROBE': '1'},
-    # rb2 bisect: class 2 with its hooks and bookkeeping but no serve (parts 0); the old window-wide drop
-    # (parts 3) should reproduce the vertex corruption. Plain rb2 is parts 1 (asked pages only).
-    'rb2serve': {'SOTC_RB_OWNER': '1', 'SOTC_RB_MATERIALIZE': '1', 'SOTC_RB_CLASS': '2',
-              'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PARTICLE_PREV': '1', 'SOTC_HOOK_XPR_PROBE': '1',
-              'SOTC_RB_CLASS2_PARTS': '1'},
     'poolnative': {'SOTC_PC_POOL_NATIVE': '1', 'SOTC_HOOK_ALLOC_PROBE': '1'},
     # Native pool with the flex-node path too (SOTC_PC_POOL=2 must stay unset: one mode per session;
     # the native module verifies its own calls).
@@ -137,9 +129,9 @@ SWITCHES = {
     # Full ring, protect then copy, with verify (=7).
     'ring7': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_FRAME_FLIP': '1', 'SOTC_PC_RING': '7'},
     # Draw thread: the fast switches together, then the same with their verify / timing modes.
-    'drawfast': {'SOTC_TEX_BIND_FAST': '1', 'SOTC_BUF_BIND_FAST': '1', 'SOTC_VK_POOL': '1',
+    'drawfast': {'SOTC_VK_POOL': '1',
                  'SOTC_PROTECT_BATCH': '1', 'SOTC_PRESENT_UNLOCKED': '1'},
-    'drawverify': {'SOTC_TEX_BIND_FAST': '1', 'SOTC_TEX_BLOCK': '2', 'SOTC_BUF_BIND_FAST': '1',
+    'drawverify': {'SOTC_TEX_BLOCK': '2',
                    'SOTC_PRESENT_UNLOCKED': '2', 'SOTC_CMD_STATS': '1'},
     # Arena rewrite attribution (who writes into the per-frame arena after a submit).
     'attrib': {'SOTC_ARENA_ATTRIB': '1', 'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_HOOK_FRAME_FLIP': '1'},
@@ -187,25 +179,24 @@ SWITCHES = {
                    'SOTC_HOOK_MEMTYPE_PROBE': '1', 'SOTC_MEMTYPE_CLASSES': '1', 'SOTC_CLASS_TRACK': '2',
                    'SOTC_PC_RING8_HEAPS': 'CPUMemory'},
     # Every draw-thread switch, plus the RAM breakdown.
-    'drawall': {'SOTC_TEX_BIND_FAST': '1', 'SOTC_BUF_BIND_FAST': '1', 'SOTC_VK_POOL': '1',
+    'drawall': {'SOTC_VK_POOL': '1',
                 'SOTC_PROTECT_BATCH': '1', 'SOTC_PRESENT_UNLOCKED': '1',
                 'SOTC_RAM_REPORT': '1'},
     # Old configurations, kept under their names.
     'ring': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PC_RING': '1'},
     'static': {'SOTC_STATIC_CLASS': '1'},
-    'rt': {'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_RT_CLASS': '1'},
     'rb': {'SOTC_RB_OWNER': '1', 'SOTC_RB_MATERIALIZE': '1', 'SOTC_RB_CLASS': '1',
            'SOTC_HOOK_ALLOC_PROBE': '1', 'SOTC_PARTICLE_PREV': '1'},
     'pool2': {'SOTC_PC_POOL': '2', 'SOTC_HOOK_ALLOC_PROBE': '1'},
     'commit': {'SOTC_COMMIT_ON_DEMAND': '1'},
 }
-# "safe": ring5, chunks2 and rb2 with the static and RT classes (the probes they need are in the parts).
-SWITCHES['safe'] = merge_switches('safe', SWITCHES['ring5'], SWITCHES['chunks2'], SWITCHES['rb2'],
-                                  {'SOTC_STATIC_CLASS': '1', 'SOTC_RT_CLASS': '1'})
-# "all" (old): the union of ring, static, rt, rb and commit (not pool2).
-SWITCHES['all'] = merge_switches('all', SWITCHES['ring'], SWITCHES['static'], SWITCHES['rt'],
-                                 SWITCHES['rb'], SWITCHES['commit'])
-DEFAULT_CONFIGS = ['base', 'verify', 'ring5', 'chunks2', 'heaps', 'rb2', 'poolnative', 'safe']
+# "safe": ring5, chunks2 and rbclass1 with the static class (the probes they need are in the parts).
+SWITCHES['safe'] = merge_switches('safe', SWITCHES['ring5'], SWITCHES['chunks2'], SWITCHES['rbclass1'],
+                                  {'SOTC_STATIC_CLASS': '1'})
+# "all" (old): the union of ring, static, rb and commit (not pool2).
+SWITCHES['all'] = merge_switches('all', SWITCHES['ring'], SWITCHES['static'], SWITCHES['rb'],
+                                 SWITCHES['commit'])
+DEFAULT_CONFIGS = ['base', 'verify', 'ring5', 'chunks2', 'heaps', 'poolnative', 'safe']
 
 ROUTE_RE = re.compile(r'SOTC LAB ROUTE done: (\d+) frames, p50 ([\d.]+) ms, p99 ([\d.]+) ms, '
                       r'max ([\d.]+) ms, hitches >33 ms (\d+), >50 ms (\d+), >100 ms (\d+)')

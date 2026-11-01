@@ -68,7 +68,6 @@ namespace SotcNativeHooks { void Report(std::string& out, double seconds); } // 
 #include "video_core/texture_cache/image.h" // sotc: SOTC_IMG_POOLED / SOTC_IMG_CREATE_AHEAD report
 #include "../../../../sotc/stale_check.h" // sotc: SOTC_STALE_CHECK report
 #include "../../../../sotc/static_class.h" // sotc: SOTC_STATIC_CLASS report
-#include "../../../../sotc/rt_class.h"     // sotc: SOTC_RT_CLASS report
 extern "C" { // sotc: SOTC_COMMIT_ON_DEMAND (src/runtime_memory.c)
 uint64_t runtime_memory_committed_bytes(void);
 uint64_t runtime_memory_commit_count(void);
@@ -2042,7 +2041,6 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcStale::Report(report, seconds);   // sotc: SOTC_STALE_CHECK
             SotcStaticClass::Report(report, seconds); // sotc: SOTC_STATIC_CLASS
             SotcGen::Report(report, seconds); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
-            SotcRtClass::Report(report, seconds);     // sotc: SOTC_RT_CLASS
             SotcPcPool::Report(report, seconds);      // sotc: SOTC_PC_POOL
             SotcRamReport::Report(report, presenter.get()); // sotc: SOTC_RAM_REPORT
             // sotc: SOTC_COMMIT_ON_DEMAND / SOTC_COMMIT_CHUNKS

@@ -35,7 +35,6 @@
 #include "hooks.h"
 #include "rb_class.h"     // sotc: SOTC_RB_CLASS feed (XPR mask arena)
 #include "pc_pool.h"      // sotc: SOTC_PC_POOL=2 free feed
-#include "rt_class.h"     // sotc: SOTC_RT_CLASS feed
 #include "pc_ring.h"     // sotc: SOTC_PC_RING feed (per-frame arena blocks)
 #include "pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE / SOTC_PC_RECYCLE feed
 #include "mem_classes.h" // sotc: step 6 feed (CPU-only ranges) and the PC memory model owner feed
@@ -472,7 +471,6 @@ void AllocPost(GuestRegs& regs, void*) {
     SotcMemClasses::OnAllocOwner(base, size, f.family, kind, name, slot);
     SotcPcPlaceGlue::Global().OnAllocObserved(SotcPcPlace::OwnerKey{f.family, name, kind}, base, size, slot, -1);
     SotcPcRing::OnBlock(base, size, name, kind); // sotc: SOTC_PC_RING, the per-frame arena blocks
-    SotcRtClass::OnBlock(base, size, name, kind); // sotc: SOTC_RT_CLASS, the RTAllocator blocks
     SotcRbClass::OnBlock(base, size, name, kind); // sotc: SOTC_RB_CLASS, the XPR mask arena
 
     PoolRow& row = g_pools[pool];
@@ -506,7 +504,6 @@ void ForgetNode(uint64_t node) {
     SotcMemClasses::OnFree(e.base); // sotc: step 6 (no-op for ranges it never tracked)
     SotcPcPlaceGlue::Global().OnFreeObserved(e.base, e.size); // sotc: SOTC_PC_PLACE
     SotcPcRing::OnFreeBlock(e.base); // sotc: SOTC_PC_RING
-    SotcRtClass::OnFreeBlock(e.base); // sotc: SOTC_RT_CLASS
     SotcRbClass::OnFreeBlock(e.base); // sotc: SOTC_RB_CLASS
     PoolRow& row = g_pools[e.pool];
     row.live_bytes -= static_cast<int64_t>(e.size);

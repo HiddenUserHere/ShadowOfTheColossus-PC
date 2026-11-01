@@ -66,7 +66,7 @@ int Mode() {
 // The mode that runs: 3 needs the sync generation stamps (region_manager.h); without them it is 1.
 int EffectiveMode() {
     const int mode = Mode();
-    if (mode == 3 && !VideoCore::SotcBufBindFast::kGenStamps) {
+    if (mode == 3 && !VideoCore::SotcSyncStamps::kOn) {
         return 1;
     }
     return mode;
@@ -361,7 +361,7 @@ void Report(std::string& out, double seconds) {
         "SOTC STATIC SKIP: mode 3%s, %zu static allocations (%zu armed), over %.1f s: "
         "registered %llu, forgotten %llu, armed %llu, skipped binds %llu (%llu MiB), rewrites "
         "%llu, unarmed binds %llu\n",
-        eff == 3 ? "" : " (no SOTC_SYNC_FAST / SOTC_BUF_BIND_FAST stamps: ran as 1)",
+        eff == 3 ? "" : " (no SOTC_SYNC_FAST stamps: ran as 1)",
         g_registry.size(), armed, seconds, static_cast<unsigned long long>(g_reg_inserted),
         static_cast<unsigned long long>(g_reg_forgotten),
         static_cast<unsigned long long>(g_reg_armed),

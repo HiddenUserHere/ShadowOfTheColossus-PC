@@ -17,13 +17,10 @@
 namespace VideoCore {
 
 // sotc: with DLSS super resolution, textures are sampled as sharp as at the output size
-// (NVIDIA: mip bias log2(render height / output height)). SOTC_MIP_BIAS overrides. Without
+// (NVIDIA: mip bias log2(render height / output height)). Without
 // SOTC_RENDER_RES the game renders at 1080p (sotc.py leaves it unset for 1920x1080).
 static float UpscalerMipBias() {
     static const float bias = [] {
-        if (const char* v = std::getenv("SOTC_MIP_BIAS"); v && *v) {
-            return static_cast<float>(std::atof(v));
-        }
         unsigned rw = 0, rh = 0, ow = 0, oh = 0;
         const char* r = std::getenv("SOTC_RENDER_RES");
         const char* o = std::getenv("SOTC_OUTPUT_RES");

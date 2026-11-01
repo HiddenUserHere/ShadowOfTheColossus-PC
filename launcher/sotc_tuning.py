@@ -1559,21 +1559,6 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
    'other threads stayed stopped. Shows why a split still stops the game.'),
   '',
   ()),
- ('SOTC_CEILING',
-  'choice',
-  'diag',
-  ('Teto de medição: pular trabalho da thread', 'Measurement ceiling: skip draw-thread work'),
-  ("Só medição: a imagem fica errada e serve para ver o teto de ganho. Medido: 'sync' derruba o "
-   "jogo; 'tex' piorou (imagens sujas). Não use para jogar. A combinação 'sync,tex' não foi "
-   'medida.',
-   "Measurement only: the picture is wrong and shows the gain ceiling. Measured: 'sync' crashes "
-   "the game; 'tex' got worse (dirty images). Do not play with it. The 'sync,tex' combination was "
-   'not measured.'),
-  '',
-  (('', ('Desligado', 'Off')),
-   ('sync', ('Pular sincronização de buffers', 'Skip buffer sync')),
-   ('tex', ('Pular upload de texturas', 'Skip texture uploads')),
-   ('sync,tex', ('Pular os dois', 'Skip both')))),
  ('SOTC_CS_STATS',
   'flag',
   'diag',

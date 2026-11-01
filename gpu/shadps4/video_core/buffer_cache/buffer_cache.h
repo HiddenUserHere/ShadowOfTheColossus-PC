@@ -215,14 +215,10 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
-    /// sotc: SOTC_HLE_TABLE_GEN (vk_shader_hle.cpp). Sum of the write generations over the span;
-    /// false when a tracking region over it does not exist.
+    /// sotc: sum of the write generations over the span (vk_shader_hle.cpp); false when a tracking
+    /// region over it does not exist.
     [[nodiscard]] bool SyncGeneration(VAddr addr, u64 size, u64& gen) const;
-    /// sotc: SOTC_HLE_TABLE_GEN. True when no page of the span has its CPU bit set.
-    [[nodiscard]] bool IsCpuClean(VAddr addr, u64 size) const;
-    /// sotc: SOTC_HLE_TABLE_GEN. True when readback data owed to guest memory intersects the span.
-    [[nodiscard]] bool OwedIntersects(VAddr addr, u64 size) const;
-    /// sotc: SOTC_HLE_TABLE_GEN. Moves the write generations of the span (a write without a CPU bit).
+    /// sotc: moves the write generations of the span (a write without a CPU bit).
     void BumpSyncGeneration(VAddr addr, u64 size);
 
     /// sotc: SOTC_WRITE_DECL (page_manager.cpp DeclareCpuWrite): lock-free check whether any page
@@ -643,8 +639,6 @@ private:
     /// sotc: SOTC_RB_PREV: serves a guest read fault from the bytes already in guest memory (the
     /// last applied version, at most SOTC_RB_PREV_FRAMES frames old) instead of waiting for the
     /// GPU. True when it did (the readback then has nothing to wait for).
-    /// sotc: SOTC_RB_CLASS=2 uses the same path for the registered mask-arena windows (no producer
-    /// test, refusals counted by reason); see the comment above it in buffer_cache.cpp.
     bool TryServePrevious(AsyncReadback& readback);
     /// sotc: SOTC_RB_MATERIALIZE: steady-clock ns of the last PrefetchMaterialize pass.
     u64 pf_mat_last_ns{};
@@ -972,7 +966,7 @@ private:
     u64 dma_runs_version = ~0ULL;
     size_t dma_runs_arenas{};
     u64 dma_runs_ranges{};
-    /// sotc (SOTC_DMA_MERGE): touching resident ranges whose start lies in the same arena,
+    /// sotc: touching resident ranges whose start lies in the same arena,
     /// merged into runs of (device address, bytes). Only rebuilt at the top of a sweep.
     std::vector<std::pair<VAddr, u64>> dma_runs;
     bool dma_full_pending{}; // sotc: the next DMA sweep visits every run (see SynchronizeDmaBuffers)

@@ -3601,7 +3601,7 @@ void Rasterizer::BindCacheSync(const Pipeline* pipeline, bool eligible) {
         //    image copy / clear / metadata clear paths flush (BindResources).
         // Inputs a hit cannot revalidate are not stored at all (BindBuffers): texel buffers at an
         // image's address (ObtainBuffer re-tiles a GPU-written image into them on every bind)
-        // and stream-buffer copies (a snapshot of guest memory, SOTC_STREAM_THRESHOLD).
+        // and stream-buffer copies (a snapshot of guest memory).
         // sotc: SOTC_BIND_CACHE_XTICK: the tick is not a flush reason. What it protected is
         // replayed by the first hit of each entry in a new tick (TryBindCache): the image and
         // sampler stamps and the block stamps; descriptors, push data, transitions and buffer
@@ -5616,7 +5616,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // of a cached bind's hit, see TryBindCacheFrame); a CPU-modified range is
                 // synchronized as there, and the block stamps are made once per use epoch.
                 // Texel buffers (re-tiled from an aliasing image by every bind) and the stream
-                // ring (small buffers with SOTC_STREAM_THRESHOLD) are not memoized.
+                // ring are not memoized.
                 // sotc: SOTC_PC_RING=8. A bind across an arena block edge is never memoized: a hit skips
                 // PcHostMarkCpu, and the ring does not fault the CPU writes of its arena part.
                 const bool memo_on = bind_memo_ok && !desc.is_written && !desc.is_formatted &&
@@ -5883,12 +5883,10 @@ void TexBlockReport() {
 int Rasterizer::TexBlockMode() {
     // sotc: SOTC_TEX_BLOCK, read once. 1: a stage's texture block is replayed from the memo when
     // it can be; 2: also runs the full bind on a would-be hit and compares the two (verify).
-    // sotc: SOTC_TEX_BIND_FAST=1 selects mode 1 when SOTC_TEX_BLOCK is not set at all (an explicit
-    // SOTC_TEX_BLOCK=0 or =2 still wins, so the verify mode can be run with the fast switch on).
     static const int mode = [] {
         const char* v = std::getenv("SOTC_TEX_BLOCK");
         if (!v) {
-            return VideoCore::TextureCache::TexBindFast() ? 1 : 0;
+            return 0;
         }
         return v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
     }();

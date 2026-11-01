@@ -22,16 +22,6 @@
 // machinery it feeds), SOTC_HOOK_ALLOC_PROBE=1 (the arena blocks) and SOTC_PARTICLE_PREV=1 (the
 // stats ring hook).
 //
-// sotc: SOTC_RB_CLASS=2 (buffer_cache.cpp TryServePrevious, c2_win) serves a guest read of a mask
-// arena window from the last applied copy, and drops the GPU-modified state of the pages it
-// serves. It needs everything above plus SOTC_HOOK_XPR_PROBE=1: the consumer hooks
-// XPR_CONSUME_MASK (0x1a6d20) and XPR_CONSUME_MASK_INDIRECT (0x1a7290) record each visibility
-// mask span (RecordMaskSpan, probe_xpr.cpp). Without the hook no span exists, so =2 serves
-// nothing and counts every read as refused (reason "no mask hook"). A page is served only when
-// every GPU-modified byte on it lies inside a mask span recorded in the last 4 command processor
-// frames (MaskSpansSince); any other GPU-modified byte makes the read refuse ("not only masks"),
-// so no other GPU data loses its GPU-modified state. See RecordMaskSpan for why the bound is
-// 4 frames.
 // sotc: SOTC_RB_HOST (rb_host.h, R1) uses the same registry and stats requests: the mask arena blocks
 // are its "covered" arena ranges, and particle_prev.cpp hands the stats arrays to it as host runs. It
 // works without SOTC_RB_CLASS for the stats arrays; the registry needs SOTC_RB_CLASS=1 for the masks.
@@ -44,15 +34,6 @@
 namespace SotcRbClass {
 
 bool On(); ///< SOTC_RB_CLASS=1, read once
-
-/// sotc: SOTC_RB_CLASS2_PARTS=<mask> (bisect switch for SOTC_RB_CLASS=2; default 0 = no serve, decimal or 0x hex).
-/// kClass2Serve: the class-2 serve (buffer_cache.cpp TryServePrevious) is on. 0 leaves class 2 as class 1
-/// plus the XPR hooks and the applied-copy bookkeeping, which is the bisect baseline.
-/// kClass2WindowDrop: also drop the GPU-modified state of the pages of the 64 KiB window that the read
-/// did not ask for (the old scope). Off by default: those pages keep their GPU state, as in class 1.
-constexpr uint32_t kClass2Serve = 1;
-constexpr uint32_t kClass2WindowDrop = 2;
-uint32_t Class2Parts();
 
 struct Range {
     uint64_t addr;
@@ -86,30 +67,6 @@ void NoteRequestIssued(uint64_t windows);
 /// The registered ranges and a version that changes with them. Any thread.
 std::vector<Range> Snapshot(uint64_t& version);
 uint64_t Version();
-
-/// sotc: SOTC_RB_CLASS=2 mask spans (probe_xpr.cpp, XPR consumer hooks; any guest thread).
-/// The visibility mask of one draw set is 4 * ceil(n / 32) bytes, n = u16 [set + 0x64] (the
-/// allocator size of sub_12820, reports 02 and 07): the consumer reads it at entry, before the
-/// first read of the bytes, so the span is recorded before any fault on them.
-///
-/// Exactness argument (why a span is a set of mask bytes):
-/// - the span is exactly the allocation the consumer is handed (its own size, not a window);
-/// - the mask bytes are written by the cull (GPU) two command processor frames before the read,
-///   and the consumer reads them at once, so a span recorded at frame C names bytes the mask writer
-///   wrote at C-2 .. C;
-/// - a span is kept for 4 command processor frames (kMaskSpanFrames) and then dropped, not
-///   extended: the RenderSingleFrameCPU block may be reused by other data after that. Within
-///   those 4 frames a reuse by another GPU writer is not excluded by this registry, only
-///   bounded (residual risk, see the report).
-/// - a read is served only if every GPU-modified byte of its pages is inside such a span (merged
-///   snapshot from MaskSpansSince, CoveredBy), so bytes outside any span are never dropped.
-/// The applied-copy freshness bound of TryServePrevious (rb_prev_frames, 150 ms) is NOT relaxed.
-void RecordMaskSpan(uint64_t addr, uint64_t size, uint64_t frame);
-/// Mask spans recorded in the last 4 frames as a sorted list of merged ranges (adjacent or
-/// overlapping spans joined). Any thread.
-std::vector<Range> MaskSpansSince(uint64_t frame);
-/// True when [lo, hi) lies inside one merged span of `spans` (a MaskSpansSince result).
-bool CoveredBy(const std::vector<Range>& spans, uint64_t lo, uint64_t hi);
 
 /// SOTC FPS 5 s report line.
 void Report(std::string& out, double seconds);

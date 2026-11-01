@@ -454,9 +454,6 @@ public:
     [[nodiscard]] u64 ImageAddrGeneration(VAddr address) const {
         return MemoGeneration(address);
     }
-    /// sotc: SOTC_TEX_BIND_FAST=1 (read once, off by default): the wider find memo table here, and
-    /// the texture block memo in Rasterizer::TexBlockMode (vk_rasterizer.cpp).
-    static bool TexBindFast();
     /// sotc: SOTC_TEX_BLOCK. True when `id` is what FindImage returns for `info` through a perfect
     /// match (same address, size and format, not a smaller chain): the result then depends only on
     /// the images registered at info.guest_address.
@@ -1000,10 +997,8 @@ private:
         u64 gpu_epoch{};
         u64 image_uid{}; ///< sotc: the image the slot held when memoized (slots are reused)
     };
-    /// sotc: SOTC_TEX_BIND_FAST=1 uses all NumFindMemos slots; otherwise the first 1024 (the
-    /// slots the table had before). Direct-mapped: a second key on a slot evicts the first.
-    static constexpr size_t NumFindMemos = 4096;
-    static constexpr size_t NumFindMemosDefault = 1024;
+    /// sotc: direct-mapped: a second key on a slot evicts the first.
+    static constexpr size_t NumFindMemos = 1024;
     std::unique_ptr<std::array<FindMemo, NumFindMemos>> find_memos =
         std::make_unique<std::array<FindMemo, NumFindMemos>>();
     FindMemo& MemoSlot(const ImageInfo& info, bool exact_fmt, bool writer);

@@ -53,29 +53,6 @@ inline bool FpsTimersFromEnv() {
     return std::getenv("SOTC_FPS") != nullptr && !(lean && lean[0] == '1');
 }
 inline const bool kFpsTimers = FpsTimersFromEnv();
-/// sotc: SOTC_CEILING=<sync,tex> (off by default): MEASUREMENT ONLY, the picture is wrong. Skips
-/// a whole part of the draw thread's work to show how much faster it would be if that part cost
-/// nothing: "sync" skips the buffer memory synchronization (uploads of CPU-written bytes and the
-/// re-protection of their pages; residency, labels and command order are kept), "tex" skips the
-/// texture uploads. Never play with it: the GPU reads stale data and readbacks return stale bytes.
-enum CeilingPart : unsigned { CeilingSync = 1, CeilingTex = 2 };
-inline const unsigned kCeiling = [] {
-    const char* v = std::getenv("SOTC_CEILING");
-    unsigned parts = 0;
-    if (v) {
-        const auto has = [v](const char* word) {
-            const char* p = std::strstr(v, word);
-            return p != nullptr;
-        };
-        parts |= has("sync") ? CeilingSync : 0u;
-        parts |= has("tex") ? CeilingTex : 0u;
-        if (parts) {
-            std::fprintf(stderr, "SOTC_CEILING=%s: measurement only, the picture is wrong%c", v,
-                         10);
-        }
-    }
-    return parts;
-}();
 inline const bool kWriteMarks = FpsTimersFromEnv(); // sotc: same switches as kFpsTimers
 /// sotc: skip BindResources on consecutive draws whose pipeline, push data and resource
 /// handles did not change. On by default (SOTC_FAST_BIND=0 turns it off). In 0.60.5 it left black

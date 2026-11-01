@@ -319,8 +319,9 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size, u
     BbWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size,
                      static_cast<BbWriteLog::Source>(10 + source));
     const bool ok = runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
-    // sotc: SOTC_HLE_TABLE_GEN. A backing write sets no CPU bit (write-through, EOP labels, decoded
-    // data), so the write generations move here, after the bytes landed.
+    // sotc: the sync generation stamps (SOTC_SYNC_FAST). A backing write sets no CPU bit
+    // (write-through, EOP labels, decoded data), so the write generations move here, after the
+    // bytes landed.
     if (ok && rasterizer) {
         rasterizer->GetBufferCache().BumpSyncGeneration(reinterpret_cast<uintptr_t>(address), size);
     }

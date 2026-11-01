@@ -481,7 +481,7 @@ public:
         return clean;
     }
 
-    /// sotc: SOTC_HLE_TABLE_GEN. Bumps the write generations of [cpu_addr, cpu_addr + size)
+    /// sotc: bumps the write generations of [cpu_addr, cpu_addr + size)
     /// without touching any bit (a write that set no CPU bit). Called after the write.
     void BumpSyncGeneration(VAddr cpu_addr, u64 size) noexcept {
         IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 len) {

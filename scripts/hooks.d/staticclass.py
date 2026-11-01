@@ -7,7 +7,7 @@ SOTC_STATIC_CLASS=2 counts only; =1 applies: every whole page of a fresh GPU all
 mesh or non-streamed texture build whose tracking region exists is made CPU-clean and write-
 protected before the game fills it, so the fill marks only the pages it writes. =3 applies and also
 lets clean mesh ranges skip the buffer cache's per-bind page scan (static_class.cpp, Mode 3; needs
-SOTC_SYNC_FAST=1 or SOTC_BUF_BIND_FAST=1). The hooks are the same for =1 and =3.
+SOTC_SYNC_FAST=1). The hooks are the same for =1 and =3.
 
 STATIC_CLASS_MESH_BUILD   wrap at CMesh::MeshFactory (0x1264d0): sets the thread's mesh build depth.
                           Wrap: the displaced span is the first 6 bytes (push rbp; mov rbp,rsp;

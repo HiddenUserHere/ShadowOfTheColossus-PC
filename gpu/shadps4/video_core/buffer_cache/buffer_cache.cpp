@@ -36,7 +36,6 @@
 #include "video_core/buffer_cache/pc_ring_copy.h"      // sotc: SOTC_PC_RING=8 (HostMaintain)
 #include "video_core/renderer_vulkan/sotc_guest_memory.h" // sotc: SOTC_PC_RING=8 (LookupGuestView)
 #include "../../../sotc/rb_class.h"     // sotc: SOTC_RB_CLASS readback ranges
-#include "../../../sotc/hooks.h"        // sotc: IsInstalled (SOTC_RB_CLASS=2 needs the mask hook)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 // sotc: SOTC_RB_SPIN_US (default 150 us), live (SotcLive): see the readback wait below.
 SotcLive::Int kRbSpinUs{"SOTC_RB_SPIN_US", 150};
@@ -299,28 +298,6 @@ const bool rb_pf_issue_env = [] {
     const char* mat = std::getenv("SOTC_RB_MATERIALIZE");
     return rb_prefetch_env && ((v && v[0] == '1') || (mat && mat[0] == '1') || rb_prev_env);
 }();
-/// sotc: SOTC_RB_CLASS=2 (off by default; the class-1 machinery plus the serve below). A guest
-/// read fault inside a registered mask-arena window (pf_mask_ranges) is served from the last applied
-/// copy by TryServePrevious instead of waiting for the GPU. Needs SOTC_RB_OWNER=1 and
-/// SOTC_RB_MATERIALIZE=1 or SOTC_RB_PREV=1, and not SOTC_RB_EXACT (its owed downloads would dirty
-/// each other, as for SOTC_RB_PREV). Inert while SotcRbClass::On() is false: the registry in
-/// rb_class.cpp accepts only SOTC_RB_CLASS=1 today.
-const bool rb_class2_env = [] {
-    const char* v = std::getenv("SOTC_RB_CLASS");
-    if (!v || v[0] != '2') {
-        return false;
-    }
-    const bool ok = rb_prefetch_env && !rb_exact_env && (rb_materialize_env || rb_prev_env);
-    std::fprintf(stderr, ok ? "SOTC RB class 2: on (serves mask-arena reads from the last applied "
-                              "copy, only the exact mask bytes; needs SOTC_HOOK_XPR_PROBE=1 for the "
-                              "mask spans, else every read is refused)\n"
-                            : "SOTC RB class 2: inactive (needs SOTC_RB_OWNER=1, "
-                              "SOTC_RB_MATERIALIZE=1 or SOTC_RB_PREV=1, no SOTC_RB_EXACT)\n");
-    return ok;
-}();
-/// The applied-copy bookkeeping (PrevNoteApplied, PrevErase, the pf_applied pruning) runs for
-/// SOTC_RB_PREV and for SOTC_RB_CLASS=2.
-const bool rb_prev_book = rb_prev_env || rb_class2_env;
 /// SOTC_RB_PREV_FRAMES (default 2, 1-4): the guest memory version served is at most this many
 /// frames old; an older one makes the read wait for the GPU as before (and refreshes it).
 const u64 rb_prev_frames = [] {
@@ -340,24 +317,7 @@ constexpr size_t RbMatFreshMax = 8;
 /// them every 5 s). Per-kind arrays: [0] the mask-arena copies (rb_class.h), [1] the stats request
 /// copies. "stale" counts the dropped dirty ones (a later write, an unmap or a freed block),
 /// "expired" the unused ones freed by the tick bound.
-/// sotc: SOTC_RB_CLASS=2 refusal reasons (TryServePrevious, mask-arena reads).
-enum C2Refuse : size_t {
-    kC2Write,      ///< a write fault needs the exact bytes
-    kC2NoCopy,     ///< no applied copy of the window within SOTC_RB_PREV_FRAMES frames
-    kC2NotCovered, ///< a GPU-modified byte of an asked page has no recent applied copy
-    kC2NotOnlyMasks, ///< sotc: a GPU-modified byte of an asked page lies outside every mask span
-    kC2Cpu,        ///< an asked page the guest also wrote
-    kC2Busy,       ///< an in-flight readback owns the pages
-    kC2Capped,     ///< prefetch count or staging budget for the owed download
-    kC2Other,      ///< other: no arena, no recurring entry, nothing to drop, spans two windows
-    kC2NoHook,     ///< SOTC_HOOK_XPR_PROBE not installed: no mask span is ever recorded
-    kC2Reasons
-};
 struct RbClassCounts {
-    std::atomic<u64> c2_served{};              ///< mask-arena reads served (class 2)
-    std::atomic<u64> c2_bytes{};               ///< bytes of the GPU-modified pages those served dropped
-    std::atomic<u64> c2_pages{};               ///< pages whose GPU-modified state class 2 dropped
-    std::atomic<u64> c2_refused[kC2Reasons]{}; ///< class-2 refusals by C2Refuse
     std::atomic<u64> issued[2]{};
     std::atomic<u64> applied[2]{};
     std::atomic<u64> applied_bytes[2]{};
@@ -371,8 +331,6 @@ struct RbClassCounts {
     std::atomic<u64> capped{};     ///< prefetch count cap (issue)
     std::atomic<u64> budget{};     ///< staging budget (issue)
     std::atomic<u64> no_arena{};   ///< window outside every arena (issue)
-    std::atomic<u64> c2_owed_dirty{};    ///< sotc: class 2 owed downloads dropped dirty (a write, unmap or CPU write)
-    std::atomic<u64> c2_unasked_kept{};  ///< sotc: class 2 pages of the window not asked, GPU state kept
 };
 RbClassCounts rb_class_cnt;
 
@@ -752,7 +710,7 @@ void BufferCache::RbxSettleWritePages(VAddr addr, u64 size, bool assume_locks) {
 }
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
-    if (rb_prev_book) {
+    if (rb_prev_env) {
         PrevErase(device_addr, size); // sotc: SOTC_RB_PREV: the memory may hold other data now
     }
     // sotc: SOTC_ASYNC_UPLOAD write fence: the range may be mapped again (the same memory at
@@ -818,7 +776,7 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
             std::unique_lock gpu_modified_lock{gpu_modified_mutex};
             gpu_modified_ranges.Subtract(device_addr, size);
         }
-        if (rb_prev_book) {
+        if (rb_prev_env) {
             // sotc: SOTC_RB_PREV: again here, ordered with the draw thread: a readback applied
             // between the erase at the top and this drop recorded the range again.
             PrevErase(device_addr, size);
@@ -1495,7 +1453,7 @@ void BufferCache::BeginAsyncReadbackImpl(AsyncReadback& readback) {
             PrefetchAtFault(readback.device_addr, readback.size);
         }
         // sotc: SOTC_RB_PREV: the last applied version instead of a wait (see TryServePrevious).
-        if ((rb_prev_env || rb_class2_env) && TryServePrevious(readback)) {
+        if (rb_prev_env && TryServePrevious(readback)) {
             readback.waiting = false;
             return;
         }
@@ -2293,7 +2251,7 @@ void BufferCache::PrefetchRebuild(u64 frame) {
     }
     // sotc: SOTC_RB_PREV: forget windows not written in the last 8 frames, and applied ranges
     // older than SOTC_RB_PREV_FRAMES.
-    if (rb_prev_book) { // sotc: pf_wmask is only filled by SOTC_RB_PREV (PrefetchNoteWrite)
+    if (rb_prev_env) { // sotc: pf_wmask is only filled by SOTC_RB_PREV (PrefetchNoteWrite)
         const u64 cpf = SotcStats::cp_frame.load(std::memory_order_relaxed);
         for (auto it = pf_wmask.begin(); it != pf_wmask.end();) {
             const u64 shift = cpf > it->second.frame ? cpf - it->second.frame : 0;
@@ -2458,11 +2416,6 @@ void BufferCache::PrefetchMarkDirty(VAddr addr, u64 size) {
 void BufferCache::PrefetchDrop(size_t index) {
     AsyncReadback& p = *pf_live[index];
     if (!p.finished) {
-        // sotc: an owed download of class 2 holds GPU-newest bytes whose GPU state was already dropped
-        // (TryServePrevious). Dirty, it is never applied: those bytes never reach guest memory.
-        if (p.pf_owed && p.dirty) {
-            rb_class_cnt.c2_owed_dirty.fetch_add(1, std::memory_order_relaxed);
-        }
         // Not applied: its ranges stay in the GPU-modified set, its pages protected. The
         // staging is reused once the tick being recorded is done, after its copies.
         if (p.pf_class) { // sotc: SOTC_RB_CLASS report: dirty ones are stale, the rest expired
@@ -3001,94 +2954,40 @@ void BufferCache::PrevErase(VAddr addr, u64 size) {
 // Readbacks in flight that own the dropped pages go dirty (StaleReason::Unmap) and read again the
 // usual way when finished. Risk accepted with the switch: an object that just became visible may
 // be culled for a frame or two.
-// sotc: SOTC_RB_CLASS=2 needs the XPR consumer hook (probe_xpr.cpp, XPR_CONSUME_MASK, switch
-// SOTC_HOOK_XPR_PROBE=1): it records the mask spans. Without it no span exists and every class-2
-// read is refused (kC2NoHook). Read once, at the first class-2 read: the hooks are installed
-// before the game runs.
-bool MaskHookOn() {
-    static const bool on = SotcHooks::IsInstalled("XPR_CONSUME_MASK");
-    return on;
-}
-// sotc: SOTC_RB_CLASS=2 (rb_class2_env). A read fault in a registered mask-arena window is served
-// by this same path, with two differences. The window is registered by the engine (the XPR
-// visibility masks, pf_mask_ranges), so the producer test (written in two of the last three frames)
-// is skipped. And every refusal is counted by reason (rb_class_cnt.c2_refused). Nothing else
-// changes, and nothing is written into guest memory: the served bytes are the ones the guest already
-// holds, which by the covered test below are the last applied copy of each GPU-modified byte that
-// is dropped. Freshness is the same bound as SOTC_RB_PREV (applied at most SOTC_RB_PREV_FRAMES cp
-// frames and 150 ms ago). The owed download of the dropped GPU-newer bytes is applied later by
-// PrefetchMaterialize, so the guest gets the newest frame a little later. The newest complete clean
-// class copy is applied before this runs (PrefetchAtFault, at this same fault), so the last applied
-// copy here is the last complete one. A copy in flight that overlaps a dropped page goes dirty
-// (PrefetchMarkDirty) and is never applied over the served version.
 bool BufferCache::TryServePrevious(AsyncReadback& readback) {
     const VAddr addr = readback.device_addr;
     const u64 size = readback.size;
     const u64 granule = PfGranule();
     const VAddr key = Common::AlignDown(addr, granule);
-    const bool c2_win = rb_class2_env && !pf_mask_ranges.empty() &&
-                        SotcRbClass::InRanges(pf_mask_ranges, key, granule);
-    if (!rb_prev_env && !c2_win) {
+    if (!rb_prev_env) {
         return false;
     }
-    // sotc: SOTC_RB_CLASS2_PARTS bisect: without kClass2Serve, class 2 never serves or drops anything.
-    const u32 c2_parts = c2_win ? SotcRbClass::Class2Parts() : 0;
-    if (c2_win && !(c2_parts & SotcRbClass::kClass2Serve)) {
-        return false;
-    }
-    const auto refuse = [&](size_t reason) {
-        if (c2_win) {
-            rb_class_cnt.c2_refused[reason].fetch_add(1, std::memory_order_relaxed);
-        }
-        return false;
-    };
     if (readback.is_write) {
-        return refuse(kC2Write);
-    }
-    if (c2_win && !MaskHookOn()) {
-        return refuse(kC2NoHook);
+        return false;
     }
     if (addr + size > key + granule) {
-        return refuse(kC2Other); // spans two windows: the usual path
+        return false; // spans two windows: the usual path
     }
     const u64 frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
-    // sotc: class 2, proof that only mask bytes lose their GPU-modified state.
-    // 1. A page is dropped only when ok holds, and ok needs every GPU-modified byte of the page
-    //    (ForEachInRange) inside one merged mask span (CoveredBy on masks): an allocation the XPR
-    //    consumer hook recorded (probe_xpr.cpp RecordMask) in the last 4 cp frames (rb_class.h).
-    // 2. A GPU-modified byte outside every span sets foreign, so ok is false: its page is not
-    //    dropped, and an asked page refuses the read (kC2NotOnlyMasks). A page that is not asked
-    //    is left as it is. Nothing else in the loop clears GPU-modified bits.
-    // 3. Subtract, UnmarkRegionAsGpuModified and the owed download (GatherDownloads) act on the
-    //    dropped pages only, and a page is dropped whole only when all its GPU-modified bytes
-    //    passed step 1, so no other GPU-written byte loses its state. In-flight readbacks or
-    //    prefetches that overlap a dropped page are marked dirty and read again: their state
-    //    changes, the GPU data they hold does not lose its GPU-modified state.
-    // Residual risk, not excluded here: a span names the allocation the consumer read, so a
-    // byte of it reused by another GPU writer within those 4 frames would pass step 1 (report).
-    const std::vector<SotcRbClass::Range> masks =
-        c2_win ? SotcRbClass::MaskSpansSince(frame) : std::vector<SotcRbClass::Range>{};
-    if (!c2_win) {
-        const auto wm = pf_wmask.find(key);
-        if (wm == pf_wmask.end()) {
-            return false;
-        }
-        const u64 shift = frame > wm->second.frame ? frame - wm->second.frame : 0;
-        const u32 mask = shift >= 32 ? 0 : wm->second.mask << shift;
-        // Written in at least two of the frames frame-1 .. frame-3 (bits 1-3), whatever this frame
-        // did: frames the command processor splits differently still count.
-        if (std::popcount(mask & 0xEu) < 2) {
-            SotcStats::rb_prev_not_producer.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
+    const auto wm = pf_wmask.find(key);
+    if (wm == pf_wmask.end()) {
+        return false;
+    }
+    const u64 shift = frame > wm->second.frame ? frame - wm->second.frame : 0;
+    const u32 mask = shift >= 32 ? 0 : wm->second.mask << shift;
+    // Written in at least two of the frames frame-1 .. frame-3 (bits 1-3), whatever this frame
+    // did: frames the command processor splits differently still count.
+    if (std::popcount(mask & 0xEu) < 2) {
+        SotcStats::rb_prev_not_producer.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
     const auto rec = std::ranges::lower_bound(pf_recurring, key, {}, &PfWindow::key);
     if (rec == pf_recurring.end() || rec->key != key) {
-        return refuse(kC2Other);
+        return false;
     }
     const Buffer* arena = address_space[addr >> ARENA_PAGE_BITS];
     if (!arena) {
-        return refuse(kC2Other);
+        return false;
     }
     boost::container::small_vector<std::pair<VAddr, VAddr>, RbMatFreshMax> spans;
     {
@@ -3097,7 +2996,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
         const auto found = pf_applied.find(key);
         if (found == pf_applied.end()) {
             SotcStats::rb_prev_too_old.fetch_add(1, std::memory_order_relaxed);
-            return refuse(kC2NoCopy);
+            return false;
         }
         for (const PfFresh& f : found->second) {
             if (f.frame + rb_prev_frames >= frame && now - f.ns <= RbPrevMaxNs) {
@@ -3117,7 +3016,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
     spans.resize(merged);
     if (spans.empty()) {
         SotcStats::rb_prev_too_old.fetch_add(1, std::memory_order_relaxed);
-        return refuse(kC2NoCopy);
+        return false;
     }
     const auto covered = [&](VAddr lo, VAddr hi) {
         const auto it =
@@ -3137,33 +3036,18 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
         for (VAddr page = Common::AlignDown(window_start, Page); page < window_end; page += Page) {
             bool any = false;
             bool uncovered = false; // a GPU-modified byte without a recent applied copy
-            bool foreign = false;   // sotc: class 2: a GPU-modified byte outside every mask span
-            bool cpu_page = false;
             gpu_modified_ranges.ForEachInRange(page, Page, [&](VAddr lo, VAddr hi) {
                 any = true;
                 if (!covered(lo, hi)) {
                     uncovered = true;
-                } else if (c2_win && !SotcRbClass::CoveredBy(masks, lo, hi)) {
-                    foreign = true;
                 }
             });
-            bool ok = !uncovered && !foreign;
+            bool ok = !uncovered;
             const bool asked = page >= ask_lo && page < ask_hi;
-            // sotc: class 2 drops only the pages the read asked for. The other pages of the window keep
-            // their GPU-modified state (as in class 1): dropping them gave the owed download and the
-            // later CPU uploads bytes nobody read (the bad run of 2026-11-01 04:27). The old scope is
-            // SOTC_RB_CLASS2_PARTS=3.
-            if (c2_win && !asked && !(c2_parts & SotcRbClass::kClass2WindowDrop)) {
-                if (any) {
-                    rb_class_cnt.c2_unasked_kept.fetch_add(1, std::memory_order_relaxed);
-                }
-                continue;
-            }
             // A page the guest also wrote (CPU and GPU bits) would upload the old guest bytes over
             // the arena's newer GPU bytes once released: the exact path (review of 2026-10-28).
             if (any && ok && memory_tracker->IsRegionCpuModified(page, Page)) {
                 ok = false;
-                cpu_page = true;
             }
             if (any && ok) {
                 if (!drop.empty() && drop.back().second == page) {
@@ -3175,16 +3059,12 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
                 // An asked page with GPU data older than the limit (or none: some other reason
                 // for the fault): the usual readback.
                 SotcStats::rb_prev_too_old.fetch_add(1, std::memory_order_relaxed);
-                // sotc: foreign (class 2) is reported only when every other byte is in order.
-                return refuse(!any        ? kC2Other
-                              : cpu_page  ? kC2Cpu
-                              : uncovered ? kC2NotCovered
-                                          : kC2NotOnlyMasks);
+                return false;
             }
         }
     }
     if (drop.empty()) {
-        return refuse(kC2Other);
+        return false;
     }
     // A guest readback in flight already downloads some of these pages: leave them to it (its
     // data would be thrown away as stale and the guest would get the old bytes).
@@ -3198,7 +3078,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
                 for (const auto& [lo, hi] : drop) {
                     if (range_addr < hi && lo < range_addr + range_size) {
                         SotcStats::rb_prev_busy.fetch_add(1, std::memory_order_relaxed);
-                        return refuse(kC2Busy);
+                        return false;
                     }
                 }
             }
@@ -3212,7 +3092,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
     // guest gets the newer version a little later instead of never.
     if (pf_live.size() >= rb_pf_max) {
         SotcStats::rb_pf_capped.fetch_add(1, std::memory_order_relaxed);
-        return refuse(kC2Capped);
+        return false;
     }
     auto owed = std::make_unique<AsyncReadback>();
     u64 owed_total = 0;
@@ -3233,7 +3113,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
     const u64 owed_bytes = owed_total ? std::bit_ceil(std::max<u64>(owed_total, 64_KB)) : 0;
     if (owed_total != 0 && pf_bytes_held + owed_bytes > rb_pf_budget) {
         SotcStats::rb_pf_capped.fetch_add(1, std::memory_order_relaxed);
-        return refuse(kC2Capped);
+        return false;
     }
     if (owed_total != 0) {
         AsyncReadback& o = *owed;
@@ -3296,11 +3176,6 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
         ++inflight_version;
         pf_live.push_back(std::move(owed));
         SotcStats::rb_prev_owed.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (c2_win) {
-        rb_class_cnt.c2_served.fetch_add(1, std::memory_order_relaxed);
-        rb_class_cnt.c2_bytes.fetch_add(bytes, std::memory_order_relaxed);
-        rb_class_cnt.c2_pages.fetch_add(bytes / Page, std::memory_order_relaxed);
     }
     SotcStats::rb_prev_served.fetch_add(1, std::memory_order_relaxed);
     SotcStats::rb_prev_served_all.fetch_add(1, std::memory_order_relaxed);
@@ -3422,10 +3297,7 @@ void BufferCache::PrefetchClassReport() {
         "SOTC RB class (5 s): mask copies issued %llu, applied %llu (%.1f MiB), read by a fault "
         "%llu, stale %llu (block gone %llu), expired %llu, claimed %llu; stats copies issued "
         "%llu, applied %llu (%.1f MiB), read by a fault %llu, stale %llu, expired %llu, claimed "
-        "%llu; refused at issue: held %llu, empty %llu, capped %llu, budget %llu, no arena %llu; "
-        "class 2 served %llu reads (%llu pages, %.1f MiB), refused: write %llu, no copy %llu, not "
-        "covered %llu, not only masks %llu, cpu %llu, busy %llu, capped %llu, no mask hook %llu, "
-        "other %llu\n",
+        "%llu; refused at issue: held %llu, empty %llu, capped %llu, budget %llu, no arena %llu\n",
         (unsigned long long)get(c.issued[0]), (unsigned long long)get(c.applied[0]),
         get(c.applied_bytes[0]) / 1048576.0, (unsigned long long)get(c.consumed[0]),
         (unsigned long long)get(c.stale[0]), (unsigned long long)get(c.block_gone[0]),
@@ -3435,23 +3307,7 @@ void BufferCache::PrefetchClassReport() {
         (unsigned long long)get(c.stale[1]), (unsigned long long)get(c.expired[1]),
         (unsigned long long)get(c.claimed[1]), (unsigned long long)get(c.held),
         (unsigned long long)get(c.empty), (unsigned long long)get(c.capped),
-        (unsigned long long)get(c.budget), (unsigned long long)get(c.no_arena),
-        (unsigned long long)get(c.c2_served), (unsigned long long)get(c.c2_pages),
-        get(c.c2_bytes) / 1048576.0,
-        (unsigned long long)get(c.c2_refused[kC2Write]),
-        (unsigned long long)get(c.c2_refused[kC2NoCopy]),
-        (unsigned long long)get(c.c2_refused[kC2NotCovered]),
-        (unsigned long long)get(c.c2_refused[kC2NotOnlyMasks]),
-        (unsigned long long)get(c.c2_refused[kC2Cpu]), (unsigned long long)get(c.c2_refused[kC2Busy]),
-        (unsigned long long)get(c.c2_refused[kC2Capped]),
-        (unsigned long long)get(c.c2_refused[kC2NoHook]),
-        (unsigned long long)get(c.c2_refused[kC2Other]));
-    // sotc: class 2 owed downloads dropped dirty (their GPU-newest bytes never reach guest memory),
-    // and window pages of a served read that kept their GPU state (SOTC_RB_CLASS2_PARTS).
-    std::fprintf(stderr, "SOTC RB class 2 (5 s): owed downloads dropped dirty %llu, window pages not "
-                         "asked, GPU state kept %llu\n",
-                 (unsigned long long)get(c.c2_owed_dirty),
-                 (unsigned long long)get(c.c2_unasked_kept));
+        (unsigned long long)get(c.budget), (unsigned long long)get(c.no_arena));
 }
 
 // sotc: SOTC_RB_EXACT=1 (off by default; needs SOTC_RB_OWNER=1 and the asynchronous readbacks;
@@ -5743,7 +5599,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 }
             };
             write_pages(dst_addr, copy.size, [&](VAddr part_addr, u64 part_size) {
-            if (rb_prev_book) {
+            if (rb_prev_env) {
                 // sotc: SOTC_RB_PREV: only the parts written (hot items skip guest-written pages)
                 PrevNoteApplied(part_addr, part_size);
             }
@@ -5989,14 +5845,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         SotcPcPlaceGlue::Global().OnGpuBind(device_addr, size);
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    // sotc: SOTC_STREAM_THRESHOLD=<bytes> (default 16 KiB) for A/B: small read-only buffers are
-    // copied into the stream buffer on every bind instead of using the synchronized arena.
-    static const u64 stream_threshold = [] {
-        const char* v = std::getenv("SOTC_STREAM_THRESHOLD");
-        // sotc: 0 by default: with the unlocked no-change check the arena is cheaper than copying
-        // (+7% on the heavy benchmark, attract demo min 20 -> 24 FPS).
-        return v ? std::strtoull(v, nullptr, 0) : u64{0};
-    }();
+    // sotc: small read-only buffers would be copied into the stream buffer. The threshold is 0: with
+    // the unlocked no-change check the arena is cheaper than copying (+7% on the heavy benchmark,
+    // attract demo min 20 -> 24 FPS), so only an empty buffer streams.
+    constexpr u64 stream_threshold = 0;
     if (!is_written && size <= stream_threshold && !IsRegionGpuModified(device_addr, size)) {
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
@@ -6720,23 +6572,15 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionCpuModified(addr, size);
 }
 
-// sotc: SOTC_HLE_TABLE_GEN accessors (vk_shader_hle.cpp). The generations exist only with
-// SOTC_SYNC_FAST or SOTC_BUF_BIND_FAST; BumpSyncGeneration checks that itself.
+// sotc: sync generation accessor for vk_shader_hle.cpp. The generations exist only with
+// SOTC_SYNC_FAST; BumpSyncGeneration checks that itself.
 bool BufferCache::SyncGeneration(VAddr addr, u64 size, u64& gen) const {
     return memory_tracker->SyncGeneration(addr, size, gen);
 }
 
-bool BufferCache::IsCpuClean(VAddr addr, u64 size) const {
-    return memory_tracker->IsSyncClean(addr, size, false);
-}
-
-bool BufferCache::OwedIntersects(VAddr addr, u64 size) const {
-    return rbx_owed_count.load(std::memory_order_relaxed) != 0 && RbxOwedIntersects(addr, size);
-}
-
 void BufferCache::BumpSyncGeneration(VAddr addr, u64 size) {
     SotcGen::Bump(addr, size); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA (a write that set no CPU bit)
-    if (!SotcBufBindFast::kGenStamps) {
+    if (!SotcSyncStamps::kOn) {
         return;
     }
     memory_tracker->BumpSyncGeneration(addr, size);
@@ -6956,15 +6800,6 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 void BufferCache::SynchronizeDmaBuffers() {
     const SotcPcRing::SweepScope ring_sweep; // sotc: SOTC_PC_RING, uploads here are sweeps
     const SyncReason sync_reason{3}; // sotc: SOTC_TRACE reason 3 (DMA sweep)
-    // sotc: SOTC_DMA_SYNC_SKIP=1, diagnostic only: no sweep, to weigh its share of the stalls when
-    // a new area loads (shaders unchanged, unlike turning the DMA off; reflections may lag).
-    static const bool skip = [] {
-        const char* v = std::getenv("SOTC_DMA_SYNC_SKIP");
-        return v && v[0] == '1';
-    }();
-    if (skip) {
-        return;
-    }
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameDma};
     fault_process_pending = true;
     // sotc: SOTC_CLASS_TRACK=1 apply (plan step 6). The CPU-only ranges of the apply pools
@@ -7115,105 +6950,86 @@ void BufferCache::SynchronizeDmaBuffers() {
     const u64 uploads_before = SotcStats::uploads.load(std::memory_order_relaxed);
     const auto sweep_start = std::chrono::steady_clock::now();
     u64 ranges = 0;
-    // sotc (SOTC_DMA_MERGE=0 disables): the sweep visited ~1200 resident ranges ~100 times a
-    // second, one tracker walk + staging request each. Touching ranges whose start maps to the
-    // same arena are merged into runs (one SynchronizeMemory per run), rebuilt only when
-    // resident_ranges or the arena set changed. Same pages are uploaded into the same arena,
-    // just batched. A run is capped (SOTC_DMA_MERGE_MAX MiB, default 16 = staging ring block,
-    // max 64) so merging never pushes an upload to RequestLarge; a single range larger than the
-    // cap stays one run as before. Runs hold addresses only; the arena is looked up per run at
-    // sync time (a migration merges arenas, so entries sharing one keep sharing one).
-    static const bool dma_merge = [] {
-        const char* v = std::getenv("SOTC_DMA_MERGE");
-        return !(v && v[0] == '0');
-    }();
-    static const u64 dma_merge_max = [] {
-        const char* v = std::getenv("SOTC_DMA_MERGE_MAX");
-        const u64 mib = v ? std::strtoull(v, nullptr, 10) : 0;
-        return std::clamp<u64>(mib ? mib : 16, 1, 64) << 20;
-    }();
-    if (dma_merge) {
-        if (dma_runs_version != resident_version || dma_runs_arenas != arenas.size()) {
-            dma_runs_version = resident_version;
-            dma_runs_arenas = arenas.size();
-            dma_runs_ranges = resident_ranges.Size();
-            dma_runs.clear();
-            for (const auto& range : resident_ranges) {
-                const VAddr device_addr = range.start << block_shift;
-                const u64 size = (range.end - range.start) << block_shift;
-                if (!dma_runs.empty()) {
-                    auto& run = dma_runs.back();
-                    if (run.first + run.second == device_addr &&
-                        run.second + size <= dma_merge_max &&
-                        address_space[run.first >> ARENA_PAGE_BITS] ==
-                            address_space[device_addr >> ARENA_PAGE_BITS]) {
-                        run.second += size;
-                        continue;
-                    }
-                }
-                dma_runs.emplace_back(device_addr, size);
-            }
-            dma_full_pending = true;
-            // sotc: SOTC_GEN_DMA. The runs changed: no run has a clean-sweep record any more.
-            dma_run_gen.assign(dma_runs.size(), 0);
-            dma_run_valid.assign(dma_runs.size(), false);
-        }
-        // sotc: incremental sweep (SOTC_DMA_INCR=0: every run, every time). Only the 256 KiB
-        // words where a CPU bit rose since the last sweep can need an upload
-        // (RegionManager::TakeSweepWords; hot pages kept by FaultGrace are marked again on each
-        // upload). After the runs change (pages that became resident may hold old CPU bits) one
-        // full sweep restores that. Each run is still synced once, over the hull of its dirty
-        // words, so the uploads per run stay as before.
-        static const bool dma_incr = [] {
-            const char* v = std::getenv("SOTC_DMA_INCR");
-            return !(v && v[0] == '0');
-        }();
-        if (!dma_incr || std::exchange(dma_full_pending, false)) {
-            if (dma_incr) {
-                memory_tracker->ForEachSweepSpan([](VAddr, u64) {});
-            }
-            // sotc: by index with a copied entry, re-reading size(): nothing nested in
-            // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
-            for (size_t i = 0; i < dma_runs.size(); ++i) {
-                const auto [device_addr, size] = dma_runs[i];
-                SweepDmaRun(i, device_addr, size, device_addr, size); // sotc: SOTC_GEN_DMA
-            }
-            ranges = dma_runs_ranges;
-        } else {
-            dma_spans.clear();
-            memory_tracker->ForEachSweepSpan(
-                [this](VAddr address, u64 size) { dma_spans.emplace_back(address, size); });
-            std::ranges::sort(dma_spans);
-            size_t s = 0;
-            for (size_t i = 0; i < dma_runs.size() && s < dma_spans.size(); ++i) {
-                const auto [run_start, run_size] = dma_runs[i];
-                const VAddr run_end = run_start + run_size;
-                while (s < dma_spans.size() &&
-                       dma_spans[s].first + dma_spans[s].second <= run_start) {
-                    ++s;
-                }
-                VAddr lo = ~0ULL;
-                VAddr hi = 0;
-                for (size_t k = s; k < dma_spans.size() && dma_spans[k].first < run_end; ++k) {
-                    lo = std::min(lo, std::max(run_start, dma_spans[k].first));
-                    hi = std::max(hi, std::min(run_end, dma_spans[k].first + dma_spans[k].second));
-                }
-                if (lo < hi) {
-                    SweepDmaRun(i, run_start, run_size, lo, hi - lo); // sotc: SOTC_GEN_DMA
-                    ++ranges;
-                }
-            }
-        }
-        SotcStats::dma_sweep_runs.fetch_add(dma_runs.size(), std::memory_order_relaxed);
-    } else {
+    // sotc: the sweep visited ~1200 resident ranges ~100 times a second, one tracker walk + staging
+    // request each. Touching ranges whose start maps to the same arena are merged into runs (one
+    // SynchronizeMemory per run), rebuilt only when resident_ranges or the arena set changed. Same
+    // pages are uploaded into the same arena, just batched. A run is capped (16 MiB, the staging ring
+    // block) so merging never pushes an upload to RequestLarge; a single range larger than the cap
+    // stays one run as before. Runs hold addresses only; the arena is looked up per run at sync time
+    // (a migration merges arenas, so entries sharing one keep sharing one).
+    static constexpr u64 dma_merge_max = 16ull << 20;
+    if (dma_runs_version != resident_version || dma_runs_arenas != arenas.size()) {
+        dma_runs_version = resident_version;
+        dma_runs_arenas = arenas.size();
+        dma_runs_ranges = resident_ranges.Size();
+        dma_runs.clear();
         for (const auto& range : resident_ranges) {
-            const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
             const VAddr device_addr = range.start << block_shift;
             const u64 size = (range.end - range.start) << block_shift;
-            SynchronizeMemory(address_space[page], device_addr, size, false, false);
-            ++ranges;
+            if (!dma_runs.empty()) {
+                auto& run = dma_runs.back();
+                if (run.first + run.second == device_addr &&
+                    run.second + size <= dma_merge_max &&
+                    address_space[run.first >> ARENA_PAGE_BITS] ==
+                        address_space[device_addr >> ARENA_PAGE_BITS]) {
+                    run.second += size;
+                    continue;
+                }
+            }
+            dma_runs.emplace_back(device_addr, size);
+        }
+        dma_full_pending = true;
+        // sotc: SOTC_GEN_DMA. The runs changed: no run has a clean-sweep record any more.
+        dma_run_gen.assign(dma_runs.size(), 0);
+        dma_run_valid.assign(dma_runs.size(), false);
+    }
+    // sotc: incremental sweep (SOTC_DMA_INCR=0: every run, every time). Only the 256 KiB
+    // words where a CPU bit rose since the last sweep can need an upload
+    // (RegionManager::TakeSweepWords; hot pages kept by FaultGrace are marked again on each
+    // upload). After the runs change (pages that became resident may hold old CPU bits) one
+    // full sweep restores that. Each run is still synced once, over the hull of its dirty
+    // words, so the uploads per run stay as before.
+    static const bool dma_incr = [] {
+        const char* v = std::getenv("SOTC_DMA_INCR");
+        return !(v && v[0] == '0');
+    }();
+    if (!dma_incr || std::exchange(dma_full_pending, false)) {
+        if (dma_incr) {
+            memory_tracker->ForEachSweepSpan([](VAddr, u64) {});
+        }
+        // sotc: by index with a copied entry, re-reading size(): nothing nested in
+        // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
+        for (size_t i = 0; i < dma_runs.size(); ++i) {
+            const auto [device_addr, size] = dma_runs[i];
+            SweepDmaRun(i, device_addr, size, device_addr, size); // sotc: SOTC_GEN_DMA
+        }
+        ranges = dma_runs_ranges;
+    } else {
+        dma_spans.clear();
+        memory_tracker->ForEachSweepSpan(
+            [this](VAddr address, u64 size) { dma_spans.emplace_back(address, size); });
+        std::ranges::sort(dma_spans);
+        size_t s = 0;
+        for (size_t i = 0; i < dma_runs.size() && s < dma_spans.size(); ++i) {
+            const auto [run_start, run_size] = dma_runs[i];
+            const VAddr run_end = run_start + run_size;
+            while (s < dma_spans.size() &&
+                   dma_spans[s].first + dma_spans[s].second <= run_start) {
+                ++s;
+            }
+            VAddr lo = ~0ULL;
+            VAddr hi = 0;
+            for (size_t k = s; k < dma_spans.size() && dma_spans[k].first < run_end; ++k) {
+                lo = std::min(lo, std::max(run_start, dma_spans[k].first));
+                hi = std::max(hi, std::min(run_end, dma_spans[k].first + dma_spans[k].second));
+            }
+            if (lo < hi) {
+                SweepDmaRun(i, run_start, run_size, lo, hi - lo); // sotc: SOTC_GEN_DMA
+                ++ranges;
+            }
         }
     }
+    SotcStats::dma_sweep_runs.fetch_add(dma_runs.size(), std::memory_order_relaxed);
     SotcStats::dma_sweeps.fetch_add(1, std::memory_order_relaxed);
     SotcStats::dma_sweep_ranges.fetch_add(ranges, std::memory_order_relaxed);
     const u64 sweep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -8104,9 +7920,6 @@ bool BufferCache::BindMemoEligible(VAddr device_addr, u32 size) const {
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
-    if (SotcStats::kCeiling & SotcStats::CeilingSync) {
-        return false; // sotc: SOTC_CEILING=sync, measurement only (see sotc_stats.h)
-    }
     // sotc: SOTC_STALE_CHECK: one bind in N compares the CPU- and GPU-clean pages of this range
     // with the hashes stored at their last upload (stale_check.h). Before any sync below.
     if (SotcStale::On() && SotcStale::SampleBind()) {
@@ -8119,8 +7932,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         SotcPcRing::InArena(device_addr, size)) {
         SotcPcRing::CheckBind(device_addr, size);
     }
-    // sotc: SOTC_BUF_BIND_FAST=1 also takes this path (its stamps are kept by region_manager.h).
-    if (!SotcBufBindFast::kGenStamps) {
+    if (!SotcSyncStamps::kOn) {
         return SynchronizeMemoryFull(arena, device_addr, size, is_written, is_texel_buffer);
     }
     // sotc: SOTC_SYNC_FAST. Skip the page scan (and its locks) when the range was found clean
@@ -9102,7 +8914,7 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     }
     // sotc: SOTC_RB_PREFETCH: the range loses its GPU-modified state below without a readback;
     // a prefetch of it must never land afterwards (the guest may map other data there).
-    if (rb_prev_book) {
+    if (rb_prev_env) {
         PrevErase(first_block << block_shift, (end_block - first_block) << block_shift);
     }
     if (rb_prefetch_env && !pf_live.empty()) {

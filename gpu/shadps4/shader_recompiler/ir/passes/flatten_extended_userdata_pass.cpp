@@ -98,8 +98,7 @@ SrtWalkerContext& WalkerContext() {
     static SrtWalkerContext context{
         .clean_pages = [] {
             // One bit per 4 KiB page; untouched parts of the bitmap are never committed. Always
-            // allocated: walkers restored from the pipeline cache test it unconditionally
-            // (SOTC_CLEAN_READS=0 only stops marking pages).
+            // allocated: walkers restored from the pipeline cache test it unconditionally.
             auto* const pages =
                 static_cast<u64*>(std::calloc(SrtCleanPageLimit >> 18, sizeof(u64)));
             ASSERT_MSG(pages, "No memory for the SRT clean page bitmap");

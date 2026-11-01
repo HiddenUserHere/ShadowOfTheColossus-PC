@@ -33,7 +33,6 @@
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_TEX (guest range generations)
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM (upload budget)
 #include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM (records and replay)
-#include "../../../sotc/rt_class.h" // sotc: SOTC_RT_CLASS (render targets in RTAllocator blocks)
 #include "video_core/texture_cache/host_compatibility.h"
 
 #include <vk_mem_alloc.h>
@@ -162,12 +161,10 @@ void ReportTexProtect(u64 tick) {
         const u64 mh = memo_hits.exchange(0, std::memory_order_relaxed);
         std::fprintf(stderr,
                      "SOTC FIND MEMO 5 s: lookups %llu (%.0f/frame), perfect hits %llu (%.1f%%), "
-                     "table %zu slots (SOTC_TEX_BIND_FAST %s)\n",
+                     "table %zu slots\n",
                      static_cast<unsigned long long>(ml), double(ml) / frames,
                      static_cast<unsigned long long>(mh),
-                     ml ? 100.0 * double(mh) / double(ml) : 0.0,
-                     TextureCache::TexBindFast() ? size_t{4096} : size_t{1024},
-                     TextureCache::TexBindFast() ? "on" : "off");
+                     ml ? 100.0 * double(mh) / double(ml) : 0.0, size_t{1024});
     }
 }
 
@@ -242,26 +239,6 @@ static void WriteBackSkippingStacks(VAddr guest_address, const u8* data, u64 siz
 
 // sotc: SOTC_AREA_PREWARM record check, defined with the replay below.
 static bool ReplayRecordKnown(const SotcAreaPrewarm::ImageRecord& rec);
-
-// sotc: SOTC_RT_CLASS. An image whose guest range lies in an RTAllocator block (render targets).
-static bool InRtBlock(const Image& image) {
-    return SotcRtClass::Mode() != 0 &&
-           SotcRtClass::Contains(image.info.guest_address, image.info.guest_size);
-}
-
-// sotc: SOTC_RT_CLASS=1: a render target, depth target or storage image in an RTAllocator block
-// that the CPU has not dirtied. Its pages are not CPU-tracked, and it is not written back.
-static bool RtClassSkipTrack(const Image& image) {
-    return SotcRtClass::Mode() == 1 && InRtBlock(image) &&
-           (image.usage.render_target || image.usage.depth_target || image.usage.storage) &&
-           False(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty));
-}
-
-// sotc: SOTC_RT_CLASS=1: an image in an RTAllocator block is never downloaded (DownloadImageMemory
-// returns before the copy), so it is not queued for one either.
-static bool RtClassNeverDownloads(const Image& image) {
-    return SotcRtClass::Mode() == 1 && InRtBlock(image);
-}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -366,16 +343,6 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (!sync && !gc_download) {
         SotcStats::gc_downloads_skipped.fetch_add(1, std::memory_order_relaxed);
         return;
-    }
-    // sotc: SOTC_RT_CLASS: a render target inside an RTAllocator block is not written back to guest
-    // memory (the CPU never reads those pages; mode 2 only counts). Risk: a later sample of the same
-    // range starts from the guest memory, not from the lost VRAM contents.
-    if (InRtBlock(image)) {
-        if (SotcRtClass::Mode() == 1) {
-            SotcRtClass::NoteDownloadSkipped(image.info.guest_size);
-            return;
-        }
-        SotcRtClass::NoteDownload(image.info.guest_size);
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
@@ -489,11 +456,6 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
         GenBumpImage(image); // sotc: SOTC_GEN_TEX, a guest write reached this image's range
-        // sotc: SOTC_RT_CLASS: a CPU write reached a render target in an RTAllocator block (it should
-        // not). The normal path below runs; mode 1 counts it as a fallback.
-        if (InRtBlock(image)) {
-            SotcRtClass::NoteCpuInvalidate();
-        }
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
@@ -520,13 +482,6 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap) {
     std::scoped_lock lock{mutex};
-    // sotc: SOTC_IMG_GPU_OVERLAP=1 also reuploads images inside a range a shader wrote as a
-    // buffer, not only an image at its exact base (test for the empty 960x540 A2B10G10R10
-    // lighting input behind the black shadows; it did not change the image, 2026-10-12).
-    static const bool overlap = [] {
-        const char* v = std::getenv("SOTC_IMG_GPU_OVERLAP");
-        return v && v[0] == '1';
-    }();
     // sotc: a DMA copy or fill moves a whole block (the game's texture streaming pool): textures
     // inside it but not at its start kept their old picture (garbage blocks on the Shrine altar
     // with Maximum textures in PS4 Pro mode, after many loads). SOTC_DMA_OVERLAP=0: base only.
@@ -567,9 +522,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         // Only consider images that match base address.
         // sotc: a mip tail counts as written when its chain's base address is.
         if (image.info.guest_address != address &&
-            image.info.guest_address - image.info.sotc_dropped_bytes != address &&
-            !(overlap && image.info.guest_address >= address &&
-              image.info.guest_address + image.info.guest_size <= address + max_size)) {
+            image.info.guest_address - image.info.sotc_dropped_bytes != address) {
             return;
         }
         // Ensure image is reuploaded when accessed again.
@@ -1917,9 +1870,8 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         MarkWritten(image);
-        // sotc: SOTC_RT_CLASS=1: a render target's download is never done, so it is not queued.
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
-            image.info.guest_address != 0 && !RtClassNeverDownloads(image)) {
+            image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
         }
@@ -1932,9 +1884,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
                                           bool update) {
     Image& image = slot_images[image_id];
     MarkWritten(image);
-    // sotc: SOTC_RT_CLASS=1: a render target's download is never done, so it is not queued.
-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
-        !RtClassNeverDownloads(image)) {
+    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }
@@ -2080,9 +2030,6 @@ void TextureCache::RefreshImage(Image& image) {
     if (image.sotc_warm_used && !SotcLoadWarm::InWarm()) { // sotc: SOTC_LOAD_WARM: paid again
         image.sotc_warm_used = false;
         TraceWarmTex("tex warm reupload", image.info.guest_address, image.info.guest_size);
-    }
-    if (SotcStats::kCeiling & SotcStats::CeilingTex) {
-        return; // sotc: SOTC_CEILING=tex, measurement only (see sotc_stats.h)
     }
     // sotc: SOTC_TRACE: a = guest address, kept when over 20 us
     const SotcTrace::ScopeMin trace_refresh{"image upload", image.info.guest_address};
@@ -2738,17 +2685,6 @@ void TextureCache::TrackImage(ImageId image_id) {
     if (image_begin == image.track_addr && image_end == image.track_addr_end) {
         return;
     }
-    // sotc: SOTC_RT_CLASS: a render target in an RTAllocator block gets no CPU page tracking (mode
-    // 1): it is untracked instead, and the skip is counted. Anything CPU-dirty stays tracked.
-    if (InRtBlock(image)) {
-        if (RtClassSkipTrack(image)) {
-            SotcRtClass::NoteTrackSkipped();
-            UntrackImage(image_id);
-            return;
-        }
-        SotcRtClass::NoteTrack();
-    }
-
     if (!image.IsTracked()) {
         // Re-track the whole image
         if (kTexProtectStats) { // sotc: a re-track of an image untracked earlier in this frame
@@ -3325,24 +3261,13 @@ bool TextureCache::IsSafeToDelete(const Image& image) const {
     return scheduler.CurrentTick() - image.tick_accessed_last > NumFramesBeforeRemoval;
 }
 
-bool TextureCache::TexBindFast() {
-    static const bool fast = [] {
-        const char* v = std::getenv("SOTC_TEX_BIND_FAST");
-        return v && v[0] == '1';
-    }();
-    return fast;
-}
-
 TextureCache::FindMemo& TextureCache::MemoSlot(const ImageInfo& info, bool exact_fmt,
                                                bool writer) {
     const u64 memo_hash = (info.guest_address * 0x9E3779B97F4A7C15ULL) ^
                           (u64{info.guest_size} * 0xC2B2AE3D27D4EB4FULL) ^
                           (u64(info.pixel_format) << 7) ^ (u64{info.size.width} << 23) ^
                           (u64{info.size.height} << 41) ^ u64{exact_fmt} ^ (u64{writer} << 1);
-    // sotc: with SOTC_TEX_BIND_FAST the table is four times larger, so fewer distinct T#s evict
-    // each other's perfect matches (an evicted one takes the ForEachImageInRegion search again).
-    const size_t slots = TexBindFast() ? NumFindMemos : NumFindMemosDefault;
-    return (*find_memos)[(memo_hash ^ (memo_hash >> 31)) % slots];
+    return (*find_memos)[(memo_hash ^ (memo_hash >> 31)) % NumFindMemos];
 }
 
 // sotc: a memo is validated against the generation of its guest_address only: perfect matches

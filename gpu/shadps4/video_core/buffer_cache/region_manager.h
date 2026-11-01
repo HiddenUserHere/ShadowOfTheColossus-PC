@@ -31,22 +31,16 @@ inline SotcLive::Int kUntrackMaxMb{"SOTC_UNTRACK_MAX_MB", 16};
 
 namespace VideoCore {
 
-/// sotc: SOTC_BUF_BIND_FAST=1 (off by default). BufferCache::SynchronizeMemory answers a range it
-/// found clean from its generation stamp, without walking the pages (see there). The stamps are
-/// the ones of SOTC_SYNC_FAST, so they are kept whenever either switch is on.
-namespace SotcBufBindFast {
-inline const bool kOn = [] {
-    const char* v = std::getenv("SOTC_BUF_BIND_FAST");
-    return v && v[0] == '1';
-}();
+/// sotc: the generation stamps of SOTC_SYNC_FAST=1 (off by default). BufferCache::SynchronizeMemory
+/// answers a range it found clean from its generation stamp, without walking the pages (see there).
+namespace SotcSyncStamps {
 /// True when UpdateStateAndProtection and ClearRingCpuBits bump the generation stamps. Its own
-/// environment reads (not SotcStats::kSyncFast) so the initialisation order does not matter.
-inline const bool kGenStamps = [] {
+/// environment read (not SotcStats::kSyncFast) so the initialisation order does not matter.
+inline const bool kOn = [] {
     const char* f = std::getenv("SOTC_SYNC_FAST");
-    const char* b = std::getenv("SOTC_BUF_BIND_FAST");
-    return (f && f[0] == '1') || (b && b[0] == '1');
+    return f && f[0] == '1';
 }();
-} // namespace SotcBufBindFast
+} // namespace SotcSyncStamps
 
 /// sotc: repeat-fault grace. The GPU command thread clears a page's CPU bit and write-protects it
 /// again right after uploading it (every DMA draw syncs every resident range), so a guest writing
@@ -649,7 +643,7 @@ public:
             const u64 clean = cpu[index] & ring[index] & ~gpu[index] & mask;
             if (clean) {
                 cpu[index] &= ~clean;
-                if (SotcBufBindFast::kGenStamps) {
+                if (SotcSyncStamps::kOn) {
                     sync_gen[index / SYNC_GEN_WORDS].fetch_add(1, std::memory_order_release);
                 }
                 if (SotcGen::Bumps()) { // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA, see ChangeRegionState
@@ -1019,13 +1013,13 @@ public:
     static constexpr u64 SYNC_GEN_WORDS = 8;
     static constexpr u64 NUM_SYNC_GENS = NUM_REGION_WORDS / SYNC_GEN_WORDS;
 
-    /// sotc: SOTC_HLE_TABLE_GEN. Bumps the generation of every granule the span touches, for a
+    /// sotc: bumps the generation of every granule the span touches, for a
     /// write that set no CPU bit (the bytes changed without a fault or a bit rise).
     void BumpSyncGen(u64 offset, u64 size) noexcept {
         if (SotcGen::Bumps()) { // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA (no CPU bit is set here)
             SotcGen::Bump(CpuAddress() + offset, size);
         }
-        if (!SotcBufBindFast::kGenStamps) {
+        if (!SotcSyncStamps::kOn) {
             return;
         }
         const auto bounds = GetBounds(offset, size);
@@ -1366,7 +1360,7 @@ private:
             if constexpr (gpu_op == StateOp::Clear) {
                 changed |= (gpu[index] ^ prev_gpu) & mask;
             }
-            if (SotcBufBindFast::kGenStamps && changed) { // SOTC_SYNC_FAST or SOTC_BUF_BIND_FAST
+            if (SotcSyncStamps::kOn && changed) { // SOTC_SYNC_FAST
                 sync_gen[index / SYNC_GEN_WORDS].fetch_add(1, std::memory_order_release);
             }
             // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA (sotc_generation.h): the same changes, per 64 KiB

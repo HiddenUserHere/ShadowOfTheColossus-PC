@@ -5,10 +5,8 @@
     XPR_CONSUME_MASK    0x1a6d20 the CPU consumer of the visibility mask; entry.
                                  rsi = the bitset (qwords), rdi = the object-set record,
                                  rdx = the draw record, rcx = the frame context.
-    XPR_CONSUME_MASK_INDIRECT 0x1a7290 the second consumer (same roles, bitset in rdx).
-                                 Both record the mask spans for SOTC_RB_CLASS=2.
 
-Both use the switch SOTC_HOOK_XPR_PROBE (scripts/sotc_hooks.py). Patterns: the first instructions
+All use the switch SOTC_HOOK_XPR_PROBE (scripts/sotc_hooks.py). Patterns: the first instructions
 of each function, no rel32 or RIP displacement inside them (so no wildcards); checked with
 tools/re/eboot_re.py sigfind on the EU 1.01 eboot.
 """
@@ -39,19 +37,5 @@ HOOKS = [
         expected={EU_FINGERPRINT: 0x1a6d20},
         # the displacement 0x64 (the count) is the disp8 at pattern offset 30
         derived=[dict(field='count_offset', offset=30, size=1, kind='disp', insn_end=31)],
-    ),
-    dict(
-        # sotc: the second visibility-mask consumer (BPXPR_ConsumeVisibilityMaskIndirect). Its
-        # entry: rdi = the draw set object, rdx = the bitset (qwords), rcx = the frame context.
-        # Used only by SOTC_RB_CLASS=2 (probe_xpr.cpp, RecordMask); the same switch.
-        name='XPR_CONSUME_MASK_INDIRECT',
-        switch='SOTC_HOOK_XPR_PROBE',
-        group='xpr_probe',
-        mode='entry',
-        # push rbp; mov rbp,rsp; push r15,r14,r13,r12,rbx; sub rsp,0x58; movzx r11d,word ptr [rdi+0x64]
-        pattern=('55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 58 44 0f b7 5f 64'),
-        expected={EU_FINGERPRINT: 0x1a7290},
-        # the displacement 0x64 (the count) is the disp8 at pattern offset 21
-        derived=[dict(field='count_offset', offset=21, size=1, kind='disp', insn_end=22)],
     ),
 ]

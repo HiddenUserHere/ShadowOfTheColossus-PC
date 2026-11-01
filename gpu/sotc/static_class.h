@@ -21,8 +21,7 @@ void Report(std::string& out, double seconds);
 // clean. Only the buffer cache calls these (BufferCache::SynchronizeMemory, see static_class.cpp
 // "Mode 3"); all three do nothing unless Skip3Enabled() is true.
 
-/// True when SOTC_STATIC_CLASS=3 and the sync generation stamps are on (SOTC_SYNC_FAST=1 or
-/// SOTC_BUF_BIND_FAST=1). Without the stamps the skip could not see a rewrite, so =3 runs as =1.
+/// True when SOTC_STATIC_CLASS=3 and the sync generation stamps are on (SOTC_SYNC_FAST=1). Without the stamps the skip could not see a rewrite, so =3 runs as =1.
 bool Skip3Enabled();
 
 /// True when the read of [addr, addr + size) may skip the page scan: the exact range was armed by

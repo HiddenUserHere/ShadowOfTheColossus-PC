@@ -108,14 +108,6 @@ struct StackLock {
 #endif
 };
 StackLock g_guest_stacks_mutex;
-/// SOTC_STACK_GUARD=0: the old early release in SignalImpl::Protect (A/B).
-int StackGuardMode() {
-    static const int v = [] {
-        const char* e = std::getenv("SOTC_STACK_GUARD");
-        return e ? std::atoi(e) : 1;
-    }();
-    return v;
-}
 /// Exclusive hold of the stack registry, acquired without ever blocking (see StackLock).
 std::unique_lock<StackLock> LockStacksExclusive() {
     for (u32 spin = 0;; ++spin) {
@@ -1185,9 +1177,6 @@ struct SignalImpl : public PageManager::Impl {
             const auto [first, last] = g_guest_stacks.equal_range(window);
             if (first == last) {
                 // Common case, no stack in the range (and no interval set to allocate).
-                if (StackGuardMode() == 0) {
-                    lk.unlock();
-                }
                 impl.Protect(address, size, perms);
             } else {
                 boost::icl::interval_set<VAddr> ranges;
@@ -1199,9 +1188,6 @@ struct SignalImpl : public PageManager::Impl {
                 if (reported++ < 8) {
                     LOG_ERROR(Render, "Not protecting guest stack pages in {:#x}+{:#x}", address,
                               size);
-                }
-                if (StackGuardMode() == 0) {
-                    lk.unlock();
                 }
                 for (const auto& range : ranges) {
                     impl.Protect(range.lower(), range.upper() - range.lower(), perms);
@@ -1285,17 +1271,9 @@ struct SignalImpl : public PageManager::Impl {
     // (seen on cold starts: ~18 rounds, then the process died silently). Make the page writable,
     // which is what the trackers already believe, and log it.
     static void RepairStuckWriteFault(void* context, VAddr addr) {
-        // SOTC_DESYNC_REPAIR: 0 off, 1 repair, unset/2 count only. With the repeat-fault grace
-        // the storms this was meant for are gone, and its buffer-bit guard cannot see texture
-        // watchers or a racing GPU sync (it could unprotect a page they just protected), so by
-        // default it only counts and logs.
-        static const int mode = [] {
-            const char* v = std::getenv("SOTC_DESYNC_REPAIR");
-            return v ? std::atoi(v) : 2;
-        }();
-        if (mode == 0) {
-            return;
-        }
+        // Count only: a repair would make the page writable against the tracker state. With the
+        // repeat-fault grace the storms it was meant for are gone, and its buffer-bit guard cannot
+        // see texture watchers or a racing GPU sync (it could unprotect a page they just protected).
         static thread_local u64 last_rip = 0;
         static thread_local VAddr last_page = 0;
         static thread_local u32 repeats = 0;
@@ -1335,18 +1313,6 @@ struct SignalImpl : public PageManager::Impl {
         }
 #endif
         SotcStats::desync_repairs.fetch_add(1, std::memory_order_relaxed);
-        if (mode != 1) {
-            return;
-        }
-        Core::Memory::Instance()->GetAddressSpace().Protect(page, 4096,
-                                                            Core::MemoryPermission::ReadWrite);
-        static std::atomic<u32> logged{0};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-            char state[160];
-            runtime_memory_describe(page, state, sizeof(state));
-            LOG_WARNING(Render, "Page tracking desync: write fault at {:#x} (rip {:#x}) kept "
-                        "recurring, page made writable; now {}", addr, rip, state);
-        }
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
@@ -1725,15 +1691,11 @@ struct SignalImpl : public PageManager::Impl {
     /// page is read-protected for those bytes, but the backing already holds every byte the GPU
     /// did not write: complete such a load from the backing instead of a full GPU readback. The
     /// page stays protected, so reads of the GPU-written bytes still fault and read back.
-    /// Idea from srt_walker_clean_reads of Pink-shadPS4 (luizgustavs). SOTC_CLEAN_READS=0 = off.
+    /// Idea from srt_walker_clean_reads of Pink-shadPS4 (luizgustavs).
     static bool TryCleanWalkerLoad(void* context) {
 #ifdef _WIN32
-        static const bool enabled = [] {
-            const char* v = std::getenv("SOTC_CLEAN_READS");
-            return v ? std::atoi(v) != 0 : true;
-        }();
         const void* rip = Common::GetRip(context);
-        if (!enabled || !Shader::IsSrtWalkerCode(rip)) {
+        if (!Shader::IsSrtWalkerCode(rip)) {
             return false;
         }
         ZydisDecodedInstruction instruction;
