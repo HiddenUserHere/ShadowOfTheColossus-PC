@@ -2980,6 +2980,14 @@ bool EmitGuestDetour(Xbyak::CodeGenerator& c, const DetourRequest& request,
         c.cmp(eax, static_cast<uint32_t>(SotcHooks::HookAction::Return));
         c.je(return_to_guest, Xbyak::CodeGenerator::T_NEAR); // the restore + span exceed rel8
     }
+    // sotc: HookAction::SkipOriginal (Wrap only, hooks.h): the original is not called. The handler's
+    // registers are restored and the post phase runs with them, as after a call that returned them.
+    Xbyak::Label skip_original;
+    Xbyak::Label post_phase;
+    if (wrap) {
+        c.cmp(eax, static_cast<uint32_t>(SotcHooks::HookAction::SkipOriginal));
+        c.je(skip_original, Xbyak::CodeGenerator::T_NEAR);
+    }
     // HookAction::CallGuest: run the guest function the handler set, then restore as usual. Wrap
     // runs its original after the restore, so its guest call comes first.
     Xbyak::Label after_guest_call;
@@ -2995,6 +3003,11 @@ bool EmitGuestDetour(Xbyak::CodeGenerator& c, const DetourRequest& request,
         c.call(original);
         // The original returns to here with rsp = E - 8.
         c.lea(rsp, ptr[rsp + 8]);
+        c.jmp(post_phase, Xbyak::CodeGenerator::T_NEAR);
+        // SkipOriginal: rsp is the frame base; the restore leaves rsp = E, as the call path does.
+        c.L(skip_original);
+        EmitDetourRestore(c);
+        c.L(post_phase);
         EmitDetourSave(c, request.hook_id, 1);
         EmitDetourRestore(c);
         c.ret();

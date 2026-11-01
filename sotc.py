@@ -367,6 +367,11 @@ def main():
     if env['SOTC_PC_RING'] == '8':
         env.setdefault('SOTC_HOOK_ALLOC_PROBE', '1')
         env.setdefault('SOTC_HOOK_FRAME_FLIP', '1')
+    # The native windows (gpu/sotc/native/native_windows_hooks.cpp) run in the allocator probe's 0x479a0 wrap
+    # and the memtype probe's 0x12820 wrap. SOTC_PC_RING_DISPATCH hooks 0x12820 too: do not set both.
+    if env.get('SOTC_NATIVE', '0') not in ('', '0'):
+        env.setdefault('SOTC_HOOK_ALLOC_PROBE', '1')
+        env.setdefault('SOTC_HOOK_MEMTYPE_PROBE', '1')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).

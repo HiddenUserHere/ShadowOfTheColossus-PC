@@ -41,6 +41,8 @@
 #include "pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE heap carves
 #include "mem_classes.h" // SotcMemClasses::OnGranule / OnGranuleShared (granule claims)
 #include "probes.h"
+#include "native/native.h"               // sotc: SOTC_NATIVE switch (SotcNative::On)
+#include "native/native_windows_hooks.h" // sotc: heap key of the native windows (window B)
 #include "video_core/sotc_trace.h" // image bounds (SotcTrace::ImageBase/ImageSize)
 
 namespace SotcProbes {
@@ -276,7 +278,8 @@ struct PendingAlloc {
 };
 thread_local std::array<PendingAlloc, kPendingDepth> t_pending{};
 thread_local uint32_t t_pending_depth = 0;
-bool g_post_on = false; // the post phase is registered: SOTC_MEMTYPE_CLASSES or the placement glue
+bool g_post_on = false; // the post phase is registered: SOTC_MEMTYPE_CLASSES, the placement glue or SOTC_NATIVE
+bool g_post_granules = false; // the post phase also claims granules: SOTC_MEMTYPE_CLASSES or the placement glue
 
 HookAction AllocPre(GuestRegs& regs, void*) {
     const uint64_t size = regs.rdi;
@@ -285,6 +288,10 @@ HookAction AllocPre(GuestRegs& regs, void*) {
     if (raw_slot >= kSlots) {
         idx = kSlots - 1;
         g_slot_clamped.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (SotcNative::On()) {
+        // sotc: the heap key of this call (window B is keyed by memtype 17); cleared by the post phase.
+        SotcNativeWindowHooks::MemtypePre(raw_slot);
     }
     if (g_post_on) {
         // sotc: SOTC_PC_PLACE: this call is the heap context of every pool block its refill hands out.
@@ -464,13 +471,18 @@ void NoteAllocGranules(uint64_t base, uint64_t size, uint32_t slot) {
 
 // Post phase of MEMTYPE_ALLOC (registered with SOTC_MEMTYPE_CLASSES=1 or the placement glue): rax = returned pointer.
 void AllocPost(GuestRegs& regs, void*) {
+    if (SotcNative::On()) {
+        SotcNativeWindowHooks::MemtypePost(); // sotc: clears the heap key on every return path (a wrap's post)
+    }
     if (t_pending_depth == 0) {
         return; // no matching pre phase on this thread (cannot happen while the hook is installed)
     }
     --t_pending_depth;
     const PendingAlloc call = t_pending[t_pending_depth % kPendingDepth];
     SotcPcPlaceGlue::PopHeapSlot(call.prev_heap); // sotc: SOTC_PC_PLACE heap context ends with the call
-    NoteAllocGranules(regs.rax, call.size, call.slot);
+    if (g_post_granules) {
+        NoteAllocGranules(regs.rax, call.size, call.slot);
+    }
 }
 
 // Granule summary of the classes mode. The counts are totals (granules are never freed), so the line
@@ -544,7 +556,10 @@ void RegisterMemtype() {
     const char* classes = std::getenv("SOTC_MEMTYPE_CLASSES");
     g_classes_on = classes && *classes && std::strtol(classes, nullptr, 10) != 0;
     // sotc: SOTC_PC_PLACE needs the same post phase (granule carves and the heap context), with or without classes.
-    g_post_on = g_classes_on || SotcPcPlaceGlue::On();
+    g_post_granules = g_classes_on || SotcPcPlaceGlue::On();
+    // sotc: SOTC_NATIVE needs the post phase too (the heap key is cleared there); the post phase then runs
+    // without the granule claims unless the classes mode or the glue asks for them (g_post_granules).
+    g_post_on = g_post_granules || SotcNative::On();
 
     SotcHooks::Handler alloc;
     alloc.pre = &AllocPre;

@@ -586,6 +586,14 @@ void RunDispatch(void* arg) {
             if (rec.has_handler && rec.handler.pre) {
                 action = rec.handler.pre(*call.regs, rec.handler.user);
             }
+            // sotc: SkipOriginal (hooks.h) is Return at an entry and the wrap's skip; elsewhere Continue.
+            if (action == HookAction::SkipOriginal) {
+                if (rec.mode == 0) {
+                    action = HookAction::Return;
+                } else if (rec.mode != 1) {
+                    action = HookAction::Continue;
+                }
+            }
             // sotc: Return is only valid at a function entry (hooks.h).
             if (action == HookAction::Return && rec.mode != 0) {
                 action = HookAction::Continue;
@@ -594,7 +602,8 @@ void RunDispatch(void* arg) {
             if (action == HookAction::CallGuest && !t_guest_call.set) {
                 action = HookAction::Continue;
             }
-            SotcHookStats::CountPre(call.hook_id, action == HookAction::Return);
+            SotcHookStats::CountPre(call.hook_id,
+                                    action == HookAction::Return || action == HookAction::SkipOriginal);
             call.action = static_cast<uint32_t>(action);
         } else if (call.phase == static_cast<uint32_t>(Phase::Post)) {
             if (rec.has_handler && rec.handler.post) {
