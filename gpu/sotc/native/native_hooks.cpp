@@ -113,7 +113,7 @@ struct Window {
     std::atomic<uint64_t> mip_announces{0}, mip_bytes{0};
     std::atomic<uint64_t> mip_releases{0}, mip_release_bytes{0};
     std::atomic<uint64_t> skipped{0};
-    Counter dcb, ccb, chunk, zc, mat, blk, inst, part;
+    Counter dcb, ccb, chunk, zc, mat, blk, inst, part, view;
     std::atomic<uint64_t> desc{0};
     std::atomic<uint64_t> chunk_dropped{0};
 };
@@ -381,6 +381,89 @@ HookAction ParticleShift(GuestRegs& regs, void*) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// N2 completion (impl-writes3.md).
+
+// 0x11788f, in Material Param Update 0x117160 right after `memcpy(rbx, DAT_02ed2108, [r12])` (0x11788a): rbx = the
+// 0x12820 block the copy filled, [r12] = the size u32 (r12 still holds the 0x2ed2100 global at this site). The block
+// is DMA'd to GPU memory by 0x16eb90 next, and it is rebuilt every frame: PerFrame.
+HookAction MatCopy(GuestRegs& regs, void*) {
+    if (!SotcNative::On() || regs.rbx == 0) {
+        return HookAction::Continue;
+    }
+    const uint32_t size = GuestU32(regs.r12);
+    if (size != 0) {
+        AnnounceRange(regs.rbx, regs.rbx + size, SotcNative::Kind::PerFrame, g_window.mat);
+    }
+    return HookAction::Continue;
+}
+
+// 0x8c120, the view block allocator (Wrap). Pre: rdi = the view record (block size u32 at +0x20), rsi = the handle the
+// block is stored into (low word at [rsi], high 12 bits at [rsi+4], as in 0x8c0d0). Post: the block is queued in the
+// chunk list. Callers kept: sub_bdfd0 (0xbdfd0-0xbe1f0) and SetViewParams (0xbe1f0-0xc0b6f); the two are the only
+// direct callers of 0x8c120 (eboot_re.py callers 8c120).
+constexpr Span kViewBlockCallers[] = {{0xbdfd0, 0xbe1f0}, {0xbe1f0, 0xc0b6f}};
+struct ViewCall {
+    uint64_t handle;
+    uint32_t size;
+    bool active;
+};
+thread_local ViewCall t_view{};
+
+HookAction ViewBlockPre(GuestRegs& regs, void*) {
+    t_view.active = false;
+    if (!SotcNative::On()) {
+        return HookAction::Continue;
+    }
+    uint64_t offset = 0;
+    if (!CallerOffset(regs, &offset) ||
+        !InSpans(offset, kViewBlockCallers, sizeof(kViewBlockCallers) / sizeof(Span))) {
+        return HookAction::Continue;
+    }
+    const uint32_t size = GuestU32(regs.rdi + 0x20);
+    t_view = ViewCall{regs.rsi, size, regs.rsi != 0 && size != 0};
+    return HookAction::Continue;
+}
+
+void ViewBlockPost(GuestRegs&, void*) {
+    if (!t_view.active) {
+        return;
+    }
+    t_view.active = false;
+    const uint64_t block = static_cast<uint64_t>(GuestU32(t_view.handle)) |
+                           (static_cast<uint64_t>(GuestU32(t_view.handle + 4) & 0xfffu) << 32);
+    if (block != 0) {
+        ChunkPush(block, t_view.size);
+    }
+}
+
+// 0xcef0d, in EndFrameView_WriteB (0xcedf0) after the 16-byte store `[r14+rbx] = rax, [r14+rbx+8] = rdx` (both exits
+// reach 0xcef08). r14 = the view table of [obj+0x330], rbx = view index * 16. The table is persistent but rewritten
+// every frame, so the 16 bytes are PerFrame.
+HookAction ViewTable(GuestRegs& regs, void*) {
+    if (!SotcNative::On() || regs.r14 == 0) {
+        return HookAction::Continue;
+    }
+    const uint64_t entry = regs.r14 + regs.rbx;
+    AnnounceRange(entry, entry + 16, SotcNative::Kind::PerFrame, g_window.view);
+    return HookAction::Continue;
+}
+
+// 0x18aa20, instance class 2 writer (Entry; rdi = the instance object). The body writes the 0x18-byte block at
+// [this+0xa8] when that pointer is set (0x18aaaf..0x18ab5e), and it does not change the pointer. Announced at entry,
+// PerFrame: the bytes are read at the next submit, after the job waits in 0xd07c0. Direct callers: UpdateGPUData_
+// InstanceData (0x118210) and sub_1b32f0 (0x1b35ba); both are instance writers, so no caller filter.
+HookAction InstClass2Entry(GuestRegs& regs, void*) {
+    if (!SotcNative::On() || regs.rdi == 0) {
+        return HookAction::Continue;
+    }
+    const uint64_t block = GuestU64(regs.rdi + 0xa8);
+    if (block != 0) {
+        AnnounceRange(block, block + 0x18, SotcNative::Kind::PerFrame, g_window.inst);
+    }
+    return HookAction::Continue;
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Earlier batch: resource copies and mip streaming (unchanged).
 
 // 0x8bf50, inside the resource buffer wrapper 0x8be60 after `memcpy(r15, r14, [rbx+0x20])`.
@@ -479,6 +562,7 @@ void Report(std::string& out, double seconds) {
     out += cls("blk", g_window.blk);
     out += cls("inst", g_window.inst);
     out += cls("part", g_window.part);
+    out += cls("view", g_window.view);
     std::snprintf(line, sizeof(line), " desc %llu dropped %llu\n",
                   static_cast<unsigned long long>(take(g_window.desc)),
                   static_cast<unsigned long long>(take(g_window.chunk_dropped)));
@@ -504,6 +588,10 @@ void Register() {
     SotcHooks::RegisterHandler("NATIVE_DESC_865600", Handler{DescPre, DescSizePost, nullptr});
     SotcHooks::RegisterHandler("NATIVE_DESC_865500", Handler{DescPre, DescBufferPost, nullptr});
     SotcHooks::RegisterHandler("NATIVE_PARTICLE_SHIFT", Handler{ParticleShift, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_MAT_COPY", Handler{MatCopy, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_VIEW_BLOCK", Handler{ViewBlockPre, ViewBlockPost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_VIEW_TABLE", Handler{ViewTable, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_INST_18AA20", Handler{InstClass2Entry, nullptr, nullptr});
 }
 
 } // namespace SotcNativeHooks

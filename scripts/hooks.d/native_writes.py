@@ -208,6 +208,51 @@ HOOKS = [
         pattern='41 89 5c 85 00 48 89 d8',
         expected={EU_FINGERPRINT: 0x101817},
     ),
+    # --- N2 write-side completion (impl-writes3.md): material copy, view blocks, view table, instance transform ---
+    dict(
+        name='NATIVE_MAT_COPY',
+        switch='SOTC_NATIVE',
+        group='native_matcopy',
+        mode='site',
+        # 0x117160 (Material Param Update), after the memcpy of 0x11788a into the block rbx: the next instructions
+        # load the GPU DMA source and call the DMA 0x16eb90. Dest rbx, size u32 at [r12] (r12 = 0x2ed2100, not yet
+        # reused here). The short signature (up to the lea) also matches CRenderer::UpdateTextureStreamingGPUData
+        # (0x118046); the exact rel32 of the DMA call (e8 dd 72 05 00) makes the pattern unique.
+        pattern='48 8d 05 ?? ?? ?? ?? 41 8b 14 24 4c 8b 64 24 08 48 89 d9 48 8b 30 c1 ea 02 4c 89 e7 41 89 d0 e8 dd 72 05 00',
+        expected={EU_FINGERPRINT: 0x11788f},
+    ),
+    dict(
+        name='NATIVE_VIEW_BLOCK',
+        switch='SOTC_NATIVE',
+        group='native_view',
+        mode='wrap',
+        # 0x8c120: the view block allocator (0x12820 category from 0x2ed1f54, size u32 at [rdi+0x20]). Its result is
+        # stored into the handle at rsi (low word [rsi], high 12 bits [rsi+4]). Callers: sub_bdfd0 (0xbe055) and
+        # SetViewParams (0xbe27b) only. The block is queued in the chunk list (announced PerFrame at the next submit).
+        pattern='55 48 89 e5 41 56 53 48 8d 05 ?? ?? ?? ?? 48 89 fb 49 89 f6 ba 10 00 00',
+        expected={EU_FINGERPRINT: 0x8c120},
+    ),
+    dict(
+        name='NATIVE_VIEW_TABLE',
+        switch='SOTC_NATIVE',
+        group='native_view',
+        mode='site',
+        # 0xcedf0 (EndFrameView_WriteB), the common exit after `mov [r14+rbx+8],rdx`: r14 = the view table of
+        # [obj+0x330], rbx = view index * 16. Writes 16 bytes per call, PerFrame. Not a 0x8c120 block: the table is
+        # persistent and rewritten each frame.
+        pattern='48 83 c4 08 5b 41 5e 41 5f 5d c3 48 8b 12 89 fb',
+        expected={EU_FINGERPRINT: 0xcef0d},
+    ),
+    dict(
+        name='NATIVE_INST_18AA20',
+        switch='SOTC_NATIVE',
+        group='native_inst2',
+        mode='entry',
+        # instance class 2 writer 0x18aa20 (rdi = the instance object): writes the 0x18-byte block at [this+0xa8]
+        # when that pointer is set (checked at 0x18aaaf). Announced at entry, PerFrame (read at the next submit).
+        pattern='55 48 89 e5 41 56 53 48 83 ec 60 4c 8b 35 ?? ?? ?? ?? 48 89 fb c5 fa 10',
+        expected={EU_FINGERPRINT: 0x18aa20},
+    ),
 ]
 
 
