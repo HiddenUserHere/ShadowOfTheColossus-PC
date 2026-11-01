@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -683,7 +684,8 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     // sotc: SOTC_HOST_IMPORT=1 (off by default): large buffer uploads are copied by the GPU
     // from guest memory imported with VK_EXT_external_memory_host (BufferCache::HostImport),
     // on the transfer-only queue. Without the extension or such a queue, uploads are unchanged.
-    xfer_routing = [] {
+    // sotc: SOTC_N5_QUEUES=1|2 routes the announced uploads the same way (vk_queues.h).
+    xfer_routing = SotcQueues::On() || [] {
         const char* env = std::getenv("SOTC_XFER_QUEUE");
         return env && env[0] == '1';
     }();
@@ -734,6 +736,25 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         }
     }
 
+    // sotc: SOTC_N5_QUEUES: probe the families once (vendor, flags, async compute family) and log it.
+    // Vulkan 1.3 baseline; a missing family is a logged fallback, never an error.
+    if (SotcQueues::On()) {
+        std::vector<SotcQueues::FamilyInfo> infos;
+        infos.reserve(family_properties.size());
+        for (const auto& f : family_properties) {
+            infos.push_back(SotcQueues::FamilyInfo{
+                .queue_count = f.queueCount,
+                .graphics = bool(f.queueFlags & vk::QueueFlagBits::eGraphics),
+                .compute = bool(f.queueFlags & vk::QueueFlagBits::eCompute),
+                .transfer = bool(f.queueFlags & vk::QueueFlagBits::eTransfer),
+            });
+        }
+        n5_probe = SotcQueues::ProbeFamilies(infos);
+        SotcQueues::LogProbe(physical_device.getProperties().vendorID, infos, n5_probe);
+        if (xfer_routing && !HasXferQueue()) {
+            SotcQueues::NoteFallback(SotcQueues::Fallback::NoTransferFamily);
+        }
+    }
     // sotc: SOTC_PRESENT_UNLOCKED=1 picks how presents reach the queue (PresentPath). Submits and
     // presents must not share a VkQueue without submit_mutex (Vulkan requires external
     // synchronization per VkQueue), so:
@@ -1141,6 +1162,7 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
                                    "retrying without them",
                     vk::to_string(device_result));
         xfer_queue_family_index = NoXferQueueFamily;
+        SotcQueues::NoteFallback(SotcQueues::Fallback::TransferQueueRefused); // sotc: N5 log once
         if (other_family_present) {
             other_family_present = false;
             if (path == PresentPath::OtherFamily) {

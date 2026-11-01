@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/vk_queues.h" // sotc: SOTC_N5_QUEUES counters
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/blit_helper.h"
@@ -148,17 +149,24 @@ bool Runtime::TryCopyBufferXfer(const VideoCore::Buffer* src, const VideoCore::B
     }
     // The copy runs ahead of the graphics work recorded since the last submit, which is not
     // waited for. Ranges that this work reads or writes stay on the graphics queue.
+    u64 bytes = 0; // sotc: SOTC_N5_QUEUES counters
+    for (const auto& copy : copies) {
+        bytes += copy.size;
+    }
     for (const auto& copy : copies) {
         if (IsBufferAccessed(src, copy.srcOffset, copy.size) ||
             IsBufferAccessed(dst, copy.dstOffset, copy.size, true)) {
+            SotcQueues::NoteUploadKept(bytes);
             return false;
         }
     }
     // No EndRendering and no barrier bookkeeping: the next graphics submit waits on the copy
     // (Scheduler::SubmitExecution), so nothing recorded later can run before it.
     if (!scheduler.XferCopy(src->Handle(), dst->Handle(), copies)) {
+        SotcQueues::NoteUploadKept(bytes);
         return false;
     }
+    SotcQueues::NoteUploadRouted(bytes);
     SotcStats::xfer_copies.fetch_add(1, std::memory_order_relaxed);
     return true;
 }

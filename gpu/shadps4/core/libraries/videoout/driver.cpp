@@ -37,6 +37,7 @@
 #include "bbport_overlay.h"
 #include "bbport_threads.h"
 #include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA report
+#include "video_core/renderer_vulkan/vk_queues.h" // sotc: SOTC_N5_QUEUES report
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND report
@@ -2025,6 +2026,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcNativeSync::Report(report, seconds);  // sotc: SOTC_NATIVE frame ticket
             SotcVerify::Report(report, seconds);      // sotc: SOTC_VERIFY
             SotcNativeResults::Report(report, seconds); // sotc: SOTC_NATIVE GPU-result consumers
+            SotcQueues::Report(report, seconds);        // sotc: SOTC_N5_QUEUES
             SotcRbClass::Report(report, seconds); // sotc: SOTC_RB_CLASS
             SotcRbHost::Report(report, seconds);  // sotc: SOTC_RB_HOST
             SotcStale::Report(report, seconds);   // sotc: SOTC_STALE_CHECK

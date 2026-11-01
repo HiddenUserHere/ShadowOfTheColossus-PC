@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_queues.h" // sotc: SOTC_N5_QUEUES family probe
 
 #define TRACY_VK_USE_SYMBOL_TABLE
 #include <tracy/TracyVulkan.hpp>
@@ -96,6 +97,12 @@ public:
     /// (Runtime::TryCopyBufferXfer). The queue may also exist for SOTC_HOST_IMPORT alone.
     bool IsXferRoutingEnabled() const {
         return xfer_routing && HasXferQueue();
+    }
+
+    /// sotc: SOTC_N5_QUEUES: the queue families found at device creation (vk_queues.h). Only
+    /// meaningful with the switch on; the async compute family is recorded, not used yet.
+    const SotcQueues::Probe& N5Probe() const {
+        return n5_probe;
     }
 
     /// sotc: SOTC_RB_TICK=1 and the transfer queue exists: guest readbacks may be copied on it
@@ -787,6 +794,7 @@ private:
     u32 xfer_queue_family_index{NoXferQueueFamily}; // sotc: see HasXferQueue()
     vk::Queue xfer_queue;                           // sotc: see HasXferQueue()
     bool xfer_routing{};          // sotc: see IsXferRoutingEnabled()
+    SotcQueues::Probe n5_probe{}; // sotc: see N5Probe()
     bool rb_tick{};               // sotc: see IsRbTickEnabled()
     bool host_import_enabled{};   // sotc: see IsHostImportEnabled()
     u64 host_import_alignment{};  // sotc: see HostImportAlignment()
