@@ -43,6 +43,11 @@
 #include "probes.h"
 #include "native/native.h"               // sotc: SOTC_NATIVE switch (SotcNative::On)
 #include "native/native_windows_hooks.h" // sotc: heap key of the native windows (window B)
+#include "pc_pool_windows.h"                // sotc: kMaskKey (memtype 17, RenderSingleFrameCPU)
+
+namespace SotcNativeHooks { // sotc: gpu/sotc/native/native_hooks.cpp
+void NoteFrameBlock(uint64_t addr, uint64_t size);
+} // namespace SotcNativeHooks
 #include "video_core/sotc_trace.h" // image bounds (SotcTrace::ImageBase/ImageSize)
 
 namespace SotcProbes {
@@ -482,6 +487,10 @@ void AllocPost(GuestRegs& regs, void*) {
     SotcPcPlaceGlue::PopHeapSlot(call.prev_heap); // sotc: SOTC_PC_PLACE heap context ends with the call
     if (g_post_granules) {
         NoteAllocGranules(regs.rax, call.size, call.slot);
+    }
+    // sotc: SOTC_NATIVE: a RenderSingleFrameCPU block is announced PerFrame at the next submit.
+    if (SotcNative::On() && static_cast<int64_t>(call.slot) == SotcPcPoolWindows::kMaskKey && regs.rax != 0) {
+        SotcNativeHooks::NoteFrameBlock(regs.rax, call.size);
     }
 }
 

@@ -730,5 +730,16 @@ void Register() {
     SotcHooks::RegisterHandler("NATIVE_MAT_COPY_STREAM", Handler{MatCopyStream, nullptr, nullptr});
 }
 
+// The RenderSingleFrameCPU ring (memtype 17): every block of it is per-frame GPU data written by the render jobs
+// (impl-writes7-region.md: 0xc7850, RunFunctionAsRenderJob). Window B would serve it in place, but a reserved window
+// has no backing to import until the game commits it, so the blocks go on the chunk list and are announced PerFrame
+// at the next submit, after every writer of the frame. Called by the MEMTYPE_ALLOC post phase (probe_memtype.cpp).
+void NoteFrameBlock(uint64_t addr, uint64_t size) {
+    if (!SotcNative::On() || addr == 0 || size == 0 || size > kMaxRange) {
+        return;
+    }
+    ChunkPush(addr, static_cast<uint32_t>(size));
+}
+
 } // namespace SotcNativeHooks
 
