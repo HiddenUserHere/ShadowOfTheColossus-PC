@@ -102,6 +102,19 @@ Estimate = lines of the dedicated source files of the family (listed in the code
 - `SOTC_TRACE_SCOPES` installs its hook only under its switch (`gpu/sotc/hook_handlers.cpp:43`); the same pattern for `SOTC_TRACE_FUNCS` and `SOTC_TRACE_IMPORTS` was not verified.
 - `SOTC_CULL_EXPRESS_*` sub-switch behaviour when `SOTC_CULL_EXPRESS=0` was not verified.
 
+## Corrections from the N4 deletions (1 Nov)
+
+The N4 specialists read each reader before deleting; these inferred defaults above were wrong. Each switch was
+deleted keeping the real default (commits 41244da, deed9d0, e8eaa0a):
+- SOTC_EARLY_Z: on for SotC (ElfInfo::IsSotc()), not off.
+- SOTC_PIPELINE_WORKERS: the computed count clamp(threads - 4, 2, 4 or 12), not off.
+- SOTC_UI_LINEAR: on whenever SOTC_RENDER_RES is not 1920x1080, not off.
+- SHADPS4_LOOP_LIMIT / _PER_LOOP: the guard is on (1 << 18 total, 1 << 13 per loop for SotC), not 0.
+- SOTC_CLEAN_READS, SOTC_STACK_GUARD, SOTC_DMA_MERGE: on. SOTC_DESYNC_REPAIR: count only. SOTC_MIP_BIAS: the
+  computed DLSS bias. SOTC_STREAM_THRESHOLD: 0.
+- SOTC_CP_YIELD, SOTC_ACCESS_REUSE, SOTC_ACCESS_UNION: on. SOTC_MVEC_FILL: 1. SOTC_LDS_BARRIERS/SMALL: SotC only.
+Kept for later: SOTC_RB_CLASS=1 (matrix profiles use it; mode 2 is gone); the four test-fixture names.
+
 ## Full table
 
 Columns: class; default (`inf` = inferred from code text, to confirm); reader file:line (`-` = no quoted reader found, see Limits); launcher row (kind/group); vendored (read from gpu/shadps4); setters outside the code (launcher, sotc.py, tools, tests, scripts); first doc mention; note.
