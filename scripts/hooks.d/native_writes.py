@@ -253,6 +253,19 @@ HOOKS = [
         pattern='55 48 89 e5 41 56 53 48 83 ec 60 4c 8b 35 ?? ?? ?? ?? 48 89 fb c5 fa 10',
         expected={EU_FINGERPRINT: 0x18aa20},
     ),
+    # --- impl-writes4: the zero-copy buffers of the BuildXPR model-section build (load time) ---
+    dict(
+        name='NATIVE_BUILDXPR_ZC',
+        switch='SOTC_NATIVE',
+        group='native_buildxpr',
+        mode='site',
+        # BuildXPR 0x1b32f0, the only return: `mov rax,r12` at 0x1b3f97 (before the epilogue). r12 is the object
+        # (the return value) whose [+0x18, +0x20) is the zero-copy V# backing written by the loop. A wrap is refused
+        # ("stack operand at an unknown stack depth": the prologue realigns rsp). Persistent (native_hooks.cpp
+        # BuildXprExit). The signature is the tool's `sig 1b3f97` output (unique in the text segment).
+        pattern='4c 89 e0 48 8d 65 d8 5b 41 5c 41 5d 41 5e 41 5f 5d c3 e8 ?? ?? ?? ?? 90 90 55 48 89',
+        expected={EU_FINGERPRINT: 0x1b3f97},
+    ),
 ]
 
 

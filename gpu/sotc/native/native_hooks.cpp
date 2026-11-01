@@ -463,6 +463,26 @@ HookAction InstClass2Entry(GuestRegs& regs, void*) {
     return HookAction::Continue;
 }
 
+// 0x1b32f0 (BuildXPR), site at its return (0x1b3f97, `mov rax,r12`; r12 = the returned object). Called through
+// 0x1b0980 by StaticModelSection::Init (0x19aad0, run as a job from 0x271b10): a model-section build, not a per-frame
+// writer (impl-writes4.md). Its loop creates one zero-copy buffer V# per instance (0x8be60 flags 0x800, type 0x1b,
+// elem 0xb0) at lVar25 = object+0x18, lVar25 += 0xb0, and writes the 0xb0 bytes after each call. [object+0x18,
+// object+0x20) is the whole zero-copy backing (object+0x20 = object+0x18 + count * 0xb0). The range is announced
+// at the return, after the writes, as Persistent (uploaded once). The 0x8be60 creator hook does not see this caller
+// (not in kZeroCopyCallers), so the range is announced here only.
+HookAction BuildXprExit(GuestRegs& regs, void*) {
+    const uint64_t object = regs.r12;
+    if (!SotcNative::On() || object == 0) {
+        return HookAction::Continue;
+    }
+    const uint64_t begin = GuestU64(object + 0x18);
+    const uint64_t end = GuestU64(object + 0x20);
+    if (begin != 0 && end > begin) {
+        AnnounceRange(begin, end, SotcNative::Kind::Persistent, g_window.zc);
+    }
+    return HookAction::Continue;
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Earlier batch: resource copies and mip streaming (unchanged).
 
@@ -592,6 +612,7 @@ void Register() {
     SotcHooks::RegisterHandler("NATIVE_VIEW_BLOCK", Handler{ViewBlockPre, ViewBlockPost, nullptr});
     SotcHooks::RegisterHandler("NATIVE_VIEW_TABLE", Handler{ViewTable, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_INST_18AA20", Handler{InstClass2Entry, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_BUILDXPR_ZC", Handler{BuildXprExit, nullptr, nullptr});
 }
 
 } // namespace SotcNativeHooks
