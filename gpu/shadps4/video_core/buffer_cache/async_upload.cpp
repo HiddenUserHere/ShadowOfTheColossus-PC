@@ -56,6 +56,9 @@ void AsyncUpload::Init() {
     // sotc: SOTC_LOAD_STREAM (load_warm.h): early uploads use the pool.
     const char* stream_env = std::getenv("SOTC_LOAD_STREAM");
     stream_enabled = stream_env && (stream_env[0] == '1' || stream_env[0] == '2');
+    // sotc: SOTC_NATIVE (1 or 2): the announced uploads (BufferCache::NativeDrain, through DrainRange) use the pool.
+    const char* native_env = std::getenv("SOTC_NATIVE");
+    stream_enabled = stream_enabled || (native_env && (native_env[0] == '1' || native_env[0] == '2'));
     const char* job_env = std::getenv("SOTC_ASYNC_JOB_MB");
     job_bytes = job_env ? std::strtoull(job_env, nullptr, 10) << 20 : 0;
     if ((!buffers_enabled && !textures_enabled && !stream_enabled) || Get()) {

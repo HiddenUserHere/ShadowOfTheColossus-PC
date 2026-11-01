@@ -14,6 +14,7 @@
 #include "../../../sotc/mem_classes.h" // sotc: SOTC_PC_RING8_HEAPS (heap granule runs)
 #include "../../../sotc/pc_ring.h"
 #include "../../../sotc/rb_host.h" // sotc: SOTC_RB_HOST (R1) result runs
+#include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE drain at submit start
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/buffer_cache/pc_ring_copy.h"
@@ -666,6 +667,12 @@ void HostMaintain(BufferCache& cache) {
 }
 
 void OnSubmitStart(Vulkan::Rasterizer& rasterizer) {
+    // sotc: SOTC_NATIVE: ring the windows registered since the last submit and drain the announced uploads,
+    // on the draw thread, before any bind of this submit. No import happens here (RegisterWindow imported
+    // the windows); the HostMaintain hang noted below came from importing/holding at submit start.
+    if (SotcNative::On()) {
+        rasterizer.GetBufferCache().NativeDrain();
+    }
     // sotc: mode 8 (host binds): no extents and no copies. The submit start imports and rings the
     // blocks (HostMaintain, before any bind of the submit) and closes the previous submit's
     // statistics (unique bytes, verify samples).

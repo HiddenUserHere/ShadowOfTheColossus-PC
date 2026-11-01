@@ -53,6 +53,8 @@
 #include "../../../../sotc/probes.h"     // sotc: engine probe report lines
 #include "../../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK report (plan step 6)
 #include "../../../../sotc/pc_ring.h"     // sotc: SOTC_PC_RING report
+#include "../../../../sotc/native/native.h" // sotc: SOTC_NATIVE report
+namespace SotcNativeHooks { void Report(std::string& out, double seconds); } // sotc: native_hooks.cpp
 #include "../../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST report
 #include "../../../../sotc/rb_class.h"    // sotc: SOTC_RB_CLASS report
 #include "../../../../sotc/rb_host.h"     // sotc: SOTC_RB_HOST report
@@ -2015,6 +2017,8 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcProbes::ReportMemtype(report, seconds); // sotc: PC memory model, wave B
             SotcProbes::ReportXprMem(report, seconds);
             SotcPcRing::Report(report, seconds); // sotc: SOTC_PC_RING
+            SotcNative::Report(report, seconds);      // sotc: SOTC_NATIVE
+            SotcNativeHooks::Report(report, seconds); // sotc: SOTC_NATIVE write hooks
             SotcRbClass::Report(report, seconds); // sotc: SOTC_RB_CLASS
             SotcRbHost::Report(report, seconds);  // sotc: SOTC_RB_HOST
             SotcStale::Report(report, seconds);   // sotc: SOTC_STALE_CHECK

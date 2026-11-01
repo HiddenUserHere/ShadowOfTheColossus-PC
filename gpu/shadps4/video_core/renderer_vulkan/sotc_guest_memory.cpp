@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "video_core/renderer_vulkan/sotc_guest_memory.h"
+#include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE windows
 #include "video_core/renderer_vulkan/vk_instance.h"
 
 extern "C" {
@@ -385,8 +386,10 @@ void Init(const Instance& instance) {
     const char* pc_memory = std::getenv("SOTC_PC_MEMORY");
     const char* pc_ring = std::getenv("SOTC_PC_RING");
     g_pc_memory = pc_memory && pc_memory[0] == '1';
-    g_ring = pc_ring && (pc_ring[0] == '3' || pc_ring[0] == '4' || pc_ring[0] == '8');
-    g_host = pc_ring && pc_ring[0] == '8'; // sotc: SOTC_PC_RING=8 (host arena binds)
+    // sotc: SOTC_NATIVE imports its windows through the same path (gpu/sotc/native/native.cpp).
+    g_ring = (pc_ring && (pc_ring[0] == '3' || pc_ring[0] == '4' || pc_ring[0] == '8')) ||
+             SotcNative::On();
+    g_host = (pc_ring && pc_ring[0] == '8') || SotcNative::On(); // sotc: host arena binds
     if (instance.IsExternalMemoryHostEnabled()) {
         g_instance = &instance;
     }

@@ -28,6 +28,8 @@
 #include "../../../sotc/mem_classes.h"  // sotc: SOTC_CLASS_TRACK (plan step 6)
 #include "../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE bind evidence
 #include "../../../sotc/pc_ring.h"      // sotc: SOTC_PC_RING shadow
+#include "../../../sotc/native/native.h"       // sotc: SOTC_NATIVE (windows, announces, frame ticket)
+#include "../../../sotc/native/native_draw.h" // sotc: SOTC_NATIVE draw-thread side
 #include "../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST (L1)
 #include "../../../sotc/rb_host.h"      // sotc: SOTC_RB_HOST (R1)
 #include <xxhash.h>                     // sotc: SOTC_PC_RING=8 verify (XXH3, as stale_check.cpp)
@@ -579,6 +581,12 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_semaphore{instance} {
     // sotc: SOTC_ASYNC_UPLOAD (see async_upload.h).
     AsyncUpload::Init();
+    // sotc: SOTC_NATIVE: the frame ticket (native.h FrameSubmitted / FrameWait / FrameCompleted).
+    if (SotcNative::On()) {
+        SotcNative::SetFrameBackend(SotcNative::FrameBackend{
+            this, &BufferCache::NativeFrameSubmitted, &BufferCache::NativeFrameWait,
+            &BufferCache::NativeFrameCompleted});
+    }
     // sotc: SOTC_HRR dry run (see hrr.h).
     if (HostResidentRanges::Enabled()) {
         hrr = std::make_unique<HostResidentRanges>();
@@ -690,6 +698,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 }
 
 BufferCache::~BufferCache() {
+    if (SotcNative::On()) {
+        SotcNative::SetFrameBackend(SotcNative::FrameBackend{}); // sotc: SOTC_NATIVE, this cache is going
+    }
     AsyncUpload::Shutdown(); // sotc: SOTC_ASYNC_UPLOAD
     std::free(block_last_use);
 }
@@ -5989,6 +6000,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         stream_buffer.Commit();
         return {&stream_buffer, offset};
     }
+    // sotc: SOTC_NATIVE: a range inside a registered window is served from its imported run, as the
+    // ring8 host binds below (no sync, no tracking).
+    if (SotcNative::On() && SotcNative::InWindow(device_addr, size)) {
+        if (auto host = NativeBind(device_addr, size, is_written)) {
+            return *host;
+        }
+    }
     // sotc: SOTC_PC_RING=8 (host arena binds): a range inside one imported arena run is read, and
     // written, in the imported host memory. No sync and no GPU tracking for it (pc_ring.h, mode 8).
     if (SotcPcRing::Mode() == 8) {
@@ -7532,6 +7550,11 @@ void BufferCache::PcRingApply(const std::vector<SotcPcRing::RingExtent>& blocks)
     for (const auto& block : blocks) {
         ranges.push_back(SotcUntrack::Range{block.addr, block.size});
     }
+    if (SotcNative::On()) { // sotc: SOTC_NATIVE windows stay ringed whatever the ring set is
+        for (const auto& w : SotcNative::WindowRanges()) {
+            ranges.push_back(SotcUntrack::Range{w.addr, w.size});
+        }
+    }
     memory_tracker->ApplyRing(ranges);
 }
 
@@ -7785,7 +7808,8 @@ void BufferCache::PcHostSubmitStart() {
 // GPU. None of them waits for the game thread, which is the only thread that calls this (the frame
 // boundary). WaitGpuIdle is the wait SubmitDone already does on that thread in the default gate.
 void BufferCache::PcHostNoteFrameRecorded(u64 seq) {
-    if (SotcPcRing::Ring8FlipWaitMode() != 2) {
+    // sotc: SOTC_NATIVE needs the same frame records for its frame ticket (NativeFrameWait).
+    if (SotcPcRing::Ring8FlipWaitMode() != 2 && !SotcNative::On()) {
         return;
     }
     // After the frame-end Flush, CurrentTick is the next (empty) buffer: the flushed one is the tick
@@ -7936,6 +7960,11 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostBind(VAddr devic
     if (relation == 2) {
         SotcPcRing::NoteHostStraddle(true);
     }
+    return PcHostServe(device_addr, size, is_written, view);
+}
+
+std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostServe(
+    VAddr device_addr, u32 size, bool is_written, const Vulkan::SotcGuestMemory::GuestView& view) {
     std::scoped_lock lock{pc_host_mutex};
     std::unique_ptr<Buffer>& slot = pc_host_views[view.cpu_base];
     if (!slot || slot->Handle() != view.buffer) {
@@ -7951,6 +7980,95 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostBind(VAddr devic
         SotcRbHost::NoteServedWrite(device_addr, size); // sotc: SOTC_RB_HOST (R1): labels wait for it (mode 1)
     }
     return std::pair<const Buffer*, u64>{slot.get(), view.offset};
+}
+
+// sotc: SOTC_NATIVE. Draw thread. The window's bytes are ringed (never protected), so a bind that cannot be
+// served from one imported run marks them CPU-modified first: the normal path then uploads their current bytes.
+std::optional<std::pair<const Buffer*, u64>> BufferCache::NativeBind(VAddr device_addr, u32 size,
+                                                                      bool is_written) {
+    Vulkan::SotcGuestMemory::GuestView view{};
+    if (!Vulkan::SotcGuestMemory::LookupGuestView(device_addr, size, &view)) {
+        SotcNative::NoteBind(false);
+        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        SotcNative::NoteMarked(size);
+        return std::nullopt;
+    }
+    SotcNative::NoteBind(true);
+    return PcHostServe(device_addr, size, is_written, view);
+}
+
+// sotc: SOTC_NATIVE. Draw thread, once per submit. Windows are ringed first, so the uploads below never
+// see them; an announced range found inside a window is served by its bind and needs no upload.
+void BufferCache::NativeDrain(u64 budget) {
+    std::vector<SotcNative::Range> windows;
+    SotcNative::TakeNewWindows(windows);
+    for (const auto& w : windows) {
+        memory_tracker->AddRingRange(w.addr, w.size);
+    }
+    u64 spent = 0;
+    SotcNative::PendingUpload up{};
+    while (spent < budget && SotcNative::TakeUpload(up)) {
+        if (up.kind == SotcNative::Kind::PerFrame) {
+            memory_tracker->MarkRegionAsCpuModified(up.addr, up.size);
+            SotcNative::NoteMarked(up.size);
+            spent += up.size;
+            continue;
+        }
+        // Persistent: the same sync the early bind uses (residency, CPU-dirty bytes copied; the copy
+        // threads when SOTC_LOAD_STREAM / SOTC_NATIVE is on). The next submit waits for those copies
+        // (Scheduler::SubmitExecution calls AsyncUpload::WaitUpTo), so the GPU never reads them early.
+        const u64 bytes = DrainRange(up.addr, up.size);
+        SotcNative::NoteUploaded(bytes);
+        spent += bytes;
+    }
+}
+
+// sotc: SOTC_NATIVE frame ticket (SotcNative::FrameBackend). The frame number is SubmitDone's count, the
+// same number PcHostNoteFrameRecorded records each frame end with.
+u64 BufferCache::NativeFrameSubmitted(void* ctx) {
+    const auto* self = static_cast<BufferCache*>(ctx);
+    return self->liverpool ? self->liverpool->SubmitDoneSeq() : 0;
+}
+
+// Waits for the GPU tick of the first recorded frame end with seq >= frame. Never waits for the command
+// processor (no WaitGpuIdle): a frame that is not recorded yet is waited for up to 200 ms, then not at all.
+void BufferCache::NativeFrameWait(void* ctx, u64 frame) {
+    auto* self = static_cast<BufferCache*>(ctx);
+    u64 wait_tick = 0;
+    {
+        std::unique_lock lock{self->pc_host_frames_mutex};
+        const auto find = [&] {
+            for (const auto& [seq, tick] : self->pc_host_frames) {
+                if (seq >= frame) {
+                    wait_tick = tick;
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (!self->pc_host_frames_cv.wait_for(lock, std::chrono::milliseconds(200), find)) {
+            static std::atomic<u32> timeouts{0};
+            if (timeouts.fetch_add(1, std::memory_order_relaxed) < 4) {
+                std::fprintf(stderr, "SOTC NATIVE frame wait: frame %llu not recorded within 200 ms\n",
+                             static_cast<unsigned long long>(frame));
+            }
+        }
+    }
+    if (wait_tick != 0) {
+        self->scheduler.Wait(wait_tick);
+    }
+}
+
+// The newest recorded frame whose tick the GPU has triggered (0: none yet).
+u64 BufferCache::NativeFrameCompleted(void* ctx) {
+    auto* self = static_cast<BufferCache*>(ctx);
+    std::scoped_lock lock{self->pc_host_frames_mutex};
+    for (auto it = self->pc_host_frames.rbegin(); it != self->pc_host_frames.rend(); ++it) {
+        if (self->scheduler.IsFree(it->second)) {
+            return it->first;
+        }
+    }
+    return 0;
 }
 
 void BufferCache::PcRingMarkClean(VAddr addr, u64 size) {

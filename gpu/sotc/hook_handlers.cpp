@@ -18,6 +18,10 @@
 #include "static_class.h"
 #include "freecam.h"
 
+namespace SotcNativeHooks { // sotc: SOTC_NATIVE write hooks (gpu/sotc/native/native_hooks.cpp)
+void Register();
+} // namespace SotcNativeHooks
+
 namespace SotcHooks {
 
 void RegisterAllHandlers() {
@@ -48,6 +52,7 @@ void RegisterAllHandlers() {
     SotcEngineCmd::Register();
     SotcFreecam::Register();
     SotcCtl::StartIfEnabled();
+    SotcNativeHooks::Register(); // sotc: SOTC_NATIVE write hooks
 }
 
 } // namespace SotcHooks

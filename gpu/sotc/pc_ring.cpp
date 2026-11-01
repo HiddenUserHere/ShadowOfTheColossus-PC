@@ -19,6 +19,7 @@
 // is only marked inactive.
 
 #include "pc_ring.h"
+#include "native/native_draw.h" // sotc: SOTC_NATIVE flip-reuse fence
 #include "arena_attrib.h" // sotc: SOTC_ARENA_ATTRIB (write faults on the arena by guest RIP)
 
 #include "hooks.h"
@@ -487,6 +488,10 @@ void OnFreeBlock(uint64_t base) {
 
 void OnFrameBoundary() {
     SotcArenaAttrib::OnFrameBoundary();
+    // sotc: SOTC_NATIVE: the engine's ring flip (0x1d230) reuses a ring block after depth frames with no GPU
+    // fence (heaps.md section 7). Host-shared rings are read in place, so the port fences the reuse here:
+    // frame N - 2 covers every ring (the shallowest has depth 2). Never drains the command processor.
+    SotcNative::FlipReuseFence(SotcNative::FrameSubmitted(), SotcNative::RingDepth::RenderSingleFrameGpu);
     if (!On()) {
         return;
     }
