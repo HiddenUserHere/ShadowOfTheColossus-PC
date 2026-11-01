@@ -303,7 +303,7 @@ private:
                           const TexBlockKey* tex_key, TexBlockMemo* rec);
     void BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set,
                       const VideoCore::Image* ui_asset);
-    /// sotc: SOTC_UI_LINEAR's image: the single image of a single-image stage that is drawn 1:1
+    /// sotc: the UI-linear image: the single image of a single-image stage that is drawn 1:1
     /// asset, or null (the point sampler is made bilinear for it).
     const VideoCore::Image* UiLinearAsset(const Shader::Info& stage, size_t num_bindings,
                                           VideoCore::ImageId first);
@@ -360,7 +360,7 @@ private:
 
     void ResetBindings(bool is_compute);
     void CaptureTextures();
-    static bool TaaOff(); ///< sotc: DLSS on or SOTC_TAA_OFF=1, vk_rasterizer.cpp
+    static bool TaaOff(); ///< sotc: DLSS on (super resolution), vk_rasterizer.cpp
     u32 CompositeUiIndex(); ///< sotc: which of the composite's two images is the UI layer
     void MaybeDumpImages(u64 pgm_hash);
     void FlushPeriodic();

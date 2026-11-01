@@ -299,9 +299,6 @@ private:
         bool preloaded{};
         /// sotc: N5: the use count the blob was saved with (a boot prebuild job, QueueAsyncPipeline).
         u32 uses{};
-        /// sotc: SOTC_PIPE_REMAP: set for a preload whose key was remapped, to the name of the
-        /// old key's blob. The new key is saved and the old blob removed only once it built.
-        std::optional<std::string> remap_old_blob;
 
         /// sotc: SOTC_ASYNC_TRANSLATE (default on): a graphics shader stage seen for the first
         /// time (or a new permutation of one) is translated by a worker, queued after the compute
@@ -329,8 +326,7 @@ private:
     bool AsyncPipelineEligible() const;
     void QueueAsyncPipeline(u64 hash,
                             const GraphicsPipeline::SerializationSupport* preloaded = nullptr,
-                            bool priority = false,
-                            std::optional<std::string> remap_old_blob = std::nullopt);
+                            bool priority = false);
     bool AsyncPreloadEnabled() const;
     bool IsDepthOnlyDraw() const;
     const char* AsyncIneligibleReason() const;

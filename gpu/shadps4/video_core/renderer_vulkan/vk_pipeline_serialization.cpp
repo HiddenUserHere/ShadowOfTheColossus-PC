@@ -121,70 +121,6 @@ bool SlotHasCurrentMeta(u64 pgm_hash, size_t perm_idx) {
         return false;
     }
 }
-// sotc: SOTC_PIPE_REMAP. A key whose permutation index holds, in this program, the same spec as
-// another index (the store has such a pair when a session did not preload the first one) takes
-// that index: =1 builds the pipeline under the new key and drops the old blob; =2 only counts the
-// keys. Unset or 0: the key fails as before. Off for an archived cache, whose entries cannot be
-// replaced while the preload reads them.
-enum class PipeRemap : u8 { Off, Remap, CountOnly };
-
-PipeRemap PipeRemapMode() {
-    static const PipeRemap mode = [] {
-        const char* v = std::getenv("SOTC_PIPE_REMAP");
-        if (!v || (v[0] != '1' && v[0] != '2')) {
-            return PipeRemap::Off;
-        }
-        if (EmulatorSettings.IsPipelineCacheArchived()) {
-            LOG_WARNING(Render_Vulkan, "SOTC_PIPE_REMAP is off for an archived pipeline cache");
-            return PipeRemap::Off;
-        }
-        return v[0] == '1' ? PipeRemap::Remap : PipeRemap::CountOnly;
-    }();
-    return mode;
-}
-
-// The stage hash a key takes when LoadPipelineStage remapped that stage (reset per stage).
-std::optional<u64> remapped_stage_hash;
-
-// sotc: the blob name of the key being loaded (WarmUp sets it before each one). A key remapped
-// to a new hash replaces the blob of this name once its pipeline has built.
-std::string current_blob_name;
-
-// What the last key load did that WarmUp has to act on (reset per key).
-enum class KeyRemap : u8 {
-    Plain,             // nothing to do: loaded as before, refused, or built (see RemapBuilt)
-    Duplicate,         // a plain key whose pipeline is loaded already: not built again
-    RemappedDuplicate, // remapped to a pipeline that is loaded already: the old blob goes
-};
-KeyRemap last_key_remap = KeyRemap::Plain;
-
-// SOTC_PIPE_REMAP totals of the warm-up in progress (WarmUp is single-threaded). Builds that
-// finish after the warm-up are logged by CollectAsyncPipelines instead.
-struct RemapTotals {
-    u32 built{};      // remapped keys built and saved under their new key
-    u32 duplicates{}; // remapped keys whose pipeline is loaded already
-    u32 removed{};    // old blobs actually removed
-    std::vector<u64> counted_graphics; // =2: the hash each candidate would be saved under
-    std::vector<u64> counted_compute;  // =2: the value each candidate would take
-};
-RemapTotals remap_totals{};
-
-// sotc: a remapped compute key waiting for its build: WarmUp saves it and drops the old blob
-// once the build succeeded (the graphics ones wait on their async job instead).
-struct PendingComputeRemap {
-    ComputePipelineKey key;
-    ComputePipeline::SerializationSupport sdata;
-    std::string old_blob;
-};
-std::vector<PendingComputeRemap> pending_compute_remaps;
-
-// sotc: a remapped key was built and saved under its new key: the old blob goes (WarmUp only).
-void RemapBuilt(const std::string& old_blob) {
-    ++remap_totals.built;
-    if (Storage::DataBase::Instance().Remove(Storage::BlobType::PipelineKey, old_blob)) {
-        ++remap_totals.removed;
-    }
-}
 
 } // namespace
 
@@ -408,22 +344,8 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
 
     Serialization::Archive meta_ar{std::move(meta_blob)};
 
-    remapped_stage_hash.reset();
     if (!LoadPipelineStage(meta_ar, 0)) {
         return false;
-    }
-    const bool remapped = remapped_stage_hash.has_value();
-    if (remapped) {
-        compute_key.value = *remapped_stage_hash;
-    }
-    const auto mode = PipeRemapMode();
-    if (remapped && mode == PipeRemap::CountOnly) {
-        remap_totals.counted_compute.push_back(compute_key.value);
-        return false;
-    }
-    if (mode != PipeRemap::Off && compute_pipelines.find(compute_key) != compute_pipelines.end()) {
-        last_key_remap = remapped ? KeyRemap::RemappedDuplicate : KeyRemap::Duplicate;
-        return true;
     }
 
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
@@ -454,19 +376,11 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     modules.fill(nullptr);
 
     if (AsyncPreloadEnabled()) {
-        if (remapped) {
-            // sotc: not built yet: WarmUp saves it under the new key and drops the old blob once
-            // the build succeeded.
-            pending_compute_remaps.push_back({compute_key, sdata, current_blob_name});
-        }
         return true; // checked by WarmUp once built
     }
     if (!it.value()->Handle()) {
         compute_pipelines.erase(compute_key);
         return false;
-    }
-    if (remapped && RegisterPipelineData(compute_key, sdata)) {
-        RemapBuilt(current_blob_name);
     }
     return true;
 }
@@ -524,8 +438,6 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
 
-    bool remapped = false; // sotc: SOTC_PIPE_REMAP: a stage took another index
-    const auto mode = PipeRemapMode();
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = graphics_key.stage_hashes[stage_idx];
         if (!hash) {
@@ -541,27 +453,9 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
         Serialization::Archive meta_ar{std::move(meta_blob)};
 
-        remapped_stage_hash.reset();
         if (!LoadPipelineStage(meta_ar, stage_idx)) {
             return false;
         }
-        if (remapped_stage_hash) {
-            graphics_key.stage_hashes[stage_idx] = *remapped_stage_hash;
-            remapped = true;
-            if (mode == PipeRemap::CountOnly) {
-                // sotc: =2 stops at its first candidate, as =0 does at its first conflict, so
-                // the later keys see the same program state. The count uses the stages so far.
-                remap_totals.counted_graphics.push_back(
-                    std::hash<GraphicsPipelineKey>{}(graphics_key));
-                return false;
-            }
-        }
-    }
-
-    if (mode != PipeRemap::Off &&
-        graphics_pipelines.find(graphics_key) != graphics_pipelines.end()) {
-        last_key_remap = remapped ? KeyRemap::RemappedDuplicate : KeyRemap::Duplicate;
-        return true;
     }
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -572,13 +466,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     // (SOTC_ASYNC_PRELOAD). Not the ones whose construction reads per-draw state.
     const bool async = AsyncPreloadEnabled() && AsyncPipelineEligible();
     if (async) {
-        // sotc: a remapped key carries its old blob name: saved and removed once it has built.
-        std::optional<std::string> remap_old_blob{};
-        if (remapped) {
-            remap_old_blob = current_blob_name;
-        }
-        QueueAsyncPipeline(std::hash<GraphicsPipelineKey>{}(graphics_key), &sdata, false,
-                           remap_old_blob);
+        QueueAsyncPipeline(std::hash<GraphicsPipelineKey>{}(graphics_key), &sdata, false);
     } else {
         WarmUpTimer timer{warmup_times.pipelines};
         it.value() = std::make_unique<GraphicsPipeline>(
@@ -601,15 +489,10 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         graphics_pipelines.erase(graphics_key);
         return false;
     }
-    if (remapped && RegisterPipelineData(graphics_key,
-                                         std::hash<GraphicsPipelineKey>{}(graphics_key), sdata)) {
-        RemapBuilt(current_blob_name);
-    }
     return true;
 }
 
 bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) {
-    remapped_stage_hash.reset();
     auto program = std::make_unique<Program>();
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
@@ -645,8 +528,6 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     }
 
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
-    // sotc: SOTC_PIPE_REMAP: the index this stage takes in place of perm_idx.
-    std::optional<size_t> existing_idx{};
     if (new_program) {
         {
             WarmUpTimer timer{warmup_times.modules};
@@ -658,17 +539,14 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         if (it != it_pgm.value()->modules.end()) {
             // A matching permutation is valid only at its original index. A different index means
             // the store holds entries from more than one cache generation, so this pipeline is
-            // left to compile at runtime (unless SOTC_PIPE_REMAP takes that index).
+            // left to compile at runtime.
             const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
             if (perm_idx != idx) {
-                if (PipeRemapMode() == PipeRemap::Off || it->module == vk::ShaderModule{}) {
-                    LOG_WARNING(Render_Vulkan,
-                                "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
-                                "preload",
-                                perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
-                    return false;
-                }
-                existing_idx = static_cast<size_t>(idx);
+                LOG_WARNING(Render_Vulkan,
+                            "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
+                            "preload",
+                            perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
+                return false;
             }
             module = it->module;
         } else {
@@ -676,20 +554,6 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
-    if (existing_idx) {
-        // sotc: SOTC_PIPE_REMAP: the stage uses the module at that index. Nothing is inserted: the
-        // key is rewritten to the index (LoadGraphicsPipeline, LoadComputePipeline).
-        infos[stage] = &it_pgm.value()->info;
-        modules[stage] = module;
-        if (auto& fetch = it_pgm.value()->modules[*existing_idx].spec.fetch_shader_data;
-            !fetch.Empty()) {
-            fetch_shader = &fetch;
-        }
-        remapped_stage_hash = HashCombine(it_pgm.value()->info.pgm_hash,
-                                          static_cast<u64>(*existing_idx));
-        return true;
-    }
-
     // The specialization must reference the cached program's info, not the temporary one.
     spec.info = &it_pgm.value()->info;
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
@@ -778,13 +642,10 @@ void PipelineCache::WarmUp() {
         static_cast<u32>(Storage::DataBase::Instance().CountBlobs(Storage::BlobType::PipelineKey)),
         std::memory_order_relaxed);
 
-    remap_totals = {};
     // sotc: one blob is loaded by load_blob (its use count is the N5 order, 0 without N5).
-    const auto load_blob = [&](std::vector<u8>&& data, const std::string& name, u32 uses) {
+    const auto load_blob = [&](std::vector<u8>&& data, u32 uses) {
         ++num_total_pipelines;
         SotcStats::warmup_done.fetch_add(1, std::memory_order_relaxed);
-        last_key_remap = KeyRemap::Plain;
-        current_blob_name = name;
         warm_uses = uses;
 
         bool result{};
@@ -813,16 +674,6 @@ void PipelineCache::WarmUp() {
             result = false;
         }
 
-        // sotc: SOTC_PIPE_REMAP=1: the key was remapped to a pipeline that is loaded already,
-        // so nothing is built or saved for it and the old blob goes now. A remapped key that
-        // is built waits for its build (RemapBuilt, CollectAsyncPipelines).
-        if (last_key_remap == KeyRemap::RemappedDuplicate) {
-            ++remap_totals.duplicates;
-            if (Storage::DataBase::Instance().Remove(Storage::BlobType::PipelineKey, name)) {
-                ++remap_totals.removed;
-            }
-        }
-
         if (result) {
             ++num_pipelines;
         }
@@ -833,23 +684,22 @@ void PipelineCache::WarmUp() {
         // keep the store's order.
         struct BootBlob {
             u32 uses;
-            std::string name;
             std::vector<u8> data;
         };
         std::vector<BootBlob> blobs;
-        Storage::DataBase::Instance().ForEachNamedBlob(
-            Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data, const std::string& name) {
-                blobs.push_back({PipelineUseCount(data), name, std::move(data)});
+        Storage::DataBase::Instance().ForEachBlob(
+            Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+                blobs.push_back({PipelineUseCount(data), std::move(data)});
             });
         std::stable_sort(blobs.begin(), blobs.end(),
                          [](const BootBlob& a, const BootBlob& b) { return a.uses > b.uses; });
         for (auto& blob : blobs) {
-            load_blob(std::move(blob.data), blob.name, blob.uses);
+            load_blob(std::move(blob.data), blob.uses);
         }
     } else {
-        Storage::DataBase::Instance().ForEachNamedBlob(
-            Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data, const std::string& name) {
-                load_blob(std::move(data), name, 0);
+        Storage::DataBase::Instance().ForEachBlob(
+            Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+                load_blob(std::move(data), 0);
             });
     }
 
@@ -861,25 +711,13 @@ void PipelineCache::WarmUp() {
             continue;
         }
         it.value()->WaitBuilt();
-        // sotc: SOTC_PIPE_REMAP: a remapped key is saved and its old blob dropped only when the
-        // build succeeded (a refused one keeps the old blob).
-        const auto remap = std::ranges::find_if(pending_compute_remaps, [&](const auto& pending) {
-            return pending.key.value == key.value;
-        });
         if (!it.value()->Handle()) {
             preload_refused.push_back(std::move(it.value()));
             compute_pipelines.erase(it);
             --num_pipelines;
-        } else if (remap != pending_compute_remaps.end() &&
-                   RegisterPipelineData(remap->key, remap->sdata)) {
-            RemapBuilt(remap->old_blob);
-        }
-        if (remap != pending_compute_remaps.end()) {
-            pending_compute_remaps.erase(remap);
         }
     }
     preload_computes.clear();
-    pending_compute_remaps.clear();
 
     // sotc: N5 boot prebuild: waits for the graphics pipelines queued above (WaitPreloadBoot).
     if (N5PsoEnabled()) {
@@ -896,41 +734,6 @@ void PipelineCache::WarmUp() {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
     }
-
-    // sotc: SOTC_PIPE_REMAP totals, once per warm-up.
-    if (PipeRemapMode() == PipeRemap::Remap &&
-        remap_totals.built + remap_totals.duplicates + remap_totals.removed > 0) {
-        LOG_INFO(Render,
-                 "SOTC_PIPE_REMAP=1: {} keys built under their remapped key, {} duplicates "
-                 "dropped, {} old keys removed (background builds are logged when they finish)",
-                 remap_totals.built, remap_totals.duplicates, remap_totals.removed);
-    }
-    if (PipeRemapMode() == PipeRemap::CountOnly) {
-        // A candidate is a duplicate when its remapped key is loaded at the end, or an earlier
-        // candidate has the same one.
-        std::unordered_set<u64> seen{};
-        for (const auto& entry : graphics_pipelines) {
-            seen.insert(std::hash<GraphicsPipelineKey>{}(entry.first));
-        }
-        u32 duplicates_graphics{};
-        for (const u64 target : remap_totals.counted_graphics) {
-            duplicates_graphics += !seen.insert(target).second;
-        }
-        seen.clear();
-        for (const auto& entry : compute_pipelines) {
-            seen.insert(entry.first.value);
-        }
-        u32 duplicates_compute{};
-        for (const u64 target : remap_totals.counted_compute) {
-            duplicates_compute += !seen.insert(target).second;
-        }
-        LOG_INFO(Render,
-                 "SOTC_PIPE_REMAP=2: {} keys remappable to an existing permutation, {} of them "
-                 "duplicates of a loaded pipeline ({} graphics, {} compute)",
-                 remap_totals.counted_graphics.size() + remap_totals.counted_compute.size(),
-                 duplicates_graphics + duplicates_compute, duplicates_graphics, duplicates_compute);
-    }
-
     Storage::DataBase::Instance().FinishPreload();
 }
 

@@ -2309,7 +2309,7 @@ static std::array<float, 5> VegetationScales() {
     return s;
 }
 
-// sotc: while DLSS takes the jittered frame (or SOTC_TAA_OFF=1), the game's TAA resolve runs
+// sotc: while DLSS takes the jittered frame, the game's TAA resolve runs
 // with its history blend off: bit 0 of SRT dword 42. Its other work stays: exposure (the input
 // colour times a scalar from a buffer) and the stencil mask in the output's alpha.
 constexpr u64 kTaaResolveHash = 0xa402ddac;
@@ -2321,12 +2321,8 @@ constexpr u64 kTonemapHash = 0x291dbcd0;
 constexpr u32 kVignetteDword = 51;
 
 bool Rasterizer::TaaOff() {
-    static const int forced = [] { // SOTC_TAA_OFF=1/0 forces; unset follows DLSS
-        const char* v = std::getenv("SOTC_TAA_OFF");
-        return v && *v ? (v[0] == '1' ? 1 : 0) : -1;
-    }();
     // TAA comes back if super resolution is switched or turns itself off
-    return forced < 0 ? Dlssg::SuperResolution() : forced == 1;
+    return Dlssg::SuperResolution();
 }
 
 namespace {
@@ -5102,16 +5098,6 @@ void Rasterizer::CaptureTextures() {
     static u32 budget = 0, session = 0, count = 0;
     static std::filesystem::path dir;
     static std::set<u64> seen;
-    // SOTC_TEXCAP_AFTER=<seconds>: one capture that long after the first draw (tests).
-    static const auto first_draw = std::chrono::steady_clock::now();
-    static long after = [] {
-        const char* v = std::getenv("SOTC_TEXCAP_AFTER");
-        return v ? std::atol(v) : 0L;
-    }();
-    if (after > 0 && std::chrono::steady_clock::now() - first_draw > std::chrono::seconds{after}) {
-        after = 0;
-        SotcStats::tex_capture.store(true, std::memory_order_relaxed);
-    }
     if (SotcStats::tex_capture.exchange(false, std::memory_order_relaxed)) {
         budget = 30000;
         count = 0;
@@ -6831,11 +6817,9 @@ const VideoCore::Image* Rasterizer::UiLinearAsset(const Shader::Info& stage, siz
     // sotc: at a render size above 1080 lines the game stretches its 1080p 2D art (splash logos,
     // UI) itself, with the point sampler meant for 1:1 drawing: hard steps. A draw that samples
     // one asset texture (never a render target, storage or depth image) magnifies bilinearly
-    // there. SOTC_UI_LINEAR=0/1 overrides, SOTC_UI_LINEAR_TRACE=1 lists the draws it changes.
+    // there. It is on whenever SOTC_RENDER_RES names another size than 1080p (set by the launcher),
+    // SOTC_UI_LINEAR_TRACE=1 lists the draws it changes.
     static const bool ui_linear = [] {
-        if (const char* v = std::getenv("SOTC_UI_LINEAR"); v && *v) {
-            return *v != '0';
-        }
         const char* r = std::getenv("SOTC_RENDER_RES");
         return r && *r && std::strcmp(r, "1920x1080") != 0;
     }();

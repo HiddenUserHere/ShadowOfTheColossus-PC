@@ -619,32 +619,6 @@ void DataBase::ForEachNamedBlob(
     }
 }
 
-// sotc: SOTC_PIPE_REMAP drops the key of a pipeline that is rebuilt under another key. Loose files
-// only: the cache pack is a copy that is rewritten at the next start without the missing file.
-bool DataBase::Remove(BlobType type, const std::string& name) {
-    if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
-        return false;
-    }
-    auto path = cache_path / name;
-    path.replace_extension(GetBlobFileExtension(type));
-    std::error_code ec;
-    if (!std::filesystem::remove(path, ec)) {
-        return false;
-    }
-    const auto file_name = path.filename().string();
-    {
-        std::scoped_lock lock{known_mutex};
-        known_files.erase(file_name);
-    }
-    if (prefetch_active) {
-        // The preload is walking prefetched right now: the copy goes when it ends.
-        prefetch_removed.push_back(file_name);
-    }
-    // Once the preload is over, prefetched is left as it is: other threads read it, and no
-    // pipeline key is loaded by name from it after the warm-up.
-    return true;
-}
-
 size_t DataBase::CountBlobs(BlobType type) {
     const auto& ext = GetBlobFileExtension(type);
     size_t count = 0;
@@ -690,11 +664,6 @@ void DataBase::FinishPreload() {
     // there. Dropping them sent every later lookup to the disk, one small file at a time, while
     // the game loaded a save from the same hard disk: the game stood still for 27 s (22 Oct).
     prefetch_active = false;
-    // sotc: blobs Remove deleted during the preload leave their in-memory copies too.
-    for (const auto& file_name : prefetch_removed) {
-        prefetched.erase(file_name);
-    }
-    prefetch_removed.clear();
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;

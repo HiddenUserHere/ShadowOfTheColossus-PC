@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <unordered_map>
-#include <cstdlib>
 #include <mutex>
 #include <span>
 #include <type_traits>
@@ -165,39 +164,24 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
 // emulation feeds a shader stale or garbage data such a loop can spin for billions of iterations,
 // which ends in a GPU timeout and a lost device. Real content stays far below this budget, so
 // cutting the loops short only degrades the affected frame instead of ending the session.
-// SHADPS4_LOOP_LIMIT overrides it (0 disables the guard).
-static u32 LoopIterationBudget() {
-    static const u32 budget = [] {
-        if (const char* value = std::getenv("SHADPS4_LOOP_LIMIT")) {
-            return static_cast<u32>(std::strtoul(value, nullptr, 0));
-        }
-        // Shadow of the Colossus used 1 << 13 here, which cut its screen-space reflection march
-        // short (it walks the 64 lanes of a wave one after another, each marching its ray): water
-        // reflected only near the horizon and stayed dark and flat closer to the camera. Its
-        // runaway loops after a save loads (stale data) are now stopped by the per-loop budget
-        // below; with only 1 << 20 here they stalled the GPU for minutes.
-        return 1U << 18;
-    }();
-    return budget;
-}
+// Shadow of the Colossus used 1 << 13 here, which cut its screen-space reflection march short
+// (it walks the 64 lanes of a wave one after another, each marching its ray): water reflected
+// only near the horizon and stayed dark and flat closer to the camera. Its runaway loops after a
+// save loads (stale data) are now stopped by the per-loop budget below; with only 1 << 20 here
+// they stalled the GPU for minutes.
+constexpr u32 kLoopIterationBudget = 1U << 18;
 
 // sotc: each loop also has its own budget, reset when the loop exits: a loop that runs away
 // stops after this many iterations, while a shader that runs many short loops one after another
 // (SotC's reflection march over the 64 lanes of a wave) only meets the invocation budget above.
-// SHADPS4_LOOP_LIMIT_PER_LOOP overrides it (0 disables the per-loop budget).
+// Other titles get no per-loop budget.
 static u32 PerLoopIterationBudget() {
-    static const u32 budget = [] {
-        if (const char* value = std::getenv("SHADPS4_LOOP_LIMIT_PER_LOOP")) {
-            return static_cast<u32>(std::strtoul(value, nullptr, 0));
-        }
-        return Common::ElfInfo::Instance().IsSotc() ? (1U << 13) : 0U;
-    }();
+    static const u32 budget = Common::ElfInfo::Instance().IsSotc() ? (1U << 13) : 0U;
     return budget;
 }
 
 void Traverse(EmitContext& ctx, const IR::Program& program) {
-    const u32 loop_budget = LoopIterationBudget();
-    const u32 per_loop_budget = loop_budget != 0 ? PerLoopIterationBudget() : 0;
+    const u32 per_loop_budget = PerLoopIterationBudget();
     // Per-loop counters, found by the loop's header and merge blocks.
     std::unordered_map<const IR::Block*, Id> header_counters;
     std::unordered_map<const IR::Block*, Id> merge_counters;
@@ -263,8 +247,8 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             const Id continue_label{node.data.loop.continue_block->Definition<Id>()};
             const Id endloop_label{node.data.loop.merge->Definition<Id>()};
 
-            if (loop_budget != 0) {
-                // The header runs once per iteration: charge it to the invocation budget.
+            // The header runs once per iteration: charge it to the invocation budget.
+            {
                 const Id counter{get_loop_counter()};
                 const Id count{ctx.OpLoad(ctx.U32[1], counter)};
                 ctx.OpStore(counter, ctx.OpIAdd(ctx.U32[1], count, ctx.ConstU32(1U)));
@@ -295,10 +279,10 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             Id cond{ctx.Def(node.data.repeat.cond)};
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
-            if (loop_budget != 0) {
+            {
                 const Id count{ctx.OpLoad(ctx.U32[1], get_loop_counter())};
                 const Id within_budget{
-                    ctx.OpULessThan(ctx.U1[1], count, ctx.ConstU32(loop_budget))};
+                    ctx.OpULessThan(ctx.U1[1], count, ctx.ConstU32(kLoopIterationBudget))};
                 cond = ctx.OpLogicalAnd(ctx.U1[1], cond, within_budget);
                 if (const auto it = header_counters.find(node.data.repeat.loop_header);
                     it != header_counters.end()) {

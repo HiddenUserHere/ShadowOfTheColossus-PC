@@ -28,8 +28,7 @@ use_count bump in the GetGraphicsPipeline/GetComputePipeline wrappers and the Wa
 1. The compute boot wait is not capped (computes are queued first; measure).
 2. Counts are saved only at ~PipelineCache: a killed process loses the session's counts; check that the DataBase
    singleton still exists at that point of static teardown.
-3. With SOTC_PIPE_REMAP=1 a remapped compute key built after the cap keeps its old blob (harmless).
-4. N5 holds all key blobs in RAM during warm-up (transient).
+3. N5 holds all key blobs in RAM during warm-up (transient).
 
 ## Item 3 (design only): skip RefreshFlatBuf when nothing it read changed
 - The SRT walker reads guest memory only through the copy function it is passed (SrtCopyWindow,

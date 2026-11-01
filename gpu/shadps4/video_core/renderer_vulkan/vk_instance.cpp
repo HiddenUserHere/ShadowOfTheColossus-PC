@@ -114,11 +114,9 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     {
         // sotc: see object_names_enabled (vk_platform.h); an attached tool turns it on again in
         // CollectToolingInfo.
-        const char* names = std::getenv("SOTC_VK_NAMES");
         object_names_enabled = enable_validation || enable_crash_diagnostic ||
                                EmulatorSettings.IsVkHostMarkersEnabled() ||
-                               EmulatorSettings.IsVkGuestMarkersEnabled() ||
-                               (names && names[0] == '1');
+                               EmulatorSettings.IsVkGuestMarkersEnabled();
     }
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());
     ASSERT_MSG(num_physical_devices > 0, "No physical devices found");
@@ -1374,11 +1372,7 @@ void Instance::CreateAllocator() {
             device_local_heap = std::max<u64>(device_local_heap, memory_properties.memoryHeaps[i].size);
         }
     }
-    // SOTC_VMA_BLOCK_MB=<n> overrides the block size (0: VMA's default), for A/B measurements.
-    u64 block_size = device_local_heap <= 8_GB ? 64_MB : 0;
-    if (const char* env = std::getenv("SOTC_VMA_BLOCK_MB")) {
-        block_size = static_cast<u64>(std::strtoull(env, nullptr, 10)) << 20;
-    }
+    const u64 block_size = device_local_heap <= 8_GB ? 64_MB : 0;
     // sotc: SOTC_CMD_STATS counts device memory allocations (SOTC sys line).
     static const VmaDeviceMemoryCallbacks memory_callbacks = {
         .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {

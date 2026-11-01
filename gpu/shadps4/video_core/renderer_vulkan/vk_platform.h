@@ -33,7 +33,7 @@ concept VulkanHandleType = vk::isVulkanHandleType<T>::value;
 
 // sotc: debug names cost a format and a driver call per object; the open world creates 250-450
 // named objects a second. Set by Instance: on with validation, the crash-diagnostic layer, an
-// attached tool (RenderDoc...), debug markers or SOTC_VK_NAMES=1; off otherwise.
+// attached tool (RenderDoc...), debug markers; off otherwise.
 inline std::atomic<bool> object_names_enabled{true};
 
 template <VulkanHandleType HandleType>

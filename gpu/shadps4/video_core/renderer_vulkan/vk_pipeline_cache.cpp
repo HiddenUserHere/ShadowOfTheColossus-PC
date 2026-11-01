@@ -244,10 +244,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         // that; without it the writes of failing fragments land too (SotC deferred decals paint
         // their whole box footprint into the G-buffer: rectangles on the ground). Not with a
         // depth, stencil ref or sample mask export (mrtz_mask bits 0-2), the tests need them.
-        // From Pink-shadPS4 (luizgustavs). SotC only (EU and US); SOTC_EARLY_Z=0/1 overrides.
+        // From Pink-shadPS4 (luizgustavs). SotC only (EU and US).
         static const bool early_z_enabled = [] {
-            const char* v = std::getenv("SOTC_EARLY_Z");
-            const bool on = v ? std::atoi(v) != 0 : Common::ElfInfo::Instance().IsSotc();
+            const bool on = Common::ElfInfo::Instance().IsSotc();
             std::fprintf(stderr, "SOTC early fragment tests: %s\n", on ? "on" : "off");
             return on;
         }();
@@ -483,15 +482,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // sotc: SotC interpolates most pixel shader inputs by hand from their three vertex values.
     // Without fragment shader barycentrics (NVIDIA GTX 10xx: no textures, black geometry, issues
     // #57/#68/#102) an auxiliary geometry shader provides them (SOTC_BARYCENTRIC_GS=0 turns it
-    // off). SOTC_NO_BARYCENTRIC=1 acts as if the GPU had neither extension, to test that path.
+    // off).
     const auto env_is = [](const char* name, const char* value) {
         const char* v = std::getenv(name);
         return v && std::strcmp(v, value) == 0;
     };
-    const bool no_barycentric = env_is("SOTC_NO_BARYCENTRIC", "1");
-    const bool khr_barycentric = instance_.IsFragmentShaderBarycentricSupported() && !no_barycentric;
-    const bool amd_explicit_vertex =
-        instance_.IsAmdShaderExplicitVertexParameterSupported() && !no_barycentric;
+    const bool khr_barycentric = instance_.IsFragmentShaderBarycentricSupported();
+    const bool amd_explicit_vertex = instance_.IsAmdShaderExplicitVertexParameterSupported();
     const bool barycentric_via_gs = !khr_barycentric && !amd_explicit_vertex &&
                                     instance.IsGeometryStageSupported() &&
                                     instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
@@ -625,16 +622,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
     // sotc: pipeline workers for SOTC_ASYNC_SHADERS (see AsyncPipelineJob).
     if (AsyncShadersEnabled()) {
-        // SOTC_PIPELINE_WORKERS=<n> sets the number of workers. Default: the hardware threads
-        // less four, 2 to 12. They are busy only on a first visit, while the game's own threads
-        // mostly wait for them (cold caches, attract demo, 16 threads: worst frame 4.8 s with 6
-        // workers, 3.4 s with 12; one worker, the old default on 4 threads: 18 s).
+        // The hardware threads less four, 2 to 12. They are busy only on a first visit, while the
+        // game's own threads mostly wait for them (cold caches, attract demo, 16 threads: worst
+        // frame 4.8 s with 6 workers, 3.4 s with 12; one worker, the old default on 4 threads:
+        // 18 s).
         // sotc: with SOTC_CPUSETS=1 the default is capped at 4 (see BbThreads::PlaceThread).
-        const char* workers = std::getenv("SOTC_PIPELINE_WORKERS");
         const int threads = static_cast<int>(std::thread::hardware_concurrency());
         const int default_cap = BbThreads::CpuSetsEnabled() ? 4 : 12;
-        const unsigned count = static_cast<unsigned>(
-            workers ? std::clamp(std::atoi(workers), 1, 16) : std::clamp(threads - 4, 2, default_cap));
+        const unsigned count = static_cast<unsigned>(std::clamp(threads - 4, 2, default_cap));
         for (unsigned i = 0; i < count; ++i) {
             async_workers.emplace_back([this](std::stop_token token) { AsyncPipelineWorker(token); });
         }
@@ -875,8 +870,7 @@ bool PipelineCache::AsyncPreloadEnabled() const {
 
 void PipelineCache::QueueAsyncPipeline(u64 hash,
                                        const GraphicsPipeline::SerializationSupport* preloaded,
-                                       bool priority,
-                                       std::optional<std::string> remap_old_blob) {
+                                       bool priority) {
     auto job = std::make_unique<AsyncPipelineJob>();
     job->key = graphics_key;
     job->hash = hash;
@@ -886,7 +880,6 @@ void PipelineCache::QueueAsyncPipeline(u64 hash,
         job->uses = warm_uses; // sotc: N5, the blob's use count
         g_n5.boot_total.fetch_add(1, std::memory_order_relaxed);
     }
-    job->remap_old_blob = std::move(remap_old_blob); // sotc: SOTC_PIPE_REMAP (nullopt otherwise)
     job->infos = infos;
     job->runtime_infos = runtime_infos;
     if (fetch_shader) {
@@ -1044,8 +1037,7 @@ void PipelineCache::CollectAsyncPipelines() {
                 continue;
             }
             // A full-screen pass built it on the command processor meanwhile (that one may be
-            // in use): the worker's copy is dropped. A remapped job leaves its old blob alone:
-            // nothing here checked the pipeline the entry holds.
+            // in use): the worker's copy is dropped.
             if (!job->preloaded) {
                 RegisterPipelineData(job->key, job->hash, job->sdata);
                 ++num_new_pipelines;
@@ -1059,18 +1051,6 @@ void PipelineCache::CollectAsyncPipelines() {
                 it.value() = std::move(job->pipeline);
                 it.value()->use_count = job->uses; // sotc: N5
                 it.value()->saved_use_count = job->uses;
-                if (job->remap_old_blob) {
-                    // sotc: SOTC_PIPE_REMAP: the remapped key built. It is saved under its new
-                    // hash, then the old blob goes; a save that is not queued keeps the old one.
-                    if (RegisterPipelineData(job->key, job->hash, job->sdata) &&
-                        Storage::DataBase::Instance().Remove(Storage::BlobType::PipelineKey,
-                                                             *job->remap_old_blob)) {
-                        LOG_INFO(Render_Vulkan,
-                                 "SOTC_PIPE_REMAP: built under the remapped key, old key {} "
-                                 "removed",
-                                 *job->remap_old_blob);
-                    }
-                }
             } else {
                 graphics_pipelines.erase(it);
             }
