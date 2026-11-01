@@ -72,6 +72,9 @@ struct GuestView {
     u64 offset{};         ///< of the bind's first byte in buffer
     u64 buffer_size{};    ///< size of buffer
     u64 cpu_base{};       ///< guest address of byte 0 of buffer (guest_addr - offset)
+    /// sotc: SOTC_BDA / SOTC_N5_BDA: device address of byte 0 of buffer, 0 when the run was
+    /// imported without one (then the buffer must not be used through the block table).
+    u64 device_address{};
 };
 
 /// sotc: SOTC_PC_RING=8. As LookupGuest, with the buffer's size and base. Thread-safe.

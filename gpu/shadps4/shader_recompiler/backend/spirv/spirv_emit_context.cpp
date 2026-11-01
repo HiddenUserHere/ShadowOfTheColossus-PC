@@ -918,8 +918,20 @@ std::pair<Id, Id> EmitContext::LoadBdaBlock(u32 handle) {
     return {address, size};
 }
 
+void EmitContext::HoistBdaBlocks() {
+    bda_blocks.resize(buffers.size());
+    for (size_t handle = 0; handle < buffers.size(); ++handle) {
+        if (!buffers[handle].bda || info.buffers[handle].used_types == IR::Type::Void) {
+            continue;
+        }
+        bda_blocks[handle] = LoadBdaBlock(static_cast<u32>(handle));
+    }
+}
+
 std::pair<Id, Id> EmitContext::BdaAddress(u32 handle, Id index, u32 elem_size, u32 count) {
-    const auto [block_address, block_size] = LoadBdaBlock(handle);
+    // A hoisted block is valid in every block of the function; otherwise it is loaded here.
+    const bool hoisted = handle < bda_blocks.size() && Sirit::ValidId(bda_blocks[handle].first);
+    const auto [block_address, block_size] = hoisted ? bda_blocks[handle] : LoadBdaBlock(handle);
     const u32 elem_shift = static_cast<u32>(std::countr_zero(elem_size));
     const Id num_elements{OpShiftRightLogical(U32[1], block_size, ConstU32(elem_shift))};
     // The access fits when index <= num_elements - count (and count fits at all).

@@ -7974,7 +7974,8 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostServe(
         if (slot) {
             pc_host_retired.push_back(std::move(slot)); // a bind may still hold the old view
         }
-        slot = std::make_unique<Buffer>(view.cpu_base, view.buffer_size, view.buffer);
+        slot = std::make_unique<Buffer>(view.cpu_base, view.buffer_size, view.buffer,
+                                        view.device_address); // sotc: SOTC_N5_BDA (0 = none)
     }
     SotcPcRing::NoteHostBind(size, is_written);
     SotcLabels::NoteSharedTouch(); // sotc: SOTC_LABELS_HONEST: GPU work on host-served memory (L1)

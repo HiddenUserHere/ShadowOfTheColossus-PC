@@ -374,6 +374,9 @@ public:
     size_t fault_buffer_index{};
     size_t lod_feedback_index{};
     size_t bda_table_index{}; ///< sotc: SOTC_BDA: info.buffers index of the block table
+    /// sotc: SOTC_BDA: (address, size) of each buffer's block, by handle, loaded by HoistBdaBlocks.
+    /// An entry whose address Id is not valid was not hoisted (BdaAddress loads it inline).
+    boost::container::small_vector<std::pair<Id, Id>, 16> bda_blocks;
     Id physical_pointer_type_u32;
 
     Id sampler_type{};
@@ -420,6 +423,11 @@ public:
     /// sotc: SOTC_BDA. Device address (U64) and size in bytes (U32) of buffer `handle`, read from
     /// its slot of the block table.
     std::pair<Id, Id> LoadBdaBlock(u32 handle);
+    /// sotc: SOTC_BDA. Loads the block of every used BDA buffer once, in the entry block (called by
+    /// Traverse before the first block's instructions), so each invocation reads its table slots
+    /// once instead of at every access. The table is never written by the shader, so the values
+    /// hold for the whole invocation; the entry block dominates every use.
+    void HoistBdaBlocks();
     /// sotc: SOTC_BDA. Byte address (U64) of element `index` of buffer `handle` (elem_size bytes
     /// each), and whether `count` elements from `index` lie inside the block. An invalid access
     /// gets the block start as its address, so a load from it stays in memory; the caller

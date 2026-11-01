@@ -250,6 +250,13 @@ Buffer::Buffer(VAddr cpu_addr_, u64 size_bytes_, vk::Buffer borrowed_buffer)
     buffer.borrowed = true;
 }
 
+// sotc: SOTC_BDA / SOTC_N5_BDA. As the ctor above, with the device address (not owned either).
+Buffer::Buffer(VAddr cpu_addr_, u64 size_bytes_, vk::Buffer borrowed_buffer,
+               vk::DeviceAddress borrowed_address)
+    : Buffer(cpu_addr_, size_bytes_, borrowed_buffer) {
+    buffer.bda_addr = borrowed_address;
+}
+
 Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
                MemoryType mem_type_, std::string_view debug_name)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},

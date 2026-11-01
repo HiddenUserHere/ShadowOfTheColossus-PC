@@ -220,6 +220,7 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
     };
 
     IR::Block* current_block{};
+    bool entry_seen{}; // sotc: SOTC_BDA: the first block is the entry block
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Block: {
@@ -229,6 +230,10 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (!entry_seen) { // sotc: SOTC_BDA: block-table loads, once, before any other code
+                entry_seen = true;
+                ctx.HoistBdaBlocks();
+            }
             // The loop exited: the next time it starts, its budget starts over (after the
             // block's OpPhi instructions, which must come first).
             const auto reset_it = merge_counters.find(node.data.block);

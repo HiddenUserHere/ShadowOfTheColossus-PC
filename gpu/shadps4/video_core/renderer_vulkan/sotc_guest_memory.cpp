@@ -14,6 +14,7 @@
 
 #include "video_core/renderer_vulkan/sotc_guest_memory.h"
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE windows
+#include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA / SOTC_N5_BDA
 #include "video_core/renderer_vulkan/vk_instance.h"
 
 extern "C" {
@@ -42,6 +43,7 @@ struct Run {
     const u8* host_begin{}; ///< backing pointer of guest_begin when imported
     u64 base_offset{};      ///< of guest_begin in buffer
     u64 buffer_size{};      ///< sotc: size of buffer (SOTC_PC_RING=8 binds need it)
+    u64 device_address{};   ///< sotc: device address of buffer byte 0 (0 when g_bda is off)
     vk::Buffer buffer{};
     vk::DeviceMemory memory{};
 };
@@ -62,6 +64,9 @@ std::mutex g_mutex;
 bool g_pc_memory{}; ///< SOTC_PC_MEMORY=1
 bool g_ring{};      ///< SOTC_PC_RING=3, 4 or 8
 bool g_host{};      ///< sotc: SOTC_PC_RING=8: runs are imported as shader-readable buffers too
+/// sotc: SOTC_BDA / SOTC_N5_BDA: runs are imported with the device-address usage and memory flag,
+/// so the block table can address them. Only with g_host; off when the probe in ResolveView fails.
+bool g_bda{};
 
 // Stage 1.
 std::atomic<bool> g_stage1_done{};
@@ -83,12 +88,19 @@ vk::BufferUsageFlags RunUsage() {
     if (!g_host) {
         return vk::BufferUsageFlagBits::eTransferSrc;
     }
-    return vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
-           vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
-           vk::BufferUsageFlagBits::eUniformTexelBuffer |
-           vk::BufferUsageFlagBits::eStorageTexelBuffer |
-           vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eIndexBuffer |
-           vk::BufferUsageFlagBits::eIndirectBuffer;
+    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eTransferSrc |
+                                 vk::BufferUsageFlagBits::eTransferDst |
+                                 vk::BufferUsageFlagBits::eUniformBuffer |
+                                 vk::BufferUsageFlagBits::eStorageBuffer |
+                                 vk::BufferUsageFlagBits::eUniformTexelBuffer |
+                                 vk::BufferUsageFlagBits::eStorageTexelBuffer |
+                                 vk::BufferUsageFlagBits::eVertexBuffer |
+                                 vk::BufferUsageFlagBits::eIndexBuffer |
+                                 vk::BufferUsageFlagBits::eIndirectBuffer;
+    if (g_bda) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    return usage;
 }
 
 const unsigned char* Backing(uint64_t guest) {
@@ -206,6 +218,18 @@ View ResolveView() {
               vk::ExternalMemoryFeatureFlagBits::eImportable)) {
         g_reason = "host allocations cannot be imported as transfer-source buffers";
         return g_view;
+    }
+    // sotc: SOTC_BDA / SOTC_N5_BDA: the runs take the device-address usage only when the device
+    // can give addresses (the feature is probed here; the import itself is checked per run in
+    // ImportRun). Without it the runs are imported as before and the table stays off for them.
+    if (g_bda) {
+        const auto features =
+            physical.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan12Features>();
+        if (features.get<vk::PhysicalDeviceVulkan12Features>().bufferDeviceAddress != VK_TRUE) {
+            g_bda = false;
+            std::fprintf(stderr, "SOTC BDA: bufferDeviceAddress missing, guest runs without "
+                                 "device addresses (logged once)\n");
+        }
     }
     // sotc: SOTC_PC_RING=8: the shader usages must be importable too.
     if (g_host) {
@@ -337,7 +361,15 @@ bool ImportRun(uint64_t guest_begin, uint64_t guest_end, const u8* host_begin) {
 
     const vk::Device device = g_instance->GetDevice();
     const vk::DeviceSize size = stop - start;
+    // sotc: SOTC_BDA / SOTC_N5_BDA: a buffer with the device-address usage needs memory allocated
+    // with the device-address flag (VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT), chained to the import.
+    // Both are core in Vulkan 1.2 (bufferDeviceAddress); the import itself is what the drivers
+    // may refuse (checked below: a refused run is not imported, so its binds take the normal path).
+    const vk::MemoryAllocateFlagsInfo flags_info{
+        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+    };
     const vk::ImportMemoryHostPointerInfoEXT import_info{
+        .pNext = g_bda ? &flags_info : nullptr,
         .handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
         .pHostPointer = reinterpret_cast<void*>(start),
     };
@@ -367,12 +399,25 @@ bool ImportRun(uint64_t guest_begin, uint64_t guest_end, const u8* host_begin) {
         RefuseRange("buffer over the imported memory");
         return false;
     }
+    // sotc: SOTC_BDA / SOTC_N5_BDA: the address of the run's buffer. A run without one would
+    // read as zero through the block table, so it is refused instead.
+    u64 device_address = 0;
+    if (g_bda) {
+        device_address = device.getBufferAddress(vk::BufferDeviceAddressInfo{.buffer = buffer});
+        if (device_address == 0) {
+            device.destroyBuffer(buffer);
+            device.freeMemory(memory);
+            RefuseRange("the imported buffer has no device address");
+            return false;
+        }
+    }
     Run run;
     run.guest_begin = guest_begin;
     run.guest_end = guest_end;
     run.host_begin = host_begin;
     run.base_offset = host - start;
     run.buffer_size = size;
+    run.device_address = device_address;
     run.buffer = buffer;
     run.memory = memory;
     g_runs.emplace(guest_begin, run);
@@ -390,6 +435,8 @@ void Init(const Instance& instance) {
     g_ring = (pc_ring && (pc_ring[0] == '3' || pc_ring[0] == '4' || pc_ring[0] == '8')) ||
              SotcNative::On();
     g_host = (pc_ring && pc_ring[0] == '8') || SotcNative::On(); // sotc: host arena binds
+    // sotc: the device-address runs serve the block table of the host binds (vk_bda_table.h).
+    g_bda = g_host && BdaTableMode(instance) != 0;
     if (instance.IsExternalMemoryHostEnabled()) {
         g_instance = &instance;
     }
@@ -488,6 +535,7 @@ bool LookupGuestView(uint64_t guest_addr, uint64_t size, GuestView* out) {
     out->buffer = run->buffer;
     out->offset = run->base_offset + (guest_addr - run->guest_begin);
     out->buffer_size = run->buffer_size;
+    out->device_address = run->device_address;
     // The guest address of buffer byte 0: the same for every bind of this run.
     out->cpu_base = guest_addr - out->offset;
     return true;

@@ -5403,6 +5403,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     const u64 alignment = instance.StorageMinAlignment();
     // sotc: SOTC_BDA: a stage compiled with the block table gets one per draw (vk_bda_table.h).
     const bool bda_stage = stage.HasBdaBlockTable();
+    // sotc: SOTC_N5_BDA (vk_bda_table.h): 1 drops the descriptors of the slots the table serves,
+    // 2 keeps them and checks each table slot against its descriptor's buffer.
+    static const u32 n5_bda = BdaN5Mode();
     if (bda_stage) {
         bda_table.Begin(static_cast<u32>(stage.buffers.size()),
                         buffer_cache.GetStreamBuffer().BufferDeviceAddress());
@@ -5474,9 +5477,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
             } else if (desc.buffer_type == Shader::BufferType::BdaBlockTable) {
                 // sotc: SOTC_BDA: the stage's block table, last of its buffers, after every guest slot.
+                // Dirty check: when the same words were uploaded earlier in this stream-buffer
+                // generation, that copy is still in place and is used again (BdaTable::Lookup).
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 table_bytes = static_cast<u32>(bda_table.Bytes());
-                const u64 offset = vk_buffer.Copy(bda_table.Words(), table_bytes, alignment);
+                u64 offset{};
+                if (!bda_table.Lookup(stage.pgm_hash, buffer_cache.StreamGeneration(), &offset)) {
+                    offset = vk_buffer.Copy(bda_table.Words(), table_bytes, alignment);
+                    // The generation after the copy: the copy may have wrapped the ring.
+                    bda_table.Store(stage.pgm_hash, buffer_cache.StreamGeneration(), offset);
+                }
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, table_bytes);
             } else {
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
@@ -5670,12 +5680,30 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 stage.pgm_hash);
                 }
                 push_data.AddOffset(binding.buffer, adjust);
+                // sotc: SOTC_BDA: a slot the table serves is a guest buffer that is neither texel nor
+                // coherent (DefineBuffers emits no descriptor for it, so the shader never reads one).
+                const bool bda_slot =
+                    bda_stage && !desc.is_formatted && desc.GetSharp(stage).mtype != 3;
                 if (bda_stage) { // sotc: SOTC_BDA: exact offset and size, not the aligned ones
-                    bda_table.SetBlock(buf_index,
-                                       buffer->HasBufferDeviceAddress() ? buffer->BufferDeviceAddress() : 0,
+                    const bool has_address = buffer->HasBufferDeviceAddress();
+                    bda_table.SetBlock(buf_index, has_address ? buffer->BufferDeviceAddress() : 0,
                                        buffer->SizeBytes(), offset, size);
+                    if (n5_bda == 2 && bda_slot && has_address) {
+                        // Verify: the address the table gives must be the descriptor buffer's device
+                        // address plus the offset the descriptor would have started at.
+                        const vk::DeviceAddress descriptor_base = instance.GetDevice().getBufferAddress(
+                            vk::BufferDeviceAddressInfo{.buffer = buffer->Handle()});
+                        bda_table.CheckSlot(buf_index, descriptor_base + offset);
+                    }
                 }
-                buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
+                if (n5_bda == 1 && bda_slot) {
+                    // sotc: SOTC_N5_BDA=1: the block table serves this slot, so its descriptor is a
+                    // null placeholder. The write stays (the layout is unchanged) and the buffer
+                    // stays in bound_buffers, so barriers and write marks still cover it.
+                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                } else {
+                    buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
+                }
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
                 if (rb_mirror_collect && desc.is_written && SotcRbHost::Covers(vbase, size)) {
                     rb_mirrors.push_back({buffer->Handle(), offset, vbase, size}); // sotc: SOTC_RB_HOST=2

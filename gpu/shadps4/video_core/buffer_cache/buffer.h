@@ -102,6 +102,10 @@ struct Buffer {
                     MemoryType mem_type, std::string_view debug_name = "");
     /// sotc: SOTC_PC_RING=8: a view of an imported buffer owned elsewhere (not created, not destroyed).
     explicit Buffer(VAddr cpu_addr_, u64 size_bytes_, vk::Buffer borrowed_buffer);
+    /// sotc: SOTC_BDA / SOTC_N5_BDA: as above, with the device address of the imported buffer's
+    /// byte 0 (0 = none). The address is not owned either.
+    explicit Buffer(VAddr cpu_addr_, u64 size_bytes_, vk::Buffer borrowed_buffer,
+                    vk::DeviceAddress borrowed_address);
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
