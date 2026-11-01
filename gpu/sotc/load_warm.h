@@ -64,6 +64,30 @@ void NoteTexture(const void* blob, std::size_t size) noexcept;
 /// texture file with another size is ignored instead of fixing the size for the process.
 void SetTextureBlobSize(std::size_t size) noexcept;
 
+// SOTC_LOAD_STREAM=1 (off by default; 2 = verify, see BufferCache::DrainRange). Not the learned
+// set: the draw thread keeps, for the whole session, the guest ranges it bound (NoteBind), and in
+// its idle gaps re-syncs the ones the CPU wrote since their last sync, so the next bind finds them
+// clean. The copies of these early syncs go to the copy threads (SOTC_LOAD_STREAM makes
+// AsyncUpload's pool exist, see async_upload.h). Independent of SOTC_LOAD_WARM: its own switch,
+// read once.
+bool StreamEnabled() noexcept;
+/// SOTC_LOAD_STREAM=2.
+bool StreamVerify() noexcept;
+
+/// Draw thread, idle. Calls drain(addr, size) for the session's bound ranges, round robin, for up
+/// to `budget_ns` and at most kStreamFrameCapBytes (SOTC_LOAD_STREAM_MB, default 16) of uploads
+/// per presented frame (`frame`), and at most kStreamCallsPerGap calls per idle gap (a clean range
+/// costs a tracker look only). Returns the calls made (0: nothing to do now). drain returns the
+/// bytes it uploaded.
+unsigned StreamIdle(std::uint64_t budget_ns, std::uint64_t frame, WarmFn drain, StopFn stop,
+                    void* ctx);
+/// Counters of SOTC_LOAD_STREAM, printed with the warm's 5 s report. NoteStreamAsync: bytes an early
+/// sync (drain or warm) handed to the copy threads. NoteStreamBind: bytes a real bind copied on the
+/// draw thread, and how long that sync took. NoteStreamVerifyBad: a =2 check failed.
+void NoteStreamAsync(std::uint64_t bytes) noexcept;
+void NoteStreamBind(std::uint64_t bytes, std::uint64_t ns) noexcept;
+void NoteStreamVerifyBad() noexcept;
+
 /// True while a warm queue has work (cheap, relaxed): lets the idle branch skip the call.
 bool HasWork() noexcept;
 

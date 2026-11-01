@@ -45,6 +45,25 @@ const bool kEnabled = [] {
     return v && v[0] == '1';
 }();
 
+// sotc: SOTC_LOAD_STREAM (see load_warm.h). Its own switch, read once.
+const bool kStreamEnabled = [] {
+    const char* v = std::getenv("SOTC_LOAD_STREAM");
+    return v && (v[0] == '1' || v[0] == '2');
+}();
+const bool kStreamVerify = [] {
+    const char* v = std::getenv("SOTC_LOAD_STREAM");
+    return v && v[0] == '2';
+}();
+// Uploads of the idle drain per presented frame (SOTC_LOAD_STREAM_MB, 1-256, default 16).
+const std::uint64_t kStreamFrameCapBytes = [] {
+    const char* v = std::getenv("SOTC_LOAD_STREAM_MB");
+    const long long mb = v ? std::atoll(v) : 16;
+    return static_cast<std::uint64_t>(std::clamp<long long>(mb, 1, 256)) << 20;
+}();
+constexpr std::uint64_t kStreamPieceShift = 20;   // ranges are kept in 1 MiB pieces
+constexpr std::size_t kStreamMaxPieces = 32768;   // 32 GiB of pieces per thread, a hard cap
+constexpr unsigned kStreamCallsPerGap = 64;       // clean checks per idle gap, at most
+
 std::uint64_t Now() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now().time_since_epoch())
@@ -236,6 +255,23 @@ std::atomic<std::uint64_t> s_tex_warmed{0};
 std::atomic<std::uint64_t> s_noted{0}, s_warm_runs{0}, s_warm_bytes{0}, s_passes{0}, s_events{0},
     s_uploaded{0}, s_stops{0};
 
+// sotc: SOTC_LOAD_STREAM state. The draw thread only (NoteBind and StreamIdle), so no lock.
+// t_live_addrs: each bound 1 MiB piece once, in the order first bound; t_live_size: its size
+// (the last bind of that address), so a grown bind is seen again by the drain.
+thread_local std::vector<std::uint64_t> t_live_addrs;
+thread_local std::unordered_map<std::uint64_t, std::uint64_t> t_live_size;
+thread_local std::size_t t_live_pos = 0;
+thread_local std::uint64_t t_stream_frame = ~0ULL;
+thread_local std::uint64_t t_stream_frame_bytes = 0;
+struct RecentStream {
+    std::uint64_t addr = 0;
+    std::uint64_t size = 0;
+};
+constexpr std::size_t kRecentStream = 1024;
+thread_local RecentStream* t_recent_stream = nullptr;
+std::atomic<std::uint64_t> s_stream_drained{0}, s_stream_calls{0}, s_stream_drain_uploads{0},
+    s_stream_async{0}, s_stream_bind{0}, s_stream_bind_max_ns{0}, s_stream_verify_bad{0};
+
 void WriterLoop() {
     Common::SetCurrentThreadName("sotc:LoadWarmSave");
     State& s = S();
@@ -282,6 +318,18 @@ void WriterLoop() {
                      s_uploaded.load() / 1048576.0,
                      static_cast<unsigned long long>(s_stops.load()),
                      static_cast<unsigned long long>(s_tex_warmed.load()));
+        if (kStreamEnabled) {
+            std::fprintf(stderr,
+                         "SOTC LOAD STREAM: %.0f MiB drained in %llu uploads (%llu calls), %.0f MiB "
+                         "to the copy threads, %.0f MiB copied by binds on the draw thread (max "
+                         "bind sync %.1f ms), verify mismatches %llu\n",
+                         s_stream_drained.load() / 1048576.0,
+                         static_cast<unsigned long long>(s_stream_drain_uploads.load()),
+                         static_cast<unsigned long long>(s_stream_calls.load()),
+                         s_stream_async.load() / 1048576.0, s_stream_bind.load() / 1048576.0,
+                         s_stream_bind_max_ns.load() / 1e6,
+                         static_cast<unsigned long long>(s_stream_verify_bad.load()));
+        }
     }
 }
 
@@ -339,6 +387,14 @@ bool HasWork() noexcept {
 
 bool InWarm() noexcept {
     return t_in_warm != 0;
+}
+
+bool StreamEnabled() noexcept {
+    return kStreamEnabled;
+}
+
+bool StreamVerify() noexcept {
+    return kStreamVerify;
 }
 
 WarmScope::WarmScope() noexcept {
@@ -401,7 +457,44 @@ void OnEvent(const char* name) {
                  key.c_str(), s.queue.size(), s.queue.size() * 64.0 / 1024.0, s.tex_queue.size());
 }
 
+namespace {
+// sotc: SOTC_LOAD_STREAM: records the 1 MiB pieces of a bound range on the draw thread. A
+// direct-mapped cache of the last ranges skips the ones a loop of binds repeats.
+void NoteStreamRange(std::uint64_t addr, std::uint64_t size) noexcept {
+    if (!t_recent_stream) {
+        t_recent_stream = new RecentStream[kRecentStream]{};
+    }
+    RecentStream& recent =
+        t_recent_stream[((addr >> 8) ^ (addr >> 19) ^ size) & (kRecentStream - 1)];
+    if (recent.addr == addr && recent.size == size) {
+        return;
+    }
+    recent = RecentStream{addr, size};
+    const std::uint64_t piece = std::uint64_t{1} << kStreamPieceShift;
+    const std::uint64_t first = addr & ~(piece - 1);
+    const std::uint64_t end = addr + size;
+    for (std::uint64_t p = first; p < end; p += piece) {
+        // The part of this piece the bind covers: starts at the bind's address or at the piece.
+        const std::uint64_t lo = std::max(addr, p);
+        const std::uint64_t len = std::min(end, p + piece) - lo;
+        auto [it, inserted] = t_live_size.try_emplace(lo, len);
+        if (inserted) {
+            if (t_live_addrs.size() >= kStreamMaxPieces) {
+                t_live_size.erase(it);
+                return;
+            }
+            t_live_addrs.push_back(lo);
+        } else if (len > it->second) {
+            it->second = len;
+        }
+    }
+}
+} // namespace
+
 void NoteBind(std::uint64_t addr, std::uint64_t size) noexcept {
+    if (kStreamEnabled && !t_in_warm && size != 0) {
+        NoteStreamRange(addr, size);
+    }
     if (!kEnabled || t_in_warm || size == 0) {
         return;
     }
@@ -602,6 +695,61 @@ unsigned WarmIdle(std::uint64_t budget_ns, std::uint64_t frame, WarmFn warm, Tex
             return runs;
         }
     }
+}
+
+unsigned StreamIdle(std::uint64_t budget_ns, std::uint64_t frame, WarmFn drain, StopFn stop,
+                    void* ctx) {
+    if (!kStreamEnabled || t_live_addrs.empty()) {
+        return 0;
+    }
+    if (frame != t_stream_frame) {
+        t_stream_frame = frame;
+        t_stream_frame_bytes = 0;
+    }
+    if (t_stream_frame_bytes >= kStreamFrameCapBytes) {
+        return 0; // this frame's share is used
+    }
+    const std::uint64_t deadline = Now() + budget_ns;
+    unsigned calls = 0;
+    while (calls < kStreamCallsPerGap) {
+        if (t_live_pos >= t_live_addrs.size()) {
+            t_live_pos = 0; // the next pass starts over; a gap never spans two passes
+        }
+        const std::uint64_t addr = t_live_addrs[t_live_pos++];
+        const std::uint64_t size = t_live_size[addr];
+        ++calls;
+        s_stream_calls.fetch_add(1, std::memory_order_relaxed);
+        std::uint64_t uploaded;
+        {
+            WarmScope scope;
+            uploaded = drain(ctx, addr, size);
+        }
+        if (uploaded != 0) {
+            t_stream_frame_bytes += uploaded;
+            s_stream_drained.fetch_add(uploaded, std::memory_order_relaxed);
+            s_stream_drain_uploads.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (stop(ctx) || Now() >= deadline || t_stream_frame_bytes >= kStreamFrameCapBytes) {
+            break;
+        }
+    }
+    return calls;
+}
+
+void NoteStreamAsync(std::uint64_t bytes) noexcept {
+    s_stream_async.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void NoteStreamBind(std::uint64_t bytes, std::uint64_t ns) noexcept {
+    s_stream_bind.fetch_add(bytes, std::memory_order_relaxed);
+    std::uint64_t cur = s_stream_bind_max_ns.load(std::memory_order_relaxed);
+    while (ns > cur &&
+           !s_stream_bind_max_ns.compare_exchange_weak(cur, ns, std::memory_order_relaxed)) {
+    }
+}
+
+void NoteStreamVerifyBad() noexcept {
+    s_stream_verify_bad.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace SotcLoadWarm

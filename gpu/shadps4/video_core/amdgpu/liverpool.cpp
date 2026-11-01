@@ -656,6 +656,30 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                     continue;
                 }
             }
+            // sotc: SOTC_LOAD_STREAM: idle drain of the session's bound ranges (load_warm.h).
+            if (SotcLoadWarm::StreamEnabled() && rasterizer) {
+                struct StreamCtx {
+                    Liverpool* self;
+                    u64 tail;
+                } sctx{this, tail};
+                const unsigned calls = SotcLoadWarm::StreamIdle(
+                    1'000'000, // 1 ms
+                    SotcStats::flip_count.load(std::memory_order_relaxed),
+                    [](void* c, std::uint64_t addr, std::uint64_t size) -> std::uint64_t {
+                        return static_cast<StreamCtx*>(c)
+                            ->self->rasterizer->GetBufferCache()
+                            .DrainRange(addr, size);
+                    },
+                    [](void* c) {
+                        auto* w = static_cast<StreamCtx*>(c);
+                        return w->self->back_head.load(std::memory_order_acquire) != w->tail ||
+                               w->self->num_commands.load(std::memory_order_acquire) != 0;
+                    },
+                    &sctx);
+                if (calls != 0) {
+                    continue;
+                }
+            }
             // sotc: SOTC_FPS_LEAN: the idle time is read only for the reports and the trace.
             const bool idle_timed = SotcStats::kFpsTimers || SotcTrace::kOn;
             const u64 idle_start = idle_timed ? SotcStats::NowNs() : 0;

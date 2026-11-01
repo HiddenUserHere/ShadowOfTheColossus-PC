@@ -71,6 +71,20 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 thread_local uint32_t tl_sync_reason = 0;
 // sotc: bytes this thread's buffer syncs uploaded (SOTC_LOAD_WARM: WarmRange returns its share).
 thread_local uint64_t tl_sync_bytes = 0;
+// sotc: SOTC_LOAD_STREAM: > 0 while an early sync (WarmRange, DrainRange) runs on this thread. Its
+// copies may go to the copy threads, and its bytes count as early (not as draw-thread bind bytes).
+// Not tl_sync_reason: that is set only while SOTC_TRACE is on.
+thread_local uint32_t tl_early_sync = 0;
+struct EarlySync {
+    EarlySync() noexcept {
+        ++tl_early_sync;
+    }
+    ~EarlySync() {
+        --tl_early_sync;
+    }
+    EarlySync(const EarlySync&) = delete;
+    EarlySync& operator=(const EarlySync&) = delete;
+};
 struct SyncReason {
     uint32_t prev = 0;
     bool active = false;
@@ -5891,9 +5905,31 @@ u64 BufferCache::WarmRange(VAddr addr, u64 size) {
         return 0;
     }
     const SyncReason sync_reason{5};
+    const EarlySync early;
     const u64 before = tl_sync_bytes;
     (void)ObtainBuffer(addr, static_cast<u32>(size), false);
     return tl_sync_bytes - before; // bytes uploaded: 0 when the range was already clean
+}
+
+u64 BufferCache::DrainRange(VAddr addr, u64 size) {
+    if (size == 0 || size > u64{64} << 20 || !memory->IsValidMapping(addr, size)) {
+        return 0;
+    }
+    // Read-only look first: a range the CPU did not write since its last sync costs only this.
+    if (memory_tracker->IsSyncClean(addr, size, false)) {
+        return 0;
+    }
+    const SyncReason sync_reason{6};
+    const EarlySync early;
+    const u64 before = tl_sync_bytes;
+    (void)ObtainBuffer(addr, static_cast<u32>(size), false);
+    const u64 uploaded = tl_sync_bytes - before;
+    // sotc: SOTC_LOAD_STREAM=2 verify: after the sync the range must be clean. A guest write racing
+    // the sync can make this fail, so it is a count to read, not proof of a wrong copy.
+    if (SotcLoadWarm::StreamVerify() && !memory_tracker->IsSyncClean(addr, size, false)) {
+        SotcLoadWarm::NoteStreamVerifyBad();
+    }
+    return uploaded;
 }
 
 namespace {
@@ -6015,9 +6051,23 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         SynchronizeMemory(arena, device_addr + mark_offset, mark_size, true, false);
         SynchronizeMemory(arena, device_addr, size, false, false);
     } else {
-        // sotc: SOTC_TRACE reason 1 (normal bind), or the warm's 5 when WarmRange called it.
-        const SyncReason sync_reason{tl_sync_reason == 5 ? 5u : 1u};
+        // sotc: SOTC_TRACE reason 1 (normal bind), or the warm's 5 / the drain's 6 when called so.
+        const SyncReason sync_reason{(tl_sync_reason == 5 || tl_sync_reason == 6)
+                                         ? tl_sync_reason
+                                         : 1u};
+        // sotc: SOTC_LOAD_STREAM: a bind's own sync is timed and counted (draw-thread bind bytes).
+        const bool stream_bind = SotcLoadWarm::StreamEnabled() && tl_early_sync == 0;
+        const u64 bind_bytes_before = tl_sync_bytes;
+        const auto bind_t0 = stream_bind ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
         SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+        if (stream_bind) {
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - bind_t0)
+                                .count();
+            SotcLoadWarm::NoteStreamBind(tl_sync_bytes - bind_bytes_before,
+                                         static_cast<std::uint64_t>(ns));
+        }
     }
     if (memo_on) { // sotc: SOTC_GEN_BIND, store (or void the slot) after the sync
         if (verify_hit && tl_sync_bytes != verify_bytes_before) {
@@ -8130,11 +8180,18 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         // (async_upload.h); the staging-to-arena copy is recorded now, and its submit waits for
         // them. The pages of the copies must be write-protected now, so that the write fence
         // sees every guest write to them; hot pages the tracker leaves writable stay here.
+        // sotc: SOTC_LOAD_STREAM: an early sync may use the pool too (AsyncUpload::StreamEnabled).
         if (auto* async_upload = AsyncUpload::Get(); async_upload &&
-                                                     AsyncUpload::BuffersEnabled() &&
+                                                     (AsyncUpload::BuffersEnabled() ||
+                                                      (tl_early_sync != 0 &&
+                                                       AsyncUpload::StreamEnabled())) &&
                                                      total_size_bytes >= async_upload->MinBytes()) {
             SotcTrace::Scope trace_async{"sync async", total_size_bytes}; // sotc: SOTC_TRACE
+            const u64 async_bytes = total_size_bytes;
             if (TryUploadAsync(*async_upload, arena, copies, total_size_bytes)) { // sotc: may keep a rest in copies
+                if (tl_early_sync != 0) {
+                    SotcLoadWarm::NoteStreamAsync(async_bytes - total_size_bytes);
+                }
                 return is_texel_buffer && !is_written
                            ? SynchronizeMemoryFromImage(arena, device_addr, size)
                            : false;

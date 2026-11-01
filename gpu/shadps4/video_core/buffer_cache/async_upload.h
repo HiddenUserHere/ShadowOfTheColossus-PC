@@ -71,6 +71,11 @@ public:
     static bool BuffersEnabled() noexcept {
         return buffers_enabled;
     }
+    /// sotc: SOTC_LOAD_STREAM=1|2: the pool exists for early uploads (BufferCache::DrainRange,
+    /// WarmRange) even when SOTC_ASYNC_UPLOAD is off; other buffer uploads do not use it then.
+    static bool StreamEnabled() noexcept {
+        return stream_enabled;
+    }
     /// SOTC_ASYNC_TEXTURE_UPLOAD=1: the guest copies of texture uploads use the pool.
     static bool TexturesEnabled() noexcept {
         return textures_enabled;
@@ -134,6 +139,7 @@ private:
     static inline bool textures_enabled{};
     static inline bool fence_pieces{};
     static inline bool stage_cached{};
+    static inline bool stream_enabled{};
     static inline u64 job_bytes{}; ///< sotc: SOTC_ASYNC_JOB_MB in bytes (0: no split)
 
     u64 min_bytes;

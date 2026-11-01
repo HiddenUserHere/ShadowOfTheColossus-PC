@@ -53,9 +53,12 @@ void AsyncUpload::Init() {
     // sotc: SOTC_ASYNC_JOB_MB=<n>: jobs above n MiB are split into jobs of n MiB (Queue).
     const char* stage_env = std::getenv("SOTC_ASYNC_STAGE_CACHED");
     stage_cached = stage_env && stage_env[0] == '1';
+    // sotc: SOTC_LOAD_STREAM (load_warm.h): early uploads use the pool.
+    const char* stream_env = std::getenv("SOTC_LOAD_STREAM");
+    stream_enabled = stream_env && (stream_env[0] == '1' || stream_env[0] == '2');
     const char* job_env = std::getenv("SOTC_ASYNC_JOB_MB");
     job_bytes = job_env ? std::strtoull(job_env, nullptr, 10) << 20 : 0;
-    if ((!buffers_enabled && !textures_enabled) || Get()) {
+    if ((!buffers_enabled && !textures_enabled && !stream_enabled) || Get()) {
         return;
     }
     // SOTC_ASYNC_UPLOAD_THREADS: copy threads, default 3 (1-8).

@@ -271,6 +271,14 @@ public:
     /// Returns the bytes uploaded (0: already clean).
     u64 WarmRange(VAddr addr, u64 size);
 
+    /// sotc: SOTC_LOAD_STREAM: the early-upload entry point. Syncs [addr, addr + size) (at most
+    /// 64 MiB, mapped) to the arena ahead of a bind: nothing when the range is clean (one tracker
+    /// look), else residency plus the sync, with the CPU-dirty bytes copied by the copy threads
+    /// when SOTC_LOAD_STREAM is on (async_upload.h). The draw thread records the staging-to-arena
+    /// copy; the next submit waits for the copy threads (WaitUpTo). Returns the bytes uploaded.
+    /// Draw thread only (load_warm.h StreamIdle).
+    u64 DrainRange(VAddr addr, u64 size);
+
     /// sotc: the arena holding [addr, addr + size) when the whole range is resident in one
     /// arena, else nullptr.
     const Buffer* ResidentArena(VAddr addr, u64 size) const;
