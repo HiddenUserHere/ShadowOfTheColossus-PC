@@ -28,6 +28,9 @@ struct Counters {
     std::atomic<u64> ops{};                                 ///< commands replayed by the workers
     std::atomic<u64> worker_ns{};                           ///< worker time in Record
     std::atomic<u64> owner_wait_ns{};                       ///< owner time waiting for a worker
+    std::atomic<u64> would{};                               ///< mode 2: passes that would go parallel
+    std::atomic<u64> would_draws{};                         ///< mode 2: draws in those passes
+    std::atomic<u64> would_blocks{};                        ///< mode 2: command blocks in those passes
 };
 Counters cnt;
 
@@ -45,12 +48,13 @@ u64 Take(std::atomic<u64>& a) {
     return a.exchange(0, std::memory_order_relaxed);
 }
 
-/// SOTC_N5_PARALLEL=1 with its prerequisites. Read once; a missing prerequisite is logged once.
-bool SwitchOn() {
-    static const bool value = [] {
+/// SOTC_N5_PARALLEL=1 (parallel) or 2 (dry run) with its prerequisites. Read once; a missing
+/// prerequisite is logged once and gives mode 0.
+int SwitchOn() {
+    static const int value = [] {
         const char* on = std::getenv("SOTC_N5_PARALLEL");
-        if (!on || on[0] != '1') {
-            return false;
+        if (!on || (on[0] != '1' && on[0] != '2')) {
+            return 0;
         }
         const auto flag = [](const char* name, const char* want) {
             const char* v = std::getenv(name);
@@ -64,16 +68,34 @@ bool SwitchOn() {
             LOG_WARNING(Render,
                         "SOTC_N5_PARALLEL: off, needs SOTC_NATIVE=1, SOTC_N5_GRAPH=1, "
                         "SOTC_PARALLEL_RECORD=1 and SOTC_PASS_SEC=1");
+            return 0;
         }
-        return ok;
+        LOG_INFO(Render, "SOTC_N5_PARALLEL={}: {}", on[0],
+                 on[0] == '2' ? "dry run, passes are counted as would-parallel and recorded serially"
+                              : "passes are recorded by the pass worker, counters on");
+        return on[0] - '0';
     }();
     return value;
 }
 
 } // namespace
 
-bool Enabled() {
+int Mode() {
     return SwitchOn();
+}
+
+bool Enabled() {
+    return SwitchOn() != 0;
+}
+
+bool Dry() {
+    return SwitchOn() == 2;
+}
+
+void NoteWouldParallel(u64 draws, u64 blocks) noexcept {
+    cnt.would.fetch_add(1, std::memory_order_relaxed);
+    cnt.would_draws.fetch_add(draws, std::memory_order_relaxed);
+    cnt.would_blocks.fetch_add(blocks, std::memory_order_relaxed);
 }
 
 void NoteFallback(Fallback reason, u8 block) noexcept {
@@ -116,15 +138,20 @@ void Report(std::string& out, double seconds) {
     const u64 ops = Take(cnt.ops);
     const u64 worker_ns = Take(cnt.worker_ns);
     const u64 owner_wait_ns = Take(cnt.owner_wait_ns);
-    if (parallel == 0 && owner == 0) {
+    const u64 would = Take(cnt.would);
+    const u64 would_draws = Take(cnt.would_draws);
+    const u64 would_blocks = Take(cnt.would_blocks);
+    if (parallel == 0 && owner == 0 && would == 0) {
         return;
     }
+    const bool dry = Dry();
 
     char line[1024];
     int n = std::snprintf(
         line, sizeof(line),
-        "N5 parallel (SOTC_N5_PARALLEL=1): passes secondary %llu, owner %llu (",
-        static_cast<unsigned long long>(parallel), static_cast<unsigned long long>(owner));
+        "N5 parallel (SOTC_N5_PARALLEL=%d%s): passes secondary %llu, owner %llu (",
+        dry ? 2 : 1, dry ? ", dry run" : "", static_cast<unsigned long long>(parallel),
+        static_cast<unsigned long long>(owner));
     for (size_t i = 0; i < fallback.size() && n > 0 && n < int(sizeof(line)); ++i) {
         n += std::snprintf(line + n, sizeof(line) - n, "%s%s %llu", i ? ", " : "",
                            kFallbackNames[i], static_cast<unsigned long long>(fallback[i]));
@@ -142,7 +169,19 @@ void Report(std::string& out, double seconds) {
     const double ops_per_job = jobs ? static_cast<double>(ops) / static_cast<double>(jobs) : 0.0;
     const double worker_ms_per_job =
         jobs ? static_cast<double>(worker_ns) / 1e6 / static_cast<double>(jobs) : 0.0;
-    if (n > 0 && n < int(sizeof(line))) {
+    if (dry) {
+        // Mode 2: nothing ran on a worker; would-parallel passes are the owner's, recorded serially
+        const double per_pass =
+            would ? static_cast<double>(would_draws) / static_cast<double>(would) : 0.0;
+        if (n > 0 && n < int(sizeof(line))) {
+            std::snprintf(line + n, sizeof(line) - n,
+                          "| would parallel %llu passes (%.1f/s, draws %llu, %.1f draws/pass, blocks "
+                          "%llu), workers 0\n",
+                          static_cast<unsigned long long>(would), static_cast<double>(would) / sec,
+                          static_cast<unsigned long long>(would_draws), per_pass,
+                          static_cast<unsigned long long>(would_blocks));
+        }
+    } else if (n > 0 && n < int(sizeof(line))) {
         std::snprintf(line + n, sizeof(line) - n,
                       "| jobs %llu, ops/job %.1f, worker %.3f ms/job (%.2f%% of 1 worker), owner "
                       "wait %.3f ms/s, workers 1\n",

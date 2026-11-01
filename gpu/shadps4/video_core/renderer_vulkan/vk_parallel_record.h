@@ -33,9 +33,17 @@ enum class Fallback : u8 {
     Count,
 };
 
-/// SOTC_N5_PARALLEL=1, with SOTC_NATIVE on, SOTC_N5_GRAPH set, SOTC_PARALLEL_RECORD=1 and
-/// SOTC_PASS_SEC=1 (the pass secondaries). Read once; logs once which prerequisite is missing.
+/// SOTC_N5_PARALLEL=1 (parallel) or 2 (dry run), with SOTC_NATIVE on, SOTC_N5_GRAPH set,
+/// SOTC_PARALLEL_RECORD=1 and SOTC_PASS_SEC=1 (the pass secondaries). Read once; logs once which
+/// prerequisite is missing. Mode 0 when off or when a prerequisite is missing.
+int Mode();
+
+/// Mode() != 0: the counters and the clock reads of the counted paths are on.
 bool Enabled();
+
+/// Mode 2: every pass runs the parallel checks and is counted as would-parallel, then is recorded
+/// on the owner as before (nothing goes to a worker).
+bool Dry();
 
 /// Owner: a pass that was not recorded on a secondary, and why. block: the BlockCategory index of
 /// the blocking command when reason is ScanBlock, otherwise ignored.
@@ -43,6 +51,10 @@ void NoteFallback(Fallback reason, u8 block = 0xFF) noexcept;
 
 /// Owner: a pass handed to a worker.
 void NotePassParallel() noexcept;
+
+/// Owner, mode 2: a pass that passed every check; draws and blocks are its draw and command
+/// block counts (what a worker would have recorded).
+void NoteWouldParallel(u64 draws, u64 blocks) noexcept;
 
 /// Worker: one pass recorded; ops is the number of commands replayed (state entries included).
 void NoteWorkerJob(u64 ops, u64 ns) noexcept;

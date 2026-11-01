@@ -976,6 +976,7 @@ private:
         ParallelRecord::Fallback reason{ParallelRecord::Fallback::ScanBlock};
         u8 block{0xFF};
         u32 draws{};
+        u32 blocks{}; ///< sotc: N5 mode 2, the command blocks of the pass (state and draws)
         Chunk* end_chunk{};
         u32 end_pos{};
         std::vector<Chunk*> chunks; ///< the chunks the pass spans, the first one holding BeginRendering
@@ -1258,6 +1259,7 @@ bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& 
             scan.block = static_cast<u8>(h->category);
             return true;
         }
+        ++scan.blocks;
         p += h->size;
     }
 }
@@ -1296,6 +1298,14 @@ bool PassSecondary::TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::st
         if (counted) {
             ParallelRecord::NoteFallback(ParallelRecord::Fallback::FewDraws);
         }
+        return false;
+    }
+
+    // sotc: SOTC_N5_PARALLEL=2 (dry run): the pass passed every check of the parallel path. It is
+    // counted and left to the owner, which records it serially as in mode 0. The scan read the
+    // blocks only, so nothing is consumed. The BeginRendering is not marked secondary.
+    if (ParallelRecord::Dry()) {
+        ParallelRecord::NoteWouldParallel(scan.draws, scan.blocks);
         return false;
     }
 
