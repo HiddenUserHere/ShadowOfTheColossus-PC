@@ -1471,7 +1471,8 @@ struct SignalImpl : public PageManager::Impl {
             // sotc: SOTC_VERIFY (verify.h). The native coverage oracle: a write fault outside every
             // host-shared window is pending until the next submit (an announce clears it). Also the
             // last-write record of the range log. Off unless the native verify mode or SOTC_VERIFY is on.
-            if (SotcNative::Verify() || SotcVerify::VerifyAll()) {
+            // The command processor's own writes (labels, fences) are GPU writes, not the engine's.
+            if (!is_gpu_thread && (SotcNative::Verify() || SotcVerify::VerifyAll())) {
                 SotcVerify::NoteWriteFault(addr, size,
                                            reinterpret_cast<uint64_t>(Common::GetRip(context)));
             }
