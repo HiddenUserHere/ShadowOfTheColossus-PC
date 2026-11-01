@@ -17,6 +17,7 @@
 #include "../../bbgpu.h"
 #include "../hooks.h"
 #include "native.h"
+#include "video_core/sotc_native_ring.h" // sotc: the ACE ring announce (SotcNativeRing::Announce, below)
 
 extern "C" {
 // runtime_memory.c: the unprotected backing view of a guest address (null when unmapped).
@@ -182,7 +183,7 @@ struct Window {
     std::atomic<uint64_t> mip_announces{0}, mip_bytes{0};
     std::atomic<uint64_t> mip_releases{0}, mip_release_bytes{0};
     std::atomic<uint64_t> skipped{0};
-    Counter dcb, ccb, chunk, zc, mat, blk, inst, part, view, strm, cull, rec;
+    Counter dcb, ccb, chunk, zc, mat, blk, inst, part, view, strm, cull, rec, ring;
     Counter gmem; // sotc: guest copies (runtime memcpy/memset/memmove) announced
     std::atomic<uint64_t> desc{0};
     std::atomic<uint64_t> chunk_dropped{0};
@@ -266,6 +267,12 @@ HookAction DcbSubmit(GuestRegs& regs, void*) {
     }
     FlushChunks();
     return HookAction::Continue;
+}
+
+// Site 0x91f97 in the flip submit thunk 0x91f90 (the frame's last DCB in a mode-1 job, KickoffSubmitJob 0xd07c0):
+// the thunk did not run 0x91f80, so the same DCB context announce is needed here. rdi still holds the slot.
+HookAction DcbSubmitFlip(GuestRegs& regs, void* user) {
+    return DcbSubmit(regs, user);
 }
 
 // 0x16f100, before the CCB submit: the CCB object at rdi has 32-bit start (+0x10) and cursor (+0x20).
@@ -766,6 +773,7 @@ void Report(std::string& out, double seconds) {
     out += cls("cull", g_window.cull);
     out += cls("rec", g_window.rec);
     out += cls("gmem", g_window.gmem);
+    out += cls("ring", g_window.ring);
     std::snprintf(line, sizeof(line), " desc %llu dropped %llu\n",
                   static_cast<unsigned long long>(take(g_window.desc)),
                   static_cast<unsigned long long>(take(g_window.chunk_dropped)));
@@ -781,6 +789,7 @@ void Register() {
     SotcHooks::RegisterHandler("NATIVE_MIP_RELEASE", Handler{MipRelease, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_DCB_SUBMIT", Handler{DcbSubmit, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_CCB_SUBMIT", Handler{CcbSubmit, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_DCB_SUBMIT_FLIP", Handler{DcbSubmitFlip, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_ZC_CREATE", Handler{ZeroCopyCreate, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_CHUNK", Handler{ChunkPre, ChunkPost, nullptr});
     SotcHooks::RegisterHandler("NATIVE_MATPARAM", Handler{MatParamPre, MatParamPost, nullptr});
@@ -826,4 +835,20 @@ extern "C" void bbgpu_native_announce_write(void* dst, uint64_t size, uint32_t c
     }
     SotcNativeHooks::AnnounceWrite(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst)), size, code);
 }
+
+namespace SotcNativeRing {
+
+// sotc: the ACE ring dwords of one sceGnmDingDong (video_core/sotc_native_ring.h). The IB packets are written by
+// the engine's compute ring writer (eboot 0x884c40) and read in place by the port after the doorbell, so they
+// are PerFrame data like the DCB and CCB ranges. Same guards as the other announces (AnnounceRange).
+void Announce(const void* begin, std::size_t bytes) {
+    if (!SotcNative::On() || begin == nullptr || bytes == 0) {
+        return;
+    }
+    const uint64_t first = reinterpret_cast<uintptr_t>(begin);
+    SotcNativeHooks::AnnounceRange(first, first + bytes, SotcNative::Kind::PerFrame,
+                                   SotcNativeHooks::g_window.ring);
+}
+
+} // namespace SotcNativeRing
 

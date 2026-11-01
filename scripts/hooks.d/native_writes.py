@@ -10,6 +10,8 @@ NATIVE_DCB_SUBMIT     0x91f80, the DCB submit thunk (called once per DCB by Kick
                       announced PerFrame, then the per-frame chunk list (NATIVE_CHUNK) is flushed.
 NATIVE_CCB_SUBMIT     0x16f100, the CCB submit (called per CCB by 0xd07c0). [start, cursor) of the CCB object,
                       PerFrame, then the chunk flush.
+NATIVE_DCB_SUBMIT_FLIP  Site 0x91f97 inside the flip submit thunk 0x91f90 (the last DCB of each mode-1 job, the
+                      frame's end, goes there instead of 0x91f80). Same handler as NATIVE_DCB_SUBMIT: rdi = slot.
 NATIVE_ZC_CREATE      0x8be60, the resource creator. Zero-copy (flag 0x800) buffers of the per-frame writers
                       (particles 0xffe60, BPXPR 0x19b760 / 0x19c1a0 / 0x19c7e0, MaterialParam-like 0x94fb0 and 0x198bb0)
                       announce [backing, count * elem) PerFrame. The caller filter keeps other creators out.
@@ -119,6 +121,17 @@ HOOKS = [
         # mov rcx,rdi; mov eax,[rcx+0x20]; sub eax,[rcx+0x10]: the CCB submit, called by 0xd07c0
         pattern='48 89 f9 8b 41 20 2b 41',
         expected={EU_FINGERPRINT: 0x16f100},
+    ),
+    dict(
+        name='NATIVE_DCB_SUBMIT_FLIP',
+        switch='SOTC_NATIVE',
+        group='native_submit_flip',
+        mode='site',
+        # 0x91f90 is the flip submit thunk: the last DCB of a mode-1 job (the frame's end job, 0xcefa0) goes
+        # through it to 0x863aa0 and never through 0x91f80. Site 0x91f97 is after its lea (RIP-relative, not
+        # displaced): mov rdi,[rdi] is still unexecuted, so rdi holds the slot, as at the 0x91f80 entry.
+        pattern='48 8b 3f 41 89 f0 48 8b 00',
+        expected={EU_FINGERPRINT: 0x91f97},
     ),
     dict(
         name='NATIVE_ZC_CREATE',
