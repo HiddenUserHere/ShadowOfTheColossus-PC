@@ -120,6 +120,18 @@ HOOKS = [
         pattern='41 8b 84 24 48 01 00 00 48 8b 8d',
         expected={EU_FINGERPRINT: 0x19c6b1},
     ),
+    # SOTC_NATIVE_MASKS=prev: the decal mask producer sub_19c7e0 (called per decal owner from the decal cull sub_c5200).
+    # Site 0x19ce08: right after the cull dispatch (call 0x86b9e0 at 0x19ce03). The owner is at [rbp-0x340] and the
+    # mask pointer at [rbp-0x358] (both written once per call). Displaced: mov rax,[rbp-0x340] (7 bytes, no RIP or
+    # rel32 operand); no branch targets 0x19ce09..0x19ce0f.
+    dict(
+        name='NATIVE_MASK_PRODUCE_DECAL',
+        switch='SOTC_NATIVE',
+        group='native_mask_produce',
+        mode='site',
+        pattern='48 8b 85 c0 fc ff ff 49 8b 4d 38',
+        expected={EU_FINGERPRINT: 0x19ce08},
+    ),
     # SOTC_NATIVE_MASKS=prev: the CPU ordering the removed RecordMaskedDraws spins gave. XPRPreRender (0xca6d0)
     # resets the two cull labels (mov [rax+0x40],0; mov [rax+0x68],0, rax = obj) before it queues
     # BPXPR_RunCullPasses; the site is the next instruction (mov [rbp-0x148],rcx, 7 bytes, no RIP operand).
@@ -130,6 +142,18 @@ HOOKS = [
         mode='site',
         pattern='48 89 8d b8 fe ff ff 48 8d 0d ?? ?? ?? ?? c5 fa',
         expected={EU_FINGERPRINT: 0xca9ab},
+    ),
+    # The decal cull label reset (RenderCullXPR sub_c53d0, the decal list is not empty): `mov qword [rax+0x78], 0`
+    # with rax = obj = [cull+0xe8], the label RenderXPRDecals (0x11e190) spins on (label = obj+0x78). The site is the
+    # store itself (8 bytes, no RIP operand; the next instruction, mov [rbp-0x80],rcx, is not displaced). No branch
+    # targets 0xc54c8..0xc54cf.
+    dict(
+        name='NATIVE_DECAL_RESET',
+        switch='SOTC_NATIVE',
+        group='native_cull_sync',
+        mode='site',
+        pattern='48 c7 40 78 00 00 00 00 48 89 4d 80',
+        expected={EU_FINGERPRINT: 0xc54c7},
     ),
     # BPGnm_WriteCsDoneLabel (0x925c0, rsi = the label): the cull job recorded the cull of that label. The same
     # bytes as XPR_CS_DONE_LABEL (scripts/hooks.d/xpr.py); sotc.py turns the XPR probe off under SOTC_NATIVE.

@@ -22,6 +22,14 @@
 // and when the job calls BPGnm_WriteCsDoneLabel (0x925c0) for one of them the port stores 1 in it at once (the
 // GPU's EOP stores the same 1 later). So the spin ends when the cull is recorded, never waiting for the GPU.
 // (1 Nov: removing the spins instead let the consumers read draw records the job had not written yet.)
+//
+// Decals (sub_19c7e0, called per decal owner from the decal cull sub_c5200, consumer sub_1a8a40 from sub_19c740):
+// the producer is NATIVE_MASK_PRODUCE_DECAL, the site right after the cull dispatch (0x19ce08). The owner (decal
+// entry) is at [rbp-0x340], the mask pointer at [rbp-0x358] (the site stores it at entry+0xa0 next). The key is
+// (owner, kDecalSlot): slot 32 is outside the main (0..3) and shadow (4..19) slots. The decal cull label obj+0x78
+// (obj = [cull+0xe8]) is reset by NATIVE_DECAL_RESET (sub_c53d0, 0xc54c7) and stored to 1 at record time by the same
+// NATIVE_CULL_RECORDED path as the main labels. RenderXPRDecals (0x11e190) spins on that label before the consumer
+// loop, so the decal spin also ends at record time.
 #include "native_masks.h"
 
 #include <atomic>
@@ -47,6 +55,13 @@ using SotcHooks::HookAction;
 
 constexpr const char* kProduceHook = "NATIVE_MASK_PRODUCE";
 constexpr const char* kProduceShadowHook = "NATIVE_MASK_PRODUCE_SHADOW";
+constexpr const char* kProduceDecalHook = "NATIVE_MASK_PRODUCE_DECAL";
+constexpr const char* kDecalResetHook = "NATIVE_DECAL_RESET";
+constexpr int64_t kDecalOwnerSlot = -0x340;      // [rbp-0x340]: the decal owner (entry) of sub_19c7e0 at the site
+constexpr int64_t kDecalMaskSlot = -0x358;       // [rbp-0x358]: the mask pointer the site stores at entry+0xa0
+constexpr uint64_t kDecalSlot = 32;              // the key slot of the decal mask (main 0..3, shadow 4..19)
+constexpr uint64_t kDecalObjectOffset = 0x20;    // owner+0x20: the decal object; its u32 count at +0
+constexpr uint64_t kDecalLabel = 0x78;           // obj+0x78, obj = [cull+0xe8] (rax at the reset site)
 constexpr int64_t kShadowMaskA = -0x368;         // [rbp-0x368], [rbp-0x360]: the two shadow masks at the site
 constexpr int64_t kShadowMaskB = -0x360;
 constexpr int64_t kShadowIndex = -0x348;         // int: the shadow slot index of the call
@@ -103,6 +118,16 @@ uint64_t MaskBytes(uint64_t owner) {
     return 4 * ((uint64_t{count} + 31) / 32);
 }
 
+// The mask bytes of a decal owner (sub_19c7e0 allocates 4 * ceil(n / 32)): n is the u32 count at its decal object.
+uint64_t DecalMaskBytes(uint64_t owner) {
+    uint64_t object = 0;
+    uint32_t count = 0;
+    if (!SotcGuest::Read(owner + kDecalObjectOffset, &object) || object == 0 || !SotcGuest::Read(object, &count)) {
+        return 0;
+    }
+    return 4 * ((uint64_t{count} + 31) / 32);
+}
+
 // Registers the mask at guest slot `at` (a guest stack slot holding the pointer) under (owner, slot).
 void RegisterMask(uint64_t owner, uint64_t slot, uint64_t at, uint64_t bytes, uint64_t frame) {
     uint64_t mask = 0;
@@ -149,6 +174,25 @@ HookAction OnProduceShadow(GuestRegs& regs, void*) {
     return HookAction::Continue;
 }
 
+// NATIVE_MASK_PRODUCE_DECAL: site 0x19ce08 in sub_19c7e0, after the decal cull dispatch (call 0x86b9e0 at 0x19ce03).
+// The owner and the mask pointer are read from the frame: the site's displaced instruction is `mov rax,[rbp-0x340]`
+// (7 bytes, no RIP operand); [rbp-0x340] and [rbp-0x358] are written once per call, before the dispatch.
+HookAction OnProduceDecal(GuestRegs& regs, void*) {
+    if (!Prev() || !SotcNative::On()) {
+        return HookAction::Continue;
+    }
+    uint64_t owner = 0;
+    if (!SotcGuest::Read(regs.rbp + kDecalOwnerSlot, &owner) || owner == 0) {
+        return HookAction::Continue;
+    }
+    const uint64_t bytes = DecalMaskBytes(owner);
+    if (bytes == 0) {
+        return HookAction::Continue;
+    }
+    RegisterMask(owner, kDecalSlot, regs.rbp + kDecalMaskSlot, bytes, SotcNativeCopies::CurrentFrame());
+    return HookAction::Continue;
+}
+
 // NATIVE_CULL_RESET: site 0xca9ab in XPRPreRender, after `mov [rax+0x40], 0; mov [rax+0x68], 0`. rax = obj.
 HookAction OnCullReset(GuestRegs& regs, void*) {
     if (!Prev() || !SotcNative::On()) {
@@ -160,8 +204,20 @@ HookAction OnCullReset(GuestRegs& regs, void*) {
     return HookAction::Continue;
 }
 
+// NATIVE_DECAL_RESET: site 0xc54c7 in RenderCullXPR (sub_c53d0), `mov qword [rax+0x78], 0` with rax = obj = [cull+0xe8]
+// (loaded at 0xc54a2, unchanged up to the site), before the decal cull job is queued. The same pairing as the main
+// labels: the record of sub_c5200 (after the decal producers) stores 1, and RenderXPRDecals waits for it.
+HookAction OnDecalReset(GuestRegs& regs, void*) {
+    if (!Prev() || !SotcNative::On()) {
+        return HookAction::Continue;
+    }
+    std::lock_guard<std::mutex> lock(g_cull_mutex);
+    g_cull_pending.insert(regs.rax + kDecalLabel);
+    return HookAction::Continue;
+}
+
 // NATIVE_CULL_RECORDED: entry of BPGnm_WriteCsDoneLabel 0x925c0 (rsi = the label). Callers: CullMainScene
-// (obj+0x68), the shadow cull (obj+0x40), the decal cull (obj+0x78, not tracked).
+// (obj+0x68), the shadow cull (obj+0x40), the decal cull sub_c5200 (obj+0x78, reset by NATIVE_DECAL_RESET).
 HookAction OnCullRecorded(GuestRegs& regs, void*) {
     if (!Prev() || !SotcNative::On()) {
         return HookAction::Continue;
@@ -201,8 +257,12 @@ void Register() {
     SotcHooks::RegisterHandler(kProduceHook, handler);
     handler.pre = &OnProduceShadow;
     SotcHooks::RegisterHandler(kProduceShadowHook, handler);
+    handler.pre = &OnProduceDecal;
+    SotcHooks::RegisterHandler(kProduceDecalHook, handler);
     handler.pre = &OnCullReset;
     SotcHooks::RegisterHandler(kCullResetHook, handler);
+    handler.pre = &OnDecalReset;
+    SotcHooks::RegisterHandler(kDecalResetHook, handler);
     handler.pre = &OnCullRecorded;
     SotcHooks::RegisterHandler(kCullRecordedHook, handler);
 }

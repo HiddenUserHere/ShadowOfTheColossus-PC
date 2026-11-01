@@ -12,6 +12,9 @@
 // the count that are 0 are counted (the objects the real path skips). Mode 2 keeps the old page tracking
 // running underneath, so the backing of GPU-written pages holds what the old path read back.
 //
+// SOTC_NATIVE_MASKS=prev: the masks of C1, C2 and C3 (NATIVE_MASK_VIS, _VIS_IND, _DECAL) are served by
+// SotcNativeMasks::Serve (native_masks.cpp). C4 (NATIVE_MASK_C4) is not served yet.
+//
 // Spin verify: the sites after each XPR label spin count the skips, and the skips where the label (its
 // pointer is in rsi on the skip path) is not 1 yet. Only counted with SOTC_NATIVE_MASKS=all, because the
 // spins are removed by byte patches only then, and rsi is not the label pointer on the wait path.
@@ -168,8 +171,9 @@ HookAction OnMaskConsume(GuestRegs& regs, void* user) {
     const int which = static_cast<int>(reinterpret_cast<uintptr_t>(user));
     ConsumerCounters& c = g_masks[which];
     c.calls++;
-    // sotc: SOTC_NATIVE_MASKS=prev: the main-scene consumers read the last completed copy (native_masks.h).
-    if (SotcNativeMasks::Prev() && (which == kVis || which == kVisInd)) {
+    // sotc: SOTC_NATIVE_MASKS=prev: the main-scene and decal consumers read the last completed copy (native_masks.h).
+    // The decal consumer (C3) has one mask, in rsi; its count is the u32 at the decal object (ReadCount).
+    if (SotcNativeMasks::Prev() && (which == kVis || which == kVisInd || which == kDecal)) {
         uint64_t count = 0;
         if (ReadCount(which, regs.rdi, &count) && count != 0) {
             regs.rsi = SotcNativeMasks::Serve(regs.rsi, count);
