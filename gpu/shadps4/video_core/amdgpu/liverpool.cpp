@@ -5309,10 +5309,14 @@ void Liverpool::ServiceFrameMarks() {
         }
         if (rasterizer) {
             XpSetHint(XpMark, 0, 0);
+            // sotc: SOTC_PC_RING8_FLIPWAIT=2: the frame end of this path records its tick too (frame tickets,
+            // SOTC_CP_AHEAD=2 or SOTC_FRAME_AHEAD=1, never take the idle path that records it otherwise; without
+            // it every flip waited the 200 ms cap, 1 Nov). frame counts SubmitDone calls, as submit_done_seq.
             BackOrRun(
-                [this] {
+                [this, frame] {
                     rasterizer->OnSubmit();
                     rasterizer->Flush();
+                    rasterizer->GetBufferCache().PcHostNoteFrameRecorded(frame);
                 },
                 false);
         }

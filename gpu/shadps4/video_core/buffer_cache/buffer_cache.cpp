@@ -7786,7 +7786,14 @@ void BufferCache::PcHostFlipWait() {
                 }
                 return false;
             };
-            pc_host_frames_cv.wait_for(lock, std::chrono::milliseconds(200), find);
+            if (!pc_host_frames_cv.wait_for(lock, std::chrono::milliseconds(200), find)) {
+                static std::atomic<u32> timeouts{0};
+                if (timeouts.fetch_add(1, std::memory_order_relaxed) < 4) {
+                    std::fprintf(stderr, "SOTC PC RING8 flip wait: no frame end recorded within 200 ms "
+                                         "(frame %llu); a frame-end path does not call PcHostNoteFrameRecorded\n",
+                                 static_cast<unsigned long long>(target));
+                }
+            }
         }
         if (wait_tick != 0) {
             scheduler.Wait(wait_tick); // flushed already (tick < CurrentTick): no Flush from here
