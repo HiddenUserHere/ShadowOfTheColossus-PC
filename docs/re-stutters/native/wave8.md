@@ -11,7 +11,7 @@ Lab route tests.json, one round each.
 | N4 dead code | STALE_CHECK, STATIC_CLASS, RB_HOST, PARTICLE_PREV modes 1-2, HOOK_PSTATS deleted (-1750 lines) | (see log) |
 | N5 parallel record | SOTC_N5_PARALLEL=2 dry run. The pass consumer (recorder, ~9.5 ms/frame) is not on the critical path; the draw thread (~35 ms) is, so a pass worker pool gains nothing until per-op work leaves the draw thread | c90480f |
 | N5 flat-buffer skip | not integrated: the recording never memoized (granules read 0, 80% "not memoized"), so no gain, and it changed the SRT walker JIT for every user and the shader cache version | (dropped) |
-| N5 async compute | pending | |
+| N5 async compute | SOTC_N5_ASYNC_COMPUTE=1 (opt-in; needs SOTC_N5_GRAPH, SOTC_PARALLEL_RECORD): 3-4 of ~1100 dispatches per frame move (most bind images or depend on graphics), no device loss; no measurable gain | d6723a7 |
 
 ## Route numbers, SOTC_NATIVE=1 SOTC_NATIVE_MASKS=prev SOTC_NATIVE_PARTICLES=prev
 
