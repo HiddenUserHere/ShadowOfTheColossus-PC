@@ -1898,6 +1898,20 @@ bool ReserveSlot(int slot) {
     return false;
 }
 
+const char* OutcomeName(Outcome outcome) {
+    switch (outcome) {
+    case Outcome::Predicted:
+        return "predicted";
+    case Outcome::Null:
+        return "null";
+    case Outcome::WouldCrash:
+        return "would-crash";
+    case Outcome::Unmodelled:
+        return "unmodelled";
+    }
+    return "?";
+}
+
 // NativeHost (below) takes its VA from the window host when a window route is set on the call.
 class NativeHost final : public Native::Host {
 public:
@@ -1943,6 +1957,34 @@ public:
             *p = SotcPcPoolDispatch::PredictCall(pre, req, &g_map, predicted, count_pre, refill, &refill_block);
         }
         st_.refill_block = refill_block;
+        // sotc: a window route records where it ends (WhyNotServed). Eligibility is the controller's own test, with the
+        // fresh paths added for a forced-fresh call (Controller::Run).
+        if (req.force_fresh) {
+            predicted_ = true;
+            outcome_ = p->outcome;
+            path_ = p->path;
+            reason_ = p->reason;
+            eligible_ = Eligible(*p, PathMask() | kFreshPathMask);
+        }
+    }
+
+    // sotc: the stage a routed call ended at without a window block (SotcPcPoolWindows::Table::NoteNotServed).
+    std::string WhyNotServed() {
+        if (!predicted_) {
+            return "no prediction (killed, lock busy or snapshot failed)";
+        }
+        if (!eligible_) {
+            std::string why = std::string("ineligible ") + PathName(path_) + " " + OutcomeName(outcome_);
+            if (reason_ != nullptr && *reason_ != '\0') {
+                why += std::string(": ") + reason_;
+            }
+            return why;
+        }
+        const char* refusal = RefusalReason();
+        if (refusal != nullptr && *refusal != '\0') {
+            return std::string("writer refused: ") + refusal;
+        }
+        return "eligible, no window VA";
     }
 
     // sotc: diagnostic text for a kill (the writer that ran, its touched nodes).
@@ -2039,6 +2081,11 @@ private:
     PoolFreshHost fresh_host_;
     SotcPcPoolWindows::WindowFreshHost window_host_; ///< sotc: the fresh VA source of a window route
     int window_slot_ = -1;                           ///< sotc: the window of this call (-1: a normal call)
+    bool predicted_ = false;                         ///< sotc: Predict ran on a window route (WhyNotServed)
+    Outcome outcome_ = Outcome::Unmodelled;
+    Path path_ = Path::Unmodelled;
+    const char* reason_ = "";
+    bool eligible_ = false;
 };
 
 Native::Controller& NativeController() {
@@ -2139,8 +2186,14 @@ HookAction NativeEntry(GuestRegs& regs, void*) {
         regs.rax = node;
         if (slot >= 0 && host.window_va() != 0) {
             WindowTable().Commit(slot, host.window_va(), req.size, node);
+        } else if (slot >= 0) {
+            WindowTable().NoteNotServed(slot, "native, no window VA");
         }
         return HookAction::Return;
+    }
+    // sotc: a routed call that ran the original is counted with the stage it ended at (the window did not place it).
+    if (slot >= 0) {
+        WindowTable().NoteNotServed(slot, host.WhyNotServed());
     }
     return HookAction::Continue;
 }

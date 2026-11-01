@@ -121,6 +121,10 @@ struct Stats {
     uint64_t imported[kSlotCount] = {};     ///< committed blocks imported with the host
     uint64_t import_refused[kSlotCount] = {}; ///< committed blocks the host refused to import (normal binds)
     uint64_t dropped[kSlotCount] = {};      ///< imports dropped when the block was freed outside the window
+    uint64_t key_miss[kSlotCount] = {};     ///< calls of the bound owner and size whose heap key is another (not routed)
+    /// Routed calls that did not end in a window VA, by where they ended (the glue names the stage: ineligible path,
+    /// writer refusal, no prediction). The sum with served = routed - full is the calls the window did not place.
+    std::map<std::string, uint64_t> not_served[kSlotCount];
     uint64_t reserve_ok = 0;
     uint64_t reserve_failed = 0;            ///< the host gave no VA, or an unaligned one (leaked at boot)
     uint64_t reserve_limit = 0;             ///< the reserved range ends above kWindowLimit (leaked at boot)
@@ -154,6 +158,8 @@ public:
     uint64_t TakeVa(int slot, uint64_t bytes, uint64_t align);
     /// Returns the VA of a refused fresh call (nothing was committed) to the window.
     void GiveVa(int slot, uint64_t va, uint64_t bytes);
+    /// Counts a routed call that ended without a window VA, under the stage it ended at (why: a short label).
+    void NoteNotServed(int slot, const std::string& why);
     /// Binds the window's block at va to its node after a verified call (node is the rax the call returned), and
     /// imports it (the writer has backed it). An import the host refuses is counted; the block stays bound.
     void Commit(int slot, uint64_t va, uint64_t bytes, uint64_t node);
@@ -191,8 +197,8 @@ private:
         std::map<uint64_t, uint64_t> imported; ///< imported block start -> bytes (set by Commit, dropped by Forget)
         std::vector<Parked> parked;
     };
-    /// The bound slot for an owner, kind, key and size, or -1. Does not count.
-    int Match(uint64_t obj, int32_t kind, int64_t key, uint64_t bytes) const;
+    /// The bound slot for an owner, kind, key and size, or -1. Counts key_miss when only the heap key differs.
+    int Match(uint64_t obj, int32_t kind, int64_t key, uint64_t bytes);
     SlotState slots_[kSlotCount];
     Stats stats_;
     ImportFn import_;

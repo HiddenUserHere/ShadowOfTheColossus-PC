@@ -458,6 +458,43 @@ void TestForcedFreshPredict() {
     CHECK(Eligible(exact, kDefaultPathMask));
 }
 
+// ---- attribution of the routed calls that the windows did not place -------------------------------------------
+
+void TestKeyMissAndNotServed() {
+    W::Table t;
+    FakeHost host(kBase);
+    CHECK(ReserveAll(t, host, nullptr) == 3);
+    CHECK(t.Bind(1, kObjB, W::kMaskKey));
+    // The owner, kind and size of window B with another heap key: not routed, counted as a key miss.
+    CHECK(t.Route(kObjB, 1, 16, 8 * kMiB, k64K) == -1);
+    CHECK(t.Route(kObjB, 1, -2, 8 * kMiB, k64K) == -1);
+    CHECK(t.stats().key_miss[1] == 2 && t.stats().routed[1] == 0);
+    // Another block size is not a key miss: the owner's block does not match at all.
+    CHECK(t.Route(kObjB, 1, 16, 4 * kMiB, k64K) == -1);
+    CHECK(t.stats().key_miss[1] == 2);
+    // The right key routes.
+    CHECK(t.Route(kObjB, 1, W::kMaskKey, 8 * kMiB, k64K) == 1 && t.stats().routed[1] == 1);
+    // The allocation side (kind -1, WindowReuse) counts its key misses the same way.
+    uint64_t node = 0;
+    CHECK(!t.Reuse(kObjB, 16, 8 * kMiB, &node) && t.stats().key_miss[1] == 3 && t.stats().reuse_miss[1] == 0);
+
+    // Routed calls that did not place a block, by stage. Out-of-range slots are ignored.
+    t.NoteNotServed(1, "ineligible unmodelled");
+    t.NoteNotServed(1, "ineligible unmodelled");
+    t.NoteNotServed(1, "writer refused: batch");
+    t.NoteNotServed(-1, "ignored");
+    t.NoteNotServed(7, "ignored");
+    CHECK(t.stats().not_served[1].at("ineligible unmodelled") == 2);
+    CHECK(t.stats().not_served[1].at("writer refused: batch") == 1);
+    CHECK(t.stats().not_served[0].empty());
+
+    std::string out;
+    W::ReportTable(t, out);
+    CHECK(out.find("B mask-heap not served: key miss 3; ineligible unmodelled 2; writer refused: batch 1") !=
+          std::string::npos);
+    CHECK(out.find("A gpu-arena not served: key miss 0; none") != std::string::npos);
+}
+
 } // namespace
 
 int main() {
@@ -472,6 +509,7 @@ int main() {
     TestImportDrop();
     TestWindowFreshHost();
     TestForcedFreshPredict();
+    TestKeyMissAndNotServed();
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -209,7 +209,7 @@ bool Table::Bind(int slot, uint64_t obj, int64_t key) {
     return true;
 }
 
-int Table::Match(uint64_t obj, int32_t kind, int64_t key, uint64_t bytes) const {
+int Table::Match(uint64_t obj, int32_t kind, int64_t key, uint64_t bytes) {
     if (obj == 0) {
         return -1;
     }
@@ -223,6 +223,7 @@ int Table::Match(uint64_t obj, int32_t kind, int64_t key, uint64_t bytes) const 
             continue;
         }
         if (s.key != kAnyKey && s.key != key) {
+            ++stats_.key_miss[i]; // the owner, kind and size are the window's: only the heap key says no
             continue;
         }
         return i;
@@ -265,6 +266,13 @@ void Table::GiveVa(int slot, uint64_t va, uint64_t bytes) {
         return;
     }
     ++stats_.given_back[slot];
+}
+
+void Table::NoteNotServed(int slot, const std::string& why) {
+    if (slot < 0 || slot >= kSlotCount) {
+        return;
+    }
+    ++stats_.not_served[slot][why];
 }
 
 void Table::Commit(int slot, uint64_t va, uint64_t bytes, uint64_t node) {
@@ -422,6 +430,17 @@ void ReportTable(const Table& table, std::string& out) {
                       static_cast<unsigned long long>(s.park_refused[i]), static_cast<unsigned long long>(s.reused[i]),
                       static_cast<unsigned long long>(s.reuse_miss[i]));
         out += line;
+        // Routed calls that did not place a block, by stage; key misses are the calls of this owner and size with another
+        // heap key (a memtype the window does not take).
+        std::string stages = "SOTC PC POOL WINDOWS " + std::string(Spec(i).name) + " not served: key miss " +
+                             std::to_string(s.key_miss[i]);
+        if (s.not_served[i].empty()) {
+            stages += "; none";
+        }
+        for (const auto& [why, count] : s.not_served[i]) {
+            stages += "; " + why + " " + std::to_string(count);
+        }
+        out += stages + "\n";
         uint64_t imported_bytes = 0;
         for (const auto& [va, bytes] : table.imported(i)) {
             imported_bytes += bytes;
