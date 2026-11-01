@@ -819,12 +819,20 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     // sotc: SOTC_N5_BINDLESS: sampled images from the heap arrays. The heap must hold every key at
     // full capacity (update-after-bind limits), and the stages keep one set (no SOTC_STAGE_BINDINGS).
     const char* stage_env = std::getenv("SOTC_STAGE_BINDINGS");
-    const u32 n5_descriptors = Shader::NUM_BINDLESS_IMAGE_KEYS * 4096u;
+    // sotc: the sampled keys (the first NUM_BINDLESS_SAMPLED_IMAGE_KEYS) and the storage keys each
+    // need their full capacity; storage also needs its dynamic indexing and update-after-bind.
+    const u32 n5_sampled = Shader::NUM_BINDLESS_SAMPLED_IMAGE_KEYS * 4096u;
+    const u32 n5_storage =
+        (Shader::NUM_BINDLESS_IMAGE_KEYS - Shader::NUM_BINDLESS_SAMPLED_IMAGE_KEYS) * 4096u;
     const bool bindless_images =
         n5_wanted && bindless_samplers && !(stage_env && stage_env[0] == '1') &&
         vk12_features.descriptorBindingSampledImageUpdateAfterBind &&
-        vk12_props.maxDescriptorSetUpdateAfterBindSampledImages >= n5_descriptors &&
-        vk12_props.maxPerStageDescriptorUpdateAfterBindSampledImages >= n5_descriptors;
+        vk12_features.descriptorBindingStorageImageUpdateAfterBind &&
+        features.shaderStorageImageArrayDynamicIndexing &&
+        vk12_props.maxDescriptorSetUpdateAfterBindSampledImages >= n5_sampled &&
+        vk12_props.maxPerStageDescriptorUpdateAfterBindSampledImages >= n5_sampled &&
+        vk12_props.maxDescriptorSetUpdateAfterBindStorageImages >= n5_storage &&
+        vk12_props.maxPerStageDescriptorUpdateAfterBindStorageImages >= n5_storage;
     if (n5_wanted && !bindless_images) {
         LOG_WARNING(Render_Vulkan, "SOTC_N5_BINDLESS ignored: heap features or limits missing");
     }
@@ -865,6 +873,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
                 // Descriptor arrays of dynamic_tsharp_array_size (shader_recompiler/info.cpp)
                 .shaderSampledImageArrayDynamicIndexing =
                     features.shaderSampledImageArrayDynamicIndexing,
+                // sotc: SOTC_N5_BINDLESS storage arrays of the heap (off with the heap)
+                .shaderStorageImageArrayDynamicIndexing =
+                    bindless_images && features.shaderStorageImageArrayDynamicIndexing,
                 .shaderClipDistance = features.shaderClipDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
@@ -891,6 +902,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
                 bindless_samplers && vk12_features.shaderSampledImageArrayNonUniformIndexing,
             .descriptorBindingSampledImageUpdateAfterBind =
                 bindless_samplers && vk12_features.descriptorBindingSampledImageUpdateAfterBind,
+            // sotc: SOTC_N5_BINDLESS storage image arrays (set 1, keys 6..11)
+            .descriptorBindingStorageImageUpdateAfterBind =
+                bindless_images && vk12_features.descriptorBindingStorageImageUpdateAfterBind,
             .descriptorBindingUpdateUnusedWhilePending =
                 bindless_samplers && vk12_features.descriptorBindingUpdateUnusedWhilePending,
             .descriptorBindingPartiallyBound =

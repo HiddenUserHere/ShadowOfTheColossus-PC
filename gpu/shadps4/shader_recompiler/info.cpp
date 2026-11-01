@@ -72,9 +72,10 @@ bool BindlessImagesEnabled() {
 }
 
 u32 BindlessImageKeyOf(const Info& info, const ImageResource& image) noexcept {
-    // Only plain sampled images: storage and atomics use typed image ops, descriptor arrays and
-    // mip-fallback images index descriptors in ways the heap does not cover yet.
-    if (!BindlessImagesEnabled() || image.is_written || image.is_atomic || image.array_size != 0 ||
+    // Sampled and non-atomic storage images. Atomics keep their descriptors (typed image ops with
+    // a format in the SPIR-V type), and so do descriptor arrays and mip-fallback images, which
+    // index descriptors in ways the heap does not cover.
+    if (!BindlessImagesEnabled() || image.is_atomic || image.array_size != 0 ||
         image.mip_fallback_mode != MipStorageFallbackMode::None) {
         return NO_BINDLESS_IMAGE_KEY;
     }
@@ -93,19 +94,26 @@ u32 BindlessImageKeyOf(const Info& info, const ImageResource& image) noexcept {
     default:
         return NO_BINDLESS_IMAGE_KEY; // sint: no heap array
     }
+    u32 shape{};
     switch (sharp.GetViewType(image.is_array)) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color2D:
-        return base + 0;
+        shape = 0;
+        break;
     case AmdGpu::ImageType::Color1DArray:
     case AmdGpu::ImageType::Color2DArray:
     case AmdGpu::ImageType::Cube: // a 2D array image in SPIR-V
-        return base + 1;
+        shape = 1;
+        break;
     case AmdGpu::ImageType::Color3D:
-        return base + 2;
+        shape = 2;
+        break;
     default:
         return NO_BINDLESS_IMAGE_KEY; // msaa and anything unknown
     }
+    // Storage images: the same shapes in the second half of the keys. The format is not part of
+    // their type (Unknown in ImageType, non-atomic), so no key depends on it.
+    return base + shape + (image.is_written ? NUM_BINDLESS_SAMPLED_IMAGE_KEYS : 0u);
 }
 
 u32 BindlessImageSlotOf(const Info& info, u32 index) noexcept {

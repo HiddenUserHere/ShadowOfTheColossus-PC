@@ -1195,14 +1195,17 @@ void EmitContext::DefineImagesAndSamplers() {
                 interfaces.push_back(bindless_image_arrays[key]);
             }
             uses_bindless_images = true;
+            // sotc: a storage image keeps its storage type (sampled = 2, see ImageType) and is read
+            // and written through LoadImage, like the sampled ones.
             images.push_back({
                 .data_types = &data_types,
                 .id = Id{},
-                .sampled_type = TypeSampledImage(bindless_image_types[key]),
+                .sampled_type = is_storage ? sampled_type
+                                           : TypeSampledImage(bindless_image_types[key]),
                 .image_type = bindless_image_types[key],
                 .view_type = sharp.GetViewType(image_desc.is_array),
                 .is_integer = is_integer,
-                .is_storage = false,
+                .is_storage = is_storage,
                 .mip_fallback_mode = mip_fallback_mode,
                 .array_size = 0,
                 .bindless = true,

@@ -359,6 +359,13 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         ctx.AddCapability(spv::Capability::RuntimeDescriptorArray);
         ctx.AddCapability(spv::Capability::SampledImageArrayDynamicIndexing);
     }
+    // sotc: SOTC_N5_BINDLESS: the storage arrays of the heap are indexed dynamically as well.
+    for (const auto& texture : ctx.images) {
+        if (texture.bindless && texture.is_storage) {
+            ctx.AddCapability(spv::Capability::StorageImageArrayDynamicIndexing);
+            break;
+        }
+    }
     ctx.AddCapability(spv::Capability::Image1D);
     ctx.AddCapability(spv::Capability::Sampled1D);
     ctx.AddCapability(spv::Capability::ImageQuery);

@@ -290,9 +290,10 @@ bool StageBindingsEnabled();
 /// Shared by the pipeline layout and the SPIR-V emitter, so both agree on the descriptors.
 bool UsesBindlessSamplers(const Info& info);
 
-/// sotc: SOTC_N5_BINDLESS: the heap key of a sampled image: 0..2 for float (2D, 2D array, 3D),
-/// 3..5 for uint (the same shapes), or NO_BINDLESS_IMAGE_KEY when the image keeps a descriptor
-/// (storage, atomic, descriptor array, mip fallback, msaa, sint). Cube is a 2D array (key 1).
+/// sotc: SOTC_N5_BINDLESS: the heap key of an image: 0..2 for float sampled (2D, 2D array, 3D),
+/// 3..5 for uint sampled (the same shapes), 6..8 and 9..11 for the same shapes as non-atomic
+/// storage images (read/write). NO_BINDLESS_IMAGE_KEY when the image keeps a descriptor (atomic,
+/// descriptor array, mip fallback, msaa, sint). Cube is a 2D array (shape 1).
 /// The emitter types the heap array with this key, the host writes the view into it.
 u32 BindlessImageKeyOf(const Info& info, const ImageResource& image) noexcept;
 

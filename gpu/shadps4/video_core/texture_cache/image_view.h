@@ -59,9 +59,8 @@ struct ImageView {
     vk::UniqueImageView image_view;
 
     /// sotc: SOTC_N5_BINDLESS: the heap slot of this view per heap key (NO_BINDLESS_IMAGE_SLOT
-    /// when none), and the image layout that slot was written with (BindlessImages::Acquire).
+    /// when none). The slot may have been taken by an eviction: BindlessImages::Holds tells.
     std::array<u32, Shader::NUM_BINDLESS_IMAGE_KEYS> bindless_slots = NoBindlessSlots();
-    std::array<vk::ImageLayout, Shader::NUM_BINDLESS_IMAGE_KEYS> bindless_layouts{};
 
     /// Gives every heap slot of this view back to the live heap (if any).
     void ReleaseBindless() noexcept;

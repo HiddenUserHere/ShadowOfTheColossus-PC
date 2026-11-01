@@ -23,11 +23,15 @@ static constexpr u32 NUM_BINDLESS_SAMPLER_WORDS = NUM_BINDLESS_SAMPLER_SLOTS / 2
 
 /// sotc: N5 bindless images (SOTC_N5_BINDLESS): the image slots, two u16 per word like the sampler slots,
 /// after the sampler words of the same push range (BindlessSamplerSlots::image_words). Each slot holds
-/// the index of a view in one of the heap's sampled image arrays (BindlessImageKey).
+/// the index of a view in one of the heap's image arrays (BindlessImageKey, sampled or storage).
 static constexpr u32 NUM_BINDLESS_IMAGE_SLOTS = 32;
 static constexpr u32 NUM_BINDLESS_IMAGE_WORDS = NUM_BINDLESS_IMAGE_SLOTS / 2;
 /// sotc: N5 bindless images: the heap arrays, one per BindlessImageKey (binding 1 + key of set 1).
-static constexpr u32 NUM_BINDLESS_IMAGE_KEYS = 6;
+/// Keys 0..5 are sampled image arrays (float, then uint; 2D, 2D array, 3D each), keys 6..11 the
+/// same shapes as storage image arrays (read/write, non-atomic). The SPIR-V type of a non-atomic
+/// storage image has no format (Unknown), so the shape and number class are its whole type.
+static constexpr u32 NUM_BINDLESS_SAMPLED_IMAGE_KEYS = 6;
+static constexpr u32 NUM_BINDLESS_IMAGE_KEYS = 2 * NUM_BINDLESS_SAMPLED_IMAGE_KEYS;
 static constexpr u32 NO_BINDLESS_IMAGE_SLOT = ~0u;
 static constexpr u32 NO_BINDLESS_IMAGE_KEY = ~0u;
 static constexpr u32 NUM_FMASKS = 8;

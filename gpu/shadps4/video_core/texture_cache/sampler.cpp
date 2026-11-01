@@ -155,15 +155,21 @@ BindlessSamplers::BindlessSamplers(const Vulkan::Instance& instance_) : instance
     layout = std::move(new_layout);
 
     // sotc: SOTC_N5_BINDLESS: one pool size per descriptor type of the set.
-    const std::array<vk::DescriptorPoolSize, 2> pool_sizes{
+    // sotc: SOTC_N5_BINDLESS: the storage keys of the heap are the keys after the sampled ones.
+    const std::array<vk::DescriptorPoolSize, 3> pool_sizes{
         vk::DescriptorPoolSize{vk::DescriptorType::eSampler, Capacity},
         vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage,
-                               Shader::NUM_BINDLESS_IMAGE_KEYS * VideoCore::BindlessImageCapacity},
+                               Shader::NUM_BINDLESS_SAMPLED_IMAGE_KEYS *
+                                   VideoCore::BindlessImageCapacity},
+        vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage,
+                               (Shader::NUM_BINDLESS_IMAGE_KEYS -
+                                Shader::NUM_BINDLESS_SAMPLED_IMAGE_KEYS) *
+                                   VideoCore::BindlessImageCapacity},
     };
     const vk::DescriptorPoolCreateInfo pool_info{
         .flags = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind,
         .maxSets = 1,
-        .poolSizeCount = images ? 2u : 1u,
+        .poolSizeCount = images ? 3u : 1u,
         .pPoolSizes = pool_sizes.data(),
     };
     auto [pool_result, new_pool] = device.createDescriptorPoolUnique(pool_info);

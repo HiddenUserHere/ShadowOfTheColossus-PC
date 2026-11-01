@@ -200,7 +200,7 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
 
 ImageView::ImageView(ImageView&& other) noexcept
     : info{other.info}, image_view{std::move(other.image_view)},
-      bindless_slots{other.bindless_slots}, bindless_layouts{other.bindless_layouts} {
+      bindless_slots{other.bindless_slots} {
     other.bindless_slots.fill(Shader::NO_BINDLESS_IMAGE_SLOT);
 }
 
@@ -210,7 +210,6 @@ ImageView& ImageView::operator=(ImageView&& other) noexcept {
         info = other.info;
         image_view = std::move(other.image_view);
         bindless_slots = other.bindless_slots;
-        bindless_layouts = other.bindless_layouts;
         other.bindless_slots.fill(Shader::NO_BINDLESS_IMAGE_SLOT);
     }
     return *this;
@@ -229,7 +228,7 @@ void ImageView::ReleaseBindless() noexcept {
             continue;
         }
         if (heap) {
-            heap->Release(key, bindless_slots[key]);
+            heap->Release(key, bindless_slots[key], *image_view);
         }
         bindless_slots[key] = Shader::NO_BINDLESS_IMAGE_SLOT;
     }

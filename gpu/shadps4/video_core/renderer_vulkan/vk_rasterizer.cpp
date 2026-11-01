@@ -91,28 +91,31 @@ static bool IsBindlessStage(const Instance& instance, const Shader::Info& stage)
            stage.samplers.size() <= Shader::GetBindlessSamplerRange(stage.sw_stage).count;
 }
 
-// sotc: SOTC_N5_BINDLESS: the heap index of one bindless sampled image of a draw, 0 (the null slot)
-// when nothing is bound. The view takes a slot of its key the first time, and a new one when it is
-// bound in another layout (the descriptor of a slot fixes its layout); the old slot is released
-// and reused only after the frame ticket. Mode 2 compares the heap mirror with the view.
-static u32 BindlessImageIndex(VideoCore::BindlessImages& heap, VideoCore::TextureCache& cache,
-                              VideoCore::ImageId image_id,
-                              const VideoCore::TextureCache::ImageDesc& desc, u32 key,
-                              vk::ImageLayout layout) {
+// sotc: SOTC_N5_BINDLESS: one bindless image of a draw (sampled or storage): its heap slot, 0 (the
+// null slot) when nothing is bound. The view keeps its slot while the heap still holds it in this
+// layout (the descriptor of a slot fixes its layout). Otherwise it gives the old slot back (a layout
+// change, or an eviction) and takes a new one. The slot is used by the current tick, so no later
+// acquire in this tick takes it (BindlessImages::Use). Mode 2 compares the heap mirror with the view.
+static VideoCore::BindlessRef BindlessImageIndex(VideoCore::BindlessImages& heap,
+                                                 VideoCore::TextureCache& cache,
+                                                 VideoCore::ImageId image_id,
+                                                 const VideoCore::TextureCache::ImageDesc& desc,
+                                                 u32 key, vk::ImageLayout layout) {
     if (!image_id) {
-        return heap.NullSlot(key);
+        return {key, heap.NullSlot(key), {}};
     }
     VideoCore::ImageView& view = cache.FindTexture(image_id, desc);
+    const vk::ImageView handle = *view.image_view;
     u32& slot = view.bindless_slots[key];
-    if (slot == Shader::NO_BINDLESS_IMAGE_SLOT || view.bindless_layouts[key] != layout) {
-        heap.Release(key, slot);
-        slot = heap.Acquire(key, *view.image_view, layout);
-        view.bindless_layouts[key] = layout;
+    if (slot == Shader::NO_BINDLESS_IMAGE_SLOT || !heap.Holds(key, slot, handle, layout)) {
+        heap.Release(key, slot, handle);
+        slot = heap.Acquire(key, handle, layout);
     }
-    if (heap.Mode() == 2) {
-        heap.Verify(key, slot, *view.image_view);
+    heap.Use(key, slot);
+    if (heap.Mode() == 2 && slot != heap.NullSlot(key)) {
+        heap.Verify(key, slot, handle);
     }
-    return slot;
+    return {key, slot, handle};
 }
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
@@ -2660,6 +2663,11 @@ bool Rasterizer::FastBindStatic(const Pipeline* pipeline, const AmdGpu::Regs& re
         if (IsBindlessStage(instance, *stage)) {
             return false;
         }
+        // sotc: SOTC_N5_BINDLESS: the image slots likewise. A fast bind keeps slots that a later
+        // acquire may evict, and it does not mark them used.
+        if (Shader::UsesBindlessImages(*stage)) {
+            return false;
+        }
         if (stage->has_storage_images || !stage->fmasks.empty()) {
             return false;
         }
@@ -3099,6 +3107,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     } write_scope_guard{buffer_cache};
     const SotcStats::SplitTimer bind_split{SotcStats::SplitBind}; // sotc: SOTC_DRAW_SPLIT
     fast_bind_hit = false;
+    bind_bindless_rec.clear();                // sotc: SOTC_N5_BINDLESS (refs of this bind)
+    bind_bindless_gen = BindlessGeneration(); // sotc: a stored bind is replayed only while it holds
     // sotc: SOTC_BIND_CACHE: flush the cached binds when the state they were made in moved, or
     // when this bind is not a read-only graphics bind (its writes and copies run before them).
     // sotc: SOTC_PARALLEL_RECORD: `prepared` holds the register-only inputs of this bind
@@ -3422,6 +3432,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             BindTextures(*stage, binding, set, pr_stage ? resolved : nullptr, pr_stage);
         }
         uses_dma |= stage->uses_dma;
+    }
+    // sotc: SOTC_N5_BINDLESS: the vector was sized for every image, and the heap images write no
+    // descriptor: keep the writes made (the bind cache and the descriptor update count them).
+    if (bindless_images) {
+        set_writes.resize(set_write_index);
+        set_write_sets.resize(set_write_index);
     }
 
     if (uses_dma) {
@@ -3776,6 +3792,12 @@ bool Rasterizer::TryBindCache(const Pipeline* pipeline, u64 hash, bool& uses_dma
         }
         return false;
     };
+    // sotc: SOTC_N5_BINDLESS: the heap slots of the entry are as made (no release or eviction since).
+    if (entry->bindless_gen != BindlessGeneration()) {
+        entry->valid = false;
+        --bind_cache_live;
+        return refuse();
+    }
     const bool xtick = SotcStats::kBindCacheXtick;
     u64 current_tick = scheduler.CurrentTick();
     // sotc: SOTC_BIND_CACHE_XTICK. What a full bind does once per submit tick (or per use epoch)
@@ -3961,6 +3983,14 @@ bool Rasterizer::TryBindCache(const Pipeline* pipeline, u64 hash, bool& uses_dma
     set_write_index = static_cast<u32>(set_writes.size());
     push_data = entry->push_data;
     bindless_slots = entry->bindless_slots;
+    if (bindless_images) { // sotc: SOTC_N5_BINDLESS: the replayed slots are used by this tick
+        for (const auto& ref : entry->bindless_refs) {
+            bindless_images->Use(ref.key, ref.slot);
+            if (bindless_images->Mode() == 2 && ref.slot != 0) {
+                bindless_images->Verify(ref.key, ref.slot, ref.view);
+            }
+        }
+    }
     entry->last_use = ++bind_cache_clock;
 
     uses_dma = entry->uses_dma;
@@ -4027,6 +4057,8 @@ void Rasterizer::CommitBindCache(const Pipeline* pipeline, u64 hash, bool uses_d
     entry->uses_dma = uses_dma;
     entry->push_data = push_data;
     entry->bindless_slots = bindless_slots;
+    entry->bindless_refs = bind_bindless_rec;
+    entry->bindless_gen = bind_bindless_gen;
     entry->writes.assign(set_writes.begin(), set_writes.end());
     entry->write_sets.assign(set_write_sets.begin(), set_write_sets.end());
     entry->write_info.resize(set_writes.size());
@@ -4366,6 +4398,10 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
     if (u32 reason; !BindCacheEntryFresh(*entry, reason)) {
         return stale(reason);
     }
+    // sotc: SOTC_N5_BINDLESS: the heap slots of the entry are as made (no release or eviction since).
+    if (entry->bindless_gen != BindlessGeneration()) {
+        return refuse(true);
+    }
     // sotc: an entry made under the resource identity key: this draw's constants. The flat
     // buffer is copied into the stream ring again (patched as BindBuffers would), unless it is
     // the very data the entry copied last and the ring has not wrapped since; the copy's offset
@@ -4563,6 +4599,14 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
         buffer_infos[slot.info].offset = slot.offset;
     }
     bindless_slots = entry->bindless_slots;
+    if (bindless_images) { // sotc: SOTC_N5_BINDLESS: the replayed slots are used by this tick
+        for (const auto& ref : entry->bindless_refs) {
+            bindless_images->Use(ref.key, ref.slot);
+            if (bindless_images->Mode() == 2 && ref.slot != 0) {
+                bindless_images->Verify(ref.key, ref.slot, ref.view);
+            }
+        }
+    }
     entry->last_use = ++bind_cache_clock;
 
     uses_dma = entry->uses_dma;
@@ -4670,6 +4714,8 @@ void Rasterizer::CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool u
     entry->uses_dma = uses_dma;
     entry->push_data = push_data;
     entry->bindless_slots = bindless_slots;
+    entry->bindless_refs = bind_bindless_rec;
+    entry->bindless_gen = bind_bindless_gen;
     entry->writes.assign(set_writes.begin(), set_writes.end());
     entry->write_sets.assign(set_write_sets.begin(), set_write_sets.end());
     entry->write_info.resize(set_writes.size());
@@ -5970,6 +6016,11 @@ bool Rasterizer::TryTextureBlock(const Shader::Info& stage, const TexBlockKey& k
     if (!TexBlockMatches(memo, key)) {
         return false;
     }
+    // sotc: SOTC_N5_BINDLESS: the heap slots the block names are as stored (no release or eviction
+    // since moved the generation).
+    if (memo.bindless_gen != BindlessGeneration()) {
+        return false;
+    }
     // A block that may hold a mip tail depends on the whole image set (DecideRebase looks at the
     // images overlapping the tail) and on the GPU-written tails: those two must not have moved.
     if (memo.candidate &&
@@ -6068,6 +6119,12 @@ bool Rasterizer::TryTextureBlock(const Shader::Info& stage, const TexBlockKey& k
         infos[i] = vk::DescriptorImageInfo(VK_NULL_HANDLE, e.view, image.backing->state.layout);
         ids[i] = e.bound;
     }
+    // sotc: SOTC_N5_BINDLESS: UpdateImage above may have destroyed views, and a destroyed view gives
+    // its heap slots back. A block that names one is not replayed (as the checks above).
+    if (memo.bindless_gen != BindlessGeneration()) {
+        restore_stamps();
+        return false;
+    }
 
     // sotc: SOTC_BIND_CACHE: the records the full bind makes, in its order (LOD banks in its first
     // pass, sampled images in its second). Nothing below can return false.
@@ -6103,6 +6160,22 @@ bool Rasterizer::TryTextureBlock(const Shader::Info& stage, const TexBlockKey& k
             if (ids[entry]) {
                 bound_images.emplace_back(ids[entry]);
             }
+        }
+        // sotc: SOTC_N5_BINDLESS: a heap image writes its push word, no descriptor and no binding.
+        if (memo.bindless_push[d]) {
+            const u32 heap_slot = memo.bindless_push[d] - 1u;
+            const VideoCore::BindlessRef& ref = memo.bindless_block[d];
+            const u32 shift = (heap_slot & 1) * 16;
+            auto& word = bindless_slots.image_words[heap_slot / 2];
+            word = (word & ~(0xFFFFu << shift)) | (ref.slot << shift);
+            if (bindless_images && ref.slot != 0) {
+                bind_bindless_rec.push_back(ref);
+                bindless_images->Use(ref.key, ref.slot);
+                if (bindless_images->Mode() == 2) {
+                    bindless_images->Verify(ref.key, ref.slot, ref.view);
+                }
+            }
+            continue;
         }
         set_write_sets[set_write_index] = set;
         auto& set_write = set_writes[set_write_index++];
@@ -6308,6 +6381,10 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
         rec->num_lods = 0;
         rec->bind_generation = texture_cache.BindGeneration();
         rec->gpu_epoch = VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
+        // sotc: SOTC_N5_BINDLESS: the heap generation at the start. A release or an eviction later in
+        // this bind moves it, and TryTextureBlock then refuses the block.
+        rec->bindless_gen = BindlessGeneration();
+        rec->bindless_push.fill(0);
     }
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -6728,21 +6805,30 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
         const auto& [image_id, desc] = image_bindings[image_binding_idx];
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         const u32 image_index = stage_image++;
-        // sotc: SOTC_N5_BINDLESS: a sampled image of the heap takes no descriptor and no binding
-        // number (Info::AddBindings skips it). Its push slot gets the heap index of its view.
-        if (bindless_images && !is_storage && array_size == 1) {
+        // sotc: SOTC_N5_BINDLESS: a sampled or storage image of the heap takes no descriptor and no
+        // binding number (Info::AddBindings skips it). Its push slot gets the heap index of its view.
+        // A stored bind replays the slot while the heap generation is unchanged (BindlessRef).
+        if (bindless_images && array_size == 1) {
             const u32 heap_slot = Shader::BindlessImageSlotOf(stage, image_index);
             if (heap_slot != Shader::NO_BINDLESS_IMAGE_SLOT) {
                 const u32 key = Shader::BindlessImageKeyOf(stage, stage.images[image_index]);
-                const u32 index = BindlessImageIndex(*bindless_images, texture_cache, image_id,
-                                                     desc, key, image_infos[image_info_idx].imageLayout);
+                const VideoCore::BindlessRef ref =
+                    BindlessImageIndex(*bindless_images, texture_cache, image_id, desc, key,
+                                       image_infos[image_info_idx].imageLayout);
                 const u32 shift = (heap_slot & 1) * 16;
                 auto& word = bindless_slots.image_words[heap_slot / 2];
-                word = (word & ~(0xFFFFu << shift)) | (index << shift);
-                // The heap slots are per view, so a block replayed by the bind cache or the texture
-                // block memo could hold a slot released since: those binds are not stored.
-                bind_cache_uncacheable = true;
-                store_ok = false;
+                word = (word & ~(0xFFFFu << shift)) | (ref.slot << shift);
+                if (ref.slot != 0) {
+                    bind_bindless_rec.push_back(ref);
+                }
+                if (rec) { // sotc: SOTC_TEX_BLOCK: the block's heap slot of this descriptor
+                    if (image_index < MaxBlockImages) {
+                        rec->bindless_push[image_index] = static_cast<u8>(heap_slot + 1);
+                        rec->bindless_block[image_index] = ref;
+                    } else {
+                        store_ok = false;
+                    }
+                }
                 image_info_idx += array_size;
                 image_binding_idx += array_size;
                 continue;

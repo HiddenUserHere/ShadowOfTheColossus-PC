@@ -285,10 +285,20 @@ private:
         std::array<TexBlockEntry, MaxBlockEntries> entries{};
         u32 num_lods{};
         std::array<u32, MaxBlockImages> lod_banks{};
+        /// sotc: SOTC_N5_BINDLESS: the heap generation the block was made at (BindlessGeneration),
+        /// and per image descriptor its push slot + 1 (0: a plain descriptor) and the heap slot.
+        u64 bindless_gen{};
+        std::array<u8, MaxBlockImages> bindless_push{};
+        std::array<VideoCore::BindlessRef, MaxBlockImages> bindless_block{};
     };
     std::unique_ptr<std::array<TexBlockMemo, NumTexBlockMemos>> tex_block_memos =
         std::make_unique<std::array<TexBlockMemo, NumTexBlockMemos>>();
     static int TexBlockMode();
+    /// sotc: SOTC_N5_BINDLESS: the heap generation, 0 without the heap. A stored bind (bind cache,
+    /// texture block) is replayed only while it is unchanged (BindlessImages::Generation).
+    u64 BindlessGeneration() const noexcept {
+        return bindless_images ? bindless_images->Generation() : 0;
+    }
     bool MakeTextureBlockKey(const Shader::Info& stage, u32 set, const PreparedResources* pr,
                              const PrStage* pr_stage, TexBlockKey& key);
     static bool TexBlockMatches(const TexBlockMemo& memo, const TexBlockKey& key);
@@ -569,6 +579,10 @@ private:
         /// last block stamping (0: due).
         std::vector<BindCacheRepair> repairs;
         std::vector<BindCacheSampler> samplers;
+        /// sotc: SOTC_N5_BINDLESS: the heap slots the bind used and the generation they were in; a
+        /// hit needs the generation unchanged, and touches the slots (BindlessImages::Use).
+        std::vector<VideoCore::BindlessRef> bindless_refs;
+        u64 bindless_gen{};
         u64 made_tick{~0ULL};
         u64 stamp_tick{~0ULL};
         u16 stamp_epoch{};
@@ -684,6 +698,10 @@ private:
     std::vector<std::pair<VAddr, u64>> bind_cache_ranges_rec;
     std::vector<BindCacheRepair> bind_cache_repairs_rec;     ///< SOTC_BIND_CACHE_XTICK
     std::vector<BindCacheSampler> bind_cache_samplers_rec;   ///< SOTC_BIND_CACHE_XTICK
+    /// sotc: SOTC_N5_BINDLESS: the heap slots of the current bind (BindlessRef), and the heap
+    /// generation the bind started at. A stored bind keeps both (BindCacheEntry).
+    std::vector<VideoCore::BindlessRef> bind_bindless_rec;
+    u64 bind_bindless_gen{};
     /// SOTC_BIND_CACHE_XTICK, SOTC_FPS only: keys of the last two frames that looked the cache up,
     /// direct-mapped (counter: lookups whose key was also seen in the previous frame).
     struct BindSeenSlot {

@@ -408,7 +408,9 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
             image_ptr = ctx.OpAccessChain(single_image_ptr_type, image_ptr, std::array{lod});
 #endif
         }
-        const Id image = ctx.OpLoad(texture.image_type, image_ptr);
+        // sotc: SOTC_N5_BINDLESS: a storage image of the heap is loaded from its array (LoadImage).
+        const Id image = texture.bindless ? LoadImage(ctx, inst, texture)
+                                          : ctx.OpLoad(texture.image_type, image_ptr);
         texel = ctx.OpImageRead(color_type, image, fixed_coords, operands.mask, operands.operands);
     }
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texel) : texel;
@@ -431,7 +433,9 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
             ctx.TypePointer(spv::StorageClass::UniformConstant, texture.image_type);
         image_ptr = ctx.OpAccessChain(single_image_ptr_type, image_ptr, std::array{lod});
     }
-    const Id image = ctx.OpLoad(texture.image_type, image_ptr);
+    // sotc: SOTC_N5_BINDLESS: a storage image of the heap is loaded from its array (LoadImage).
+    const Id image = texture.bindless ? LoadImage(ctx, inst, texture)
+                                      : ctx.OpLoad(texture.image_type, image_ptr);
     const Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;
     ctx.OpImageWrite(image, fixed_coords, texel, operands.mask, operands.operands);
 }

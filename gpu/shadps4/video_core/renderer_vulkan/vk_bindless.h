@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -29,15 +30,30 @@ inline constexpr u32 BindlessImageCapacity = 4096;
 /// array of BindlessSamplers. The set layout (sampler.cpp) appends BindlessImageLayoutBindings().
 inline constexpr u32 BindlessImageFirstBinding = 1;
 
+/// sotc: descriptor type of the heap array of `key`: sampled for the sampled keys, storage for the
+/// storage keys (Shader::BindlessImageKeyOf).
+vk::DescriptorType BindlessImageDescriptorType(u32 key);
+
 /// sotc: layout bindings of the heap arrays (one per key), for the bindless set layout.
 std::array<vk::DescriptorSetLayoutBinding, Shader::NUM_BINDLESS_IMAGE_KEYS>
 BindlessImageLayoutBindings();
 
-/// sotc: SOTC_N5_BINDLESS: the sampled image views of the bindless set. A view takes a slot of
-/// a heap array the first time a bindless stage binds it for that key (ImageView::bindless_slots),
-/// keeps it while the view lives, and gives it back when the view dies. A released slot is
-/// cleared and reused only after the GPU passed the tick of its release (frame ticket), so no
-/// submitted draw can read a slot that changes under it.
+/// sotc: one heap slot a bind uses: its array (key), its index (the push word value) and the view
+/// the slot held when the bind used it. A stored bind (SOTC_BIND_CACHE, SOTC_TEX_BLOCK) keeps these
+/// and replays them while BindlessImages::Generation is unchanged.
+struct BindlessRef {
+    u32 key{};
+    u32 slot{};
+    vk::ImageView view{};
+};
+
+/// sotc: SOTC_N5_BINDLESS: the image views of the bindless set. A view takes a slot of its key's
+/// array when a bindless stage first binds it (ImageView::bindless_slots) and keeps it while it
+/// holds it. A slot is given back when its view releases it (a layout change, or the view dies),
+/// or taken away when the heap is full (the least recently used slot the GPU has finished with).
+/// A released slot is cleared and reused only after the GPU passed the tick of its release, and a
+/// slot is evicted only after the GPU passed the last tick that used it, so no submitted draw can
+/// read a slot that changes under it.
 class BindlessImages {
 public:
     /// `set` is the bindless set (BindlessSamplers::Set()), with the heap arrays in its layout.
@@ -56,15 +72,30 @@ public:
         return mode;
     }
 
+    /// Bumped whenever a slot stops holding the view it held (a release, an eviction). A bind
+    /// stored with the generation it was made at is replayed only while it is unchanged.
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation.load(std::memory_order_acquire);
+    }
+
     /// Slot of `view` in the array of `key`, written with `layout`: the descriptor fixes the layout
     /// at write time, so a view bound in another layout takes a new slot (the caller releases the
-    /// old one). Writes the heap on each Acquire, never per draw for a view that keeps its slot.
-    /// Returns the null slot of the key when the heap is full. Called with the texture cache lock.
+    /// old one). When the heap is full, the least recently used slot the GPU has finished with is
+    /// taken (counted as an eviction). Returns the null slot of the key when none is free.
+    /// The new slot is marked used by the current tick. Called with the texture cache lock.
     [[nodiscard]] u32 Acquire(u32 key, vk::ImageView view, vk::ImageLayout layout);
 
-    /// Gives `slot` of `key` back. Slot 0 (null) and NO_BINDLESS_IMAGE_SLOT are never released. The
-    /// slot is cleared after the frame ticket (see above).
-    void Release(u32 key, u32 slot);
+    /// True when `slot` of `key` is live and holds `view` in `layout`.
+    [[nodiscard]] bool Holds(u32 key, u32 slot, vk::ImageView view, vk::ImageLayout layout);
+
+    /// Marks a live `slot` of `key` used by the current tick: it is not evicted before that tick
+    /// has finished on the GPU. Every bind that names a slot calls it when it names it.
+    void Use(u32 key, u32 slot);
+
+    /// Gives `slot` of `key` back when it is live and holds `view` (otherwise a no-op: the view
+    /// lost the slot to an eviction). Slot 0 (null) is never released. The slot is cleared after the
+    /// frame ticket (see above).
+    void Release(u32 key, u32 slot, vk::ImageView view);
 
     /// The null slot of every key: holds no view, reads as zero (nullDescriptor).
     [[nodiscard]] static constexpr u32 NullSlot(u32 /*key*/) noexcept {
@@ -76,19 +107,33 @@ public:
     bool Verify(u32 key, u32 slot, vk::ImageView expected);
 
     /// One line for the 5 s report (counters are reset on read):
-    /// "SOTC N5 BINDLESS acquire N writes N releases N reclaims N full N verify N mismatch N pending N".
-    /// Returns the length written.
+    /// "SOTC N5 BINDLESS acquire N writes N releases N reclaims N evict N full N verify N mismatch N
+    /// pending N". Returns the length written.
     u32 Report(char* out, u32 size);
 
 private:
-    void Reclaim();
-    void WriteSlot(u32 key, u32 slot, vk::ImageView view, vk::ImageLayout layout);
+    enum class SlotState : u8 {
+        Free,    ///< no view; in the free list or never used
+        Live,    ///< holds `view` for its owner
+        Pending, ///< released: still holds the old view until its release tick is free
+    };
 
-    struct Pending {
+    struct Slot {
+        vk::ImageView view{};
+        vk::ImageLayout layout{vk::ImageLayout::eUndefined};
+        u64 last_use{}; ///< tick of the last bind that named the slot
+        SlotState state{SlotState::Free};
+    };
+
+    struct ReleasedSlot {
         u32 key;
         u32 slot;
         u64 tick;
     };
+
+    void Reclaim();
+    u32 Evict(u32 key);
+    void WriteSlot(u32 key, u32 slot, vk::ImageView view, vk::ImageLayout layout);
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -96,17 +141,19 @@ private:
     u32 mode;
 
     std::mutex mutex;
-    // Mirror of the heap: the view written at each slot (null handle when cleared).
-    std::array<std::vector<vk::ImageView>, Shader::NUM_BINDLESS_IMAGE_KEYS> mirror{};
+    std::atomic<u64> generation{1};
+    // Mirror of the heap, one entry per slot of each array (index 0 is the null slot).
+    std::array<std::vector<Slot>, Shader::NUM_BINDLESS_IMAGE_KEYS> slots{};
     std::array<std::vector<u32>, Shader::NUM_BINDLESS_IMAGE_KEYS> free_slots{};
-    std::array<u32, Shader::NUM_BINDLESS_IMAGE_KEYS> next_slot{1, 1, 1, 1, 1, 1};
-    std::deque<Pending> pending;
+    std::array<u32, Shader::NUM_BINDLESS_IMAGE_KEYS> next_slot{};
+    std::deque<ReleasedSlot> pending;
     bool logged_full{};
 
     u64 acquires{};
     u64 writes{};
     u64 releases{};
     u64 reclaims{};
+    u64 evictions{};
     u64 full{};
     u64 verifies{};
     u64 mismatches{};
