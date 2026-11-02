@@ -69,6 +69,14 @@ struct Profile {
     /// Last member: the profile grows from 68 to 72 bytes (alignment 4). vk_pipeline_serialization.cpp
     /// pads the 68-byte profiles of older caches with this byte off, the 64-byte ones through bda.
     bool bindless_images{};
+    /// sotc: SOTC_HEAP: a stage whose images and samplers are all in the bindless heap takes their heap
+    /// indices from the index table of the draw (UsesHeapImages), not from push slots. Sits in the
+    /// padding byte after bindless_images, so the profile keeps its size (vk_pipeline_serialization.cpp).
+    bool heap_images{};
+    /// sotc: SOTC_SHADER_ADDR: guest buffers that are neither formatted nor coherent take their
+    /// base and size from their V# words in the flat buffer, and their window bases from the push
+    /// block (ShaderAddrBuffer in runtime_info.h). Last member: the cache check pads older profiles.
+    bool shader_addr{};
 
     bool operator==(const Profile&) const = default;
 };

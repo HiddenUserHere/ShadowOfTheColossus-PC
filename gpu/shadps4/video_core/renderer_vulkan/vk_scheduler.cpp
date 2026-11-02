@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_MIRROR (ReadyForSubmit)
 #include "video_core/sotc_stats.h"
 #include "../../../sotc/native/native_copies.h" // sotc: SOTC_N5_ASYNC_COMPUTE (copies of an async submit)
 #include "sotc_gpu_trace.h"
@@ -1310,10 +1311,34 @@ static void QueueSubmit(const Instance& instance, const SubmitInfo& info,
     }
 }
 
+void Scheduler::RequireExternalWait(vk::Semaphore sem, u64 value, vk::PipelineStageFlags stages) {
+    std::scoped_lock lk{external_wait_mutex};
+    for (u32 i = 0; i < num_external_waits; ++i) {
+        if (external_waits[i].sem == sem) {
+            external_waits[i].value = std::max(external_waits[i].value, value);
+            return;
+        }
+    }
+    if (num_external_waits < external_waits.size()) {
+        external_waits[num_external_waits++] = ExternalWait{sem, value, stages};
+        return;
+    }
+    // No slot left: wait on the CPU now (rare).
+    const vk::SemaphoreWaitInfo wait_info = {
+        .semaphoreCount = 1,
+        .pSemaphores = &sem,
+        .pValues = &value,
+    };
+    (void)instance.GetDevice().waitSemaphores(wait_info, std::numeric_limits<u64>::max());
+}
+
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     // Only the queue operations take submit_mutex (the sparse binds of on_submit take it on
     // their own): with the recorder, holding it while queueing commands could wait for the
     // recording thread, which needs it for its submits.
+    // sotc: SOTC_MIRROR: the sparse binds of the GPU memory mirror are processed first (no-op when
+    // off). Before NextTick, so CurrentTick() is this submit's tick.
+    SotcArch::Mirror::ReadyForSubmit(*this);
     const u64 signal_value = work_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED
@@ -1369,6 +1394,25 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             async->WaitValue(async_pending); // no wait slot left: wait on the CPU instead
         }
         async_pending = 0;
+    }
+    // sotc: SOTC_MIRROR: this submit waits for the sparse binds registered since the previous one.
+    {
+        std::scoped_lock lk{external_wait_mutex};
+        for (u32 i = 0; i < num_external_waits; ++i) {
+            const ExternalWait& wait = external_waits[i];
+            if (info.num_wait_semas < info.wait_semas.size()) {
+                info.AddWait(wait.sem, wait.value, wait.stages);
+            } else {
+                const vk::SemaphoreWaitInfo wait_info = {
+                    .semaphoreCount = 1,
+                    .pSemaphores = &wait.sem,
+                    .pValues = &wait.value,
+                };
+                (void)instance.GetDevice().waitSemaphores(wait_info,
+                                                          std::numeric_limits<u64>::max());
+            }
+        }
+        num_external_waits = 0;
     }
 
     const vk::Semaphore timeline = work_semaphore.Handle();

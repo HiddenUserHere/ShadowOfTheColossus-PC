@@ -29,6 +29,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_HEAP
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_generation.h"
 #include "video_core/texture_cache/tsharp_slot_cache.h" // sotc: SOTC_TSLOT (identity skip) // sotc: SOTC_GEN_TEX (guest range generations)
@@ -255,6 +256,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     if (SotcAreaPrewarm::Recording()) {
         SotcAreaPrewarm::SetRecordCheck(&ReplayRecordKnown); // sotc: checked when loaded
     }
+    SotcArch::Heap::Init(instance); // sotc: SOTC_HEAP (no-op unless the switch is set)
     if (image_prefetcher) {
         prefetch_seen = std::make_unique<std::array<PrefetchSeen, NumPrefetchSeen>>();
         LOG_INFO(Render, "SOTC_ASYNC_IMAGE_CREATE: new images are created ahead of their draw");
@@ -2764,7 +2766,8 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     // never shrinks. A full heap hands out the default sampler of the right kind (compare for
     // depth samplers: a non-compare sampler on a Dref lookup is undefined, blinking shadows).
     VideoCore::Sampler& entry = samplers.at(hash);
-    if (bindless_slot && bindless_samplers.Enabled() &&
+    // sotc: SOTC_HEAP: every new sampler takes its bindless slot at creation (the GC keeps such samplers).
+    if ((bindless_slot || SotcArch::Heap::On()) && bindless_samplers.Enabled() &&
         entry.bindless_slot == BindlessSamplers::NoSlot) {
         entry.bindless_slot = bindless_samplers.Allocate(entry.Handle());
     }

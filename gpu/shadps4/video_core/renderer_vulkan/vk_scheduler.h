@@ -641,6 +641,10 @@ public:
     /// sotc: timeline value of the newest async submit (0: none).
     [[nodiscard]] u64 AsyncLast() const noexcept;
 
+    /// sotc: SOTC_MIRROR. The next graphics submit waits for value on the timeline sem, on stages
+    /// (merged per semaphore; beyond the free slots the wait is taken on the CPU). Any thread.
+    void RequireExternalWait(vk::Semaphore sem, u64 value, vk::PipelineStageFlags stages);
+
     /// sotc: SOTC_HOST_IMPORT, see XferQueue::CopyAndWait. False without the transfer queue.
     bool XferCopyAndWait(std::span<const XferQueue::Region> regions) {
         if (!xfer) {
@@ -945,6 +949,15 @@ private:
     u64 async_graphics_tick{};     ///< sotc: newest graphics tick the open async submit waits for
     u64 async_pending{};           ///< sotc: async value the next graphics submit waits for
     u64 async_joined{};            ///< sotc: newest async value a graphics submit waits for or the host
+    /// sotc: SOTC_MIRROR, see RequireExternalWait. Consumed by SubmitExecution.
+    struct ExternalWait {
+        vk::Semaphore sem{};
+        u64 value{};
+        vk::PipelineStageFlags stages{};
+    };
+    std::array<ExternalWait, 4> external_waits{};
+    u32 num_external_waits{};
+    std::mutex external_wait_mutex;
     /// Last member: stops (after running everything queued) before the rest is destroyed.
     std::unique_ptr<CommandRecorder> recorder;
 };

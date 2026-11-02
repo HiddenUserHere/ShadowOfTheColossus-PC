@@ -327,4 +327,16 @@ static_assert(sizeof(BindlessSamplerSlots) ==
 static_assert(sizeof(PushData) + sizeof(BindlessSamplerSlots) <= 192,
               "bindless push block is larger than the 192 bytes the probe requires");
 
+/// sotc: SOTC_SHADER_ADDR: the window words of the shader-computed buffer addresses, at the byte offsets of
+/// the same fields of sotc_arch::DrawPacket (video_core/sotc_arch/sotc_arch.h, PacketPushOffset = 56): the
+/// packet starts right after PushData, so the window words sit at 72..120 and the block ends at 128 bytes.
+/// Shaders with bindless slots are excluded (ShaderAddrBuffer), so these words never share bytes with them.
+static constexpr u32 ShaderAddrMirrorGuestOffset = 72;
+static constexpr u32 ShaderAddrMirrorDeviceOffset = 80;
+static constexpr u32 ShaderAddrArenaGuestOffset = 88;
+static constexpr u32 ShaderAddrArenaDeviceOffset = 96;
+static constexpr u32 ShaderAddrArenaSizeOffset = 104;
+static constexpr u32 ShaderAddrMirrorSizeOffset = 120;
+static_assert(sizeof(PushData) == 56, "the SotcArch packet starts at 56 (PacketPushOffset)");
+
 } // namespace Shader

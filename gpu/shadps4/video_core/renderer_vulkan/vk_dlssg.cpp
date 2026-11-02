@@ -1279,11 +1279,11 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
         .dstOffset = {0, 0, 0},
         .extent = {w, h, 1},
     };
-    cmdbuf.copyImage(scene->GetImage(), Layout::eTransferSrcOptimal, sr_color.image,
+    cmdbuf.copyImage(scene->GetImage(), SotcArch::Layouts::Pick(Layout::eTransferSrcOptimal), sr_color.image,
                      Layout::eTransferDstOptimal, region);
     vk::ImageCopy ui_region = region;
     ui_region.extent = vk::Extent3D{uw, uh, 1};
-    cmdbuf.copyImage(ui->GetImage(), Layout::eTransferSrcOptimal, sr_ui.image,
+    cmdbuf.copyImage(ui->GetImage(), SotcArch::Layouts::Pick(Layout::eTransferSrcOptimal), sr_ui.image,
                      Layout::eTransferDstOptimal, ui_region);
     const std::array to_read{
         barrier(sr_color.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
@@ -1554,7 +1554,7 @@ bool CopyGameInputs(vk::CommandBuffer cmdbuf, Runtime& runtime, VideoCore::Image
             .dstOffset = {0, 0, 0},
             .extent = {width, height, 1},
         };
-        cmdbuf.copyImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
+        cmdbuf.copyImage(src, SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), dst,
                          vk::ImageLayout::eTransferDstOptimal, region);
     };
     copy(depth->GetImage(), dst.depth, vk::ImageAspectFlagBits::eDepth);

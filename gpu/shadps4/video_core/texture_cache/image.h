@@ -16,6 +16,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_TEX (MarkGpuModified)
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_LAYOUT_UNIFIED (SotcArch::Layouts)
 
 namespace Vulkan {
 class Instance;
@@ -24,6 +25,21 @@ class Runtime;
 
 VK_DEFINE_HANDLE(VmaAllocation)
 VK_DEFINE_HANDLE(VmaAllocator)
+
+// sotc: SOTC_LAYOUT_UNIFIED (A1) functions beyond the contract, defined in sotc_arch/layouts.cpp.
+namespace SotcArch::Layouts {
+/// The image code reports whether the device has VK_KHR_unified_image_layouts (instance probe).
+void NoteSupported(bool supported);
+/// The layout a command or descriptor names for an image whose tracked layout is `layout`: GENERAL when On().
+vk::ImageLayout Pick(vk::ImageLayout layout);
+/// SOTC_LAYOUT_UNIFIED=2: the old layouts are used and the barriers the new path would drop are counted.
+bool Verify();
+void NoteKept();
+void NoteSkipped();
+void NoteVerifySkip();
+/// Counters for the 5 s line (out is empty when the switch is off).
+void Report(char* out, u32 size, double seconds);
+} // namespace SotcArch::Layouts
 
 namespace VideoCore {
 

@@ -21,6 +21,7 @@
 #include "../../../sotc/pc_ring.h" // sotc: SOTC_BPE_FIX (HostServed)
 #include "video_core/buffer_cache/bpe_heap_guard.h" // sotc: SOTC_BPE_FIX
 #include "video_core/renderdoc.h"
+#include "video_core/sotc_arch/shader_addr.h" // sotc: SOTC_SHADER_ADDR, SOTC_MIRROR (sotc_arch.h)
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "core/debug_state.h"
@@ -51,6 +52,7 @@
 #include "../../../sotc/native/verify.h" // sotc: SOTC_VERIFY (SotcVerify::VerifyAll)
 #include "../../../sotc/native/n1verify.h" // sotc: SOTC_VERIFY=n1
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH (barrier events)
+#include "video_core/sotc_arch/passes.h" // sotc: SOTC_PASSES (pass rule, ARCH-DRAW.md section 5)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -65,6 +67,8 @@
 // sotc: SOTC_PR_RESOLVE. Generation of the runtime memory table (src/runtime_memory.c); odd while
 // a change is in progress. Same declaration as sotc_bininfo.cpp.
 extern "C" uint64_t runtime_memory_generation(void);
+
+namespace Passes = SotcArch::Passes; // sotc: SOTC_PASSES (passes.h)
 
 namespace Vulkan {
 
@@ -149,6 +153,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
+    // sotc: SOTC_MIRROR: before SetRasterizer, which replays the live GPU mappings into Mirror::OnMap.
+    SotcArch::Mirror::Init(instance, scheduler);
     memory->SetRasterizer(this);
     SotcGuestMemory::Init(instance); // sotc: SOTC_PC_MEMORY=1 (docs/sotc/MODELO-MEMORIA-PC.md)
 
@@ -689,7 +695,7 @@ bool Rasterizer::RsMemoBegin(RenderState& state) {
                                              vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                                              access, desc.view_info.range);
         }
-        state.color_attachments[cb].image_layout = image->backing->state.layout;
+        state.color_attachments[cb].image_layout = SotcArch::Layouts::Pick(image->backing->state.layout); // sotc: A1
         if (cb == 0 && image->usage.vo_surface) { // sotc: TakeHudless
             hudless_vo = image->info.guest_address;
             hudless_vo_format = state.color_formats[0];
@@ -713,7 +719,7 @@ bool Rasterizer::RsMemoBegin(RenderState& state) {
             needs_barrier |= runtime.Transit(&image, rs_memo.depth_layout, rs_memo.depth_stages,
                                              rs_memo.depth_access, db_desc.second.view_info.range);
         }
-        state.depth_stencil_attachment.image_layout = image.backing->state.layout;
+        state.depth_stencil_attachment.image_layout = SotcArch::Layouts::Pick(image.backing->state.layout); // sotc: A1
     }
     if (SotcStats::kFpsLog) {
         SotcStats::rs_memo_hits.fetch_add(1, std::memory_order_relaxed);
@@ -1986,7 +1992,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(index_offset); });
     }
 
-    if (needs_barrier) {
+    if (Passes::Decide(needs_barrier, !bound_buffers.empty() || !fixed_function_reads.empty())) {
         runtime.FlushBarriers();
     }
 
@@ -2164,7 +2170,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               : sizeof(VkDrawIndirectCommand)) &&
         !buffer_cache.IsRegionGpuModified(arg_address + offset, stride) &&
         memory->TryReadBacking(arg_address + offset, &args, stride)) {
-        if (needs_barrier) {
+        if (Passes::Decide(needs_barrier, !bound_buffers.empty() || !fixed_function_reads.empty())) {
             runtime.FlushBarriers();
         }
         {
@@ -2220,18 +2226,21 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         const SotcTrace::BindScope trace_step{"indirect args"};
         return buffer_cache.ObtainBuffer(arg_address + offset, stride * max_count, false);
     }();
-    needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+    // sotc: SOTC_PASSES=1 leaves the overlap check to Passes::Decide (its pass rule covers it).
+    needs_barrier |=
+        Passes::BufferNeed(!Passes::On() && runtime.IsBufferAccessed(buffer, base, stride * max_count));
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
     if (count_address != 0) {
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
-        needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+        needs_barrier |=
+            Passes::BufferNeed(!Passes::On() && runtime.IsBufferAccessed(count_buffer, count_offset, 4));
     }
     // sotc: the argument buffers can submit too.
     RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(); });
 
-    if (needs_barrier) {
+    if (Passes::Decide(needs_barrier, !bound_buffers.empty() || !fixed_function_reads.empty())) {
         runtime.FlushBarriers();
     }
 
@@ -2567,7 +2576,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     if (async_value == 0) {
         scheduler.AsyncJoinBefore(Vulkan::FrameGraph::AsyncConflicts(async.fp));
     }
-    if (needs_barrier) {
+    if (Passes::Decide(needs_barrier, !bound_buffers.empty() || !fixed_function_reads.empty())) {
         runtime.FlushBarriers();
     }
 
@@ -2653,7 +2662,8 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     }
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+    // sotc: SOTC_PASSES=1 leaves the overlap check to Passes::Decide (its pass rule covers it).
+    needs_barrier |= Passes::BufferNeed(!Passes::On() && runtime.IsBufferAccessed(buffer, base, size));
 
     // sotc: N5 async move, see DispatchDirect.
     const u64 async_value =
@@ -2664,7 +2674,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     if (async_value == 0) {
         scheduler.AsyncJoinBefore(Vulkan::FrameGraph::AsyncConflicts(async.fp));
     }
-    if (needs_barrier) {
+    if (Passes::Decide(needs_barrier, !bound_buffers.empty() || !fixed_function_reads.empty())) {
         runtime.FlushBarriers();
     }
 
@@ -2727,7 +2737,8 @@ void Rasterizer::OnFence() {
 void Rasterizer::RefreshImageLayouts() {
     for (size_t i = 0; i < image_infos.size(); ++i) {
         if (const VideoCore::ImageId id = image_info_images[i]) {
-            image_infos[i].imageLayout = texture_cache.GetImage(id).backing->state.layout;
+            image_infos[i].imageLayout =
+                SotcArch::Layouts::Pick(texture_cache.GetImage(id).backing->state.layout); // sotc: A1
         }
     }
 }
@@ -4047,7 +4058,8 @@ bool Rasterizer::TryBindCache(const Pipeline* pipeline, u64 hash, bool& uses_dma
     // The buffer side of BindBuffers: barrier against earlier writes, and the reads recorded
     // after the draw (ResetBindings).
     for (const auto& buf : entry->buffers) {
-        needs_barrier |= runtime.IsBufferAccessed(buf.buffer, buf.offset, buf.size, buf.is_written);
+        needs_barrier |= Passes::BufferNeed( // sotc: SOTC_PASSES (see BindVertexBuffers)
+            !Passes::On() && runtime.IsBufferAccessed(buf.buffer, buf.offset, buf.size, buf.is_written));
         bound_buffers.emplace_back(buf);
     }
     for (const u32 bank : entry->lod_banks) {
@@ -4655,7 +4667,8 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
     // The buffer side of BindBuffers: barrier against earlier writes, and the reads recorded
     // after the draw (ResetBindings).
     for (const auto& buf : entry->buffers) {
-        needs_barrier |= runtime.IsBufferAccessed(buf.buffer, buf.offset, buf.size, buf.is_written);
+        needs_barrier |= Passes::BufferNeed( // sotc: SOTC_PASSES (see BindVertexBuffers)
+            !Passes::On() && runtime.IsBufferAccessed(buf.buffer, buf.offset, buf.size, buf.is_written));
         bound_buffers.emplace_back(buf);
     }
     for (const u32 bank : entry->lod_banks) {
@@ -4955,7 +4968,8 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         SotcVerify::BindKindScope verify_kind{SotcVerify::BindKind::Vertex}; // sotc: SOTC VERIFY BYTES
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
-        needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+        needs_barrier |= Passes::BufferNeed( // sotc: SOTC_PASSES: Passes::Decide covers it when On()
+            !Passes::On() && runtime.IsBufferAccessed(range.buffer, range.offset, size));
         fixed_function_reads.push_back({range.buffer, range.offset, static_cast<u32>(size), false});
     }
 
@@ -5008,7 +5022,8 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
     SotcVerify::BindKindScope verify_kind{SotcVerify::BindKind::Index}; // sotc: SOTC VERIFY BYTES
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+    needs_barrier |= Passes::BufferNeed( // sotc: SOTC_PASSES: Passes::Decide covers it when On()
+        !Passes::On() && runtime.IsBufferAccessed(buffer, offset, index_buffer_size));
     fixed_function_reads.push_back({buffer, offset, index_buffer_size, false});
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
@@ -5652,13 +5667,23 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                      buffer_infos.capacity(), n5_bda, n5_buffers);
         }
     }
+    // sotc: SOTC_SHADER_ADDR (A3, sotc_arch/shader_addr.cpp). The pipeline's profile (SetBindProfile, BindResources)
+    // gives Shader::ShaderAddrBuffer, the same predicate the recompiler uses: a buffer it addresses from its V# words
+    // takes no ObtainBuffer and no descriptor here. Block-table stages keep their own path. Mode 2 runs the old path
+    // and verifies each such bind after ObtainBuffer.
+    const Shader::Profile* shader_addr_profile =
+        SotcArch::ShaderAddr::On() && !bda_stage ? SotcArch::ShaderAddr::BindProfile() : nullptr;
+    const auto shader_addressed = [&](const Shader::BufferResource& desc) {
+        return shader_addr_profile && Shader::ShaderAddrBuffer(*shader_addr_profile, stage, desc);
+    };
     for (const auto& desc : stage.buffers) {
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
-                needs_barrier |=
-                    runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
+                needs_barrier |= Passes::BufferNeed( // sotc: SOTC_PASSES (see BindVertexBuffers)
+                    !Passes::On() &&
+                    runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written));
                 bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
@@ -5796,6 +5821,23 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 size = VideoCore::BpeNative::Check(vbase, size, VideoCore::BpeNative::Kind::Bind,
                                                    stage.pgm_hash, SotcPcRing::HostServed(vbase, size),
                                                    true);
+            }
+            // sotc: SOTC_SHADER_ADDR (A3). The shader addresses this buffer itself: no ObtainBuffer, no
+            // descriptor, no buffer record for the barriers. What does not need the buffer object stays: the
+            // invalidation of images and the write mark of a written range. Mode 2 takes the old path below.
+            if (shader_addressed(desc) && !SotcArch::ShaderAddr::Verify()) {
+                SotcArch::ShaderAddr::NoteSkip(size, desc.is_written);
+                if (desc.is_written && size != 0) {
+                    texture_cache.InvalidateMemoryFromGPU(vbase, size);
+                    Core::MemoryManager::NoteHostWrite(vbase, size, 7, stage.pgm_hash);
+                    if (SotcStats::kBindCacheRanges) {
+                        BindCacheInvalidate(vbase, size);
+                    }
+                }
+                bind_cache_uncacheable = true; // the op's bind cache is not recorded: no buffer object to check
+                ++binding.unified;
+                ++binding.buffer;
+                continue;
             }
             // sotc: SOTC_BIND_CACHE_XTICK (BindCacheRepair)
             const u64 mapped_size = pb ? pb->mapped : size;
@@ -5982,6 +6024,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     BdaNoteDirect(same ? BdaDirect::Verified : BdaDirect::Mismatch);
                 }
                 const auto [buffer, offset] = obtained;
+                // sotc: SOTC_SHADER_ADDR=2: the address the shader computes for this bind, against the one
+                // ObtainBuffer just gave. This run is the old path.
+                if (SotcArch::ShaderAddr::Verify() && shader_addressed(desc)) {
+                    SotcArch::ShaderAddr::VerifyBind(vbase, vsize, buffer, offset);
+                }
                 if (SotcStats::kWriteMarks && desc.is_written) { // sotc: kWriteMarks (SOTC_FPS_LEAN)
                     SotcWriteExtent::NoteMark(
                         stage.pgm_hash, buf_index, vbase, size,
@@ -6082,7 +6129,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         BindCacheInvalidate(vbase, size);
                     }
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                needs_barrier |= Passes::BufferNeed( // sotc: SOTC_PASSES (see BindVertexBuffers)
+                    !Passes::On() && runtime.IsBufferAccessed(buffer, offset, size, desc.is_written));
                 SotcOpPhases::ChargeBinding(desc.is_written, ph_upload0, ph_t0); // sotc: SOTC_OP_PHASES
             }
             if (drop_desc) {
@@ -6385,7 +6433,8 @@ bool Rasterizer::TryTextureBlock(const Shader::Info& stage, const TexBlockKey& k
                                          vk::PipelineStageFlagBits2::eAllCommands,
                                          vk::AccessFlagBits2::eShaderRead, e.range);
         image.usage.texture = 1u;
-        infos[i] = vk::DescriptorImageInfo(VK_NULL_HANDLE, e.view, image.backing->state.layout);
+        infos[i] = vk::DescriptorImageInfo(VK_NULL_HANDLE, e.view,
+                                           SotcArch::Layouts::Pick(image.backing->state.layout)); // sotc: A1
         ids[i] = e.bound;
     }
     // sotc: SOTC_N5_BINDLESS: UpdateImage above may have destroyed views, and a destroyed view gives
@@ -7075,8 +7124,9 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
+            // sotc: SOTC_LAYOUT_UNIFIED: the descriptor names the layout the image really is in.
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
-                                     image.backing->state.layout);
+                                     SotcArch::Layouts::Pick(image.backing->state.layout));
             image_info_images[image_infos.size() - 1] = image_id;
         }
     }
@@ -7481,7 +7531,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
         auto& attachment = state.color_attachments[cb];
         attachment.image_view = *image_view.image_view;
-        attachment.image_layout = image->backing->state.layout;
+        attachment.image_layout = SotcArch::Layouts::Pick(image->backing->state.layout); // sotc: A1
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
         state.color_formats[cb] = image_view.info.format;
@@ -7566,7 +7616,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
 
         auto& attachment = state.depth_stencil_attachment;
         attachment.image_view = *image_view.image_view;
-        attachment.image_layout = image.backing->state.layout;
+        attachment.image_layout = SotcArch::Layouts::Pick(image.backing->state.layout); // sotc: A1
         attachment.clear_value = {};
         attachment.is_clear = 0;
 

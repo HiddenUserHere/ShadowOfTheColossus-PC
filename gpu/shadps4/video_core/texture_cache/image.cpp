@@ -438,6 +438,8 @@ ImagePlan PlanImage(const Vulkan::Instance& instance, const ImageInfo& info) {
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
              Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
     : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
+    // sotc: SOTC_LAYOUT_UNIFIED: the feature the layouts may use (Pick); the switch is part of the accessor.
+    SotcArch::Layouts::NoteSupported(instance.SotcUnifiedLayouts());
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
@@ -537,6 +539,37 @@ static bool SkipSameGeneral(Image& image, vk::ImageLayout a, vk::ImageLayout b, 
     return false;
 }
 
+// sotc: SOTC_LAYOUT_UNIFIED. A barrier that moved only the tracked layout (same access, no write before it) orders
+// no hazard: with every image in GENERAL there is no layout change left to order, so it is dropped. Only the
+// barriers that carry an access or a write are kept (their layouts become GENERAL, see Layouts::Pick). The first
+// use of an image still moves it from UNDEFINED to GENERAL. =2 keeps every barrier and counts the drops.
+static bool DropLayoutOnlyBarrier(const Image::State& prev, vk::ImageLayout dst_layout,
+                                  vk::AccessFlags2 dst_mask) {
+    if (!SotcArch::Layouts::On() && !SotcArch::Layouts::Verify()) {
+        return false;
+    }
+    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite;
+    // The real layout must not change either: a feedback loop kept by Pick (no unified feature) is a real change.
+    const bool layout_only = prev.layout != dst_layout && prev.access_mask == dst_mask &&
+                             prev.layout != vk::ImageLayout::eUndefined &&
+                             SotcArch::Layouts::Pick(prev.layout) == SotcArch::Layouts::Pick(dst_layout) &&
+                             !static_cast<bool>(prev.access_mask & write_flags);
+    if (SotcArch::Layouts::Verify()) {
+        if (layout_only) {
+            SotcArch::Layouts::NoteVerifySkip();
+        }
+        return false;
+    }
+    if (layout_only) {
+        SotcArch::Layouts::NoteSkipped();
+        return true;
+    }
+    SotcArch::Layouts::NoteKept();
+    return false;
+}
+
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                         vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
@@ -587,13 +620,14 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                 const bool is_write = static_cast<bool>(state.access_mask & write_flags);
                 if (state.layout != dst_layout || state.access_mask != dst_mask ||
                     (is_write && !SkipSameGeneral(*this, state.layout, dst_layout, state.access_mask, dst_mask))) {
-                    barriers.emplace_back(vk::ImageMemoryBarrier2{
+                    const bool dropped = DropLayoutOnlyBarrier(state, dst_layout, dst_mask); // sotc: A1
+                    if (!dropped) barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = state.pl_stage,
                         .srcAccessMask = state.access_mask,
                         .dstStageMask = dst_stage,
                         .dstAccessMask = dst_mask,
-                        .oldLayout = state.layout,
-                        .newLayout = dst_layout,
+                        .oldLayout = SotcArch::Layouts::Pick(state.layout),
+                        .newLayout = SotcArch::Layouts::Pick(dst_layout),
                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                         .image = GetImage(),
@@ -627,13 +661,14 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
             (!is_write || SkipSameGeneral(*this, last_state.layout, dst_layout, last_state.access_mask, dst_mask))) {
             return;
         }
-        barriers.emplace_back(vk::ImageMemoryBarrier2{
+        const bool dropped = DropLayoutOnlyBarrier(last_state, dst_layout, dst_mask); // sotc: A1
+        if (!dropped) barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
             .srcAccessMask = last_state.access_mask,
             .dstStageMask = dst_stage,
             .dstAccessMask = dst_mask,
-            .oldLayout = last_state.layout,
-            .newLayout = dst_layout,
+            .oldLayout = SotcArch::Layouts::Pick(last_state.layout),
+            .newLayout = SotcArch::Layouts::Pick(dst_layout),
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = GetImage(),

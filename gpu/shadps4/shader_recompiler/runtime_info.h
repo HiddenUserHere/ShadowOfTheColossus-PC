@@ -7,12 +7,21 @@
 #include <span>
 #include "common/types.h"
 #include "shader_recompiler/frontend/tessellation.h"
+#include "shader_recompiler/profile.h" // sotc: Profile::shader_addr (ShaderAddrBuffer)
 #include "shader_recompiler/resource.h" // sotc: NUM_BINDLESS_IMAGE_SLOTS for GetBindlessImageRange
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/regs_shader.h"
 #include "video_core/amdgpu/regs_vertex.h"
 
 namespace Shader {
+
+struct Info;
+
+/// sotc: SOTC_SHADER_ADDR: true when the guest buffer `desc` of `info` takes its address from the shader
+/// (base and size from the V# words of the flat buffer, window bases from the push block; see
+/// spirv_emit_context.cpp). Shared by the SPIR-V emitter and the host, so both agree on the bindings.
+/// Formatted and coherent (MTYPE 3) buffers keep their descriptors.
+bool ShaderAddrBuffer(const Profile& profile, const Info& info, const BufferResource& desc);
 
 enum class HwStage : u32 {
     Fragment,

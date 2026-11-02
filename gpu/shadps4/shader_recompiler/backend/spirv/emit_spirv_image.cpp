@@ -148,7 +148,9 @@ static Id LoadImage(EmitContext& ctx, IR::Inst* inst,
     if (texture.bindless) {
         // sotc: SOTC_N5_BINDLESS: the view sits in the heap array of its key at the index of its
         // push slot (the host writes the slot per draw, the heap holds the view).
-        const Id index = ctx.LoadBindlessImageIndex(texture.bindless_slot);
+        // sotc: SOTC_HEAP (texture.heap): the index comes from the draw's index table instead of the slot.
+        const Id index = texture.heap ? ctx.LoadTableIndex(texture.table_entry)
+                                      : ctx.LoadBindlessImageIndex(texture.bindless_slot);
         const Id pointer_type =
             ctx.TypePointer(spv::StorageClass::UniformConstant, texture.image_type);
         const Id pointer =

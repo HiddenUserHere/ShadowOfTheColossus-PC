@@ -74,8 +74,22 @@ u64 NowNs() noexcept;
 /// header write is timed, not the wait for a free chunk (NextChunk).
 void NoteEmit(u8 category, u32 bytes, u64 ns) noexcept;
 
-/// Appends one 5 s report line (the caller's window) and resets the window counters. Prints
-/// nothing when Enabled() is false.
+/// sotc: SOTC_PASS_RECORD=1 with SOTC_PACKET=1 (SotcArch::Passes::ParallelRecord() and
+/// SotcArch::Packet::On(), read once). True: the packet-pass counters and the stitch timer run, for
+/// the worker recording of packet ops (ARCH-DRAW A6). False: nothing here runs.
+bool PacketRecord();
+
+/// Owner, at a BeginRendering that passed the scan (PacketRecord() only): whether the pass binds no
+/// descriptor set (the packet shape) and its draw count.
+void NotePacketPass(bool descriptor_free, u64 draws) noexcept;
+
+/// Owner, at EndRendering (PacketRecord() only): ns from executing the secondary to the replay of
+/// the state table on the primary (the stitch of the pass into the ordered stream).
+void NoteStitch(u64 ns) noexcept;
+
+/// Appends the 5 s report lines (the caller's window) and resets the window counters. Each group
+/// prints nothing when its switches are off (Enabled() for the N5 lines, PacketRecord() for the packet
+/// line).
 void Report(std::string& out, double seconds);
 
 } // namespace Vulkan::ParallelRecord

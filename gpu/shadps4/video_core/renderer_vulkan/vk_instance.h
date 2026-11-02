@@ -611,6 +611,48 @@ public:
         return descriptor_buffer_props;
     }
 
+    // sotc: feature probes of the draw architecture (ARCH-DRAW.md, sotc_arch/sotc_arch.h). Each is
+    // false when its feature is missing or its switch is off; the switch is read once at device
+    // creation, and nothing is enabled for a switch that is unset.
+
+    /// sotc: SOTC_LAYOUT_UNIFIED and VK_KHR_unified_image_layouts with unifiedImageLayouts.
+    bool SotcUnifiedLayouts() const {
+        return sotc_unified_layouts;
+    }
+
+    /// sotc: SOTC_HEAP and VK_EXT_descriptor_heap with descriptorHeap (never together with
+    /// SOTC_DESC_BUFFER or SOTC_N5_DESCBUF).
+    bool SotcDescriptorHeap() const {
+        return sotc_descriptor_heap;
+    }
+
+    /// sotc: SOTC_MIRROR, sparseBinding and sparseResidencyBuffer, and the graphics queue family
+    /// supports sparse binding (SotcSparseQueueFamily). The sparse features are enabled at device
+    /// creation whenever the device has them.
+    bool SotcSparseBuffers() const {
+        return sotc_sparse_buffers;
+    }
+
+    /// sotc: returned when no queue family can bind sparse memory (SotcSparseBuffers() is false).
+    static constexpr u32 NoSparseQueueFamily = ~u32{0};
+
+    /// sotc: the queue family index with VK_QUEUE_SPARSE_BINDING_BIT (the graphics family), or
+    /// NoSparseQueueFamily. The queue is family queue index 0.
+    u32 SotcSparseQueueFamily() const {
+        return sotc_sparse_queue_family;
+    }
+
+    /// sotc: SOTC_PASSES and VK_EXT_device_generated_commands with deviceGeneratedCommands.
+    bool SotcDeviceGeneratedCommands() const {
+        return sotc_device_generated_commands;
+    }
+
+    /// sotc: bufferDeviceAddress (enabled at device creation whenever the device has it) and one of
+    /// SOTC_MIRROR, SOTC_SHADER_ADDR or SOTC_PACKET.
+    bool SotcBufferDeviceAddress() const {
+        return sotc_buffer_device_address;
+    }
+
     /// Returns the maximum size of a single VkDeviceMemory
     vk::DeviceSize MaxMemoryAllocationSize() const {
         return vk11_props.maxMemoryAllocationSize;
@@ -822,6 +864,12 @@ private:
     bool descriptor_buffer{}; // sotc: VK_EXT_descriptor_buffer enabled (SOTC_DESC_BUFFER=1)
     bool descriptor_buffer_n5{}; // sotc: VK_EXT_descriptor_buffer probed for SOTC_N5_DESCBUF
     bool host_image_copy{};   // sotc: VK_EXT_host_image_copy enabled (SOTC_HOST_IMAGE_COPY=1)
+    bool sotc_unified_layouts{};            // sotc: see SotcUnifiedLayouts()
+    bool sotc_descriptor_heap{};            // sotc: see SotcDescriptorHeap()
+    bool sotc_sparse_buffers{};             // sotc: see SotcSparseBuffers()
+    u32 sotc_sparse_queue_family{NoSparseQueueFamily}; // sotc: see SotcSparseQueueFamily()
+    bool sotc_device_generated_commands{};  // sotc: see SotcDeviceGeneratedCommands()
+    bool sotc_buffer_device_address{};      // sotc: see SotcBufferDeviceAddress()
     bool present_wait_enabled{}; // sotc: VK_KHR_present_wait on, see IsPresentWaitEnabled
     bool present_wait_pacing{};  // sotc: SOTC_PRESENT_WAIT, see IsPresentWaitPacingEnabled
     bool present_id_enabled{};   // sotc: VK_KHR_present_id on, see IsPresentIdEnabled

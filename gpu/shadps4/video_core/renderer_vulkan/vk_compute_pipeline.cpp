@@ -72,10 +72,13 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         });
     }
 
+    // sotc: SOTC_PACKET: a packet pipeline's range holds the DrawPacket after PushData (no slot words).
+    ASSERT_MSG(!(packet_range && uses_bindless_samplers),
+               "packet pipeline with bindless slot words (the heap replaces them)");
     const vk::PushConstantRange push_constants = {
         .stageFlags = vk::ShaderStageFlagBits::eCompute,
         .offset = 0,
-        .size = sizeof(Shader::PushData),
+        .size = packet_range ? PacketPushBytes : static_cast<u32>(sizeof(Shader::PushData)),
     };
 
     // sotc: descriptor buffers replace push descriptors (the two layout flags are exclusive).

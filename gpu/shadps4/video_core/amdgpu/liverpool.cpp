@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_lod_stats.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_OPCOST (OpCostScope below)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (AscRptrMode below)
 #include "../../../sotc/pc_ring.h"                   // sotc: SOTC_PC_RING full ring (mode)
@@ -1564,7 +1565,50 @@ static bool FuseTransparent(const PM4Header* header, PM4ItOpcode opcode) {
     }
 }
 
+// sotc: SOTC_OPCOST (sotc_arch/opcost.cpp): the time of one op on the thread that runs it, from the
+// start to the end of the function (every return included). Off: one flag check per op.
+class OpCostScope {
+public:
+    OpCostScope(SotcArch::OpCost::Thread thread, SotcArch::OpCost::Op op)
+        : thread_{thread}, op_{op}, on_{SotcArch::OpCost::On()} {
+        if (on_) {
+            t0_ = SotcStats::NowNs();
+        }
+    }
+    ~OpCostScope() {
+        if (on_) {
+            SotcArch::OpCost::Note(thread_, op_, SotcStats::NowNs() - t0_);
+        }
+    }
+    OpCostScope(const OpCostScope&) = delete;
+    OpCostScope& operator=(const OpCostScope&) = delete;
+
+private:
+    SotcArch::OpCost::Thread thread_;
+    SotcArch::OpCost::Op op_;
+    bool on_;
+    u64 t0_{};
+};
+
 void Liverpool::ExecuteBackOp(BackOp& op) {
+    SotcArch::OpCost::Op cost_kind = SotcArch::OpCost::Op::Other;
+    switch (op.kind) {
+    case BackOp::Kind::Draw:
+        cost_kind = SotcArch::OpCost::Op::Draw;
+        break;
+    case BackOp::Kind::DrawIndirect:
+        cost_kind = SotcArch::OpCost::Op::DrawIndirect;
+        break;
+    case BackOp::Kind::Dispatch:
+        cost_kind = SotcArch::OpCost::Op::Dispatch;
+        break;
+    case BackOp::Kind::DispatchIndirect:
+        cost_kind = SotcArch::OpCost::Op::DispatchIndirect;
+        break;
+    case BackOp::Kind::Func:
+        break;
+    }
+    const OpCostScope op_cost{SotcArch::OpCost::Thread::Draw, cost_kind}; // sotc: SOTC_OPCOST
     struct TraceOp {
         const BackOp& op;
         u64 t0;
@@ -1789,6 +1833,8 @@ const Vulkan::PreparedDraw* Liverpool::TakePrepared(u64 seq) {
 }
 
 void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
+    const OpCostScope op_cost{SotcArch::OpCost::Thread::CommandProcessor,
+                              SotcArch::OpCost::Op::Draw}; // sotc: SOTC_OPCOST
     if (!back_threaded) {
         rasterizer->Draw(is_indexed, index_offset);
         return;
@@ -1812,6 +1858,8 @@ void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
 void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u32 stride,
                                    u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                                    u16 instance_sgpr_offset) {
+    const OpCostScope op_cost{SotcArch::OpCost::Thread::CommandProcessor,
+                              SotcArch::OpCost::Op::DrawIndirect}; // sotc: SOTC_OPCOST
     if (!back_threaded) {
         rasterizer->DrawIndirect(is_indexed, address, offset, stride, max_count, count_address,
                                  vertex_sgpr_offset, instance_sgpr_offset);
@@ -1912,6 +1960,9 @@ void Liverpool::PrefetchComputeAhead(std::span<const u32> rest) {
 }
 
 void Liverpool::SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 size) {
+    const OpCostScope op_cost{SotcArch::OpCost::Thread::CommandProcessor,
+                              indirect ? SotcArch::OpCost::Op::DispatchIndirect
+                                       : SotcArch::OpCost::Op::Dispatch}; // sotc: SOTC_OPCOST
     if (!back_threaded) {
         if (indirect) {
             rasterizer->DispatchIndirect(address, offset, size);

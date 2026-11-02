@@ -14,6 +14,7 @@
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_parallel_record.h"
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE mode
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_PACKET and SOTC_PASS_RECORD accessors
 
 namespace Vulkan::ParallelRecord {
 
@@ -37,6 +38,12 @@ struct Counters {
     std::atomic<u64> emit_bytes{};
     std::atomic<u64> emit_ns{};
     std::array<std::atomic<u64>, kBlockCategories> emit_by_category{};
+    // sotc: SOTC_PASS_RECORD + SOTC_PACKET (PacketRecord): passes that passed the scan
+    std::atomic<u64> packet_passes{};           ///< scanned passes
+    std::atomic<u64> packet_passes_free{};      ///< of those, passes that bind no descriptor set
+    std::atomic<u64> packet_draws{};            ///< draws in the scanned passes
+    std::atomic<u64> stitch_ns{};               ///< owner: execute secondary + replay at EndRendering
+    std::atomic<u64> stitch_count{};            ///< owner: stitches timed
 };
 Counters cnt;
 
@@ -133,7 +140,59 @@ void ReportEmit(std::string& out, double seconds) {
     out += line;
 }
 
+/// One 5 s line for the packet-pass window: the passes the worker recording of packet ops would take,
+/// and what the owner spends stitching a secondary into the stream.
+void ReportPacket(std::string& out, double seconds) {
+    if (!PacketRecord()) {
+        return;
+    }
+    const u64 passes = Take(cnt.packet_passes);
+    const u64 free = Take(cnt.packet_passes_free);
+    const u64 draws = Take(cnt.packet_draws);
+    const u64 stitch_ns = Take(cnt.stitch_ns);
+    const u64 stitches = Take(cnt.stitch_count);
+    if (passes == 0 && stitches == 0) {
+        return;
+    }
+    const double sec = seconds > 0.0 ? seconds : 1.0;
+    char line[512];
+    std::snprintf(
+        line, sizeof(line),
+        "N5 packet (SOTC_PASS_RECORD=1, SOTC_PACKET=1): passes %.1f/s, no descriptor bind %.1f/s, "
+        "draws %.1f/pass, stitch %.1f us/pass (%.3f ms/s), workers 0\n",
+        static_cast<double>(passes) / sec, static_cast<double>(free) / sec,
+        passes ? static_cast<double>(draws) / static_cast<double>(passes) : 0.0,
+        stitches ? static_cast<double>(stitch_ns) / 1e3 / static_cast<double>(stitches) : 0.0,
+        static_cast<double>(stitch_ns) / 1e6 / sec);
+    out += line;
+}
+
 } // namespace
+
+bool PacketRecord() {
+    static const bool value = [] {
+        const bool on = SotcArch::Packet::On() && SotcArch::Passes::ParallelRecord();
+        if (on) {
+            LOG_INFO(Render, "SOTC_PASS_RECORD=1 with SOTC_PACKET=1: packet passes are counted, "
+                             "stitch timed");
+        }
+        return on;
+    }();
+    return value;
+}
+
+void NotePacketPass(bool descriptor_free, u64 draws) noexcept {
+    cnt.packet_passes.fetch_add(1, std::memory_order_relaxed);
+    if (descriptor_free) {
+        cnt.packet_passes_free.fetch_add(1, std::memory_order_relaxed);
+    }
+    cnt.packet_draws.fetch_add(draws, std::memory_order_relaxed);
+}
+
+void NoteStitch(u64 ns) noexcept {
+    cnt.stitch_ns.fetch_add(ns, std::memory_order_relaxed);
+    cnt.stitch_count.fetch_add(1, std::memory_order_relaxed);
+}
 
 int Mode() {
     return SwitchOn();
@@ -195,6 +254,7 @@ void NoteEmit(u8 category, u32 bytes, u64 ns) noexcept {
 
 void Report(std::string& out, double seconds) {
     ReportEmit(out, seconds);
+    ReportPacket(out, seconds); // sotc: SOTC_PASS_RECORD + SOTC_PACKET
     if (!Enabled()) {
         return;
     }

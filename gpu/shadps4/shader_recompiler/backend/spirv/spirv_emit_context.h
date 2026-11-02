@@ -18,6 +18,22 @@ namespace Shader::Backend::SPIRV {
 
 using Sirit::Id;
 
+/// sotc: SOTC_HEAP (Profile::heap_images). A stage uses the index table when every image of it is in the
+/// bindless heap (BindlessImageSlotOf), every sampler is in the sampler heap (UsesBindlessSamplers), and
+/// the profile has 64-bit integers (the table address is a 64-bit value). Such a stage declares no
+/// sampler or image push words. Table layout, one u32 per entry, at table address + 4 * entry:
+///   entry i (0 <= i < info.images.size())       = heap index of image i in the array of its
+///                                                 BindlessImageKeyOf key (the value the host writes
+///                                                 into the push slot of that image today)
+///   entry images.size() + s                      = heap index of sampler s (the sampler heap)
+/// The table address is a u64 in the push constant block: member HeapIndexTableMember, a uvec2 at byte
+/// offset 64 = PacketPushOffset + 8 (DrawPacket::index_table_address, sotc_arch.h), low word first. Bytes
+/// 56..63 (flatbuf_address in the packet) are not declared by a heap stage. Heap indices never hold
+/// Heap::InvalidIndex: the host maps a null T# to a valid null descriptor index of the heap.
+bool UsesHeapImages(const Info& info, const Profile& profile);
+constexpr u32 HeapIndexTableMember = 7;
+constexpr u32 HeapIndexTableOffset = 64;
+
 struct VectorIds {
     [[nodiscard]] Id& operator[](u32 index) {
         return ids[index - 1];
@@ -322,6 +338,10 @@ public:
         bool bindless{};
         u32 bindless_slot{NO_BINDLESS_IMAGE_SLOT};
         u32 bindless_key{NO_BINDLESS_IMAGE_KEY};
+        /// sotc: SOTC_HEAP (UsesHeapImages): the heap index comes from the index table entry
+        /// table_entry (LoadTableIndex), not from the push slot bindless_slot.
+        bool heap{};
+        u32 table_entry{};
     };
 
     enum class PointerType : u32 {
@@ -355,6 +375,9 @@ public:
         /// sotc: SOTC_BDA: no descriptor. The buffer is accessed through its block table slot
         /// (EmitContext::BdaAddress); aliases and offsets stay unset.
         bool bda{};
+        /// sotc: SOTC_SHADER_ADDR: with bda, the block comes from the V# words and the window words
+        /// of the push block (LoadBdaBlock), not from the block table.
+        bool shader_addr{};
 
         template <class Self>
         auto& Alias(this Self& self, PointerType alias) {
@@ -402,6 +425,12 @@ public:
     std::array<Id, NUM_BINDLESS_IMAGE_KEYS> bindless_image_types{};
     /// Reads the heap index of push slot `slot` (BindlessSamplerSlots::image_words, 16 bits).
     Id LoadBindlessImageIndex(u32 slot);
+    /// sotc: SOTC_HEAP: this stage reads its heap indices from the index table (UsesHeapImages), set
+    /// in DefineImagesAndSamplers.
+    bool uses_heap_images{};
+    /// sotc: SOTC_HEAP: the u32 index of table entry `entry`. The table is the draw's index table,
+    /// its 64-bit address in the push member HeapIndexTableMember (see UsesHeapImages).
+    Id LoadTableIndex(u32 entry);
 
     struct SpirvAttribute {
         union {
@@ -437,6 +466,14 @@ public:
     /// sotc: SOTC_BDA. Device address (U64) and size in bytes (U32) of buffer `handle`, read from
     /// its slot of the block table.
     std::pair<Id, Id> LoadBdaBlock(u32 handle);
+    /// sotc: SOTC_SHADER_ADDR. The same (address, size) pair as LoadBdaBlock, computed from the V# words
+    /// of buffer `handle` in the flat buffer: address = window device base + (V# base - window guest
+    /// base) for the arena or mirror window that holds the whole range, size = GetSize's rule (u32);
+    /// size 0 when the V# is invalid or the range is in no window (every access is then out of range).
+    std::pair<Id, Id> LoadShaderAddrBlock(u32 handle);
+    /// sotc: SOTC_SHADER_ADDR. Index of the first of the five window members of the push block
+    /// (mirror guest, mirror device, arena guest, arena device, arena size; offsets 72..104).
+    u32 shader_addr_member{};
     /// sotc: SOTC_BDA. Loads the block of every used BDA buffer once, in the entry block (called by
     /// Traverse before the first block's instructions), so each invocation reads its table slots
     /// once instead of at every access. The table is never written by the shader, so the values

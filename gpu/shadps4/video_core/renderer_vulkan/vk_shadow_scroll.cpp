@@ -214,7 +214,7 @@ void ShadowScroll::CopyLayer(VideoCore::Image& image, u32 layer, Scratch& scratc
         .dstOffset = {0, 0, 0},
         .extent = {scratch.width, scratch.height, 1},
     };
-    scheduler.CommandBuffer().copyImage(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+    scheduler.CommandBuffer().copyImage(image.GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
                                         scratch.image, vk::ImageLayout::eTransferDstOptimal,
                                         region);
 }
@@ -354,7 +354,9 @@ bool ShadowScroll::Scroll(VideoCore::Image& image, u32 layer, s32 sx, s32 sy, fl
     state.height = static_cast<u16>(height);
     state.num_layers = 1;
     state.depth_stencil_attachment.image_view = target_view;
-    state.depth_stencil_attachment.image_layout = target_layout;
+    // sotc: A1: the texture-cache layer takes Pick; the verification scratch image is ours (no Pick).
+    state.depth_stencil_attachment.image_layout =
+        to_check ? target_layout : SotcArch::Layouts::Pick(target_layout);
     state.depth_stencil_attachment.has_depth = true;
     state.depth_format = format;
     scheduler.BeginRendering(state);

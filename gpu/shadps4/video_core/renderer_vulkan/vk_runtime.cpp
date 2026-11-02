@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/sotc_arch/passes.h" // sotc: SOTC_PASSES
 #include "video_core/renderer_vulkan/vk_queues.h" // sotc: SOTC_N5_QUEUES counters
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
@@ -219,7 +220,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyBufferToImage(src->Handle(), dst->GetImage(), vk::ImageLayout::eTransferDstOptimal,
+    cmdbuf.copyBufferToImage(src->Handle(), dst->GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
                              upload_copies);
 
     for (const auto& copy : upload_copies) {
@@ -252,11 +253,11 @@ bool Runtime::TryHostImageCopy(VideoCore::Image* dst, const u8* guest_base,
     const auto aspect = static_cast<VkImageAspectFlags>(dst->aspect_mask);
 
     // The host transition discards the old contents, which the copy below replaces entirely.
-    if (backing.state.layout != vk::ImageLayout::eGeneral) {
+    if (SotcArch::Layouts::Pick(backing.state.layout) != vk::ImageLayout::eGeneral) {
         VkHostImageLayoutTransitionInfo transition{};
         transition.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO;
         transition.image = image;
-        transition.oldLayout = static_cast<VkImageLayout>(backing.state.layout);
+        transition.oldLayout = static_cast<VkImageLayout>(SotcArch::Layouts::Pick(backing.state.layout));
         transition.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         transition.subresourceRange.aspectMask = aspect;
         transition.subresourceRange.baseMipLevel = 0;
@@ -331,7 +332,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     }
 
     auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->Handle(),
+    cmdbuf.copyImageToBuffer(src->GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), dst->Handle(),
                              download_copies);
 
     for (const auto& copy : download_copies) {
@@ -432,8 +433,8 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     }
 
     auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
-                     vk::ImageLayout::eTransferDstOptimal, regions);
+    cmdbuf.copyImage(src->GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), dst->GetImage(),
+                     SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), regions);
 
     if (True(src->flags & VideoCore::ImageFlagBits::GpuModified)) {
         VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
@@ -478,7 +479,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     }
 
     auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+    cmdbuf.copyImageToBuffer(src->GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
                              buffer->Handle(), buffer_copy);
 
     const vk::MemoryBarrier2 post_copy_barrier = {
@@ -496,7 +497,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 
     buffer_copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
     cmdbuf.copyBufferToImage(buffer->Handle(), dst->GetImage(),
-                             vk::ImageLayout::eTransferDstOptimal, buffer_copy);
+                             SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), buffer_copy);
 
     if (True(src->flags & VideoCore::ImageFlagBits::GpuModified)) {
         VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
@@ -549,8 +550,8 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
-                     vk::ImageLayout::eTransferDstOptimal, image_copy);
+    cmdbuf.copyImage(src->GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), dst->GetImage(),
+                     SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), image_copy);
 
     if (True(src->flags & VideoCore::ImageFlagBits::GpuModified)) {
         VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
@@ -649,8 +650,8 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
     };
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
-                     vk::ImageLayout::eTransferDstOptimal, region);
+    cmdbuf.copyImage(src->GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), dst->GetImage(),
+                     SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), region);
 
     VideoCore::MarkGpuModified(*dst); // sotc: moves the mip-tail epoch on a first write
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -694,8 +695,8 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
             .dstOffset = {0, 0, 0},
             .extent = {src->info.size.width, src->info.size.height, 1},
         };
-        cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
-                         vk::ImageLayout::eTransferDstOptimal, region);
+        cmdbuf.copyImage(src->GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), dst->GetImage(),
+                         SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), region);
     } else {
         const vk::ImageResolve region = {
             .srcSubresource{
@@ -714,8 +715,8 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
             .dstOffset = {0, 0, 0},
             .extent = {src->info.size.width, src->info.size.height, 1},
         };
-        cmdbuf.resolveImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
-                            vk::ImageLayout::eTransferDstOptimal, region);
+        cmdbuf.resolveImage(src->GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), dst->GetImage(),
+                            SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), region);
     }
 
     VideoCore::MarkGpuModified(*dst); // sotc: moves the mip-tail epoch on a first write
@@ -741,7 +742,7 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         .layerCount = range.extent.layers,
     };
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.clearColorImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
+    cmdbuf.clearColorImage(dst->GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), clear_value.color,
                            vk_range);
 
     VideoCore::MarkGpuModified(*dst); // sotc: moves the mip-tail epoch on a first write
@@ -799,7 +800,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
             .dstStageMask = dst_stage,
             .dstAccessMask = dst_access,
             .oldLayout = vk::ImageLayout::eUndefined,
-            .newLayout = dst_layout,
+            .newLayout = SotcArch::Layouts::Pick(dst_layout),
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = new_backing->image,
@@ -866,6 +867,9 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         resource->read_ranges.AddUnion(range);
     }
 
+    if (src_access & WRITE_MASK) {
+        SotcArch::Passes::NoteWrite(); // sotc: SOTC_PASSES (passes.h): a write the pass rule must order
+    }
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }

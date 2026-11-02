@@ -6,6 +6,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/sotc_arch/sotc_arch.h"
 
 #include <mutex>
 #include <span>
@@ -30,6 +31,14 @@ static constexpr auto AllGraphicsStageBits =
 class Instance;
 class Scheduler;
 class DescriptorHeap;
+
+/// sotc: SOTC_PACKET (ARCH-DRAW.md part 4). A pipeline whose shaders read the DrawPacket (profile
+/// shader_addr or heap_images) has its push range extended: PushData at offset 0, then the packet at
+/// PacketPushOffset. The offset is sizeof(PushData) because such a pipeline has no bindless slot words.
+/// 56 + 64 = 120 bytes, inside the 128 bytes Vulkan guarantees.
+inline constexpr u32 PacketPushOffset = sizeof(Shader::PushData);
+inline constexpr u32 PacketPushBytes = PacketPushOffset + sizeof(SotcArch::DrawPacket);
+static_assert(PacketPushBytes <= 128, "the packet push range must fit the guaranteed 128 bytes");
 
 /// sotc: shares descriptor set layouts and pipeline layouts between the pipelines that need the
 /// same ones (many pipelines differ only in their shaders). Owned by PipelineCache, so it outlives
@@ -144,11 +153,19 @@ public:
         return stage_sets;
     }
 
+    /// sotc: true when the layout has the packet push range (PacketPushBytes): the shaders read the
+    /// DrawPacket, so BindResources needs `packet` (see below).
+    bool HasPacketRange() const noexcept {
+        return packet_range;
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     /// `write_sets[i]` is the descriptor set of `set_writes[i]`, used only with UsesStageSets().
+    /// sotc: `packet` is required when HasPacketRange() and ignored otherwise.
     void BindResources(DescriptorWrites& set_writes, std::span<const u32> write_sets,
                        const Shader::PushData& push_data,
-                       const Shader::BindlessSamplerSlots& bindless_slots) const;
+                       const Shader::BindlessSamplerSlots& bindless_slots,
+                       const SotcArch::DrawPacket* packet = nullptr) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
@@ -182,6 +199,8 @@ protected:
     /// has set 1 (the heap) and BindResources binds it.
     bool uses_bindless_samplers{};
     bool stage_sets{}; ///< sotc: a graphics pipeline with one descriptor set per stage
+    /// sotc: SOTC_PACKET: the push range carries the DrawPacket (PacketPushBytes), set from the profile.
+    bool packet_range{};
     vk::DeviceSize desc_layout_size{};             ///< sotc: descriptor buffer size of one set
     std::vector<vk::DeviceSize> desc_binding_offsets; ///< sotc: by binding number, in the set
 };

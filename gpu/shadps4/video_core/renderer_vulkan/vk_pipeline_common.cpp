@@ -168,6 +168,8 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
       is_compute{is_compute_} {
     stage_sets = !is_compute && profile.stage_bindings;
+    // sotc: SOTC_PACKET: the shader reads the DrawPacket when it was built with addresses or the heap.
+    packet_range = profile.shader_addr || profile.heap_images;
 }
 
 Pipeline::~Pipeline() = default;
@@ -434,7 +436,8 @@ void VerifyN5Set(const Instance& instance, DescriptorHeap& desc_heap,
 
 void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> write_sets,
                              const Shader::PushData& push_data,
-                             const Shader::BindlessSamplerSlots& bindless_slots) const {
+                             const Shader::BindlessSamplerSlots& bindless_slots,
+                             const SotcArch::DrawPacket* packet) const {
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
@@ -446,19 +449,32 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
     // command buffer) and every Invalidate() call (other pipelines bound on it).
     auto& dynamic = scheduler.GetDynamicState();
     auto& cache = dynamic.push_constant_cache;
-    const auto size = static_cast<u32>(sizeof(push_data));
     static_assert(sizeof(Shader::PushData) <= DynamicState::PushConstantCache::MaxBytes);
+    static_assert(PacketPushBytes <= DynamicState::PushConstantCache::MaxBytes);
+    // sotc: SOTC_PACKET: a packet pipeline pushes PushData and the DrawPacket as one block. Other
+    // pipelines push PushData alone, byte for byte as before.
+    // Left uninitialized on purpose: a packet block is written in full before any read.
+    std::array<u8, PacketPushBytes> packet_block;
+    const void* block = &push_data;
+    u32 size = static_cast<u32>(sizeof(push_data));
+    if (packet_range) {
+        ASSERT_MSG(packet, "packet pipeline bound without a DrawPacket");
+        std::memcpy(packet_block.data(), &push_data, sizeof(push_data));
+        std::memcpy(packet_block.data() + PacketPushOffset, packet, sizeof(*packet));
+        block = packet_block.data();
+        size = PacketPushBytes;
+    }
     const bool same = kDedupState && cache.generation == dynamic.generation &&
                       cache.layout == pipeline_layout && cache.stages == stage_flags &&
-                      cache.size == size && std::memcmp(cache.bytes.data(), &push_data, size) == 0;
+                      cache.size == size && std::memcmp(cache.bytes.data(), block, size) == 0;
     if (!same) {
-        cmdbuf.pushConstants(pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+        cmdbuf.pushConstants(pipeline_layout, stage_flags, 0u, size, block);
         if (kDedupState) {
             cache.generation = dynamic.generation;
             cache.layout = pipeline_layout;
             cache.stages = stage_flags;
             cache.size = size;
-            std::memcpy(cache.bytes.data(), &push_data, size);
+            std::memcpy(cache.bytes.data(), block, size);
         }
     }
     // sotc: SOTC_BINDLESS_SAMP: the sampler slots, after PushData (the second range of the layout).

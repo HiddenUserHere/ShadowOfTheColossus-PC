@@ -1055,6 +1055,7 @@ private:
         u8 block{0xFF};
         u32 draws{};
         u32 blocks{}; ///< sotc: N5 mode 2, the command blocks of the pass (state and draws)
+        u32 descriptors{}; ///< sotc: SOTC_PASS_RECORD packet shape: descriptor binds in the pass
         Chunk* end_chunk{};
         u32 end_pos{};
         std::vector<Chunk*> chunks; ///< the chunks the pass spans, the first one holding BeginRendering
@@ -1323,8 +1324,10 @@ bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& 
         case BlockCategory::Draw:
             ++scan.draws;
             break;
-        case BlockCategory::BindPipeline:
         case BlockCategory::BindDescriptors:
+            ++scan.descriptors; // sotc: SOTC_PASS_RECORD packet shape (TryStart), same handling as below
+            break;
+        case BlockCategory::BindPipeline:
         case BlockCategory::PushConstants:
         case BlockCategory::DynamicState:
         case BlockCategory::VertexIndex:
@@ -1345,6 +1348,7 @@ bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& 
 bool PassSecondary::TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::stop_token stop) {
     auto* begin = reinterpret_cast<BeginPayload*>(header + 1);
     const bool counted = ParallelRecord::Enabled(); // sotc: SOTC_N5_PARALLEL counters
+    const bool packet = ParallelRecord::PacketRecord(); // sotc: SOTC_PASS_RECORD + SOTC_PACKET counters
     if (!begin->formats.valid || dropped.contains(begin->cmdbuf)) {
         if (SotcStats::kCmdStats) {
             SotcStats::passes_fallback.fetch_add(1, std::memory_order_relaxed);
@@ -1371,6 +1375,9 @@ bool PassSecondary::TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::st
             ParallelRecord::NoteFallback(scan.reason, scan.block);
         }
         return false;
+    }
+    if (packet) {
+        ParallelRecord::NotePacketPass(scan.descriptors == 0, scan.draws);
     }
     if (scan.draws <= min_draws) {
         if (counted) {
@@ -1468,11 +1475,17 @@ void PassSecondary::Finish(BlockHeader* end) {
                                                                  wait_t0)
                 .count()));
     }
+    // sotc: SOTC_PASS_RECORD + SOTC_PACKET: the stitch (execute, EndRendering, replay), clock reads only then
+    const bool stitch = ParallelRecord::PacketRecord();
+    const u64 stitch_t0 = stitch ? ParallelRecord::NowNs() : 0;
     const VkCommandBuffer primary = rec.Real(job->fake);
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdExecuteCommands(primary, 1, &job->secondary);
     awaiting.push_back(Awaiting{job->fake, job->secondary});
     end->invoke(end + 1); // EndRendering on the primary
     Replay(job->fake);
+    if (stitch) {
+        ParallelRecord::NoteStitch(ParallelRecord::NowNs() - stitch_t0);
+    }
     delete job;
     active = nullptr;
     rec.SweepDeferred();

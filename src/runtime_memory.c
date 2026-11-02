@@ -1319,6 +1319,62 @@ static void host_discard(uint64_t phys, uint64_t size) {
     fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)phys,(off_t)size);
 }
 #endif
+/* sotc: SOTC_MIRROR (GPU memory mirror, docs/re-stutters/native/ARCH-DRAW.md part 1). The events the mirror needs
+ * are queued under the table lock like the GPU hooks and delivered by flush_mirror after the lock is dropped, in
+ * queue order. Armed with the GPU hooks: runtime_memory_set_gpu_hooks replays the live mappings. Deliveries are
+ * serialized (mirror_deliver), so a map and an unmap of one range from two threads arrive in order, and a call
+ * returns only after the events it saw queued are delivered: the mirror has the event when the guest call returns. */
+void bbgpu_mirror_on_map(uint64_t addr, uint64_t size) __attribute__((weak));
+void bbgpu_mirror_on_unmap(uint64_t addr, uint64_t size) __attribute__((weak));
+enum { MIRROR_MAP, MIRROR_UNMAP };
+typedef struct { int kind; uintptr_t address; uint64_t size; } MirrorEvent;
+static MirrorEvent *mirror_events; static size_t mirror_head, mirror_count, mirror_capacity;
+static pthread_mutex_t mirror_queue_lock=PTHREAD_MUTEX_INITIALIZER, mirror_deliver=PTHREAD_MUTEX_INITIALIZER;
+static uint64_t mirror_maps, mirror_unmaps; /* delivered, cumulative (runtime_memory_mirror_counts) */
+static int mirror_mode=-1;
+static int mirror_switch(void) { /* SOTC_MIRROR 1 or 2, read once (as SotcArch::SwitchMode) */
+    if (mirror_mode<0) { const char *v=getenv("SOTC_MIRROR"); mirror_mode=v && (v[0]=='1' || v[0]=='2'); }
+    return mirror_mode;
+}
+/* Mappings the GPU can reach: every direct map, and flexible maps with GPU access bits (SCE_KERNEL_PROT_GPU_ALL). */
+static int mirror_gpu_visible(int kind, int prot) { return kind==KIND_DIRECT || (kind==KIND_FLEXIBLE && (prot & 0x30)); }
+/* Queues an event (table lock held). Nothing is queued before the GPU hooks are installed (no mirror yet). */
+static void mirror_note(int kind, uintptr_t address, uint64_t size) {
+    if (!mirror_switch() || !hook_map || !bbgpu_mirror_on_map || !bbgpu_mirror_on_unmap || !size) return;
+    pthread_mutex_lock(&mirror_queue_lock);
+    if (mirror_count==mirror_capacity) {
+        if (mirror_head) { /* delivered events in front of the head: drop them */
+            memmove(mirror_events,mirror_events+mirror_head,(mirror_count-mirror_head)*sizeof(*mirror_events));
+            mirror_count-=mirror_head; mirror_head=0;
+        } else {
+            size_t capacity=mirror_capacity ? mirror_capacity*2 : 256;
+            MirrorEvent *grown=realloc(mirror_events,capacity*sizeof(*grown));
+            if (!grown) { fputs("STOP: GPU mirror queue out of memory\n",stderr); fflush(stderr); _Exit(21); }
+            mirror_events=grown; mirror_capacity=capacity;
+        }
+    }
+    mirror_events[mirror_count++]=(MirrorEvent){kind,address,size};
+    pthread_mutex_unlock(&mirror_queue_lock);
+}
+/* Delivers the queued events to the mirror. Called with no table lock held: the mirror's side may take locks of its
+ * own, and those must never wait on the table lock. */
+static void flush_mirror(void) {
+    if (!mirror_switch()) return;
+    pthread_mutex_lock(&mirror_deliver);
+    for (;;) {
+        pthread_mutex_lock(&mirror_queue_lock);
+        if (mirror_head==mirror_count) { mirror_head=mirror_count=0; pthread_mutex_unlock(&mirror_queue_lock); break; }
+        MirrorEvent e=mirror_events[mirror_head++];
+        pthread_mutex_unlock(&mirror_queue_lock);
+        if (e.kind==MIRROR_MAP) { bbgpu_mirror_on_map(e.address,e.size); __atomic_add_fetch(&mirror_maps,1,__ATOMIC_RELAXED); }
+        else { bbgpu_mirror_on_unmap(e.address,e.size); __atomic_add_fetch(&mirror_unmaps,1,__ATOMIC_RELAXED); }
+    }
+    pthread_mutex_unlock(&mirror_deliver);
+}
+void runtime_memory_mirror_counts(uint64_t *maps, uint64_t *unmaps) {
+    *maps=__atomic_load_n(&mirror_maps,__ATOMIC_RELAXED);
+    *unmaps=__atomic_load_n(&mirror_unmaps,__ATOMIC_RELAXED);
+}
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
     if (!hook) return;
@@ -1335,7 +1391,7 @@ static void queue_hook(int kind, uintptr_t address, uint64_t size) {
 static void flush_hooks(void) {
     for (;;) {
         write_lock();
-        if (!pending_count) { write_unlock(); return; }
+        if (!pending_count) { write_unlock(); flush_mirror(); return; }
         PendingHook h=pending[0];
         memmove(pending,pending+1,--pending_count*sizeof(*pending));
         GpuRange hook = h.kind==HOOK_MAP ? hook_map : h.kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
@@ -1481,6 +1537,7 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
+    if (mirror_gpu_visible(kind,prot)) mirror_note(MIRROR_MAP,address,size); /* sotc: SOTC_MIRROR */
     *inout=mapped;
     return 0;
 }
@@ -1573,6 +1630,7 @@ static int32_t unmap_locked(uintptr_t start, uint64_t size) {
     for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i) {
         uintptr_t a=vmas[i].start>start ? vmas[i].start : start, b=vmas[i].end<end ? vmas[i].end : end;
         if (host_unmap(a,b-a)) return INVALID;
+        if (mirror_gpu_visible(vmas[i].kind,vmas[i].prot)) mirror_note(MIRROR_UNMAP,a,b-a); /* sotc: SOTC_MIRROR, after the host unmap */
     }
     drop_range(start,end);
     return 0;
@@ -1611,6 +1669,7 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
     int32_t result=unmap_locked((uintptr_t)address,size);
     pending_count=before; /* already notified above */
     write_unlock();
+    flush_mirror(); /* sotc: SOTC_MIRROR: the mirror events queued by unmap_locked (not discarded above) */
     return result;
 }
 static ABI int32_t direct_release(uint64_t start, uint64_t size) {
@@ -1705,7 +1764,12 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     int error; size_t i=carve(start,end,&error);
     if (error) return NO_MEMORY;
     vma_seq_begin();
-    for (; i<vma_count && vmas[i].start<end; ++i) { vmas[i].prot=prot; if (type>=0) vmas[i].type=type; }
+    for (; i<vma_count && vmas[i].start<end; ++i) {
+        /* sotc: SOTC_MIRROR: a protection change that gives or takes GPU access maps or unmaps the mirror pages */
+        const int was=mirror_gpu_visible(vmas[i].kind,vmas[i].prot), now=mirror_gpu_visible(vmas[i].kind,prot);
+        if (was!=now) mirror_note(now ? MIRROR_MAP : MIRROR_UNMAP,vmas[i].start,vmas[i].end-vmas[i].start);
+        vmas[i].prot=prot; if (type>=0) vmas[i].type=type;
+    }
     vma_seq_end();
     queue_hook(HOOK_INVALIDATE,start,end-start);
     ++protects;
@@ -1928,6 +1992,8 @@ void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalid
     write_lock();
     hook_map=map; hook_unmap=unmap; hook_invalidate=invalidate;
     for (size_t i=0;i<vma_count;++i) if (vmas[i].kind!=KIND_RESERVED) queue_hook(HOOK_MAP,vmas[i].start,vmas[i].end-vmas[i].start);
+    /* sotc: SOTC_MIRROR: the mirror is armed here (the rasterizer exists), so the live GPU-visible mappings are replayed. */
+    for (size_t i=0;i<vma_count;++i) if (mirror_gpu_visible(vmas[i].kind,vmas[i].prot)) mirror_note(MIRROR_MAP,vmas[i].start,vmas[i].end-vmas[i].start);
     write_unlock();
     flush_hooks();
 }

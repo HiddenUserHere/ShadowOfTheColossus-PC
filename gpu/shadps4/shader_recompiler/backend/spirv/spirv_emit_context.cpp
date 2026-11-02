@@ -18,6 +18,28 @@
 #include <numbers>
 #include <string_view>
 
+namespace Shader {
+
+// sotc: SOTC_SHADER_ADDR. Shared with the host (runtime_info.h): the same guest buffers keep their descriptors.
+bool ShaderAddrBuffer(const Profile& profile, const Info& info, const BufferResource& desc) {
+    if (!profile.shader_addr || !profile.support_int64 || !info.has_flatbuf) {
+        return false;
+    }
+    // The window words sit where the bindless slot words are: such a stage keeps its descriptors.
+    if (UsesBindlessSamplers(info) || UsesBindlessImages(info)) {
+        return false;
+    }
+    if (desc.buffer_type != BufferType::Guest || desc.is_formatted ||
+        desc.post_op != SharpFetchPostOp::None ||
+        desc.sharp_fetch.summary == SharpFetch<AmdGpu::Buffer>::Summary::Invalid) {
+        return false;
+    }
+    // MTYPE 3 marks a buffer shared between invocations: it keeps the Coherent descriptor.
+    return desc.GetSharp(info).mtype != 3;
+}
+
+} // namespace Shader
+
 namespace Shader::Backend::SPIRV {
 namespace {
 
@@ -68,13 +90,24 @@ void Name(EmitContext& ctx, Id object, std::string_view format_str, Args&&... ar
                          .c_str());
 }
 
+// sotc: SOTC_SHADER_ADDR: any guest buffer of the shader takes its address from the shader.
+bool UsesShaderAddr(const Profile& profile, const Info& info) {
+    for (const auto& desc : info.buffers) {
+        if (ShaderAddrBuffer(profile, info, desc)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // Anonymous namespace
 
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_, Info& info_,
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma || info.HasBdaBlockTable()) { // sotc: SOTC_BDA needs physical pointers too
+    // sotc: SOTC_SHADER_ADDR buffers need physical pointers as well (UsesShaderAddr).
+    if (info.uses_dma || info.HasBdaBlockTable() || UsesShaderAddr(profile, info)) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -82,6 +115,11 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     String(fmt::format("{:#x}", info.pgm_hash));
 
     AddCapability(spv::Capability::Shader);
+    if (UsesShaderAddr(profile, info)) { // sotc: SOTC_SHADER_ADDR: 64-bit pointers (as emit_spirv.cpp does for the block table)
+        AddCapability(spv::Capability::Int64);
+        AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
+        AddExtension("SPV_KHR_physical_storage_buffer");
+    }
     DefineArithmeticTypes();
     DefineInterfaces();
     DefineSharedMemory();
@@ -823,6 +861,14 @@ void EmitContext::DefinePushDataBlock() {
             members.push_back(U32[1]);
         }
     }
+    // sotc: SOTC_SHADER_ADDR: the window words of the packet (ShaderAddr*Offset, 72..120).
+    const bool shader_addr = UsesShaderAddr(profile, info);
+    if (shader_addr) {
+        shader_addr_member = static_cast<u32>(members.size());
+        for (u32 word = 0; word < 6; ++word) {
+            members.push_back(U64);
+        }
+    }
     const Id struct_type{Name(TypeStruct(std::span<const Id>(members)), "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
@@ -851,6 +897,15 @@ void EmitContext::DefinePushDataBlock() {
             MemberDecorate(struct_type, PushData::ImageSlotIndex + word, spv::Decoration::Offset,
                            static_cast<u32>(sizeof(PushData) +
                                             (NUM_BINDLESS_SAMPLER_WORDS + word) * sizeof(u32)));
+        }
+    }
+    if (shader_addr) {
+        const std::array<u32, 6> window_offsets{
+            ShaderAddrMirrorGuestOffset, ShaderAddrMirrorDeviceOffset, ShaderAddrArenaGuestOffset,
+            ShaderAddrArenaDeviceOffset, ShaderAddrArenaSizeOffset,    ShaderAddrMirrorSizeOffset};
+        for (u32 member = 0; member < window_offsets.size(); ++member) {
+            MemberDecorate(struct_type, shader_addr_member + member, spv::Decoration::Offset,
+                           window_offsets[member]);
         }
     }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
@@ -920,6 +975,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
 };
 
 std::pair<Id, Id> EmitContext::LoadBdaBlock(u32 handle) {
+    if (buffers[handle].shader_addr) { // sotc: SOTC_SHADER_ADDR: the block comes from the V#
+        return LoadShaderAddrBlock(handle);
+    }
     const auto [table_id, table_pointer] = buffers[bda_table_index].Alias(PointerType::U32);
     const auto word = [&](u32 index) {
         const Id ptr{OpAccessChain(table_pointer, table_id, u32_zero_value,
@@ -931,6 +989,86 @@ std::pair<Id, Id> EmitContext::LoadBdaBlock(u32 handle) {
     const Id size{word(2)};
     const Id address{OpBitcast(U64, OpCompositeConstruct(U32[2], std::array<Id, 2>{low, high}))};
     return {address, size};
+}
+
+// sotc: SOTC_SHADER_ADDR. Mirrors AmdGpu::Buffer exactly: base = dw0 | (dw1 & 0xff) << 32 (base_address
+// is 40 bits), stride = dw1 bits 16..29, num_records = dw2, type = dw3 bits 30..31 (Valid() needs 0), and
+// GetSize = stride == 0 ? num_records : stride * num_records in u32. Window check: the whole range
+// [base, base + size) must lie in the arena window, else in mirror window 0 (push block words).
+std::pair<Id, Id> EmitContext::LoadShaderAddrBlock(u32 handle) {
+    const auto& desc = info.buffers[handle];
+    const BufferSpv flat = buffers[flatbuf_index].Alias(PointerType::U32);
+    // The words SharpFetch::Fetch reads: contiguous for SingleLoad, per dword (an immediate where the
+    // load mask is clear) for MultiLoad. Invalid sharps are excluded by ShaderAddrBuffer.
+    const auto dword = [&](u32 i) -> Id {
+        const auto& fetch = desc.sharp_fetch;
+        if (fetch.summary == SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+            const u32 index = u32{fetch.offsets[0]} + i;
+            return OpLoad(U32[1], OpAccessChain(flat.pointer_type, flat.id, u32_zero_value,
+                                                ConstU32(index)));
+        }
+        if ((fetch.load_mask >> i) & 1) {
+            return OpLoad(U32[1], OpAccessChain(flat.pointer_type, flat.id, u32_zero_value,
+                                                ConstU32(u32{fetch.offsets[i]})));
+        }
+        return ConstU32(fetch.immediates[i]);
+    };
+    const Id dw0{dword(0)};
+    const Id dw1{dword(1)};
+    const Id dw2{dword(2)};
+    const Id dw3{dword(3)};
+
+    // AmdGpu::Buffer::Valid(): type (dw3 bits 30..31) is 0. An invalid V# is a null buffer (size 0).
+    const Id type{OpShiftRightLogical(U32[1], dw3, ConstU32(30u))};
+    const Id is_valid{OpIEqual(U1[1], type, u32_zero_value)};
+
+    // GetSize: u32 arithmetic, wrapping like the CPU product.
+    const Id stride{OpBitFieldUExtract(U32[1], dw1, ConstU32(16u), ConstU32(14u))};
+    const Id stride_zero{OpIEqual(U1[1], stride, u32_zero_value)};
+    const Id stride_size{OpIMul(U32[1], dw2, stride)};
+    const Id size{OpSelect(U32[1], stride_zero, dw2, stride_size)};
+
+    // base_address: 40 bits, dw0 and the low byte of dw1.
+    const Id base_hi{OpShiftLeftLogical(
+        U64, OpUConvert(U64, OpBitFieldUExtract(U32[1], dw1, ConstU32(0u), ConstU32(8u))),
+        Constant(U64, 32ULL))};
+    const Id base{OpIAdd(U64, OpUConvert(U64, dw0), base_hi)};
+    const Id size64{OpUConvert(U64, size)};
+
+    const auto push_u64 = [&](u32 member) {
+        return OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64),
+                                         push_data_block, ConstU32(shader_addr_member + member)));
+    };
+    // Window words, in the order of the window offsets (resource.h).
+    const Id mirror_guest{push_u64(0)};
+    const Id mirror_device{push_u64(1)};
+    const Id arena_guest{push_u64(2)};
+    const Id arena_device{push_u64(3)};
+    const Id arena_size{push_u64(4)};
+    const Id mirror_size{push_u64(5)};
+
+    // [base, base + size) inside [guest, guest + window_size), without wrapping. Returns the offset of base
+    // in the window (rel) and whether the whole range fits.
+    const auto fits = [&](Id guest, Id window_size) {
+        const Id from_start{OpUGreaterThanEqual(U1[1], base, guest)};
+        const Id rel{OpISub(U64, base, guest)};
+        const Id inside{OpULessThanEqual(U1[1], rel, window_size)};
+        const Id room{OpISub(U64, window_size, rel)};
+        const Id fits_size{OpULessThanEqual(U1[1], size64, room)};
+        return std::pair{rel, OpLogicalAnd(U1[1], from_start, OpLogicalAnd(U1[1], inside, fits_size))};
+    };
+    // Arena first, then mirror window 0 (the same order as the host packet).
+    const auto [arena_rel, in_arena]{fits(arena_guest, arena_size)};
+    const auto [mirror_rel, in_mirror]{fits(mirror_guest, mirror_size)};
+    const Id arena_address{OpIAdd(U64, arena_device, arena_rel)};
+    const Id mirror_address{OpIAdd(U64, mirror_device, mirror_rel)};
+    const Id address{OpSelect(U64, in_arena, arena_address, mirror_address)};
+
+    // Outside both windows or invalid: size 0, so BdaAddress reports the access invalid.
+    const Id in_window{OpLogicalOr(U1[1], in_arena, in_mirror)};
+    const Id valid{OpLogicalAnd(U1[1], is_valid, in_window)};
+    const Id block_size{OpSelect(U32[1], valid, size, u32_zero_value)};
+    return {address, block_size};
 }
 
 void EmitContext::HoistBdaBlocks() {
@@ -1043,6 +1181,13 @@ void EmitContext::DefineBuffers() {
 
         // Define aliases depending on the shader usage.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
+        // sotc: SOTC_SHADER_ADDR: the block comes from the V# words (LoadShaderAddrBlock); no descriptor.
+        if (ShaderAddrBuffer(profile, info, desc)) {
+            spv_buffer.bda = true;
+            spv_buffer.shader_addr = true;
+            ++binding.unified;
+            continue;
+        }
         // sotc: SOTC_BDA: a guest buffer that is not texel or coherent takes no descriptor; its
         // block table slot gives its address. Coherent buffers keep the descriptor (Coherent
         // decoration, which physical pointers do not get).
@@ -1176,7 +1321,26 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     UNREACHABLE_MSG("Invalid texture type {}", type);
 }
 
+bool UsesHeapImages(const Info& info, const Profile& profile) {
+    // sotc: SOTC_HEAP. Only whole stages switch: a stage with an image or sampler outside the heap
+    // keeps its push slots, and the table is then never read. The table load needs 64-bit integers.
+    if (!profile.heap_images || !profile.support_int64) {
+        return false;
+    }
+    if (info.images.empty() && info.samplers.empty()) {
+        return false;
+    }
+    for (u32 i = 0; i < info.images.size(); ++i) {
+        // Storage images stay on their descriptors: the index table carries sampled images only.
+        if (info.images[i].is_written || BindlessImageSlotOf(info, i) == NO_BINDLESS_IMAGE_SLOT) {
+            return false;
+        }
+    }
+    return info.samplers.empty() || UsesBindlessSamplers(info);
+}
+
 void EmitContext::DefineImagesAndSamplers() {
+    uses_heap_images = UsesHeapImages(info, profile);
     for (u32 image_index = 0; image_index < info.images.size(); ++image_index) {
         const auto& image_desc = info.images[image_index];
         const auto sharp = image_desc.GetSharp(info);
@@ -1222,6 +1386,8 @@ void EmitContext::DefineImagesAndSamplers() {
                 .bindless = true,
                 .bindless_slot = bindless_slot,
                 .bindless_key = key,
+                .heap = uses_heap_images,
+                .table_entry = image_index,
             });
             continue;
         }
@@ -1288,7 +1454,23 @@ void EmitContext::DefineImagesAndSamplers() {
     }
 }
 
+Id EmitContext::LoadTableIndex(u32 entry) {
+    // sotc: SOTC_HEAP: the table address is the uvec2 push member at HeapIndexTableOffset (low word
+    // first, as LoadBdaBlock reads its words); entry i is one u32 at address + 4 * i.
+    const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[2]), push_data_block,
+                               ConstU32(HeapIndexTableMember))};
+    const Id table{OpBitcast(U64, OpLoad(U32[2], ptr))};
+    const Id address{OpIAdd(U64, table, Constant(U64, static_cast<u64>(entry) * sizeof(u32)))};
+    return OpLoad(U32[1], BdaPointer(address, U32[1]), spv::MemoryAccessMask::Aligned, 4U);
+}
+
 Id EmitContext::LoadSampler(u32 index) {
+    if (uses_heap_images) {
+        // sotc: SOTC_HEAP: sampler s is the entry after the images of the stage (UsesHeapImages).
+        const Id heap_index{LoadTableIndex(static_cast<u32>(info.images.size()) + index)};
+        const Id sampler_ptr{OpAccessChain(sampler_pointer_type, bindless_sampler_array, heap_index)};
+        return OpLoad(sampler_type, sampler_ptr);
+    }
     if (!uses_bindless_samplers) {
         return OpLoad(sampler_type, samplers[index]);
     }

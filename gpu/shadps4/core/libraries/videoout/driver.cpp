@@ -42,6 +42,8 @@
 #include "video_core/renderer_vulkan/vk_parallel_record.h" // sotc: SOTC_N5_PARALLEL counters
 #include "video_core/renderer_vulkan/vk_bindless.h" // sotc: SOTC_N5_BINDLESS report
 #include "video_core/texture_cache/tsharp_slot_cache.h" // sotc: SOTC_TSLOT report
+#include "video_core/sotc_arch/shader_addr.h" // sotc: draw architecture reports (sotc_arch.h)
+#include "video_core/sotc_arch/passes.h"      // sotc: SOTC_PASSES report
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_recorder.h" // sotc: SOTC_FUTEX_WAIT report
 #include "video_core/sotc_fps_cap.h"
@@ -2096,6 +2098,26 @@ void VideoOutDriver::Flip(const Request& req) {
                 }
             }
             SotcRbClass::Report(report, seconds); // sotc: SOTC_RB_CLASS
+            { // sotc: draw architecture (docs/re-stutters/native/ARCH-DRAW.md), one line per part when on
+                char arch_line[1024];
+                const auto arch = [&](auto&& fn) {
+                    arch_line[0] = 0;
+                    fn(arch_line, static_cast<u32>(sizeof arch_line), seconds);
+                    if (arch_line[0]) {
+                        report += arch_line;
+                        report += '\n';
+                    }
+                };
+                arch(SotcArch::OpCost::Report);
+                arch(SotcArch::Layouts::Report);
+                arch(SotcArch::Mirror::Report);
+                if (SotcArch::ShaderAddr::On()) {
+                    arch(SotcArch::ShaderAddr::Report);
+                }
+                if (SotcArch::SwitchMode("SOTC_PASSES") != 0) {
+                    arch(SotcArch::Passes::Report);
+                }
+            }
             SotcGen::Report(report, seconds); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
             SotcPcPool::Report(report, seconds);      // sotc: SOTC_PC_POOL
             SotcRamReport::Report(report, presenter.get()); // sotc: SOTC_RAM_REPORT

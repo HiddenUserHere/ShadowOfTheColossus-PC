@@ -7875,7 +7875,38 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
     static thread_local std::vector<SotcNative::PendingUpload> snapshot;
     popped.clear();
     snapshot.clear();
+    // sotc: SOTC_MIRROR (SotcArch::Mirror). Every taken announce, served or not, is also uploaded to the mirror; the
+    // arena path below is unchanged (the binds read the arenas until phase A3). =2 keeps one sampled range read back
+    // from the mirror and compared with the guest bytes taken at its upload (see the block before the merged loop).
+    const bool mirror_on = SotcArch::Mirror::On();
+    static const int mirror_verify = SotcArch::SwitchMode("SOTC_MIRROR");
+    struct MirrorCheck {
+        VAddr addr;
+        u64 size;
+        u64 drain;
+        u64 tick;
+        Vulkan::StagingBufferRef staging;
+        std::vector<u8> snapshot;
+    };
+    static thread_local std::vector<SotcNative::PendingUpload> mirrored;
+    static thread_local std::vector<SotcNative::PendingUpload> mirror_merged;
+    static thread_local std::deque<MirrorCheck> mirror_checks;
+    static thread_local std::vector<VAddr> mirror_bad;
+    static thread_local std::chrono::steady_clock::time_point mirror_report_at{};
+    static thread_local u64 mirror_drains = 0;
+    static thread_local u64 mirror_uploads = 0;
+    static thread_local u64 mirror_bytes = 0;
+    static thread_local u64 mirror_sampled = 0;
+    static thread_local u64 mirror_match = 0;
+    static thread_local u64 mirror_mismatch = 0;
+    static thread_local u64 mirror_gpu_skip = 0;
+    static thread_local u64 mirror_not_resident = 0;
+    mirrored.clear();
+    mirror_merged.clear();
     const auto handle = [&](const SotcNative::PendingUpload& u) {
+        if (mirror_on) {
+            mirrored.push_back(u);
+        }
         SotcNative::NoteDrainEntry(u.seq, pickup_seq, u.size);
         // The announce is the CPU write the fault path used to see. Images in the range are
         // invalidated as a guest write fault invalidates them (TextureCache::InvalidateMemory: dirty,
@@ -7927,6 +7958,121 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
             }
         }
         merged.push_back(e);
+    }
+    if (mirror_on) {
+        // Every announced range goes to the mirror: sorted by address, overlapping or touching ranges merged
+        // (whatever their kind), at most kMaxChunk each. The copies are recorded before this submit's commands.
+        std::sort(mirrored.begin(), mirrored.end(), [](const SotcNative::PendingUpload& a, const SotcNative::PendingUpload& b) {
+            return a.addr < b.addr;
+        });
+        for (const auto& e : mirrored) {
+            if (!mirror_merged.empty()) {
+                SotcNative::PendingUpload& r = mirror_merged.back();
+                const u64 lo = std::min<u64>(r.addr, e.addr);
+                const u64 hi = std::max<u64>(r.addr + r.size, e.addr + e.size);
+                if (e.addr <= r.addr + r.size && hi - lo <= kMaxChunk) {
+                    r.addr = lo;
+                    r.size = hi - lo;
+                    continue;
+                }
+            }
+            mirror_merged.push_back(e);
+        }
+        for (const auto& m : mirror_merged) {
+            SotcArch::Mirror::Upload(scheduler, m.addr, m.size);
+            ++mirror_uploads;
+            mirror_bytes += m.size;
+        }
+        if (mirror_verify == 2) {
+            // Checks are read on a later drain and never waited for: 3 drains on, and the copy's tick has finished.
+            ++mirror_drains;
+            while (!mirror_checks.empty()) {
+                MirrorCheck& c = mirror_checks.front();
+                if (mirror_drains - c.drain < 3 || !scheduler.IsFree(c.tick)) {
+                    break;
+                }
+                if (IsRegionGpuModified(c.addr, c.size)) {
+                    ++mirror_gpu_skip; // the GPU wrote the range since: its bytes are not the guest's
+                } else if (std::memcmp(c.staging.mapped, c.snapshot.data(), c.size) == 0) {
+                    ++mirror_match;
+                } else {
+                    ++mirror_mismatch;
+                    if (mirror_bad.size() < 8) {
+                        mirror_bad.push_back(c.addr);
+                    }
+                }
+                staging_pool.FreeDeferred(c.staging);
+                mirror_checks.pop_front();
+            }
+            // One range per drain (rotated over the merged ranges, at most 8 checks in flight): its first 64 KiB
+            // is copied from the mirror into a download buffer, and the guest bytes now are kept to compare with.
+            if (!mirror_merged.empty() && mirror_checks.size() < 8) {
+                const auto& m = mirror_merged[mirror_drains % mirror_merged.size()];
+                const u64 n = std::min<u64>(m.size, u64{64} << 10);
+                if (const SotcArch::Mirror::Window* w = SotcArch::Mirror::Find(m.addr, n)) {
+                    MirrorCheck c{};
+                    c.addr = m.addr;
+                    c.size = n;
+                    c.drain = mirror_drains;
+                    c.snapshot.resize(n);
+                    memory->CopySparseMemory(m.addr, c.snapshot.data(), n);
+                    c.staging = staging_pool.Request(n, VideoCore::MemoryType::HostCached, 0, true);
+                    const vk::BufferCopy copy{m.addr - w->guest_base, c.staging.offset, n};
+                    scheduler.RecordDeferred([src = w->buffer, dst = c.staging.buffer->Handle(),
+                                              copy](vk::CommandBuffer cmdbuf) {
+                        // The upload's transfer write is visible to this read; the copy is visible to the host.
+                        const vk::MemoryBarrier2 pre_barrier = {
+                            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                        };
+                        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                            .memoryBarrierCount = 1,
+                            .pMemoryBarriers = &pre_barrier,
+                        });
+                        cmdbuf.copyBuffer(src, dst, copy);
+                        const vk::MemoryBarrier2 host_barrier = {
+                            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+                        };
+                        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                            .memoryBarrierCount = 1,
+                            .pMemoryBarriers = &host_barrier,
+                        });
+                    });
+                    c.tick = scheduler.CurrentTick();
+                    mirror_checks.push_back(std::move(c));
+                    ++mirror_sampled;
+                } else {
+                    ++mirror_not_resident;
+                }
+            }
+        }
+        // Report every 5 s on the draw thread (the counters are per thread, cumulative since start).
+        const auto now = std::chrono::steady_clock::now();
+        if (mirror_report_at == std::chrono::steady_clock::time_point{}) {
+            mirror_report_at = now;
+        }
+        if (now - mirror_report_at >= std::chrono::seconds(5)) {
+            mirror_report_at = now;
+            std::fprintf(stderr,
+                         "SOTC MIRROR DRAIN: %llu ranges, %.1f MiB uploaded; verify: %llu sampled, %llu match, "
+                         "%llu mismatch, %llu gpu-written, %llu not resident",
+                         static_cast<unsigned long long>(mirror_uploads),
+                         static_cast<double>(mirror_bytes) / (1024.0 * 1024.0),
+                         static_cast<unsigned long long>(mirror_sampled),
+                         static_cast<unsigned long long>(mirror_match),
+                         static_cast<unsigned long long>(mirror_mismatch),
+                         static_cast<unsigned long long>(mirror_gpu_skip),
+                         static_cast<unsigned long long>(mirror_not_resident));
+            for (const VAddr bad : mirror_bad) {
+                std::fprintf(stderr, " %#llx", static_cast<unsigned long long>(bad));
+            }
+            std::fprintf(stderr, "\n");
+        }
     }
     for (const auto& r : merged) {
         // sotc: without tracking, GPU-written bytes are never read back into guest memory, so a page
