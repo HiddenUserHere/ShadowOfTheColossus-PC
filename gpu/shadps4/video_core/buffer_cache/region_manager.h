@@ -26,6 +26,7 @@
 #include "../../../sotc/pc_ring.h"     // sotc: SotcPcRing::FullRingMode (stall guard in LockTimed)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "../sotc_generation.h"      // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA granule generations
+#include "sync_events.h" // sotc: SOTC_SYNC_EVENTS (dirty journal hint on CPU rises)
 #include "video_core/sotc_arch/addr_table_hooks.h" // sotc: SOTC_ADDR_TABLE clean state (Dirty hooks)
 // sotc: SOTC_UNTRACK_MAX_MB (default 16 MiB), live (SotcLive): the cap of the untrack list.
 inline SotcLive::Int kUntrackMaxMb{"SOTC_UNTRACK_MAX_MB", 16};
@@ -1328,6 +1329,13 @@ private:
             gpu[index] |= mask;
         }
         const u64 cpu_changed = (cpu[index] ^ prev_cpu) & mask;
+        // sotc: SOTC_SYNC_EVENTS. The CPU bits that rose in this word: the journal's hint for the
+        // draw-side drain (sync_events.h). Recorded after the bit store, under the region mutex.
+        if constexpr (cpu_op == StateOp::Set) {
+            if (SotcSyncEvents::On() && cpu_changed) {
+                SotcSyncEvents::PushWords(CpuAddress() + index * BYTES_PER_WORD, cpu_changed);
+            }
+        }
         if (!RingOn()) {
             if constexpr (cpu_op != StateOp::None) {
                 write_prot[index] = cpu_changed;

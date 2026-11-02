@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: A1 (Layouts::Residual)
 #include "video_core/sotc_stats.h"
 
 #include "video_core/host_shaders/fg_depth_comp.h"
@@ -148,6 +149,11 @@ vk::ImageMemoryBarrier2 Barrier(vk::Image image, vk::PipelineStageFlags2 src_sta
                                 vk::AccessFlags2 src_access, vk::ImageLayout old_layout,
                                 vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                                 vk::ImageLayout new_layout) {
+    // sotc: A1 residual (Sdk). Each call's barrier is recorded by its caller at once. Creation is not counted.
+    if (new_layout != vk::ImageLayout::eGeneral ||
+        (old_layout != vk::ImageLayout::eUndefined && old_layout != vk::ImageLayout::eGeneral)) {
+        SotcArch::Layouts::NoteResidual(SotcArch::Layouts::Residual::Sdk);
+    }
     return vk::ImageMemoryBarrier2{
         .srcStageMask = src_stage,
         .srcAccessMask = src_access,

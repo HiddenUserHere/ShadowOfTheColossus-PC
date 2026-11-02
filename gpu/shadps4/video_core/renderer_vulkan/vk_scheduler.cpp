@@ -194,10 +194,25 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     is_rendering = true;
     render_state = new_state;
 
+    // sotc: A1. Under the unified layouts a feedback attachment is GENERAL, and Vulkan needs the feedback loop
+    // declared for it: VkAttachmentFeedbackLoopInfoEXT with feedbackLoopEnable, chained to its attachment info. It
+    // needs only unifiedImageLayouts (no attachmentFeedbackLoopLayout bit). The rasterizer marks the attachments only
+    // when VK_EXT_attachment_feedback_loop_layout is missing; with it, the dynamic state carries the enable.
+    const bool unified_feedback = SotcArch::Layouts::Active() && render_state.feedback_mask != 0;
+    std::array<vk::AttachmentFeedbackLoopInfoEXT, 9> feedback_info{};
+    const auto feedback_next = [&](u32 bit) -> const void* {
+        if (!unified_feedback || !(render_state.feedback_mask & (1u << bit))) {
+            return nullptr;
+        }
+        feedback_info[bit].feedbackLoopEnable = VK_TRUE;
+        return &feedback_info[bit];
+    };
+
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
         const auto& cb = render_state.color_attachments[i];
         color_attachments[i] = vk::RenderingAttachmentInfo{
+            .pNext = feedback_next(i),
             .imageView = cb.image_view,
             .imageLayout = cb.image_layout,
             .loadOp = cb.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
@@ -208,6 +223,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 
     const auto& db = render_state.depth_stencil_attachment;
     const vk::RenderingAttachmentInfo depth_attachment = {
+        .pNext = feedback_next(8),
         .imageView = db.image_view,
         .imageLayout = db.image_layout,
         .loadOp = db.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
@@ -217,6 +233,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
                                                                           db.clear_value[0])}},
     };
     const vk::RenderingAttachmentInfo stencil_attachment = {
+        .pNext = feedback_next(8),
         .imageView = db.image_view,
         .imageLayout = db.image_layout,
         .loadOp = db.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,

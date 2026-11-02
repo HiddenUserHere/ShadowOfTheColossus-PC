@@ -9,6 +9,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/sotc_arch/passes.h" // sotc: SOTC_PASSES
+#include "video_core/sotc_arch/guest_barrier.h" // sotc: SOTC_BARRIER_GUEST (safety net ranges, recorded barriers)
 #include "video_core/renderer_vulkan/vk_queues.h" // sotc: SOTC_N5_QUEUES counters
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
@@ -831,6 +832,12 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
+    // sotc: SOTC_BARRIER_STATIC=1 keeps no ranges: the static rule answers for every buffer (passes.h). The DMA,
+    // copy and mirror paths come here, and so does the transfer-queue routing (a conservative answer only keeps a
+    // copy on the graphics queue).
+    if (SotcArch::Passes::BarrierStatic::On()) {
+        return SotcArch::Passes::BarrierStatic::DmaNeeds(check_read_access);
+    }
     MakeCurrent(handle);
     bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
     if (check_read_access && !has_access) {
@@ -841,6 +848,30 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+    // sotc: SOTC_BARRIER_STATIC. A copy or indirect read is a pending read of the static rule (a later write to the
+    // buffer orders after it). The op-level reads are noted by ResetBindings (BarrierStatic::NoteOp); off, this is no-op.
+    constexpr static vk::AccessFlags2 STATIC_WRITE_MASK =
+        vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
+        vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
+        vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
+    if (!(src_access & STATIC_WRITE_MASK)) {
+        SotcArch::Passes::BarrierStatic::NoteOp(true, false);
+    }
+    // sotc: SOTC_BARRIER_GUEST. Every access feeds the safety net (its ranges and the pending-write flag). The per-resource
+    // records below stay: the host paths (copies, readbacks, mirrors) still order against them.
+    if (SotcArch::GuestBarrier::Active()) {
+        const bool write_access = static_cast<bool>(src_access & STATIC_WRITE_MASK);
+        SotcArch::GuestBarrier::NoteAccess(handle->CpuAddr() + offset, size, write_access);
+    }
+    // sotc: SOTC_BARRIER_STATIC=1: no per-resource records. A write only joins the pending static barrier.
+    if (SotcArch::Passes::BarrierStatic::On()) {
+        if (src_access & STATIC_WRITE_MASK) {
+            SotcArch::Passes::NoteWrite(); // sotc: marks the pending write of the static rule
+            memory_barrier.srcStageMask |= src_stage;
+            memory_barrier.srcAccessMask |= src_access & STATIC_WRITE_MASK;
+        }
+        return;
+    }
     MakeCurrent(handle);
 
     const Interval range = {
@@ -879,6 +910,9 @@ void Runtime::NoteAddressedWrite() {
     memory_barrier.srcStageMask |= vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.srcAccessMask |= vk::AccessFlagBits2::eShaderWrite;
     addressed_write_pending = true;
+    if (SotcArch::GuestBarrier::Active()) { // sotc: SOTC_BARRIER_GUEST (a write without a range)
+        SotcArch::GuestBarrier::NoteWritePending();
+    }
 }
 
 bool Runtime::MemoryBarrierPending() const noexcept {
@@ -892,6 +926,15 @@ bool Runtime::AddressedWritePending() const noexcept {
 void Runtime::FlushBarriers() {
     vk::DependencyInfo dep_info{};
 
+    // sotc: SOTC_BARRIER_STATIC=1. A pending read or write (any op or copy since the last barrier) is ordered by this
+    // barrier: all stages and all writes as the source, so the write-after-read and read-after-write pairs both hold.
+    if (SotcArch::Passes::BarrierStatic::On() && SotcArch::Passes::BarrierStatic::Pending()) {
+        memory_barrier.srcStageMask |= vk::PipelineStageFlagBits2::eAllCommands;
+        memory_barrier.srcAccessMask |=
+            vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
+            vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
+    }
     if (memory_barrier.srcStageMask) {
         dep_info.pMemoryBarriers = &memory_barrier;
         dep_info.memoryBarrierCount = 1U;
@@ -909,6 +952,10 @@ void Runtime::FlushBarriers() {
     const auto cmdbuf = scheduler.CommandBuffer();
     Vulkan::FrameGraph::NoteBarrier(); // sotc: SOTC_N5_GRAPH verify (barrier events)
     cmdbuf.pipelineBarrier2(dep_info);
+    SotcArch::Passes::BarrierStatic::Flushed(); // sotc: SOTC_BARRIER_STATIC=1, the pending flags are ordered now
+    if (dep_info.memoryBarrierCount != 0) { // sotc: SOTC_BARRIER_GUEST=1, every pending access is ordered by this barrier
+        SotcArch::GuestBarrier::Recorded();
+    }
 
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;

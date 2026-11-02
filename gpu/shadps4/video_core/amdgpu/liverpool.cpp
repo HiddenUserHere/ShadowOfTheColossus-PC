@@ -39,6 +39,8 @@
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (AscRptrMode below)
 #include "../../../sotc/pc_ring.h"                   // sotc: SOTC_PC_RING full ring (mode)
 #include "video_core/buffer_cache/pc_ring_copy.h"    // sotc: SOTC_PC_RING full ring (copy)
+#include "video_core/buffer_cache/sync_events.h"  // sotc: SOTC_SYNC_EVENTS (drain at the submit start)
+#include "video_core/sotc_arch/guest_barrier.h"  // sotc: SOTC_BARRIER_GUEST (guest sync points)
 #include "bbport_threads.h"
 #include "video_core/amdgpu/draw_prep.h"
 #include "video_core/amdgpu/op_footprint.h" // sotc: SOTC_CULL_EXPRESS
@@ -1141,6 +1143,47 @@ void Liverpool::BackPublish(bool writes_memory, bool gpu_write) {
             std::scoped_lock lk{back_mutex};
             back_cv.notify_one();
         }
+    }
+}
+
+// sotc: SOTC_BARRIER_GUEST. Command processor thread. The marker writes nothing to guest memory (writes_memory false).
+void Liverpool::QueueGuestSync(u8 kind) {
+    if (!SotcArch::GuestBarrier::Active()) {
+        return;
+    }
+    BackOrRun(
+        [this, kind] {
+            if (rasterizer) {
+                rasterizer->GuestSyncPoint(kind);
+            }
+        },
+        false);
+}
+
+// sotc: SOTC_BARRIER_GUEST. The event types that order GPU work before later work (cache and partial flushes, end of
+// pipe and its timestamps, the DB and CB flushes). An EVENT_WRITE of one of them is a guest sync point.
+static bool IsGuestSyncEvent(EventType type) {
+    switch (type) {
+    case EventType::CacheFlushTs:
+    case EventType::CacheFlush:
+    case EventType::CsPartialFlush:
+    case EventType::VsPartialFlush:
+    case EventType::PsPartialFlush:
+    case EventType::CacheFlushAndInvTsEvent:
+    case EventType::CacheFlushAndInvEvent:
+    case EventType::VgtFlush:
+    case EventType::BottomOfPipeTs:
+    case EventType::DbCacheFlushAndInv:
+    case EventType::FlushAndInvDbDataTs:
+    case EventType::FlushAndInvDbMeta:
+    case EventType::FlushAndInvCbDataTs:
+    case EventType::FlushAndInvCbMeta:
+    case EventType::FlushAndInvCbPixelData:
+    case EventType::CsDone:
+    case EventType::PsDone:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -4004,6 +4047,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (host ring copy)
         BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); });
     }
+    // sotc: SOTC_SYNC_EVENTS. The journal's hinted uploads, on the draw thread before this submit's ops
+    // (outermost gfx submit only; the BufferCache checks the switch again).
+    if (pc_ring_top && rasterizer && SotcSyncEvents::On()) {
+        BackOrRun([r = rasterizer] { r->GetBufferCache().DrainSyncEvents(); });
+    }
 
     // TODO: potentially, ASCs also can depend on CE and in this case the
     // CE task should be moved into more global scope
@@ -4486,6 +4534,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
                           magic_enum::enum_name(event->event_type.Value()),
                           magic_enum::enum_name(event->event_index.Value()));
+                if (IsGuestSyncEvent(event->event_type.Value())) { // sotc: SOTC_BARRIER_GUEST
+                    QueueGuestSync(static_cast<u8>(SotcArch::GuestBarrier::Sync::Event));
+                }
                 if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
                     // TODO: handle proper synchronization, for now signal that update is done
                     // immediately
@@ -4519,6 +4570,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                      g_ring8_submit_waits.contains(reinterpret_cast<VAddr>(eos.Address()) &
                                                    ~VAddr{7}));
                 NoteBackWriteRange(reinterpret_cast<VAddr>(eos.Address()), 8); // sotc: SOTC_CP_PRECISE_WAIT
+                QueueGuestSync(static_cast<u8>(SotcArch::GuestBarrier::Sync::Eos)); // sotc: SOTC_BARRIER_GUEST
                 BackOrRun([this, eos, eos_waited] {
                     if (rasterizer) {
                         rasterizer->OnFence();
@@ -4629,6 +4681,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else {
                     NoteBackWriteRange(reinterpret_cast<VAddr>(eop_packet.Address<void>()), 8);
                 }
+                QueueGuestSync(static_cast<u8>(SotcArch::GuestBarrier::Sync::Eop)); // sotc: SOTC_BARRIER_GUEST
                 BackOrRun([this, eop_packet, t_cp, ring8_waited] {
                 const auto* event_eop = &eop_packet;
                 if (rasterizer) {
@@ -4826,6 +4879,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 ASSERT(dma_data->command.das == 0);
                 const PM4DmaData dma = *dma_data;
+                if (dma.cp_sync) { // sotc: SOTC_BARRIER_GUEST, the CP waits for the prior work
+                    QueueGuestSync(static_cast<u8>(SotcArch::GuestBarrier::Sync::Dma));
+                }
                 if (dma.src_sel == DmaDataSrc::Data && dma.dst_sel == DmaDataDst::Gds) {
                     NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (GDS)
                     BackOrRun([this, dma] {
@@ -4937,6 +4993,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::AcquireMem: {
                 // const auto* acquire_mem = reinterpret_cast<PM4CmdAcquireMem*>(header);
+                QueueGuestSync(static_cast<u8>(SotcArch::GuestBarrier::Sync::Acquire)); // sotc: SOTC_BARRIER_GUEST
                 break;
             }
             case PM4ItOpcode::Rewind: {
@@ -5309,6 +5366,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::AcquireMem: {
+            QueueGuestSync(static_cast<u8>(SotcArch::GuestBarrier::Sync::Acquire)); // sotc: SOTC_BARRIER_GUEST
             break;
         }
         case PM4ItOpcode::Rewind: {
@@ -5498,6 +5556,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else {
                 NoteBackWriteRange(release.Address<VAddr>(), 8);
             }
+            QueueGuestSync(static_cast<u8>(SotcArch::GuestBarrier::Sync::Release)); // sotc: SOTC_BARRIER_GUEST
             BackOrRun([this, release, pipe_id = queue.pipe_id, rm_waited] {
                 if (rasterizer) {
                     rasterizer->OnFence();
@@ -5584,7 +5643,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::EventWrite: {
-            // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header); // sotc: SOTC_BARRIER_GUEST
+            if (IsGuestSyncEvent(event->event_type.Value())) {
+                QueueGuestSync(static_cast<u8>(SotcArch::GuestBarrier::Sync::Event));
+            }
             break;
         }
         default:

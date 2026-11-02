@@ -19,8 +19,11 @@ public:
 
     void Create(vk::Device device, VmaAllocator allocator, u32 num_images);
 
+    /// sotc: input_layout is the layout the input view is in: a texture-cache image is GENERAL with the unified
+    /// layouts (Layouts::Pick), an image of this pass chain is SHADER_READ_ONLY.
     vk::ImageView Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
-                         vk::Extent2D output_size, Settings settings, bool hdr);
+                         vk::Extent2D output_size, Settings settings, bool hdr,
+                         vk::ImageLayout input_layout = vk::ImageLayout::eShaderReadOnlyOptimal);
 
     /// sotc: RCAS only, for an image that is already at the output size (DLSS output).
     vk::ImageView Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D size,

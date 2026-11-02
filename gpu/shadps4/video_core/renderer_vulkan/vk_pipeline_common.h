@@ -6,6 +6,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_descriptor_heap.h" // sotc: SOTC_DESCRIPTOR_HEAP (heap plan of a pipeline)
 #include "video_core/sotc_arch/sotc_arch.h"
 
 #include <mutex>
@@ -168,6 +169,11 @@ public:
     bool HasSlotWords() const noexcept {
         return uses_slot_words;
     }
+    /// sotc: SOTC_DESCRIPTOR_HEAP: true when the pipeline was built with the heap flag and no layout. Its
+    /// BindResources writes the descriptors into the heap rings and pushes the push block with vkCmdPushDataEXT.
+    [[nodiscard]] bool UsesDescriptorHeap() const noexcept {
+        return heap_mode;
+    }
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     /// `write_sets[i]` is the descriptor set of `set_writes[i]`, used only with UsesStageSets().
@@ -181,6 +187,14 @@ public:
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
+
+    /// sotc: SOTC_DESCRIPTOR_HEAP: plans the mapping of `bindings` (the layout's set 0, in order) when the mode is on
+    /// and `pre` (the reason the caller found, Heap when none) allows it. Counts the outcome. True when the pipeline is
+    /// a heap pipeline: its layout must then not be created (heap_plan holds the mappings).
+    bool PlanHeapMode(std::span<const HeapBinding> bindings, HeapFallback pre);
+    /// sotc: SOTC_DESCRIPTOR_HEAP draw: writes the set's descriptors into the rings, binds both heaps, and pushes the
+    /// push block (PushData, then the two ring base slots) with vkCmdPushDataEXT.
+    void BindHeapResources(const Shader::PushData& push_data, const DescriptorWrites& set_writes) const;
 
     /// sotc: SOTC_STAGE_BINDINGS: commits one descriptor set per stage layout, writes each
     /// stage's descriptors into its own set and binds them all together.
@@ -214,6 +228,9 @@ protected:
     /// stage reads its indices from the index table instead, so it needs the heap set but no slot words.
     bool uses_slot_words{};
     bool stage_sets{}; ///< sotc: a graphics pipeline with one descriptor set per stage
+    /// sotc: SOTC_DESCRIPTOR_HEAP: the pipeline is a heap pipeline (see UsesDescriptorHeap) and its mapping plan.
+    bool heap_mode{};
+    DescriptorHeapPlan heap_plan{};
     /// sotc: SOTC_PACKET: the push range carries the DrawPacket (PacketPushBytes). Set when the layout is built: true
     /// when a stage has a shader-addressed buffer (UsesShaderAddr) or is the heap stage. Never true together with
     /// uses_slot_words (the packet and the slot words share bytes 56..128).

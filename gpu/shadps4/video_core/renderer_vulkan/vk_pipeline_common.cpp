@@ -12,6 +12,7 @@
 #include "common/assert.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
+#include "video_core/renderer_vulkan/vk_descriptor_heap.h" // sotc: SOTC_DESCRIPTOR_HEAP
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
@@ -434,6 +435,54 @@ void VerifyN5Set(const Instance& instance, DescriptorHeap& desc_heap,
 
 } // namespace
 
+bool Pipeline::PlanHeapMode(std::span<const HeapBinding> bindings, HeapFallback pre) {
+    // Off: nothing is planned or counted, the layout is built as before.
+    if (!instance.IsDescriptorHeapEnabled()) {
+        return false;
+    }
+    DescriptorHeapBuffers* heaps = desc_heap.GetDescriptorHeapBuffers();
+    HeapFallback outcome = pre;
+    if (outcome == HeapFallback::Heap && !heaps) {
+        outcome = HeapFallback::NoHeaps;
+    }
+    if (outcome == HeapFallback::Heap) {
+        outcome = PlanDescriptorHeap(*heaps, bindings, heap_plan);
+    }
+    DescriptorHeapNoteLayout(is_compute, outcome);
+    heap_mode = outcome == HeapFallback::Heap;
+    if (!heap_mode) {
+        heap_plan = DescriptorHeapPlan{};
+    }
+    return heap_mode;
+}
+
+void Pipeline::BindHeapResources(const Shader::PushData& push_data,
+                                 const DescriptorWrites& set_writes) const {
+    DescriptorHeapBuffers* heaps = desc_heap.GetDescriptorHeapBuffers();
+    ASSERT_MSG(heaps, "heap pipeline bound without the heap buffers");
+
+    // This draw's region of each ring: its slots are reused only after the GPU finished the ticks that used them.
+    // An allocation that waits may flush the recording (a new command buffer), so the command buffer is taken after.
+    const u32 resource_base = heaps->AllocResourceSlots(heap_plan.resource_slots, scheduler);
+    const u32 sampler_base = heaps->AllocSamplerSlots(heap_plan.sampler_slots, scheduler);
+    ASSERT_MSG(resource_base != HeapNoSlot && sampler_base != HeapNoSlot,
+               "heap ring cannot hold a pipeline's plan");
+    // A refused write is counted by WriteHeapDescriptors; the draw then reads the slots as they were.
+    static_cast<void>(
+        WriteHeapDescriptors(instance, *heaps, heap_plan, set_writes, resource_base, sampler_base));
+
+    const VkCommandBuffer cmdbuf = static_cast<VkCommandBuffer>(scheduler.CommandBuffer());
+    // Heaps are bound on every heap draw: any classic descriptor state (this layer's or another pass's) voids them.
+    BindDescriptorHeaps(cmdbuf, *heaps);
+    std::array<u8, HeapPushBytes> block{};
+    std::memcpy(block.data(), &push_data, sizeof(push_data));
+    const std::array<u32, 2> words{resource_base, sampler_base};
+    std::memcpy(block.data() + HeapPushResourceWord, words.data(), sizeof(words));
+    PushDescriptorHeapData(cmdbuf, block.data(), HeapPushBytes);
+    // vkCmdPushDataEXT voids the push constants of the classic layers, so their dedup cache starts over.
+    scheduler.GetDynamicState().InvalidatePushConstants();
+}
+
 void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> write_sets,
                              const Shader::PushData& push_data,
                              const Shader::BindlessSamplerSlots& bindless_slots,
@@ -442,6 +491,12 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
+
+    // sotc: SOTC_DESCRIPTOR_HEAP: a heap pipeline has no layout: its descriptors and push block go to the heaps.
+    if (heap_mode) {
+        BindHeapResources(push_data, set_writes);
+        return;
+    }
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
 

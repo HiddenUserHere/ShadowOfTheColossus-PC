@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include <algorithm>
@@ -50,6 +51,11 @@ struct State {
     std::vector<u8> dirty;               ///< one flag per chunk (guarded by g_mutex)
     std::vector<u32> dirty_list;         ///< the chunks whose flag is set, so a flush visits only those
     u64 live{};                          ///< nonzero entries (guarded by g_mutex)
+    // sotc: SOTC_ADDR_VERTEX. The buffer each entry lives in, host only: owner[page] is an index into owners (0: none,
+    // the entry is 0). owners[0] is nullptr; a buffer gets its index the first time a placement names it.
+    std::vector<u32> owner;              ///< guarded by g_mutex
+    std::vector<const VideoCore::Buffer*> owners; ///< guarded by g_mutex
+    std::unordered_map<const VideoCore::Buffer*, u32> owner_ids; ///< guarded by g_mutex
 };
 
 std::mutex g_mutex;
@@ -74,6 +80,14 @@ std::atomic<u64> g_reverts{};        // slow Touch calls whose clean bits a conc
 std::atomic<u64> g_dirty_calls{};    // ClearClean calls (Dirty, DirtyPages, OnPlace, OnRemove, written binds)
 std::atomic<u64> g_would_fast{};     // SOTC_SHADER_ADDR=2: reads the fast path would have answered
 std::atomic<u64> g_would_fast_bad{}; // SOTC_SHADER_ADDR=2: of those, the slow path wrote other entries
+
+// sotc: SOTC_ADDR_VERTEX counters, per VertexPath (ObtainRead). table: answered by the table; fallback: ObtainBuffer ran
+// (outside the window, a page not resident or of another owner, a refused Touch); verify_*: mode 2's comparison.
+constexpr size_t kVertexPaths = static_cast<size_t>(VertexPath::Count);
+std::atomic<u64> g_vx_table[kVertexPaths]{};
+std::atomic<u64> g_vx_fallback[kVertexPaths]{};
+std::atomic<u64> g_vx_verify_match[kVertexPaths]{};
+std::atomic<u64> g_vx_verify_bad[kVertexPaths]{};
 
 // sotc: refusal at Init, like ShaderAddr::Refuse: a run that goes on would read the table as zero.
 [[noreturn]] void Refuse(const char* reason) {
@@ -120,8 +134,22 @@ void ClearClean(VAddr addr, u64 size) {
     });
 }
 
+// The owner index of buffer (g_mutex held). 0 for nullptr; a new buffer is appended to the registry.
+u32 OwnerIdLocked(State& s, const VideoCore::Buffer* buffer) {
+    if (!buffer) {
+        return 0;
+    }
+    const auto [it, inserted] = s.owner_ids.try_emplace(buffer, static_cast<u32>(s.owners.size()));
+    if (inserted) {
+        s.owners.push_back(buffer);
+    }
+    return it->second;
+}
+
 // Writes one entry (g_mutex held). The placed bit follows the entry: set when it is not 0, cleared when it is.
-void SetEntryLocked(State& s, u64 page, u64 value) {
+// owner: the buffer the entry lives in (0 when value is 0).
+void SetEntryLocked(State& s, u64 page, u64 value, u32 owner) {
+    s.owner[page] = value == 0 ? 0 : owner;
     u64& entry = s.shadow[page];
     if (entry == value) {
         return;
@@ -158,13 +186,13 @@ bool AnyDirtyLocked(const State& s, u64 first, u64 last) {
 
 // Entries of the pages of [addr, addr + size) for a range whose byte addr lies at device. Each entry is the device
 // address of its page's first byte: device minus the bytes of the page that lie before addr (u64 wrap, and the
-// shader adds the offset in the page back, so the sum is exact).
-void SetRangeLocked(State& s, VAddr addr, u64 size, vk::DeviceAddress device) {
+// shader adds the offset in the page back, so the sum is exact). owner: the buffer that holds the range.
+void SetRangeLocked(State& s, VAddr addr, u64 size, vk::DeviceAddress device, u32 owner) {
     const u64 first = (addr - WindowBase) >> PageShift;
     const u64 last = (addr - WindowBase + size - 1) >> PageShift;
     for (u64 page = first; page <= last; ++page) {
         const VAddr page_start = WindowBase + (page << PageShift);
-        SetEntryLocked(s, page, device + (page_start - addr));
+        SetEntryLocked(s, page, device + (page_start - addr), owner);
     }
 }
 
@@ -275,6 +303,8 @@ void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler) {
     state->base = device.getBufferAddress(vk::BufferDeviceAddressInfo{.buffer = *buffer});
     state->shadow.assign(NumPages, 0);
     state->dirty.assign(kNumChunks, 0);
+    state->owner.assign(NumPages, 0);
+    state->owners.push_back(nullptr); // index 0: no owner
     state->stream = std::make_unique<VideoCore::StreamBuffer>(
         instance, scheduler, VideoCore::MemoryType::HostUncached, kStreamSize);
     // Every entry starts at 0 (not resident). The fill runs on the upload command buffer, before any draw.
@@ -420,7 +450,7 @@ bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr ad
         if (compare) {
             before.assign(s->shadow.begin() + first, s->shadow.begin() + last + 1);
         }
-        SetRangeLocked(*s, addr, size, device);
+        SetRangeLocked(*s, addr, size, device, OwnerIdLocked(*s, buffer));
         FlushLocked(*s, scheduler);
         if (compare) {
             g_would_fast.fetch_add(1, std::memory_order_relaxed);
@@ -471,14 +501,14 @@ void DirtyPages(VAddr base, u64 mask) noexcept {
     }
 }
 
-void OnPlace(VAddr addr, u64 size, vk::DeviceAddress device_addr) {
+void OnPlace(VAddr addr, u64 size, vk::DeviceAddress device_addr, const VideoCore::Buffer* owner) {
     State* s = g_state.get();
     if (!s || size == 0 || addr < WindowBase || addr - WindowBase > WindowSize - size) {
         return;
     }
     ClearClean(addr, size); // before the entries change: a fast read must not see a clean page with the old entry
     std::scoped_lock lock{g_mutex};
-    SetRangeLocked(*s, addr, size, device_addr);
+    SetRangeLocked(*s, addr, size, device_addr, OwnerIdLocked(*s, owner));
 }
 
 void OnRemove(VAddr addr, u64 size) {
@@ -492,7 +522,7 @@ void OnRemove(VAddr addr, u64 size) {
     ClearClean(addr, size);
     std::scoped_lock lock{g_mutex};
     for (u64 page = first; page <= last; ++page) {
-        SetEntryLocked(*s, page, 0);
+        SetEntryLocked(*s, page, 0, 0);
     }
 }
 
@@ -504,6 +534,118 @@ vk::DeviceAddress Translate(VAddr addr) {
     std::scoped_lock lock{g_mutex};
     const u64 entry = s->shadow[(addr - WindowBase) >> PageShift];
     return entry == 0 ? 0 : entry + (addr & (PageSize - 1));
+}
+
+// sotc: SOTC_ADDR_VERTEX (see addr_table.h). The mode is read once, like On().
+bool VertexOn() {
+    static const bool on = On() && SwitchMode("SOTC_ADDR_VERTEX") != 0;
+    return on;
+}
+
+namespace {
+bool VertexVerify() {
+    static const bool verify = SwitchMode("SOTC_ADDR_VERTEX") == 2;
+    return verify;
+}
+} // namespace
+
+bool Backing(VAddr addr, u64 size, const VideoCore::Buffer*& buffer, u64& offset) {
+    State* s = g_state.get();
+    if (!s || size == 0 || addr < WindowBase || addr - WindowBase > WindowSize - size) {
+        return false;
+    }
+    const u64 first = (addr - WindowBase) >> PageShift;
+    const u64 last = (addr - WindowBase + size - 1) >> PageShift;
+    std::scoped_lock lock{g_mutex};
+    const u64 first_entry = s->shadow[first];
+    const u32 id = s->owner[first];
+    if (first_entry == 0 || id == 0) {
+        return false;
+    }
+    // One backing: every page has the same owner, and the entries are linear (page p at first_entry + (p - first) * 16K).
+    for (u64 page = first; page <= last; ++page) {
+        if (s->owner[page] != id || s->shadow[page] != first_entry + ((page - first) << PageShift)) {
+            return false;
+        }
+    }
+    const VideoCore::Buffer* owner = s->owners[id];
+    if (!owner || !owner->HasBufferDeviceAddress()) {
+        return false;
+    }
+    // The device address of byte addr: the first page's entry plus the byte's offset in its page (see Translate).
+    const vk::DeviceAddress device = first_entry + (addr & (PageSize - 1));
+    const vk::DeviceAddress base = owner->BufferDeviceAddress();
+    if (device < base || device - base > owner->SizeBytes() || size > owner->SizeBytes() - (device - base)) {
+        return false;
+    }
+    buffer = owner;
+    offset = device - base;
+    return true;
+}
+
+std::pair<const VideoCore::Buffer*, u64> ObtainRead(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler,
+                                                    VAddr addr, u32 size, VertexPath path) {
+    if (!VertexOn() || size == 0) {
+        return cache.ObtainBuffer(addr, size, false);
+    }
+    const size_t i = static_cast<size_t>(path);
+    // Outside the window the table holds nothing: the old path, counted here (Touch would count it as refused).
+    if (addr < WindowBase || addr - WindowBase > WindowSize - size) {
+        g_vx_fallback[i].fetch_add(1, std::memory_order_relaxed);
+        return cache.ObtainBuffer(addr, size, false);
+    }
+    const VideoCore::Buffer* buffer = nullptr;
+    u64 offset = 0;
+    const bool answered = Touch(cache, scheduler, addr, size, false) && Backing(addr, size, buffer, offset);
+    if (answered) {
+        g_vx_table[i].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_vx_fallback[i].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!VertexVerify()) {
+        return answered ? std::pair{buffer, offset} : cache.ObtainBuffer(addr, size, false);
+    }
+    // Mode 2: the old path runs too; its result is the one the draw uses, and the table's answer is compared with it.
+    const auto old = cache.ObtainBuffer(addr, size, false);
+    if (answered) {
+        if (buffer == old.first && offset == old.second) {
+            g_vx_verify_match[i].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_vx_verify_bad[i].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return old;
+}
+
+void ReportVertex(char* out, u32 size, double seconds) {
+    if (!out || size == 0) {
+        return;
+    }
+    static const char* const kNames[kVertexPaths] = {"vertex", "index", "indirect", "indirect count",
+                                                     "dispatch indirect"};
+    int used = std::snprintf(out, size, "SOTC ADDR_VERTEX (table / fallback):");
+    for (size_t i = 0; i < kVertexPaths; ++i) {
+        if (used < 0 || static_cast<u32>(used) + 1 >= size) {
+            break; // the line is full: the rest is cut
+        }
+        const u64 table = g_vx_table[i].exchange(0, std::memory_order_relaxed);
+        const u64 fallback = g_vx_fallback[i].exchange(0, std::memory_order_relaxed);
+        const u64 match = g_vx_verify_match[i].exchange(0, std::memory_order_relaxed);
+        const u64 bad = g_vx_verify_bad[i].exchange(0, std::memory_order_relaxed);
+        const u32 left = size - static_cast<u32>(used);
+        used += VertexVerify()
+                    ? std::snprintf(out + used, left, " %s %llu/%llu [match %llu, differ %llu]", kNames[i],
+                                    static_cast<unsigned long long>(table),
+                                    static_cast<unsigned long long>(fallback),
+                                    static_cast<unsigned long long>(match),
+                                    static_cast<unsigned long long>(bad))
+                    : std::snprintf(out + used, left, " %s %llu/%llu", kNames[i],
+                                    static_cast<unsigned long long>(table),
+                                    static_cast<unsigned long long>(fallback));
+    }
+    if (used >= 0 && static_cast<u32>(used) + 1 < size) {
+        std::snprintf(out + used, size - static_cast<u32>(used), " over %.1f s", seconds);
+    }
 }
 
 void Report(char* out, u32 size, double seconds) {

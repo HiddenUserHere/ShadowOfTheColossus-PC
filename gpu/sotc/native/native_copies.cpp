@@ -38,6 +38,7 @@
 
 #include "native.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/sotc_write_journal.h" // sotc: SOTC_WRITE_JOURNAL (page filter, journal counters)
 
 namespace SotcNativeCopies {
 namespace {
@@ -123,6 +124,11 @@ struct Counters {
     std::atomic<uint64_t> flat_mismatch{0};  // mode 2: answers of the flat indexes that differ from the map's
 };
 Counters g_c;
+
+// sotc: SOTC_WRITE_JOURNAL. Hashed page counts of the live entries (every page of [base, base + bytes)): Register adds
+// an entry, PruneLocked removes it when it leaves g_entries. A write whose pages all have a zero count overlaps no entry.
+// Owned by the registration lock (g_mutex); the draw thread reads it without the lock (MayTouch).
+SotcWriteJournal::PageCounts g_filter;
 
 // sotc: SOTC_FLAT_NOTES (read once). 0: the std::maps only, the flat vectors are not touched (today's code).
 // 1: the flat vectors only. 2: both are kept up to date; every answer comes from the std::map, the flat answer is
@@ -316,6 +322,9 @@ void PruneLocked(uint64_t completed) {
             g_c.pruned_count.fetch_add(1, std::memory_order_relaxed);
         }
         RemoveFromIndexes(&e);
+        if (SotcWriteJournal::On()) {
+            g_filter.Add(e.base, e.bytes, -1); // sotc: SOTC_WRITE_JOURNAL: the entry leaves the page counts
+        }
         g_entries.pop_front();
     }
     g_watching.store(!Pick(g_by_base.empty(), g_flat_base.empty()), std::memory_order_release);
@@ -474,6 +483,47 @@ bool SameOverlaps(const std::vector<Overlap>& a, const std::vector<Overlap>& b) 
 std::vector<Overlap> g_overlaps;
 std::vector<Overlap> g_overlaps_check;
 
+// sotc: SOTC_WRITE_JOURNAL. The written ranges of the draw thread in this epoch: a flat per-thread vector (no lock, no
+// map), appended by NoteWrittenBind and merged by EpochEnd (the start of the next submit). It is not read before the
+// epoch end: the copies of an op are recorded at the op (a later op of the same submit may write the same bytes).
+struct Range {
+    uint64_t addr;
+    uint64_t size;
+};
+constexpr size_t kJournalCap = size_t{1} << 17; // entries before a compaction (2 MiB per thread)
+thread_local std::vector<Range> tl_journal;
+thread_local std::vector<Range> tl_merged;
+thread_local size_t tl_compact_at = kJournalCap;
+
+// Sorts the ranges (in place) and merges the overlapping or adjacent ones into merged.
+void MergeRanges(std::vector<Range>& ranges, std::vector<Range>& merged) {
+    std::sort(ranges.begin(), ranges.end(), [](const Range& a, const Range& b) { return a.addr < b.addr; });
+    merged.clear();
+    for (const Range& r : ranges) {
+        if (!merged.empty() && r.addr <= merged.back().addr + merged.back().size) {
+            const uint64_t end = std::max(merged.back().addr + merged.back().size, r.addr + r.size);
+            merged.back().size = end - merged.back().addr;
+        } else {
+            merged.push_back(r);
+        }
+    }
+}
+
+void JournalAppend(uint64_t addr, uint64_t size) {
+    if (tl_journal.size() >= tl_compact_at) {
+        // Full before its epoch ended: merged in place (every byte stays covered). The threshold grows with the
+        // result, so a journal of many disjoint ranges is not merged again and again.
+        const auto t0 = Clock::now();
+        MergeRanges(tl_journal, tl_merged);
+        SotcWriteJournal::Count(SotcWriteJournal::g_counters.coalesced, tl_merged.size());
+        SotcWriteJournal::Count(SotcWriteJournal::g_counters.coalesce_ns, NsSince(t0));
+        tl_journal.swap(tl_merged);
+        tl_compact_at = std::max(kJournalCap, 2 * tl_journal.size());
+    }
+    tl_journal.push_back(Range{addr, size});
+    SotcWriteJournal::Count(SotcWriteJournal::g_counters.ranges);
+}
+
 } // namespace
 
 // sotc: compute programs the draw thread dispatched, by code address (the LOD mirror tells its pre-shader variants
@@ -572,6 +622,9 @@ bool Register(uint64_t key, uint64_t seq, uint64_t base, uint64_t bytes, uint64_
     e->async = 0;
     e->identity = identity;
     e->single = single_write;
+    if (SotcWriteJournal::On()) {
+        g_filter.Add(base, bytes, +1); // sotc: SOTC_WRITE_JOURNAL: the entry's pages join the counts
+    }
     if (UseMap()) {
         g_by_base[base] = e;
     }
@@ -689,8 +742,21 @@ bool Watching() {
 }
 
 void NoteWrittenBind(vk::CommandBuffer cmdbuf, vk::Buffer src, uint64_t src_offset, uint64_t addr, uint64_t size) {
+    // sotc: SOTC_WRITE_JOURNAL. Mode 1: a write that no live entry's page covers returns here, before the lock and the
+    // walks (no entry can overlap it, so the walk would find nothing and pop nothing). Mode 2 runs the walk and checks.
+    const bool journal = SotcWriteJournal::On();
+    if (journal) {
+        SotcWriteJournal::Count(SotcWriteJournal::g_counters.ops);
+    }
     if (size == 0) {
         return;
+    }
+    if (journal) {
+        JournalAppend(addr, size);
+        if (!SotcWriteJournal::Verify() && !g_filter.MayTouch(addr, size)) {
+            SotcWriteJournal::Count(SotcWriteJournal::g_counters.native_filtered);
+            return;
+        }
     }
     std::lock_guard<std::mutex> lock(g_mutex);
     const bool base_empty = Pick(g_by_base.empty(), g_flat_base.empty());
@@ -725,6 +791,19 @@ void NoteWrittenBind(vk::CommandBuffer cmdbuf, vk::Buffer src, uint64_t src_offs
             }
         }
     }
+    if (journal) {
+        SotcWriteJournal::Count(SotcWriteJournal::g_counters.native_walks);
+        if (SotcWriteJournal::Verify()) {
+            // The filter's answer against the walk's: "no page" must mean "no overlap", and the reverse counts as
+            // a false "may touch".
+            const bool may = g_filter.MayTouch(addr, size);
+            if (!may && !out.empty()) {
+                SotcWriteJournal::Count(SotcWriteJournal::g_counters.verify_diff);
+            } else if (may && out.empty()) {
+                SotcWriteJournal::Count(SotcWriteJournal::g_counters.may_false);
+            }
+        }
+    }
     // Copies the overlap of the write with e (recorded now, in stream order).
     const auto record = [&](Entry& e, uint64_t lo, uint64_t hi) {
         vk::MemoryBarrier before{};
@@ -753,6 +832,36 @@ void NoteWrittenBind(vk::CommandBuffer cmdbuf, vk::Buffer src, uint64_t src_offs
     for (const Overlap& o : out) {
         record(*o.e, o.lo, o.hi);
     }
+}
+
+void EpochEnd() {
+    if (!SotcWriteJournal::On() || tl_journal.empty()) {
+        return;
+    }
+    const auto t0 = Clock::now();
+    std::vector<Range> originals;
+    if (SotcWriteJournal::Verify()) {
+        originals = tl_journal; // MergeRanges sorts its input in place
+    }
+    MergeRanges(tl_journal, tl_merged);
+    SotcWriteJournal::Count(SotcWriteJournal::g_counters.coalesced, tl_merged.size());
+    SotcWriteJournal::Count(SotcWriteJournal::g_counters.coalesce_ns, NsSince(t0));
+    if (SotcWriteJournal::Verify()) {
+        // Every journaled range must lie inside one merged interval; a merge that dropped bytes would fail here.
+        uint64_t bad = 0;
+        for (const Range& r : originals) {
+            const auto it = std::upper_bound(tl_merged.begin(), tl_merged.end(), r.addr,
+                                             [](uint64_t a, const Range& m) { return a < m.addr; });
+            if (it == tl_merged.begin() || (it - 1)->addr + (it - 1)->size < r.addr + r.size) {
+                ++bad;
+            }
+        }
+        if (bad != 0) {
+            SotcWriteJournal::Count(SotcWriteJournal::g_counters.verify_diff, bad);
+        }
+    }
+    tl_journal.clear();
+    tl_compact_at = kJournalCap;
 }
 
 void SetRecordingTick(uint64_t tick) {

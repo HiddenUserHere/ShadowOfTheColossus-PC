@@ -90,6 +90,27 @@ enum BindCacheFlushReason : uint32_t {
 inline constexpr const char* kBindCacheFlushNames[BindCacheReasons] = {
     "tick", "memory", "resources", "targets", "unsafe"};
 inline std::atomic<uint64_t> bind_cache_flushes[BindCacheReasons]{};
+/// sotc: SOTC_BIND_CACHE eligibility counters (SOTC_FPS only). Rasterizer::BindCacheRefusal names the
+/// first gate a bind fails; BindResources counts each op once: heap-dropped, or refused by a gate, or
+/// eligible (then fast-served, or consulted). Post-gate drops are counted on top of those.
+enum BindGate : uint32_t {
+    BgNone, BgCompute, BgClip, BgStorage, BgDispatchDma, BgShared, BgWrittenBuf, BgWrittenImg,
+    BgPacket, BgPacketHeap, BgGates
+};
+inline constexpr const char* kBindGateNames[BgGates] = {
+    "none", "compute", "clip plane", "storage/fmask", "dispatch dma", "shared mem",
+    "written buf", "written img", "packet", "packet+heap"};
+inline std::atomic<uint64_t> bind_ops{0}, bind_eligible{0}, bind_consulted{0},
+    bind_fast_eligible{0}, bind_fast_refused{0}, bind_heap_dropped{0}, bind_post_copy{0},
+    bind_post_nodata{0};
+inline std::atomic<uint64_t> bind_gate_refused[BgGates]{};
+/// Call sites of BindCacheFlush(BindCacheUnsafe), by the bind that flushed.
+enum BindUnsafeSite : uint32_t {
+    UsCopy, UsMetaClear, UsImageClear, UsSyncIneligible, UsSyncWriteEpoch, UsSites
+};
+inline constexpr const char* kBindUnsafeSiteNames[UsSites] = {
+    "copy", "meta clear", "image clear", "sync ineligible", "sync write epoch"};
+inline std::atomic<uint64_t> bind_unsafe_sites[UsSites]{};
 /// sotc: SOTC_BIND_CACHE_RANGES=1 (default off; only with SOTC_BIND_CACHE=1): a dispatch, draw or
 /// DMA that writes GPU memory drops only the cached binds that read what it writes
 /// (Rasterizer::BindCacheInvalidate), and guest memory changes (mem_epoch) no longer flush the
@@ -191,6 +212,22 @@ enum BindFrameReason : uint32_t {
 inline constexpr const char* kBindFrameNames[BfReasons] = {"none", "flush",  "buffers", "stream",
                                                            "writes", "images", "mapping", "refused"};
 inline std::atomic<uint64_t> bf_miss[BfReasons]{}, bf_drop[BfReasons]{};
+/// sotc: SOTC_BIND_CACHE_FRAME. The site that refused a hit (BfRefused), by the check it failed. Counted with
+/// bf_miss[BfRefused]; the sites are the refuse calls of Rasterizer::TryBindCacheFrame (SOTC_OPSET measurements).
+enum BindRefuseSite : uint32_t {
+    RfBindless,     ///< the bindless heap generation moved (a slot released or evicted)
+    RfFlatSize,     ///< a flat buffer of the entry changed size (the stage's words no longer fit the copy)
+    RfMapReplay,    ///< a repair's guest mapping changed before the entry was replayed
+    RfMapRepair,    ///< a repair's guest mapping changed while it was synchronized
+    RfFlatTick,     ///< a flat copy left its stream lap or tick during the repair
+    RfMapAfter,     ///< the guest mapping changed after the repair (second check of the replay)
+    RfSampler,      ///< a sampler of the entry is no longer the one the sampler cache returns
+    RfImage,        ///< an image of the entry is dirty, unregistered, re-bound, a target or force-general
+    RfSites
+};
+inline constexpr const char* kBindRefuseSiteNames[RfSites] = {
+    "bindless", "flatsize", "map", "maprepair", "flattick", "mapafter", "sampler", "image"};
+inline std::atomic<uint64_t> bf_refuse[RfSites]{};
 inline std::atomic<uint64_t> bf_stored{0}, bf_replaced{0}, bf_not_stored_moved{0},
     bf_cross_frame_hits{0}, bf_narrowed{0};
 /// sotc: SOTC_BIND_CACHE_FRAME buffer binding memo (BindBuffers): read-only V#s that skipped
@@ -240,6 +277,10 @@ inline std::atomic<uint64_t> rs_memo_misses[RsMissReasons]{};
 inline std::atomic<uint64_t> pr_prepared{0}, pr_not_ready{0}, pr_epoch{0}, pr_ineligible{0},
     pr_throttle_ns{0}, pr_verify_mismatches{0};
 inline std::atomic<uint32_t> pr_lag_max{0};
+/// sotc: SOTC_PR_KEYS (draw_prep.h PreparedDraw::table_keys, TableMemo::ComputeKey). precomputed: heap table keys a
+/// GpuPrep thread computed (SOTC_FPS only); used: TableMemo::Resolve replayed one instead of KeyOf (SOTC_FPS only);
+/// mismatch: SOTC_VERIFY differences between the record and the draw thread's KeyOf (always counted).
+inline std::atomic<uint64_t> pr_keys_precomputed{0}, pr_keys_used{0}, pr_keys_mismatch{0};
 /// sotc: SOTC_HOST_IMAGE_COPY=1 (default off): linear textures the GPU did not write are re-uploaded
 /// by the host (vkCopyMemoryToImageEXT, VK_EXT_host_image_copy) instead of a staging copy in a
 /// command buffer (TextureCache::RefreshImage, Runtime::TryHostImageCopy). Off as well when the

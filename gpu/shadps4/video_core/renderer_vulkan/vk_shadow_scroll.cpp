@@ -184,8 +184,8 @@ void ShadowScroll::TransitScratch(Scratch& scratch, vk::ImageLayout layout) {
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .oldLayout = scratch.layout,
-        .newLayout = layout,
+        .oldLayout = SotcArch::Layouts::Pick(scratch.layout),
+        .newLayout = SotcArch::Layouts::Pick(layout),
         .image = scratch.image,
         .subresourceRange{.aspectMask = AllAspects(scratch.format),
                           .baseMipLevel = 0,
@@ -193,6 +193,10 @@ void ShadowScroll::TransitScratch(Scratch& scratch, vk::ImageLayout layout) {
                           .baseArrayLayer = 0,
                           .layerCount = 1},
     };
+    if (barrier.newLayout != vk::ImageLayout::eGeneral ||
+        (barrier.oldLayout != vk::ImageLayout::eUndefined && barrier.oldLayout != vk::ImageLayout::eGeneral)) {
+        SotcArch::Layouts::NoteResidual(SotcArch::Layouts::Residual::Internal); // sotc: A1, a raw layout is named
+    }
     scheduler.CommandBuffer().pipelineBarrier2({
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &barrier,
@@ -215,7 +219,7 @@ void ShadowScroll::CopyLayer(VideoCore::Image& image, u32 layer, Scratch& scratc
         .extent = {scratch.width, scratch.height, 1},
     };
     scheduler.CommandBuffer().copyImage(image.GetImage(), SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
-                                        scratch.image, vk::ImageLayout::eTransferDstOptimal,
+                                        scratch.image, SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
                                         region);
 }
 
@@ -354,9 +358,9 @@ bool ShadowScroll::Scroll(VideoCore::Image& image, u32 layer, s32 sx, s32 sy, fl
     state.height = static_cast<u16>(height);
     state.num_layers = 1;
     state.depth_stencil_attachment.image_view = target_view;
-    // sotc: A1: the texture-cache layer takes Pick; the verification scratch image is ours (no Pick).
+    // sotc: A1: the texture-cache layer and the scratch images both name their layouts through Pick.
     state.depth_stencil_attachment.image_layout =
-        to_check ? target_layout : SotcArch::Layouts::Pick(target_layout);
+        SotcArch::Layouts::Pick(target_layout);
     state.depth_stencil_attachment.has_depth = true;
     state.depth_format = format;
     scheduler.BeginRendering(state);
@@ -364,7 +368,7 @@ bool ShadowScroll::Scroll(VideoCore::Image& image, u32 layer, s32 sx, s32 sy, fl
     const auto cmdbuf = scheduler.CommandBuffer();
     const vk::DescriptorImageInfo image_info = {
         .imageView = source.view,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal),
     };
     const vk::WriteDescriptorSet write = {
         .dstBinding = 0,
@@ -424,7 +428,7 @@ void ShadowScroll::SaveCheck(VideoCore::Image& image, u32 layer, const std::stri
             .imageExtent = {width, height, 1},
         };
         cmdbuf.copyImageToBuffer(i == 0 ? checked.image : drawn.image,
-                                 vk::ImageLayout::eTransferSrcOptimal, vk::Buffer{buffer}, copy);
+                                 SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), vk::Buffer{buffer}, copy);
     }
     scheduler.Finish();
     vmaInvalidateAllocation(instance.GetAllocator(), allocation, 0, VK_WHOLE_SIZE);

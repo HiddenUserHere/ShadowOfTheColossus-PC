@@ -19,6 +19,7 @@ class Instance;
 class Semaphore;
 class Scheduler;
 class DescriptorBufferRing;
+class DescriptorHeapBuffers; // sotc: SOTC_DESCRIPTOR_HEAP=1 only (vk_descriptor_heap.h)
 
 /**
  * Handles a pool of resources protected by fences. Manages resource overflow allocating more
@@ -100,6 +101,10 @@ public:
         bindless_layout = layout;
         bindless_set = set;
     }
+    /// sotc: SOTC_DESCRIPTOR_HEAP=1: the resource and sampler heaps (vk_descriptor_heap.h), else null.
+    [[nodiscard]] DescriptorHeapBuffers* GetDescriptorHeapBuffers() const noexcept {
+        return descriptor_heap_buffers.get();
+    }
     [[nodiscard]] vk::DescriptorSetLayout BindlessSamplerLayout() const noexcept {
         return bindless_layout;
     }
@@ -120,6 +125,7 @@ private:
     using DescSetBatch = boost::container::static_vector<vk::DescriptorSet, DescriptorSetBatch>;
     tsl::robin_map<u64, DescSetBatch> descriptor_sets;
     std::unique_ptr<DescriptorBufferRing> descriptor_buffer; // sotc: SOTC_DESC_BUFFER=1 only
+    std::unique_ptr<DescriptorHeapBuffers> descriptor_heap_buffers; // sotc: SOTC_DESCRIPTOR_HEAP=1 only
     vk::DescriptorSetLayout bindless_layout{}; // sotc: SOTC_BINDLESS_SAMP, null otherwise
     vk::DescriptorSet bindless_set{};
 };

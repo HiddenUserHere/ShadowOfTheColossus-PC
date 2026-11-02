@@ -438,8 +438,6 @@ ImagePlan PlanImage(const Vulkan::Instance& instance, const ImageInfo& info) {
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
              Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
     : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
-    // sotc: SOTC_LAYOUT_UNIFIED: the feature the layouts may use (Pick); the switch is part of the accessor.
-    SotcArch::Layouts::NoteSupported(instance.SotcUnifiedLayouts());
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
@@ -539,35 +537,63 @@ static bool SkipSameGeneral(Image& image, vk::ImageLayout a, vk::ImageLayout b, 
     return false;
 }
 
-// sotc: SOTC_LAYOUT_UNIFIED. A barrier that moved only the tracked layout (same access, no write before it) orders
-// no hazard: with every image in GENERAL there is no layout change left to order, so it is dropped. Only the
-// barriers that carry an access or a write are kept (their layouts become GENERAL, see Layouts::Pick). The first
-// use of an image still moves it from UNDEFINED to GENERAL. =2 keeps every barrier and counts the drops.
-static bool DropLayoutOnlyBarrier(const Image::State& prev, vk::ImageLayout dst_layout,
-                                  vk::AccessFlags2 dst_mask) {
-    if (!SotcArch::Layouts::On() && !SotcArch::Layouts::Verify()) {
-        return false;
+// sotc: SOTC_LAYOUT_UNIFIED (A1). With every texture-cache image in GENERAL (Layouts::Active), a barrier between two
+// uses that only read orders no hazard and changes no layout: it is dropped. Two kinds are counted apart: layout-only
+// (the same read access on both sides, the first rule of A1) and read-to-read (another read access). A write on
+// either side keeps the barrier (its layouts become GENERAL, see Layouts::Pick). The first use of an image (tracked
+// UNDEFINED) keeps its UNDEFINED -> GENERAL transition. A dropped barrier merges its stages and accesses into the
+// tracked state (see GetBarriers): a later write must still wait for every read. Verify (=2) keeps every barrier and
+// counts what would be dropped.
+enum class Drop : u8 { None, LayoutOnly, ReadToRead };
+
+static Drop ClassifyDrop(const Image::State& prev, vk::AccessFlags2 dst_mask) {
+    if (prev.layout == vk::ImageLayout::eUndefined) {
+        return Drop::None;
     }
-    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                 vk::AccessFlagBits2::eShaderWrite |
-                                 vk::AccessFlagBits2::eMemoryWrite;
-    // The real layout must not change either: a feedback loop kept by Pick (no unified feature) is a real change.
-    const bool layout_only = prev.layout != dst_layout && prev.access_mask == dst_mask &&
-                             prev.layout != vk::ImageLayout::eUndefined &&
-                             SotcArch::Layouts::Pick(prev.layout) == SotcArch::Layouts::Pick(dst_layout) &&
-                             !static_cast<bool>(prev.access_mask & write_flags);
+    constexpr auto read_only = vk::AccessFlagBits2::eShaderRead |
+                               vk::AccessFlagBits2::eShaderSampledRead |
+                               vk::AccessFlagBits2::eShaderStorageRead |
+                               vk::AccessFlagBits2::eTransferRead |
+                               vk::AccessFlagBits2::eColorAttachmentRead |
+                               vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                               vk::AccessFlagBits2::eInputAttachmentRead |
+                               vk::AccessFlagBits2::eMemoryRead;
+    const bool reads_only = (prev.access_mask & ~read_only) == vk::AccessFlags2{} &&
+                            (dst_mask & ~read_only) == vk::AccessFlags2{};
+    if (!reads_only) {
+        return Drop::None;
+    }
+    return prev.access_mask == dst_mask ? Drop::LayoutOnly : Drop::ReadToRead;
+}
+
+// Decides and counts one barrier of a tracked use change. Counts nothing when the mode is neither active nor verified.
+static Drop AccountBarrier(const Image::State& prev, vk::AccessFlags2 dst_mask) {
+    if (!SotcArch::Layouts::Active() && !SotcArch::Layouts::Verify()) {
+        return Drop::None;
+    }
+    const Drop drop = ClassifyDrop(prev, dst_mask);
     if (SotcArch::Layouts::Verify()) {
-        if (layout_only) {
+        if (drop != Drop::None) {
             SotcArch::Layouts::NoteVerifySkip();
         }
-        return false;
+        return Drop::None;
     }
-    if (layout_only) {
+    switch (drop) {
+    case Drop::None:
+        SotcArch::Layouts::NoteKept();
+        // sotc: a kept barrier orders a write (either side) or is a first use: what a drop may never remove.
+        if (prev.layout != vk::ImageLayout::eUndefined) {
+            SotcArch::Layouts::NoteKeptWrite();
+        }
+        break;
+    case Drop::LayoutOnly:
         SotcArch::Layouts::NoteSkipped();
-        return true;
+        break;
+    case Drop::ReadToRead:
+        SotcArch::Layouts::NoteSkippedRead();
+        break;
     }
-    SotcArch::Layouts::NoteKept();
-    return false;
+    return drop;
 }
 
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
@@ -579,6 +605,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     const State before = last_state;
     const bool had_subresources = !subresource_states.empty();
     bool subresources_changed = false;
+    Drop drop_kind = Drop::None; // sotc: A1, the full-resource barrier's drop (merged below when dropped)
 
     const bool needs_partial_transition =
         subres_range &&
@@ -620,8 +647,8 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                 const bool is_write = static_cast<bool>(state.access_mask & write_flags);
                 if (state.layout != dst_layout || state.access_mask != dst_mask ||
                     (is_write && !SkipSameGeneral(*this, state.layout, dst_layout, state.access_mask, dst_mask))) {
-                    const bool dropped = DropLayoutOnlyBarrier(state, dst_layout, dst_mask); // sotc: A1
-                    if (!dropped) barriers.emplace_back(vk::ImageMemoryBarrier2{
+                    const Drop drop = AccountBarrier(state, dst_mask); // sotc: A1
+                    if (drop == Drop::None) barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = state.pl_stage,
                         .srcAccessMask = state.access_mask,
                         .dstStageMask = dst_stage,
@@ -643,8 +670,13 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                             state.access_mask != dst_mask ||
                                             state.pl_stage != dst_stage;
                     state.layout = dst_layout;
-                    state.access_mask = dst_mask;
-                    state.pl_stage = dst_stage;
+                    if (drop == Drop::None) {
+                        state.access_mask = dst_mask;
+                        state.pl_stage = dst_stage;
+                    } else { // sotc: A1, the reads already tracked still come before a later write
+                        state.access_mask |= dst_mask;
+                        state.pl_stage |= dst_stage;
+                    }
                 }
             }
         }
@@ -661,8 +693,8 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
             (!is_write || SkipSameGeneral(*this, last_state.layout, dst_layout, last_state.access_mask, dst_mask))) {
             return;
         }
-        const bool dropped = DropLayoutOnlyBarrier(last_state, dst_layout, dst_mask); // sotc: A1
-        if (!dropped) barriers.emplace_back(vk::ImageMemoryBarrier2{
+        drop_kind = AccountBarrier(last_state, dst_mask); // sotc: A1
+        if (drop_kind == Drop::None) barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
             .srcAccessMask = last_state.access_mask,
             .dstStageMask = dst_stage,
@@ -683,8 +715,13 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     }
 
     last_state.layout = dst_layout;
-    last_state.access_mask = dst_mask;
-    last_state.pl_stage = dst_stage;
+    if (drop_kind == Drop::None) {
+        last_state.access_mask = dst_mask;
+        last_state.pl_stage = dst_stage;
+    } else { // sotc: A1, a dropped read keeps the stages and accesses of the reads before it
+        last_state.access_mask |= dst_mask;
+        last_state.pl_stage |= dst_stage;
+    }
     if (subresources_changed || before.layout != dst_layout || before.access_mask != dst_mask ||
         before.pl_stage != dst_stage || had_subresources != !subresource_states.empty()) {
         backing->state_version = NextBackingVersion(); // sotc: SOTC_TEX_BLOCK

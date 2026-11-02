@@ -15,6 +15,7 @@
 #include "../../../sotc/pc_ring.h"
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE drain at submit start
 #include "../../../sotc/native/n1verify.h" // sotc: SOTC_VERIFY=n1
+#include "../../../sotc/native/native_copies.h" // sotc: SOTC_WRITE_JOURNAL epoch end (EpochEnd)
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/buffer_cache/pc_ring_copy.h"
@@ -641,6 +642,8 @@ void HostMaintain(BufferCache& cache) {
 }
 
 void OnSubmitStart(Vulkan::Rasterizer& rasterizer, u64 announce_seq) {
+    // sotc: SOTC_WRITE_JOURNAL: the writes journaled since the last submit start are one epoch (nothing when off).
+    SotcNativeCopies::EpochEnd();
     // sotc: SOTC_LEAN_SUBMIT=1 (default off). The SOTC_VERIFY=n1 pass at the submit start is skipped when
     // n1 verify is off. Its state (pending writes, re-arm list, suspects) is only written by producers
     // behind SotcN1Verify::On() (n1verify.cpp NoteWriteFault / NoteReadFault, reached only from

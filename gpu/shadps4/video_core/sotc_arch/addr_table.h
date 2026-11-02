@@ -23,6 +23,8 @@
 // addr_table.cpp for the ordering proof and for why a native GPU write keeps the bits.
 #pragma once
 
+#include <utility>
+
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/sotc_arch/addr_table_hooks.h"
@@ -34,6 +36,7 @@ class Scheduler;
 
 namespace VideoCore {
 class BufferCache;
+struct Buffer;
 }
 
 namespace SotcArch::AddrTable {
@@ -66,9 +69,9 @@ vk::DeviceAddress Base();
 /// already GPU-modified (BufferCache::WrittenAlreadyGpuModified); then it runs NoteWrittenFast and no sync.
 bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size, bool is_written);
 
-/// The buffer cache placed [addr, addr+size) at device address device_addr (any thread). Only the shadow changes; the
-/// next Touch uploads it.
-void OnPlace(VAddr addr, u64 size, vk::DeviceAddress device_addr);
+/// The buffer cache placed [addr, addr+size) at device address device_addr in owner (any thread). Only the shadow
+/// changes; the next Touch uploads it.
+void OnPlace(VAddr addr, u64 size, vk::DeviceAddress device_addr, const VideoCore::Buffer* owner);
 
 /// The buffer cache released [addr, addr+size) (any thread). Entries become 0.
 void OnRemove(VAddr addr, u64 size);
@@ -77,8 +80,27 @@ void OnRemove(VAddr addr, u64 size);
 /// verify paths (ShaderAddr::Expected).
 vk::DeviceAddress Translate(VAddr addr);
 
+/// sotc: SOTC_ADDR_VERTEX (1 on, 2 on with verify). Needs On(). The vertex, index and indirect-argument reads of a draw
+/// take their buffer from the table (ObtainRead) instead of ObtainBuffer. Pipelines do not change with it yet.
+bool VertexOn();
+/// sotc: the read paths of SOTC_ADDR_VERTEX, counted apart.
+enum class VertexPath : u8 { Vertex, Index, Indirect, IndirectCount, DispatchIndirect, Count };
+/// sotc: the buffer and the offset in it of [addr, addr + size), from the page entries and their owners. True only when
+/// every page of the range is resident, the pages share one owner, and their device addresses are contiguous (one
+/// backing). Draw thread or any thread (takes g_mutex).
+bool Backing(VAddr addr, u64 size, const VideoCore::Buffer*& buffer, u64& offset);
+/// sotc: SOTC_ADDR_VERTEX. The buffer and offset for a read-only range the draw reads by address: Touch (residency,
+/// synchronization, no ObtainBuffer for a clean range), then Backing. Otherwise cache.ObtainBuffer, counted as a
+/// fallback. Mode 2 runs ObtainBuffer as well, counts whether the table's answer matches it, and returns its result.
+/// Off: exactly cache.ObtainBuffer(addr, size, false). Draw thread.
+std::pair<const VideoCore::Buffer*, u64> ObtainRead(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler,
+                                                    VAddr addr, u32 size, VertexPath path);
+
 /// One report line (counters reset): entries live, table and shadow memory, updates per second, touches served
 /// and failed, uploads.
 void Report(char* out, u32 size, double seconds);
+/// sotc: SOTC_ADDR_VERTEX, one report line (counters reset): per path, the table answers and the fallbacks, and mode 2's
+/// comparison.
+void ReportVertex(char* out, u32 size, double seconds);
 
 } // namespace SotcArch::AddrTable

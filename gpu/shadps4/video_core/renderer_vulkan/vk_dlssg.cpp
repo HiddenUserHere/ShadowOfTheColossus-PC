@@ -35,10 +35,20 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: A1 (Layouts::Pick, Residual::Sdk)
 #include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan::Dlssg {
+
+// sotc: A1 residual count for the SDK boundary (SOTC LAYOUT report): a barrier of ours handed to Streamline that names
+// a layout other than GENERAL. The boundary keeps its declared layouts; the count shows how many remain.
+static void NoteSdkBarrier(vk::ImageLayout from, vk::ImageLayout to) {
+    if (to != vk::ImageLayout::eGeneral ||
+        (from != vk::ImageLayout::eUndefined && from != vk::ImageLayout::eGeneral)) {
+        SotcArch::Layouts::NoteResidual(SotcArch::Layouts::Residual::Sdk);
+    }
+}
 
 // The sky: how much DLSS favours the current frame there (bias hint, 0..1), and how near the
 // far plane its depth is.
@@ -1187,6 +1197,7 @@ void SanitizeColor(vk::CommandBuffer cmdbuf) {
     const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to,
                              vk::PipelineStageFlags2 src, vk::AccessFlags2 src_access,
                              vk::PipelineStageFlags2 dst, vk::AccessFlags2 dst_access) {
+        NoteSdkBarrier(from, to); // sotc: A1 SDK count
         const vk::ImageMemoryBarrier2 b{.srcStageMask = src,
                                         .srcAccessMask = src_access,
                                         .dstStageMask = dst,
@@ -1247,6 +1258,7 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
     const auto barrier = [](vk::Image image, Layout from, Layout to, vk::PipelineStageFlags2 src,
                             vk::AccessFlags2 src_access, vk::PipelineStageFlags2 dst,
                             vk::AccessFlags2 dst_access) {
+        NoteSdkBarrier(from, to); // sotc: A1 SDK count
         return vk::ImageMemoryBarrier2{
             .srcStageMask = src,
             .srcAccessMask = src_access,
@@ -1307,7 +1319,7 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
         return;
     }
     const std::array to_copy{
-        barrier(composite.ui_shadow, Layout::eColorAttachmentOptimal, Layout::eTransferSrcOptimal,
+        barrier(composite.ui_shadow, SotcArch::Layouts::Pick(Layout::eColorAttachmentOptimal), SotcArch::Layouts::Pick(Layout::eTransferSrcOptimal),
                 Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite, Stage::eCopy,
                 Access::eTransferRead),
         barrier(sr_ui_full.image, Layout::eUndefined, Layout::eTransferDstOptimal,
@@ -1322,7 +1334,7 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
         .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
         .extent = {composite.shadow_width, composite.shadow_height, 1},
     };
-    cmdbuf.copyImage(composite.ui_shadow, Layout::eTransferSrcOptimal, sr_ui_full.image,
+    cmdbuf.copyImage(composite.ui_shadow, SotcArch::Layouts::Pick(Layout::eTransferSrcOptimal), sr_ui_full.image,
                      Layout::eTransferDstOptimal, full_region);
     const auto full_to_read =
         barrier(sr_ui_full.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
@@ -1396,6 +1408,7 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     const auto barrier = [](vk::Image image, Layout from, Layout to, vk::PipelineStageFlags2 src,
                             vk::AccessFlags2 src_access, vk::PipelineStageFlags2 dst,
                             vk::AccessFlags2 dst_access) {
+        NoteSdkBarrier(from, to); // sotc: A1 SDK count
         return vk::ImageMemoryBarrier2{
             .srcStageMask = src,
             .srcAccessMask = src_access,
@@ -1744,6 +1757,7 @@ void FillCameraMotion(vk::CommandBuffer cmdbuf, const FrameSlot& f, const sl::Co
     const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to,
                              vk::PipelineStageFlags2 src, vk::AccessFlags2 src_access,
                              vk::PipelineStageFlags2 dst, vk::AccessFlags2 dst_access) {
+        NoteSdkBarrier(from, to); // sotc: A1 SDK count
         const std::array b{
             vk::ImageMemoryBarrier2{.srcStageMask = src,
                                     .srcAccessMask = src_access,

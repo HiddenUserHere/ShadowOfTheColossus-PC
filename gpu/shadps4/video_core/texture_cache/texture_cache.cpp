@@ -29,6 +29,8 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_arch/bindset_events.h" // sotc: SOTC_BINDSET (events of the replayed table memo entries)
+#include "video_core/buffer_cache/sync_events.h" // sotc: SOTC_SYNC_EVENTS (image hints)
 #include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_HEAP
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_generation.h"
@@ -227,6 +229,12 @@ static void GenBump(VAddr addr, u64 size) {
 static void GenBumpImage(const Image& image) {
     GenBump(image.info.guest_address, image.info.guest_size);
 }
+// sotc: SOTC_BINDSET. Reports that an image changed in a way the replayed table memo entries depend on (the causes are
+// listed in sotc_arch/bindset_events.h). Posting is a no-op while the layer is off.
+static void PostBindSet(ImageId image_id, SotcArch::BindSet::Cause cause) {
+    SotcArch::BindSet::PostImage(image_id.index, cause);
+}
+
 static u64 GenSumImage(const Image& image) {
     return GenOn() ? SotcGen::Sum(image.info.guest_address, image.info.guest_size) : 0;
 }
@@ -343,6 +351,9 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (!SotcNative::TracksGuestPages()) {
         SotcNative::NoteSkippedReadback(image.info.guest_address, image.info.guest_size);
         image.flags &= ~ImageFlagBits::GpuModified;
+        // sotc: SOTC_BINDSET. A mip-tail decision reads the GPU-written mark of the images over its bytes.
+        SotcArch::BindSet::PostRange(image.info.guest_address - image.info.sotc_dropped_bytes,
+                                     image.info.guest_address + image.info.guest_size);
         return;
     }
     // sotc: SOTC_GC_DOWNLOAD=0: images freed by the collector are not written back to guest
@@ -439,6 +450,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     // thread to flush it, while the GPU thread waits for this mutex. RefreshImage hashes the
     // first texels on the GPU thread anyway (an unset hash simply means "re-upload").
     image.flags |= ImageFlagBits::MaybeCpuDirty;
+    PostBindSet(image_id, SotcArch::BindSet::Cause::ImageDirty);
     UntrackImage(image_id);
 }
 
@@ -463,6 +475,11 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_writt
             return;
         }
     }
+    // sotc: SOTC_SYNC_EVENTS. A guest write reached pages with an image: the draw-side drain
+    // (DrainImageEvents) looks at the images over the range before the next submit's binds.
+    if (SotcSyncEvents::On()) {
+        SotcSyncEvents::PushImage(addr, size);
+    }
     std::scoped_lock lock{mutex};
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         if (keep_gpu_written && True(image.flags & ImageFlagBits::GpuModified)) {
@@ -479,6 +496,8 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_writt
                 return;
             }
             image.flags &= ~(ImageFlagBits::GpuModified | ImageFlagBits::GpuDirty);
+            SotcArch::BindSet::PostRange(image.info.guest_address - image.info.sotc_dropped_bytes,
+                                         image.info.guest_address + image.info.guest_size);
             SotcNative::NoteImageReused(); // counter for the report
         }
         const auto image_begin = image.info.guest_address;
@@ -488,6 +507,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_writt
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            PostBindSet(image_id, SotcArch::BindSet::Cause::ImageDirty);
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -506,6 +526,35 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_writt
             MarkAsMaybeDirty(image_id, image);
         }
     });
+}
+
+// sotc: SOTC_SYNC_EVENTS. The images over [addr, addr + size) that the CPU changed or may have
+// changed (CpuDirty, MaybeCpuDirty) are updated now, on the draw thread at the submit start, as a
+// bind of them would update them. UpdateImage takes `mutex` itself, so the list is built under it
+// and the updates run after it is released. Returns the images updated.
+u32 TextureCache::DrainImageEvents(VAddr addr, size_t size) {
+    if (size == 0) {
+        return 0;
+    }
+    thread_local std::vector<ImageId> dirty;
+    dirty.clear();
+    {
+        const auto pages_start = PageManager::GetPageAddr(addr);
+        const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+        std::scoped_lock lock{mutex};
+        ForEachImageInRegion(pages_start, pages_end - pages_start,
+                             [&](ImageId image_id, Image& image) {
+                                 if (True(image.flags & (ImageFlagBits::CpuDirty |
+                                                         ImageFlagBits::MaybeCpuDirty)) &&
+                                     image.Overlaps(addr, size)) {
+                                     dirty.push_back(image_id);
+                                 }
+                             });
+    }
+    for (const ImageId image_id : dirty) {
+        UpdateImage(image_id);
+    }
+    return static_cast<u32>(dirty.size());
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap) {
@@ -538,9 +587,10 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         }
     }
     if (any_overlap && dma_overlap) {
-        ForEachImageInRegion(address, max_size, [&](ImageId, Image& image) {
+        ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
             if (image.Overlaps(address, max_size)) {
                 image.flags |= ImageFlagBits::GpuDirty;
+                PostBindSet(image_id, SotcArch::BindSet::Cause::ImageDirty);
                 GenBumpImage(image); // sotc: SOTC_GEN_TEX
             }
         });
@@ -555,6 +605,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        PostBindSet(image_id, SotcArch::BindSet::Cause::ImageDirty);
         GenBumpImage(image); // sotc: SOTC_GEN_TEX
     });
 }
@@ -1008,6 +1059,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 // bound as render target. In this case we need to rebind render target.
                 if (cache_image.binding.is_target) {
                     cache_image.binding.needs_rebind = 1u;
+                    PostBindSet(cache_image_id, SotcArch::BindSet::Cause::ImageRebind);
                     if (merged_image_id) {
                         GetImage(merged_image_id).binding.is_target = 1u;
                     }
@@ -1056,6 +1108,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
+        PostBindSet(image_id, SotcArch::BindSet::Cause::ImageRebind);
     }
 
     FreeImage(image_id, ImageLeave::Expand);
@@ -2009,6 +2062,29 @@ void TextureCache::TouchBoundImage(ImageId image_id) {
     NoteBoundImage(image);
 }
 
+// sotc: SOTC_BINDSET. The test TouchBoundImage makes before it chooses between UpdateImage and its no-op branch.
+bool TextureCache::BoundImageUpdateIsNoOp(ImageId image_id) {
+    return TexUpdateIsNoOp(slot_images[image_id]);
+}
+
+// sotc: SOTC_BINDSET. The time rule of DecideRebase (live_full: a full chain that IsSafeToDelete does not hold a tail
+// back). A tail found for the candidate never changes with time (the match wins before that rule).
+bool TextureCache::BindSetTailTimeStale(ImageId found_id) const {
+    const Image& found = slot_images[found_id];
+    return found.info.sotc_first_mip == 0 && IsSafeToDelete(found);
+}
+
+// sotc: SOTC_BINDSET. The no-op branch of TouchBoundImage (LRU touch, protect flush, bind evidence) for a bound image
+// whose update is a no-op (BoundImageUpdateIsNoOp, kept so by the events). Caller holds `mutex` (BatchLock).
+void TextureCache::BindSetTouchBound(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    std::unique_lock lk{mutex, std::defer_lock};
+    LockCounted(lk);
+    TouchImage(image);
+    FlushTexProtect(); // as RefreshImage does first
+    NoteBoundImage(image);
+}
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, bool update) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
@@ -2187,6 +2263,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
                 stencil_image.info.guest_address + stencil_image.info.guest_size);
         }
         stencil_image.AssociateDepth(image_id, image.image_uid);
+        PostBindSet(stencil_id, SotcArch::BindSet::Cause::ImageDepth);
     }
 
     return image.FindView(desc.view_info, false);
@@ -2826,6 +2903,20 @@ void TextureCache::RegisterImage(ImageId image_id) {
                     page_images[page].fetch_add(1, std::memory_order_relaxed);
                     page_table[page].push_back(image_id);
                 });
+    if (SotcArch::BindSet::Armed()) {
+        // sotc: SOTC_BINDSET. A newly registered image may now be the one FindImage gives for these addresses: every
+        // image it overlaps gives up the replays that name it (ImageSet).
+        ForEachImageInRegion(image.info.guest_address, image.info.guest_size,
+                             [this, image_id](ImageId other_id, Image&) {
+                                 if (other_id != image_id) {
+                                     PostBindSet(other_id, SotcArch::BindSet::Cause::ImageSet);
+                                 }
+                             });
+        // sotc: SOTC_BINDSET. A mip-tail candidate over these bytes may now find this image (its decision reads the
+        // images registered over its range, which no link of the candidate names).
+        SotcArch::BindSet::PostRange(image.info.guest_address - image.info.sotc_dropped_bytes,
+                                     image.info.guest_address + image.info.guest_size);
+    }
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
@@ -2833,6 +2924,10 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    PostBindSet(image_id, SotcArch::BindSet::Cause::ImageFree);
+    // sotc: SOTC_BINDSET. The mip-tail candidates over its bytes (their decision reads the registered images there).
+    SotcArch::BindSet::PostRange(image.info.guest_address - image.info.sotc_dropped_bytes,
+                                 image.info.guest_address + image.info.guest_size);
     ++image_set_generation;
     ++tex_epoch; // sotc: SOTC_GEN_TEX identity memo (the image set moved)
     GenBumpImage(image); // sotc: SOTC_GEN_TEX, the image's range is no longer texture-side data
@@ -2885,6 +2980,7 @@ void TextureCache::TrackImage(ImageId image_id) {
         }
         image.track_addr = image_begin;
         image.track_addr_end = image_end;
+        PostBindSet(image_id, SotcArch::BindSet::Cause::ImageTrack); // sotc: SOTC_BINDSET, after the write
         TexUpdateWatchers(tracker, image_begin, image.info.guest_size, PageOp::Track,
                           TexDeferOk(image));
     } else {
@@ -2909,6 +3005,7 @@ void TextureCache::TrackImageHead(ImageId image_id) {
     ASSERT(image.track_addr != 0 && image_begin < image.track_addr);
     const auto size = image.track_addr - image_begin;
     image.track_addr = image_begin;
+    PostBindSet(image_id, SotcArch::BindSet::Cause::ImageTrack); // sotc: SOTC_BINDSET, after the write
     TexUpdateWatchers(tracker, image_begin, size, PageOp::Track, TexDeferOk(image));
 }
 
@@ -2925,6 +3022,7 @@ void TextureCache::TrackImageTail(ImageId image_id) {
     const auto addr = image.track_addr_end;
     const auto size = image_end - image.track_addr_end;
     image.track_addr_end = image_end;
+    PostBindSet(image_id, SotcArch::BindSet::Cause::ImageTrack); // sotc: SOTC_BINDSET, after the write
     TexUpdateWatchers(tracker, addr, size, PageOp::Track, TexDeferOk(image));
 }
 
@@ -2943,6 +3041,7 @@ void TextureCache::UntrackImage(ImageId image_id) {
     }
     image.track_addr = 0;
     image.track_addr_end = 0;
+    PostBindSet(image_id, SotcArch::BindSet::Cause::ImageTrack); // sotc: SOTC_BINDSET, after the write
     if (size != 0) {
         TexUpdateWatchers(tracker, addr, size, PageOp::Untrack);
     }
@@ -2957,6 +3056,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
     const auto addr = tracker.GetNextPageAddr(image_begin);
     const auto size = addr - image_begin;
     image.track_addr = addr;
+    PostBindSet(image_id, SotcArch::BindSet::Cause::ImageTrack); // sotc: SOTC_BINDSET, after the write (see UntrackImageTail)
     if (image.track_addr == image.track_addr_end) {
         // This image spans only 2 pages and both are modified,
         // but the image itself was not directly affected.
@@ -2976,6 +3076,8 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     const auto addr = tracker.GetPageAddr(image_end);
     const auto size = image_end - addr;
     image.track_addr_end = addr;
+    // sotc: SOTC_BINDSET. Posted after the write: the link gate (PostImageGated) reads the links after the change.
+    PostBindSet(image_id, SotcArch::BindSet::Cause::ImageTrack);
     if (image.track_addr == image.track_addr_end) {
         // This image spans only 2 pages and both are modified,
         // but the image itself was not directly affected.
@@ -3205,6 +3307,7 @@ void TextureCache::GarbageCollectSamplers() {
         const size_t lru_id = samplers.at(hash).lru_id;
         samplers.erase(hash);
         sampler_epoch.fetch_add(1, std::memory_order_release);
+        SotcArch::BindSet::PostSamplers(); // sotc: SOTC_BINDSET, the sampler generation moved
         sampler_lru_cache.Free(lru_id);
         return false;
     };
@@ -3622,6 +3725,7 @@ void TextureCache::FreeRebased(ImageId image_id, std::atomic<std::uint64_t>& cou
     Image& image = slot_images[image_id];
     if (image.binding.is_bound || image.binding.is_target) {
         image.binding.needs_rebind = 1u;
+        PostBindSet(image_id, SotcArch::BindSet::Cause::ImageRebind);
     }
     FreeImage(image_id, ImageLeave::MipTail);
     counter.fetch_add(1, std::memory_order_relaxed);
@@ -3684,9 +3788,12 @@ void TextureCache::RunGarbageCollector() {
                     return;
                 }
                 image.flags &= ~ImageFlagBits::GpuModified;
+                SotcArch::BindSet::PostRange(image.info.guest_address - image.info.sotc_dropped_bytes,
+                                             image.info.guest_address + image.info.guest_size);
                 ++gpu_only_copies;
             }
             image.flags |= ImageFlagBits::CpuDirty;
+            PostBindSet(image_id, SotcArch::BindSet::Cause::ImageDirty);
             image.sotc_upload_from_guest = true;
             UntrackImage(image_id);
             ++marked;
@@ -3757,6 +3864,7 @@ void TextureCache::UnparkImage(ImageId image_id) {
     image.sotc_has_data = false;
     image.sotc_zero_filled = false;
     image.sotc_deferred_flip = ~0ull;
+    PostBindSet(image_id, SotcArch::BindSet::Cause::ImageFree); // sotc: SOTC_BINDSET, the identity changes
     image.RenewIdentity();
     {
         std::unique_lock lk{download_images_mutex};

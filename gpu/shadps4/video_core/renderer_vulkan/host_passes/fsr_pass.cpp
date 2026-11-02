@@ -1,6 +1,8 @@
 //  SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <span>
+
 #include "common/assert.h"
 #include "core/emulator_settings.h"
 #include "video_core/host_shaders/fsr_easu_comp.h"
@@ -129,6 +131,21 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) 
     }
 }
 
+// sotc: A1 residual count (SOTC LAYOUT report): a barrier into or out of a layout other than GENERAL. Creation
+// (UNDEFINED -> GENERAL) is not counted.
+static void NoteResidualBarriers(std::span<const vk::ImageMemoryBarrier2> barriers) {
+    u64 count = 0;
+    for (const auto& b : barriers) {
+        if (b.newLayout != vk::ImageLayout::eGeneral ||
+            (b.oldLayout != vk::ImageLayout::eUndefined && b.oldLayout != vk::ImageLayout::eGeneral)) {
+            ++count;
+        }
+    }
+    if (count) {
+        SotcArch::Layouts::NoteResidual(SotcArch::Layouts::Residual::Internal, count);
+    }
+}
+
 vk::ImageView FsrPass::Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D size,
                                float attenuation) {
     if (size != cur_size) {
@@ -160,6 +177,7 @@ vk::ImageView FsrPass::Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk
             .image = img.output_image,
             .subresourceRange = simple_subresource,
         };
+        NoteResidualBarriers(std::span{&b, 1});
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
     };
     barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
@@ -169,7 +187,7 @@ vk::ImageView FsrPass::Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk
     FSRConstants consts{};
     FsrRcasCon(reinterpret_cast<AU1*>(&consts.Const0), attenuation);
     std::array<vk::DescriptorImageInfo, 3> img_info{{
-        {.imageView = input, .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal},
+        {.imageView = input, .imageLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal)},
         {.imageView = img.output_image_view.get(), .imageLayout = vk::ImageLayout::eGeneral},
         {.sampler = sampler.get()},
     }};
@@ -194,7 +212,7 @@ vk::ImageView FsrPass::Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk
                          sizeof(FSRConstants), &consts);
     cmdbuf.dispatch((size.width + 15) / 16, (size.height + 15) / 16, 1);
 
-    barrier(vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
+    barrier(vk::ImageLayout::eGeneral, SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal),
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
     return img.output_image_view.get();
@@ -202,7 +220,7 @@ vk::ImageView FsrPass::Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk
 
 vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                               vk::Extent2D input_size, vk::Extent2D output_size, Settings settings,
-                              bool hdr) {
+                              bool hdr, vk::ImageLayout input_layout) {
     if (!settings.enable) {
         DebugState.is_using_fsr = false;
         return input;
@@ -274,7 +292,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             std::array<vk::DescriptorImageInfo, 3> img_info{{
                 {
                     .imageView = input,
-                    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .imageLayout = input_layout,
                 },
                 {
                     .imageView = img.intermediary_image_view.get(),
@@ -321,7 +339,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                 .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
                 .oldLayout = vk::ImageLayout::eGeneral,
-                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal),
                 .image = img.intermediary_image,
                 .subresourceRange = simple_subresource,
             },
@@ -336,6 +354,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                 .subresourceRange = simple_subresource,
             },
         };
+        NoteResidualBarriers(img_barrier);
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
             .imageMemoryBarrierCount = img_barrier.size(),
             .pImageMemoryBarriers = img_barrier.data(),
@@ -349,7 +368,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             std::array<vk::DescriptorImageInfo, 3> img_info{{
                 {
                     .imageView = img.intermediary_image_view.get(),
-                    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .imageLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal),
                 },
                 {
                     .imageView = img.output_image_view.get(),
@@ -394,7 +413,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         std::array<vk::DescriptorImageInfo, 3> img_info{{
             {
                 .imageView = input,
-                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .imageLayout = input_layout,
             },
             {
                 .imageView = img.output_image_view.get(),
@@ -441,11 +460,12 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
             .oldLayout = vk::ImageLayout::eGeneral,
-            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal),
             .image = img.output_image,
             .subresourceRange = simple_subresource,
         },
     };
+    NoteResidualBarriers(return_barrier);
     cmdbuf.pipelineBarrier2({
         .imageMemoryBarrierCount = return_barrier.size(),
         .pImageMemoryBarriers = return_barrier.data(),

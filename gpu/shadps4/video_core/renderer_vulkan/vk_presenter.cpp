@@ -782,7 +782,7 @@ Frame* Presenter::PrepareLastFrame() {
                                 .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
                                 .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                                 .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
-                                .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                                .oldLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal),
                                 .newLayout = vk::ImageLayout::eGeneral,
                                 .image = frame->image,
                                 .subresourceRange{frame_subresources}};
@@ -843,7 +843,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
         .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
         .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
         .image = frame->image,
         .subresourceRange{frame_subresources},
     };
@@ -1007,8 +1007,18 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 fsr_settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
             }
         }
+        // sotc: A1. The game image is a texture-cache image: GENERAL with the unified layouts, its sampled
+        // descriptors name the same layout. The FSR output (or the image itself when FSR passes it through)
+        // says which one the post process pass gets.
+        const vk::ImageView texture_view = image_view;
+        const vk::ImageLayout texture_layout =
+            SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal);
         image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
-                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr,
+                                     texture_layout);
+        const vk::ImageLayout pp_layout = image_view == texture_view
+                                              ? texture_layout
+                                              : SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal);
 
         // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
         // the post process pass still sRGB encoded and has to be decoded there instead.
@@ -1016,7 +1026,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
         pp_settings.ui = 0;
         pp_settings.vignette = {};
-        pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+        pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings, {}, {}, pp_layout);
     }
 
     // sotc: the game frame without the HUD, through the same pass (frame generation keeps the
@@ -1046,10 +1056,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             pp_pass.Render(cmdbuf, upscaled_scene, {frame->width, frame->height}, hudless,
                            scene_only, upscaled.ui, upscaled.sky);
         } else {
+            // sotc: A1, the rasterizer's hudless image is GENERAL with the unified layouts (TakeHudless, Pick).
+            const vk::ImageLayout hudless_layout =
+                SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal);
             const vk::ImageView scaled =
                 fsr_pass_hudless.Render(cmdbuf, hudless_view, image_size,
-                                        {frame->width, frame->height}, fsr_settings, frame->is_hdr);
-            pp_pass.Render(cmdbuf, scaled, image_size, hudless, pp_settings);
+                                        {frame->width, frame->height}, fsr_settings, frame->is_hdr,
+                                        hudless_layout);
+            pp_pass.Render(cmdbuf, scaled, image_size, hudless, pp_settings, {}, {},
+                           scaled == hudless_view ? hudless_layout
+                                                  : SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal));
         }
         frame->hudless = &hudless;
         Dlssg::NoteHudless(frame->id, hudless.image, hudless.image_view,
@@ -1080,10 +1096,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                         .pImageMemoryBarriers = &barrier,
                     });
                 };
-                to(vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal);
-                CopyImageToReadback(cmdbuf, source, vk::ImageLayout::eTransferSrcOptimal,
+                to(vk::ImageLayout::eGeneral, SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal));
+                CopyImageToReadback(cmdbuf, source, SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
                                     *readback);
-                to(vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral);
+                to(SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), vk::ImageLayout::eGeneral);
                 draw_scheduler.DeferPriorityOperation(
                     [readback] { SavePendingScreenshot(*readback); });
             }
@@ -1127,7 +1143,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
         .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
         .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
         .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
         .image = frame->image,
         .subresourceRange = simple_subresource,
     };
@@ -1137,7 +1153,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
         .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
         .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .oldLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
         .newLayout = vk::ImageLayout::eGeneral,
         .image = frame->image,
         .subresourceRange = simple_subresource,
@@ -1145,7 +1161,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 
     const vk::RenderingAttachmentInfo attachment = {
         .imageView = frame->image_view,
-        .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .imageLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
         .loadOp = vk::AttachmentLoadOp::eClear,
         .storeOp = vk::AttachmentStoreOp::eStore,
     };
@@ -1340,7 +1356,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .srcAccessMask = vk::AccessFlagBits::eNone,
                 .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
-                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = swapchain_image,
@@ -1356,7 +1372,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
                 .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead,
                 .oldLayout = vk::ImageLayout::eGeneral,
-                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal),
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = frame->image,
@@ -1388,8 +1404,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 vk::ImageMemoryBarrier{
                     .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
                     .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-                    .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
-                    .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .oldLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
+                    .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .image = swapchain_image,
@@ -1398,8 +1414,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 vk::ImageMemoryBarrier{
                     .srcAccessMask = vk::AccessFlagBits::eColorAttachmentRead,
                     .dstAccessMask = vk::AccessFlagBits::eTransferRead,
-                    .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-                    .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .oldLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal),
+                    .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .image = frame->image,
@@ -1409,7 +1425,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                                    vk::PipelineStageFlagBits::eTransfer,
                                    vk::DependencyFlagBits::eByRegion, {}, {}, to_transfer);
-            cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal,
+            cmdbuf.clearColorImage(swapchain_image, SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
                                    vk::ClearColorValue{std::array<float, 4>{0.f, 0.f, 0.f, 1.f}},
                                    color_range);
             // sotc: the clear and the blit both write the swapchain image; without a barrier
@@ -1418,8 +1434,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             const vk::ImageMemoryBarrier clear_to_blit{
                 .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
                 .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .oldLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
+                .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = swapchain_image,
@@ -1440,14 +1456,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                     vk::Offset3D{rect.offset.x + static_cast<s32>(rect.extent.width),
                                  rect.offset.y + static_cast<s32>(rect.extent.height), 1}},
             };
-            cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
-                             vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+            cmdbuf.blitImage(frame->image, SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), swapchain_image,
+                             SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), blit, vk::Filter::eLinear);
             const std::array back{
                 vk::ImageMemoryBarrier{
                     .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
                     .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-                    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-                    .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                    .oldLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
+                    .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .image = swapchain_image,
@@ -1456,8 +1472,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 vk::ImageMemoryBarrier{
                     .srcAccessMask = vk::AccessFlagBits::eTransferRead,
                     .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-                    .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
-                    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .oldLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
+                    .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal),
                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .image = frame->image,
@@ -1490,8 +1506,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             const vk::ImageMemoryBarrier to_transfer{
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
                 .dstAccessMask = vk::AccessFlagBits::eTransferRead,
-                .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
-                .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .oldLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
+                .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = swapchain_image,
@@ -1507,7 +1523,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
                                    vk::PipelineStageFlagBits::eTransfer,
                                    vk::DependencyFlagBits::eByRegion, {}, {}, to_transfer);
-            CopyImageToReadback(cmdbuf, swapchain_image, vk::ImageLayout::eTransferSrcOptimal,
+            CopyImageToReadback(cmdbuf, swapchain_image, SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
                                 readback);
             swapchain_copied_for_screenshot = true;
         }
@@ -1516,8 +1532,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             swapchain_copied_for_screenshot ? vk::AccessFlagBits::eTransferRead
                                             : vk::AccessFlagBits::eColorAttachmentWrite;
         const vk::ImageLayout post_old_layout = swapchain_copied_for_screenshot
-                                                    ? vk::ImageLayout::eTransferSrcOptimal
-                                                    : vk::ImageLayout::eColorAttachmentOptimal;
+                                                    ? SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal)
+                                                    : SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal);
+        SotcArch::Layouts::NoteResidual(SotcArch::Layouts::Residual::Present); // sotc: A1, to PRESENT_SRC
         const vk::ImageMemoryBarrier post_barrier{
             .srcAccessMask = post_src_access_mask,
             .dstAccessMask = vk::AccessFlagBits::eNone,
@@ -1808,8 +1825,8 @@ bool Presenter::PresentGenerated(Frame* frame) {
                            swapchain_barrier(vk::AccessFlagBits::eNone,
                                              vk::AccessFlagBits::eTransferWrite,
                                              vk::ImageLayout::eUndefined,
-                                             vk::ImageLayout::eTransferDstOptimal));
-    cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal,
+                                             SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal)));
+    cmdbuf.clearColorImage(swapchain_image, SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
                            vk::ClearColorValue{std::array<float, 4>{0.f, 0.f, 0.f, 1.f}},
                            color_range);
     // sotc: the same clear-to-blit barrier as the game frames (issue #43): without it AMD RX 7000
@@ -1818,8 +1835,8 @@ bool Presenter::PresentGenerated(Frame* frame) {
                            vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
                            swapchain_barrier(vk::AccessFlagBits::eTransferWrite,
                                              vk::AccessFlagBits::eTransferWrite,
-                                             vk::ImageLayout::eTransferDstOptimal,
-                                             vk::ImageLayout::eTransferDstOptimal));
+                                             SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
+                                             SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal)));
     const auto rect = FitImage(frame->width, frame->height, extent.width, extent.height);
     const vk::ImageBlit blit{
         .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
@@ -1833,7 +1850,7 @@ bool Presenter::PresentGenerated(Frame* frame) {
                                     rect.offset.y + static_cast<s32>(rect.extent.height), 1}},
     };
     cmdbuf.blitImage(generated, vk::ImageLayout::eGeneral, swapchain_image,
-                     vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+                     SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), blit, vk::Filter::eLinear);
     // sotc: SOTC_SHOT_GENERATED=<file>: when the file appears it is removed and the next generated
     // frame is saved as a screenshot ("hud" file name, without the overlay): checking frame
     // generation (BB_FRAME_DUMP_TRIGGER saves the game frames).
@@ -1851,17 +1868,17 @@ bool Presenter::PresentGenerated(Frame* frame) {
                                vk::DependencyFlagBits::eByRegion, {}, {},
                                swapchain_barrier(vk::AccessFlagBits::eTransferWrite,
                                                  vk::AccessFlagBits::eTransferRead,
-                                                 vk::ImageLayout::eTransferDstOptimal,
-                                                 vk::ImageLayout::eTransferSrcOptimal));
-        CopyImageToReadback(cmdbuf, swapchain_image, vk::ImageLayout::eTransferSrcOptimal,
+                                                 SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
+                                                 SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal)));
+        CopyImageToReadback(cmdbuf, swapchain_image, SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
                             readback);
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                                vk::PipelineStageFlagBits::eTransfer,
                                vk::DependencyFlagBits::eByRegion, {}, {},
                                swapchain_barrier(vk::AccessFlagBits::eTransferRead,
                                                  vk::AccessFlagBits::eTransferWrite,
-                                                 vk::ImageLayout::eTransferSrcOptimal,
-                                                 vk::ImageLayout::eTransferDstOptimal));
+                                                 SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
+                                                 SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal)));
         scheduler.DeferPriorityOperation([deferred_screenshot = std::move(pending_screenshot)]() {
             SavePendingScreenshot(deferred_screenshot.value());
         });
@@ -1871,15 +1888,16 @@ bool Presenter::PresentGenerated(Frame* frame) {
                            vk::DependencyFlagBits::eByRegion, {}, {},
                            swapchain_barrier(vk::AccessFlagBits::eTransferWrite,
                                              vk::AccessFlagBits::eColorAttachmentWrite,
-                                             vk::ImageLayout::eTransferDstOptimal,
-                                             vk::ImageLayout::eColorAttachmentOptimal));
+                                             SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
+                                             SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal)));
     BbOverlay::Render(cmdbuf, swapchain.ImageView(), extent, false);
+    SotcArch::Layouts::NoteResidual(SotcArch::Layouts::Residual::Present); // sotc: A1, to PRESENT_SRC
     cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                            vk::PipelineStageFlagBits::eAllCommands,
                            vk::DependencyFlagBits::eByRegion, {}, {},
                            swapchain_barrier(vk::AccessFlagBits::eColorAttachmentWrite,
                                              vk::AccessFlagBits::eNone,
-                                             vk::ImageLayout::eColorAttachmentOptimal,
+                                             SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
                                              vk::ImageLayout::ePresentSrcKHR));
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddSignal(swapchain.GetPresentReadySemaphore());

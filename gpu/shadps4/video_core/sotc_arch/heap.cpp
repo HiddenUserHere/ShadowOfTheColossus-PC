@@ -237,9 +237,11 @@ void Report(char* out, u32 size, double seconds) {
 
 bool On() {
     // The environment part is read once; the device part is final before any pipeline is built (the instance).
+    // sotc: the heap writes its descriptors in GENERAL: SOTC_LAYOUT_UNIFIED=1 only (2 is verify, which uses the old
+    // layouts), and the feature is checked by CheckRequirements.
     static const bool env_on = SwitchMode("SOTC_HEAP") != 0 && SwitchMode("SOTC_N5_BINDLESS") != 0 &&
                                SwitchMode("SOTC_BINDLESS_SAMP") != 0 &&
-                               SwitchMode("SOTC_LAYOUT_UNIFIED") != 0;
+                               SwitchMode("SOTC_LAYOUT_UNIFIED") == 1;
     return env_on && !g_refused.load(std::memory_order_relaxed);
 }
 
@@ -266,15 +268,16 @@ void CheckRequirements(bool bindless_images, bool bindless_samplers) {
     }
     const bool n5 = SwitchMode("SOTC_N5_BINDLESS") != 0;
     const bool samp = SwitchMode("SOTC_BINDLESS_SAMP") != 0;
-    const bool layout = SwitchMode("SOTC_LAYOUT_UNIFIED") != 0;
+    // sotc: the heap's GENERAL descriptors need the layouts mode acting (=1 or the auto default) with the feature.
+    const bool layout = Layouts::On() && Layouts::Supported();
     if (n5 && samp && layout && bindless_images && bindless_samplers) {
         return;
     }
     g_refused.store(true, std::memory_order_relaxed);
     std::fprintf(stderr,
                  "SOTC HEAP refused: needs SOTC_N5_BINDLESS=1 (%s), SOTC_BINDLESS_SAMP=1 (%s), "
-                 "SOTC_LAYOUT_UNIFIED=1 (%s) and a device with the bindless arrays (%s); the run uses the "
-                 "descriptor path\n",
+                 "SOTC_LAYOUT_UNIFIED=1 with VK_KHR_unified_image_layouts (%s) and a device with the bindless "
+                 "arrays (%s); the run uses the descriptor path\n",
                  n5 && bindless_images ? "ok" : "missing", samp && bindless_samplers ? "ok" : "missing",
                  layout ? "ok" : "missing", bindless_images && bindless_samplers ? "ok" : "missing");
 }

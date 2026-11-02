@@ -17,6 +17,7 @@
 #include <boost/container/static_vector.hpp>
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_TEX (MarkGpuModified)
 #include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_LAYOUT_UNIFIED (SotcArch::Layouts)
+#include "video_core/sotc_arch/bindset_events.h" // sotc: SOTC_BINDSET (the first GPU write moves candidates' Range)
 
 namespace Vulkan {
 class Instance;
@@ -28,14 +29,13 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 // sotc: SOTC_LAYOUT_UNIFIED (A1) functions beyond the contract, defined in sotc_arch/layouts.cpp.
 namespace SotcArch::Layouts {
-/// The image code reports whether the device has VK_KHR_unified_image_layouts (instance probe).
-void NoteSupported(bool supported);
 /// The layout a command or descriptor names for an image whose tracked layout is `layout`: GENERAL when On().
 vk::ImageLayout Pick(vk::ImageLayout layout);
 /// SOTC_LAYOUT_UNIFIED=2: the old layouts are used and the barriers the new path would drop are counted.
 bool Verify();
 void NoteKept();
 void NoteSkipped();
+void NoteSkippedRead();
 void NoteVerifySkip();
 /// Counters for the 5 s line (out is empty when the switch is off).
 void Report(char* out, u32 size, double seconds);
@@ -298,6 +298,13 @@ inline void MarkGpuModified(Image& image, bool bump_epoch = true) {
         if (image.info.sotc_first_mip) {
             NoteMipTailWrite(image);
         }
+        image.flags |= ImageFlagBits::GpuModified;
+        // sotc: SOTC_BINDSET. The mip-tail candidates over these bytes read the GPU-written mark of the images there
+        // (DecideRebase: any_gpu), so the candidates overlapping the range are killed (Range). Posted after the mark is
+        // set (the link gate reads the links after the change). The epoch above moves on the same write for every
+        // candidate, which is why its check is replaced.
+        SotcArch::BindSet::PostRange(image.info.guest_address - image.info.sotc_dropped_bytes,
+                                     image.info.guest_address + image.info.guest_size);
     }
     image.flags |= ImageFlagBits::GpuModified;
 }

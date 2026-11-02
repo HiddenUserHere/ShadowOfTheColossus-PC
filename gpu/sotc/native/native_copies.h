@@ -85,6 +85,9 @@ void Attach(VideoCore::Buffer* staging);
 void NoteWrittenBind(vk::CommandBuffer cmdbuf, vk::Buffer src, uint64_t src_offset, uint64_t addr, uint64_t size);
 /// True while registrations wait (a cheap check before walking the written binds).
 bool Watching();
+/// Draw thread, at the start of a submit: ends the epoch of this thread's write journal (sorts and merges the ranges
+/// NoteWrittenBind journaled since the last one). Nothing when SOTC_WRITE_JOURNAL is off (sotc_write_journal.h).
+void EpochEnd();
 
 /// "SOTC NATIVE COPIES" 5 s line (counters reset). Nothing when not armed.
 /// sotc: SOTC_N5_ASYNC_COMPUTE. The async queue tick the GPU copies recorded now belong to (0: the

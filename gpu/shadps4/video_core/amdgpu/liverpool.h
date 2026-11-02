@@ -737,6 +737,9 @@ private:
         QueueBackFunc(Common::InlineFunction{std::forward<F>(func)}, writes_memory);
     }
     void QueueBackFunc(Common::InlineFunction&& func, bool writes_memory);
+    /// sotc: SOTC_BARRIER_GUEST. Queues a guest sync point (SotcArch::GuestBarrier::Sync as u8) in the op stream; the
+    /// draw thread records its barrier there. Nothing is queued when the switch is off.
+    void QueueGuestSync(u8 kind);
 
     // sotc: SOTC_WD_FUSE (command processor thread only). WRITE_DATA packets wait here instead of
     // being queued while only packets that neither read nor write guest memory, nor queue an op,

@@ -521,6 +521,41 @@ void VKAPI_CALL CmdPushConstants(VkCommandBuffer cmdbuf, VkPipelineLayout layout
                  });
 }
 
+// sotc: SOTC_DESCRIPTOR_HEAP. vkCmdBind{Resource,Sampler}HeapEXT take their range by pointer: the info is copied
+// into the stream. A bind is descriptor state, one key per heap kind (the command's tag).
+template <auto Member>
+void VKAPI_CALL CmdBindHeap(VkCommandBuffer cmdbuf, const VkBindHeapInfoEXT* info) {
+    if (!CommandRecorder::IsFake(cmdbuf)) {
+        return RealOf<Member>()(cmdbuf, info);
+    }
+    auto& rec = *g_recorder;
+    rec.Reserve(sizeof(VkBindHeapInfoEXT) + 256);
+    CheckNoChain(info->pNext, "VkBindHeapInfoEXT");
+    const auto* copy = rec.Copy(info);
+    rec.CountCommand();
+    rec.RunState(BlockCategory::BindDescriptors, cmdbuf, KeyOf(TagOf<Member>()),
+                 [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy); });
+}
+
+// sotc: SOTC_DESCRIPTOR_HEAP. vkCmdPushDataEXT carries a host pointer to the pushed bytes: the info and the bytes
+// are copied. Push data is push-constant state, keyed by its byte range as vkCmdPushConstants is.
+template <auto Member>
+void VKAPI_CALL CmdPushData(VkCommandBuffer cmdbuf, const VkPushDataInfoEXT* info) {
+    if (!CommandRecorder::IsFake(cmdbuf)) {
+        return RealOf<Member>()(cmdbuf, info);
+    }
+    auto& rec = *g_recorder;
+    const size_t size = info->data.size;
+    rec.Reserve(sizeof(VkPushDataInfoEXT) + size + 256);
+    CheckNoChain(info->pNext, "VkPushDataInfoEXT");
+    auto* copy = rec.Copy(info);
+    copy->data.address = rec.Copy(static_cast<const u8*>(info->data.address), size);
+    rec.CountCommand();
+    rec.RunState(BlockCategory::PushConstants, cmdbuf,
+                 KeyOf(TagOf<Member>(), info->offset, static_cast<u32>(size)),
+                 [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy); });
+}
+
 const VkDebugUtilsLabelEXT* CopyLabel(CommandRecorder& rec, const VkDebugUtilsLabelEXT* label) {
     const size_t name_size = label->pLabelName ? std::strlen(label->pLabelName) + 1 : 0;
     rec.Reserve(sizeof(VkDebugUtilsLabelEXT) + name_size + 256);
@@ -891,6 +926,9 @@ void CommandRecorder::InstallThunks() {
         OVERRIDE(vkCmdPushDescriptorSetKHR,
                  CmdPushDescriptorSet<&Dispatch::vkCmdPushDescriptorSetKHR>);
         OVERRIDE(vkCmdPushConstants, CmdPushConstants<&Dispatch::vkCmdPushConstants>);
+        OVERRIDE(vkCmdBindResourceHeapEXT, CmdBindHeap<&Dispatch::vkCmdBindResourceHeapEXT>);
+        OVERRIDE(vkCmdBindSamplerHeapEXT, CmdBindHeap<&Dispatch::vkCmdBindSamplerHeapEXT>);
+        OVERRIDE(vkCmdPushDataEXT, CmdPushData<&Dispatch::vkCmdPushDataEXT>);
         OVERRIDE(vkCmdBeginDebugUtilsLabelEXT,
                  CmdDebugLabel<&Dispatch::vkCmdBeginDebugUtilsLabelEXT>);
         OVERRIDE(vkCmdInsertDebugUtilsLabelEXT,

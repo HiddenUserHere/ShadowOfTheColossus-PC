@@ -41,6 +41,13 @@ static bool SrtPhiDisabled() {
     const char* v = std::getenv("SOTC_SRT_PHI");
     return v && v[0] == '0';
 }
+// sotc: SOTC_ADDR_VERTEX=1 or 2 (stage 3 of ARCH-BINDSET) gets +8000 so its binaries are kept apart. Its vertex pulling
+// changes the shaders' output; the first step (indirect and index buffers through the table) does not, so the term
+// only separates the caches until then.
+static bool AddrVertexRequested() {
+    const char* v = std::getenv("SOTC_ADDR_VERTEX");
+    return v && (v[0] == '1' || v[0] == '2');
+}
 // sotc: 39/137 (from 38/136): the SRT walker no longer uses dynamic-window ReadConsts as offsets.
 // 40/138: the cache now takes loose files newer than the pack (cache_storage.cpp), which brought
 // back binaries written by older recompiler builds under the same number (wrong vertices, dark
@@ -50,7 +57,8 @@ static bool SrtPhiDisabled() {
 static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 41u : 138u) +
                                        (Shader::StageBindingsEnabled() ? 1000u : 0u) +
                                        (BindlessSamplersRequested() ? 2000u : 0u) +
-                                       (SrtPhiDisabled() ? 4000u : 0u);
+                                       (SrtPhiDisabled() ? 4000u : 0u) +
+                                       (AddrVertexRequested() ? 8000u : 0u);
 // sotc: 22 (from 21): the record ends with the stage variant (SOTC_HEAP). Without it a cached Plain or Heap
 // program came back as Default, so its layout disagreed with its binary (slot-word assert, device lost).
 // 23: a variant's pgm_hash is the game's hash again (Info::CacheHash keys the caches), so 22's variant records differ.

@@ -186,6 +186,10 @@ struct Info : InfoPersistent {
     };
     BindlessCache bindless{};
 
+    /// sotc: SOTC_BARRIER_STATIC. True when the stage writes memory: a buffer or image with is_written (stores,
+    /// atomics, storage images). Set by FillBindlessCache; the draw thread reads it once per op (passes.h).
+    bool writes_memory{};
+
     /// sotc: computes the answers from the rules and merges them into `bindless` (CombineBindlessCache). Call once
     /// the Info is complete.
     void FillBindlessCache();

@@ -57,13 +57,15 @@ struct RenderState {
     u16 height;
     u16 num_layers;
     u16 num_color_attachments;
+    // sotc: A1. Attachments that are also sampled in this pass (bit i: color i, bit 8: depth). Declared to Vulkan
+    // with VkAttachmentFeedbackLoopInfoEXT when the unified layouts act (Scheduler::BeginRendering). Compared by ==.
+    u32 feedback_mask{};
     // Formats and sample count of the attachments, for VkCommandBufferInheritanceRenderingInfo.
     // An undefined format means no attachment of that kind. Filled wherever attachments are set.
     std::array<vk::Format, 8> color_formats{};
     vk::Format depth_format{};
     vk::Format stencil_format{};
     vk::SampleCountFlagBits samples{vk::SampleCountFlagBits::e1};
-    u32 tail_pad{}; // sotc: explicit padding, the struct must have no implicit padding (see below)
 
     /// sotc: the attachments decide the state. The formats and samples are informational (the
     /// inheritance of the pass secondaries, vk_recorder.cpp), so they do not restart a render pass.

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <utility>
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_descriptor_heap.h" // sotc: SOTC_DESCRIPTOR_HEAP (sampler create infos)
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
@@ -104,9 +105,17 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
     ASSERT_MSG(sampler_result == vk::Result::eSuccess, "Failed to create sampler: {}",
                vk::to_string(sampler_result));
     handle = std::move(smplr);
+    // sotc: SOTC_DESCRIPTOR_HEAP: the heap writes encode a sampler from its create info (vk_descriptor_heap.h).
+    if (instance.IsDescriptorHeapEnabled()) {
+        Vulkan::DescriptorHeapRegisterSampler(static_cast<VkSampler>(*handle), sampler_ci);
+    }
 }
 
-Sampler::~Sampler() = default;
+Sampler::~Sampler() {
+    if (handle && Vulkan::DescriptorHeapActive()) {
+        Vulkan::DescriptorHeapForgetSampler(static_cast<VkSampler>(*handle));
+    }
+}
 
 // sotc: SOTC_BINDLESS_SAMP. Off unless the instance enabled the descriptor indexing features.
 BindlessSamplers::BindlessSamplers(const Vulkan::Instance& instance_) : instance{instance_} {

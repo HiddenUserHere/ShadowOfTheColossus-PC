@@ -95,7 +95,30 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     const bool descriptor_buffer =
         instance.IsDescriptorBufferEnabled() ||
         DescriptorBufferN5Layout(instance, desc_heap, false, uses_bindless_samplers);
-    uses_push_descriptors = !descriptor_buffer && binding < instance.MaxPushDescriptors();
+    // sotc: SOTC_DESCRIPTOR_HEAP (vk_descriptor_heap.h): all bindings map to the heaps: no layout, the heap flag.
+    {
+        HeapFallback pre = HeapFallback::Heap;
+        if (descriptor_buffer) {
+            pre = HeapFallback::DescriptorBuffer;
+        } else if (uses_bindless_samplers) {
+            pre = HeapFallback::Bindless;
+        } else if (uses_slot_words) {
+            pre = HeapFallback::SlotWords;
+        } else if (packet_range) {
+            pre = HeapFallback::PacketRange;
+        }
+        boost::container::small_vector<HeapBinding, 32> heap_bindings;
+        for (const auto& b : bindings) {
+            heap_bindings.push_back(HeapBinding{
+                .binding = b.binding,
+                .count = b.descriptorCount,
+                .sampler = b.descriptorType == vk::DescriptorType::eSampler,
+                .stage = vk::ShaderStageFlagBits::eCompute,
+            });
+        }
+        PlanHeapMode(heap_bindings, pre);
+    }
+    uses_push_descriptors = !heap_mode && !descriptor_buffer && binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                        : descriptor_buffer
@@ -119,15 +142,18 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                 }
                               : vk::PushConstantRange{},
     };
-    const auto layouts = layout_cache.Get(request, owned_layouts);
-    set_layouts = layouts.sets;
-    desc_layout = set_layouts[0];
-    pipeline_layout = layouts.pipeline_layout;
-    // sotc: the offsets are per set layout, so every pipeline queries them from the shared handle.
-    QueryDescriptorBufferLayout(bindings);
-    if (layouts.created) {
-        SetObjectName(instance.GetDevice(), pipeline_layout, "Compute PipelineLayout {}",
-                      debug_str);
+    // sotc: a heap pipeline (heap_mode) has no layout: none is created.
+    if (!heap_mode) {
+        const auto layouts = layout_cache.Get(request, owned_layouts);
+        set_layouts = layouts.sets;
+        desc_layout = set_layouts[0];
+        pipeline_layout = layouts.pipeline_layout;
+        // sotc: the offsets are per set layout, so every pipeline queries them from the shared handle.
+        QueryDescriptorBufferLayout(bindings);
+        if (layouts.created) {
+            SetObjectName(instance.GetDevice(), pipeline_layout, "Compute PipelineLayout {}",
+                          debug_str);
+        }
     }
 
     if (deferred) {
@@ -148,11 +174,27 @@ void ComputePipeline::CreatePipeline() {
         .requiredSubgroupSize = required_size,
     };
     const bool require_size = required_size != 0;
-    const vk::PipelineShaderStageCreateInfo shader_ci = {
+    // sotc: SOTC_DESCRIPTOR_HEAP: a heap pipeline chains its mapping list ahead of the subgroup size.
+    const VkShaderDescriptorSetAndBindingMappingInfoEXT heap_info{
+        .sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT,
         .pNext = require_size ? &subgroup_size_ci : nullptr,
+        .mappingCount = static_cast<u32>(heap_plan.MappingsOf(vk::ShaderStageFlagBits::eCompute).size()),
+        .pMappings = heap_plan.MappingsOf(vk::ShaderStageFlagBits::eCompute).data(),
+    };
+    const void* stage_next = require_size ? static_cast<const void*>(&subgroup_size_ci) : nullptr;
+    if (heap_mode) {
+        stage_next = &heap_info;
+    }
+    const vk::PipelineShaderStageCreateInfo shader_ci = {
+        .pNext = stage_next,
         .stage = vk::ShaderStageFlagBits::eCompute,
         .module = module,
         .pName = "main",
+    };
+    // sotc: SOTC_DESCRIPTOR_HEAP: the heap flag is a VkPipelineCreateFlags2 bit.
+    const VkPipelineCreateFlags2CreateInfo heap_flags{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT,
     };
     // sotc: pipelines whose layouts are descriptor buffer layouts carry this flag.
     const bool n5_layout = DescriptorBufferN5Layout(instance, desc_heap, false, uses_bindless_samplers);
@@ -161,9 +203,10 @@ void ComputePipeline::CreatePipeline() {
             ? vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eDescriptorBufferEXT)
             : vk::PipelineCreateFlags{};
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        .pNext = heap_mode ? static_cast<const void*>(&heap_flags) : nullptr,
         .flags = pipeline_flags,
         .stage = shader_ci,
-        .layout = pipeline_layout,
+        .layout = heap_mode ? vk::PipelineLayout{} : pipeline_layout, // sotc: heap pipelines have none
     };
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(cache, compute_pipeline_ci);

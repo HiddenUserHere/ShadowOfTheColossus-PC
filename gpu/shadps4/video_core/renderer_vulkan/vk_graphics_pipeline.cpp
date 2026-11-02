@@ -322,11 +322,23 @@ GraphicsPipeline::GraphicsPipeline(
     // (Instance::RequiredSubgroupSize).
     std::array<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo, MaxShaderStages>
         subgroup_size_cis{};
+    // sotc: SOTC_DESCRIPTOR_HEAP: a heap pipeline chains each stage's mapping list ahead of its subgroup size.
+    std::array<VkShaderDescriptorSetAndBindingMappingInfoEXT, MaxShaderStages> heap_mapping_infos{};
     for (size_t i = 0; i < shader_stages.size(); ++i) {
         auto& stage = shader_stages[i];
         const u32 size = instance.RequiredSubgroupSize(stage.stage);
         subgroup_size_cis[i].requiredSubgroupSize = size;
         stage.pNext = size != 0 ? &subgroup_size_cis[i] : nullptr;
+        if (heap_mode) {
+            const auto& mappings = heap_plan.MappingsOf(stage.stage);
+            heap_mapping_infos[i] = VkShaderDescriptorSetAndBindingMappingInfoEXT{
+                .sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT,
+                .pNext = stage.pNext,
+                .mappingCount = static_cast<u32>(mappings.size()),
+                .pMappings = mappings.data(),
+            };
+            stage.pNext = &heap_mapping_infos[i];
+        }
     }
 
     const auto depth_format =
@@ -490,8 +502,16 @@ GraphicsPipeline::GraphicsPipeline(
         instance.IsDescriptorBufferEnabled() || n5_layout
             ? vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eDescriptorBufferEXT)
             : vk::PipelineCreateFlags{};
-    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+    // sotc: SOTC_DESCRIPTOR_HEAP: the heap flag is a VkPipelineCreateFlags2 bit, chained ahead of the rendering info.
+    const VkPipelineCreateFlags2CreateInfo heap_flags{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
         .pNext = &pipeline_rendering_ci,
+        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT,
+    };
+    const void* pipeline_next = heap_mode ? static_cast<const void*>(&heap_flags)
+                                          : static_cast<const void*>(&pipeline_rendering_ci);
+    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+        .pNext = pipeline_next,
         .flags = pipeline_flags,
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
@@ -505,14 +525,15 @@ GraphicsPipeline::GraphicsPipeline(
             !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
         .pColorBlendState = &color_blending,
         .pDynamicState = &dynamic_info,
-        .layout = pipeline_layout,
+        .layout = heap_mode ? vk::PipelineLayout{} : pipeline_layout, // sotc: heap pipelines have none
     };
 
     // sotc: SOTC_PIPE_GPL. The pipeline as four libraries, each shared by every pipeline whose state
     // for that part is equal (the key is the exact bytes of that state, with the layout and the
     // dynamic states), then fast-linked without link-time optimization. A refused library or link
     // leaves the pipeline unbuilt (linked stays false): the caller keeps the draw skipped.
-    if (gpl && !preloading && FastLinkable(key, infos, runtime_infos, profile)) {
+    // sotc: SOTC_DESCRIPTOR_HEAP pipelines are not linked from libraries (the heap flag and the mappings are per pipeline).
+    if (gpl && !preloading && !heap_mode && FastLinkable(key, infos, runtime_infos, profile)) {
         const vk::PipelineLayout layout = pipeline_layout;
         const vk::PipelineCreateFlags lib_flags =
             pipeline_flags | vk::PipelineCreateFlagBits::eLibraryKHR;
@@ -884,6 +905,36 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
     const bool descriptor_buffer =
         !stage_sets && (instance.IsDescriptorBufferEnabled() ||
                         DescriptorBufferN5Layout(instance, desc_heap, stage_sets, uses_bindless_samplers));
+    // sotc: SOTC_DESCRIPTOR_HEAP (vk_descriptor_heap.h): a pipeline whose set 0 bindings all map to the heaps is built
+    // with the heap flag and no layout. Any other pipeline keeps the classic layout below.
+    {
+        HeapFallback pre = HeapFallback::Heap;
+        if (stage_sets) {
+            pre = HeapFallback::StageSets;
+        } else if (descriptor_buffer) {
+            pre = HeapFallback::DescriptorBuffer;
+        } else if (uses_bindless_samplers) {
+            pre = HeapFallback::Bindless;
+        } else if (uses_slot_words) {
+            pre = HeapFallback::SlotWords;
+        } else if (packet_range) {
+            pre = HeapFallback::PacketRange;
+        }
+        boost::container::small_vector<HeapBinding, 32> heap_bindings;
+        for (const auto& b : set_bindings[0]) {
+            heap_bindings.push_back(HeapBinding{
+                .binding = b.binding,
+                .count = b.descriptorCount,
+                .sampler = b.descriptorType == vk::DescriptorType::eSampler,
+                .stage = static_cast<vk::ShaderStageFlagBits>(
+                    static_cast<VkShaderStageFlags>(b.stageFlags)),
+            });
+        }
+        if (PlanHeapMode(heap_bindings, pre)) {
+            uses_push_descriptors = false;
+            return false;
+        }
+    }
     uses_push_descriptors =
         !stage_sets && !descriptor_buffer && binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors

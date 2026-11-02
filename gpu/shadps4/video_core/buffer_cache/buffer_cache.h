@@ -5,6 +5,7 @@
 
 #include "../../../sotc/pc_ring.h" // sotc: SOTC_PC_RING (RingExtent)
 #include "../../../sotc/rb_class.h" // sotc: SOTC_RB_CLASS (PfWindow mask ranges)
+#include "video_core/sotc_write_journal.h" // sotc: SOTC_WRITE_JOURNAL (hashed_pages)
 #include <array>
 #include <atomic>
 #include <thread>
@@ -292,6 +293,9 @@ public:
     // budget bytes are uploaded.
     /// pickup_seq: SotcNative::AnnounceSeq() when the command processor picked the submit up (timing counters).
     void NativeDrain(u64 budget = u64{64} << 20, u64 pickup_seq = 0);
+    /// sotc: SOTC_SYNC_EVENTS (sync_events.h). Draw thread, at the start of each outermost gfx submit
+    /// (queued before its ops): uploads the CPU-modified ranges and images the journal hinted.
+    void DrainSyncEvents();
     /// sotc: SOTC_NATIVE=1 (no tracking). The command processor or draw thread wrote guest memory itself
     /// ([addr, addr + size), already written): the write fault of mode 0 told the cache, nothing does now.
     /// A range holding GPU-written bytes gets exactly these bytes (allow_exact; else left alone, the host
@@ -826,6 +830,9 @@ private:
     };
     std::mutex hashed_uploads_mutex; // unbinds run on guest threads (ReleaseMemory)
     std::multimap<VAddr, HashedUpload> hashed_uploads;
+    /// sotc: SOTC_WRITE_JOURNAL: page counts of hashed_uploads (each entry's pages, added and removed under
+    /// hashed_uploads_mutex). A write or a dedupe lookup no page covers takes neither the lock nor the tree walk.
+    SotcWriteJournal::PageCounts hashed_pages;
     std::atomic<size_t> hashed_upload_count{0};
     /// sotc: SOTC_HASH_EPOCH=1 (off by default): hull [lo, hi) of the ranges in hashed_uploads.
     /// Written only under hashed_uploads_mutex (insert, clear, reset when the map empties); read

@@ -35,6 +35,7 @@
 #include "../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST (L1)
 #include <xxhash.h>                     // sotc: SOTC_PC_RING=8 verify (XXH3)
 #include "video_core/buffer_cache/pc_ring_copy.h"      // sotc: SOTC_PC_RING=8 (HostMaintain)
+#include "video_core/buffer_cache/sync_events.h"  // sotc: SOTC_SYNC_EVENTS (journal, drain, bind skip)
 #include "video_core/renderer_vulkan/sotc_guest_memory.h" // sotc: SOTC_PC_RING=8 (LookupGuestView)
 #include "../../../sotc/rb_class.h"     // sotc: SOTC_RB_CLASS readback ranges
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
@@ -5968,7 +5969,31 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         const u64 bind_bytes_before = tl_sync_bytes;
         const auto bind_t0 = stream_bind ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
-        SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+        // sotc: SOTC_SYNC_EVENTS. A read binding on the draw thread whose CPU bits are clean skips the
+        // sync: SynchronizeMemory would only upload CPU-modified pages (ForEachUploadRange), and
+        // IsSyncClean is true exactly when there are none (lock-free look; false for a range without
+        // a tracking region). The drain at the submit start has already uploaded the journal's
+        // ranges, so this holds for most binds. =2 runs the sync anyway and counts an upload there.
+        bool events_synced = false;
+        if (SotcSyncEvents::On() && !is_written && !is_texel_buffer && SotcStats::t_draw_thread &&
+            SotcPcRing::FullRingMode() == 0 && SotcPcRing::Mode() != 8) {
+            SotcSyncEvents::bind_checks.fetch_add(1, std::memory_order_relaxed);
+            if (memory_tracker->IsSyncClean(device_addr, size, false)) {
+                SotcSyncEvents::bind_clean.fetch_add(1, std::memory_order_relaxed);
+                SotcSyncEvents::bind_skips.fetch_add(1, std::memory_order_relaxed);
+                if (SotcSyncEvents::kMode == 2) {
+                    const u64 before = tl_sync_bytes;
+                    SynchronizeMemory(arena, device_addr, size, false, false);
+                    if (tl_sync_bytes != before) {
+                        SotcSyncEvents::verify_stale.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                events_synced = true;
+            }
+        }
+        if (!events_synced) {
+            SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+        }
         if (stream_bind) {
             const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - bind_t0)
@@ -6308,15 +6333,36 @@ void BufferCache::EraseHashedUploads(VAddr addr, u64 size) {
                        addr >= hashed_hi.load(std::memory_order_relaxed))) {
         return;
     }
+    // sotc: SOTC_WRITE_JOURNAL. An entry this write erases shares a page with it ([addr, addr + size), one page when
+    // size is 0: the entry then starts inside addr's page and covers it). No count on those pages: nothing to erase.
+    const bool journal = SotcWriteJournal::On();
+    const bool may_touch = !journal || hashed_pages.MayTouch(addr, size);
+    if (!may_touch && !SotcWriteJournal::Verify()) {
+        SotcWriteJournal::Count(SotcWriteJournal::g_counters.erase_filtered);
+        return;
+    }
     std::scoped_lock lock{hashed_uploads_mutex};
     // Entries are at most kHashSmall long: an overlapping one starts within that much before addr.
     const VAddr window = SotcStats::kHashSmall;
     auto it = hashed_uploads.lower_bound(addr > window ? addr - window : 0);
+    u64 erased = 0;
     while (it != hashed_uploads.end() && it->first < end) {
         if (it->first + it->second.size > addr) {
+            if (journal) {
+                hashed_pages.Add(it->first, it->second.size, -1); // sotc: SOTC_WRITE_JOURNAL
+            }
             it = hashed_uploads.erase(it);
+            ++erased;
         } else {
             ++it;
+        }
+    }
+    if (journal && SotcWriteJournal::Verify()) {
+        // The filter's answer against the walk's (mode 2 walks in every case).
+        if (!may_touch && erased != 0) {
+            SotcWriteJournal::Count(SotcWriteJournal::g_counters.verify_diff);
+        } else if (may_touch && erased == 0) {
+            SotcWriteJournal::Count(SotcWriteJournal::g_counters.may_false);
         }
     }
     if (kHashEpoch && hashed_uploads.empty()) { // sotc: empty hull again
@@ -7221,7 +7267,8 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
         const u64 end = std::min(end_block, backing.end);
         // sotc: SOTC_ADDR_TABLE hook (arena migration): the resident blocks now live in the new arena.
         SotcArch::AddrTable::OnPlace(start << block_shift, (end - start) << block_shift,
-                                     new_arena->BufferDeviceAddress() + ((start << block_shift) - first_addr));
+                                     new_arena->BufferDeviceAddress() + ((start << block_shift) - first_addr),
+                                     new_arena);
         bind->binds.push_back(vk::SparseMemoryBind{
             .resourceOffset = (start - base_block) << block_shift,
             .size = (end - start) << block_shift,
@@ -7253,6 +7300,73 @@ void BufferCache::NoteBindUse(VAddr device_addr, u64 size) noexcept {
     for (u64 block = first; block <= last; ++block) {
         block_last_use[block] = use_epoch;
     }
+}
+
+// sotc: SOTC_SYNC_EVENTS. The batched uploads: takes the journal's hints (sync_events.h) and runs
+// SynchronizeMemory (read) over each hinted buffer range, merged and coalesced, and
+// TextureCache::DrainImageEvents over the hinted image ranges. Queued by the command processor at
+// the start of each outermost gfx submit, before the submit's ops, so the uploads precede the binds
+// of the submit. A hint is only a hint: the sync acts on the CPU bits, so a range that needs nothing
+// costs one lock-free look, and a range that is not resident is left for the bind (it stays dirty).
+void BufferCache::DrainSyncEvents() {
+    if (!SotcSyncEvents::On()) {
+        return;
+    }
+    thread_local std::vector<SotcSyncEvents::Hint> hints;
+    thread_local std::vector<std::pair<VAddr, u64>> runs;
+    thread_local std::vector<std::pair<VAddr, u64>> merged;
+    hints.clear();
+    runs.clear();
+    merged.clear();
+    SotcSyncEvents::TakeBatch(hints);
+    u64 images = 0;
+    for (const auto& hint : hints) {
+        if (hint.kind == SotcSyncEvents::HintImage) {
+            images += texture_cache.DrainImageEvents(hint.addr, hint.data);
+            continue;
+        }
+        // Words: each run of consecutive set pages of the mask is one range.
+        u64 mask = hint.data;
+        while (mask) {
+            const unsigned lo = static_cast<unsigned>(std::countr_zero(mask));
+            const unsigned len = static_cast<unsigned>(std::countr_one(mask >> lo));
+            const u64 bits = len >= 64 ? ~0ULL : ((1ULL << len) - 1);
+            runs.emplace_back(hint.addr + u64{lo} * BYTES_PER_PAGE, u64{len} * BYTES_PER_PAGE);
+            mask &= ~(bits << lo);
+        }
+    }
+    // Merge adjacent or overlapping runs; a merged range stays within 16 MiB (one sync call).
+    constexpr u64 kMaxMerged = u64{16} << 20;
+    std::sort(runs.begin(), runs.end());
+    for (const auto& [addr, size] : runs) {
+        if (!merged.empty()) {
+            auto& back = merged.back();
+            const u64 end = back.first + back.second;
+            if (addr <= end && std::max(end, addr + size) - back.first <= kMaxMerged) {
+                back.second = std::max(end, addr + size) - back.first;
+                continue;
+            }
+        }
+        merged.emplace_back(addr, size);
+    }
+    u64 ranges = 0;
+    u64 bytes = 0;
+    u64 nonresident = 0;
+    for (const auto& [addr, size] : merged) {
+        const Buffer* arena = ResidentArena(addr, size);
+        if (!arena) {
+            ++nonresident; // not resident: the bind allocates it and syncs it, as before
+            continue;
+        }
+        const u64 before = tl_sync_bytes;
+        SynchronizeMemory(arena, addr, static_cast<u32>(size), false, false);
+        bytes += tl_sync_bytes - before;
+        ++ranges;
+    }
+    SotcSyncEvents::drained_ranges.fetch_add(ranges, std::memory_order_relaxed);
+    SotcSyncEvents::drained_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    SotcSyncEvents::drained_images.fetch_add(images, std::memory_order_relaxed);
+    SotcSyncEvents::drain_nonresident.fetch_add(nonresident, std::memory_order_relaxed);
 }
 
 void BufferCache::SynchronizeBinding(const Buffer* arena, VAddr device_addr, u32 size,
@@ -7386,7 +7500,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         resident_ranges.Add(backing);
         // sotc: SOTC_ADDR_TABLE hook (placement): the page entries of the placed blocks point into this arena.
         SotcArch::AddrTable::OnPlace(backing.start << block_shift, (backing.end - backing.start) << block_shift,
-                                     arena->BufferDeviceAddress() + (backing.start << block_shift) - arena->cpu_addr);
+                                     arena->BufferDeviceAddress() + (backing.start << block_shift) - arena->cpu_addr,
+                                     arena);
         ++resident_version; // sotc: invalidates the merged DMA runs
         // sotc: SOTC_MIRROR (A2b). The window maps the same memory at the same blocks: one block is one 64 KiB page,
         // so the block's memory offset is also the window page's (no shift). Refused memory types stay with own pages.
@@ -8542,12 +8657,21 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
                 memory->CopySparseMemory(copy.dstOffset, hash_bytes.data(), copy.size);
                 const u64 hash = XXH3_64bits(hash_bytes.data(), copy.size);
                 bool hit = false;
-                {
+                // sotc: SOTC_WRITE_JOURNAL. A hit needs an entry keyed at dstOffset, and that entry covers dstOffset's
+                // page: with no count there, the multimap is not searched (its equal_range is the tree walk).
+                const bool journal = SotcWriteJournal::On();
+                const bool may_hit = !journal || hashed_pages.MayTouch(copy.dstOffset, 1);
+                if (may_hit || SotcWriteJournal::Verify()) {
                     std::scoped_lock lock{hashed_uploads_mutex};
                     const auto [first, last] = hashed_uploads.equal_range(copy.dstOffset);
                     for (auto it = first; it != last && !hit; ++it) {
                         hit = it->second.size == copy.size && it->second.hash == hash;
                     }
+                }
+                if (journal && !may_hit) {
+                    // Mode 1 never searches here (hit stays false); mode 2 counts a hit the filter missed.
+                    SotcWriteJournal::Count(hit ? SotcWriteJournal::g_counters.verify_diff
+                                                : SotcWriteJournal::g_counters.lookup_filtered);
                 }
                 if (hit) {
                     SotcStats::hash_small_hits.fetch_add(1, std::memory_order_relaxed);
@@ -8663,6 +8787,11 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         if (!new_hashes.empty()) {
             std::scoped_lock lock{hashed_uploads_mutex};
             if (hashed_uploads.size() >= 4096) { // sotc: capped; refilled by later uploads
+                if (SotcWriteJournal::On()) { // sotc: SOTC_WRITE_JOURNAL: the counts of the dropped entries go
+                    for (const auto& [dropped, info] : hashed_uploads) {
+                        hashed_pages.Add(dropped, info.size, -1);
+                    }
+                }
                 hashed_uploads.clear();
                 if (kHashEpoch) { // sotc: SOTC_HASH_EPOCH: the hull goes with the map
                     hashed_lo.store(~VAddr{0}, std::memory_order_relaxed);
@@ -8671,6 +8800,9 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
             }
             for (const auto& [copy, hash] : new_hashes) {
                 hashed_uploads.emplace(copy.dstOffset, HashedUpload{copy.size, hash});
+                if (SotcWriteJournal::On()) {
+                    hashed_pages.Add(copy.dstOffset, copy.size, +1); // sotc: SOTC_WRITE_JOURNAL
+                }
                 if (kHashEpoch) { // sotc: SOTC_HASH_EPOCH: widen the hull (under the lock)
                     hashed_lo.store(std::min<VAddr>(hashed_lo.load(std::memory_order_relaxed),
                                                     copy.dstOffset),

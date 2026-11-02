@@ -10,6 +10,7 @@
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_bindless.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/sotc_arch/bindset_events.h" // sotc: SOTC_BINDSET (a slot given back ends the replays that hold it)
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace VideoCore {
@@ -126,6 +127,7 @@ u32 BindlessImages::Evict(u32 key) {
     // The owner of the victim finds it no longer held (Holds) and takes a new one at its next bind.
     slots[key][victim].state = SlotState::Free;
     generation.fetch_add(1, std::memory_order_acq_rel);
+    SotcArch::BindSet::PostSlot(key, victim); // sotc: SOTC_BINDSET
     ++evictions;
     return victim;
 }
@@ -174,6 +176,7 @@ void BindlessImages::Release(u32 key, u32 slot, vk::ImageView view) {
     s.state = SlotState::Pending;
     generation.fetch_add(1, std::memory_order_acq_rel);
     pending.push_back(ReleasedSlot{key, slot, scheduler.CurrentTick()});
+    SotcArch::BindSet::PostSlot(key, slot); // sotc: SOTC_BINDSET
 }
 
 void BindlessImages::Reclaim() {

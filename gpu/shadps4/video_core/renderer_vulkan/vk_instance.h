@@ -599,6 +599,18 @@ public:
         return descriptor_buffer_n5;
     }
 
+    /// sotc: true when SOTC_DESCRIPTOR_HEAP=1 was requested and VK_EXT_descriptor_heap is enabled with its
+    /// limits fitting the port's heaps (vk_descriptor_heap.h). Decided at device creation; never with the
+    /// descriptor buffer switches. False in every other case, and the device is then the same as before.
+    bool IsDescriptorHeapEnabled() const noexcept {
+        return descriptor_heap_mode;
+    }
+
+    /// sotc: the descriptor heap limits, valid when IsDescriptorHeapEnabled().
+    const vk::PhysicalDeviceDescriptorHeapPropertiesEXT& GetDescriptorHeapProperties() const noexcept {
+        return descriptor_heap_props;
+    }
+
     /// sotc: true when VK_EXT_host_image_copy is enabled (SOTC_HOST_IMAGE_COPY=1). Images created
     /// with VK_IMAGE_USAGE_HOST_TRANSFER_BIT may then be written by the host (Runtime::TryHostImageCopy).
     bool IsHostImageCopyEnabled() const noexcept {
@@ -872,6 +884,8 @@ private:
     bool host_image_copy{};   // sotc: VK_EXT_host_image_copy enabled (SOTC_HOST_IMAGE_COPY=1)
     bool sotc_unified_layouts{};            // sotc: see SotcUnifiedLayouts()
     bool sotc_descriptor_heap{};            // sotc: see SotcDescriptorHeap()
+    bool descriptor_heap_mode{};            // sotc: SOTC_DESCRIPTOR_HEAP=1 and the limits fit (IsDescriptorHeapEnabled)
+    vk::PhysicalDeviceDescriptorHeapPropertiesEXT descriptor_heap_props{}; // sotc: valid in descriptor_heap_mode
     bool sotc_sparse_buffers{};             // sotc: see SotcSparseBuffers()
     bool sotc_sparse_aliased{};             // sotc: see SotcSparseAliased()
     u32 sotc_sparse_queue_family{NoSparseQueueFamily}; // sotc: see SotcSparseQueueFamily()

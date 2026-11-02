@@ -41,6 +41,7 @@
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH report
 #include "video_core/renderer_vulkan/vk_parallel_record.h" // sotc: SOTC_N5_PARALLEL counters
 #include "video_core/renderer_vulkan/vk_bindless.h" // sotc: SOTC_N5_BINDLESS report
+#include "video_core/renderer_vulkan/vk_descriptor_heap.h" // sotc: SOTC_DESCRIPTOR_HEAP report
 #include "video_core/texture_cache/tsharp_slot_cache.h" // sotc: SOTC_TSLOT report
 #include "video_core/sotc_arch/addr_table.h" // sotc: SOTC_ADDR_TABLE report
 #include "video_core/sotc_arch/shader_addr.h" // sotc: draw architecture reports (sotc_arch.h)
@@ -49,6 +50,7 @@
 #include "video_core/renderer_vulkan/vk_recorder.h" // sotc: SOTC_FUTEX_WAIT report
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND report
+#include "video_core/buffer_cache/sync_events.h" // sotc: SOTC_SYNC_EVENTS report
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_event.h"
 #include "video_core/buffer_cache/hrr.h"
@@ -56,7 +58,10 @@
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_trace.h" // sotc: SOTC_TRACE flip marks
 #include "video_core/sotc_write_extent.h"
+#include "video_core/sotc_write_journal.h" // sotc: SOTC_WRITE_JOURNAL report
+#include "video_core/sotc_arch/guest_barrier.h" // sotc: SOTC_BARRIER_GUEST report
 #include "video_core/sotc_ui_lang.h"
+#include "video_core/sotc_draw_merge.h" // sotc: SOTC_DRAW_MERGE_STATS report
 #include "../../../../sotc/hooks.h"      // sotc: SotcHookStats::Report
 #include "../../../../sotc/write_decl.h" // sotc: SotcWriteDecl::Report
 #include "../../../../sotc/probes.h"     // sotc: engine probe report lines
@@ -109,6 +114,7 @@ void ReportN5Pso(std::string& out, double seconds); // sotc: N5 (SOTC_N5_PSO=1)
 void ReportPipeMemo(std::string& out, double seconds); // sotc: SOTC_PIPE_MEMO
 void ReportPipeDirty(std::string& out, double seconds); // sotc: SOTC_PIPE_DIRTY
 void ReportPipeFast(std::string& out, double seconds); // sotc: SOTC_PIPE_FAST
+void ReportOpSet(std::string& out, double seconds); // sotc: SOTC_OPSET_STATS
 void ReportSpecMemo(std::string& out, double seconds); // sotc: SOTC_SPEC_MEMO
 void ReportPipeGpl(std::string& out, double seconds); // sotc: SOTC_PIPE_GPL
 } // namespace Vulkan
@@ -1407,6 +1413,37 @@ void VideoOutDriver::Flip(const Request& req) {
                                   static_cast<unsigned long long>(
                                       SotcStats::bind_cache_seen_prev_frame.exchange(0)));
                 }
+                if (SotcStats::kFpsLog) { // sotc: SOTC BIND ELIGIBLE (counters: sotc_stats.h, vk_rasterizer.cpp)
+                    char gates[320]{}, sites[200]{};
+                    size_t gi = 0, si = 0;
+                    for (uint32_t g = 0; g < SotcStats::BgGates; ++g) {
+                        gi += std::snprintf(gates + gi, sizeof(gates) - gi, "%s%s %llu",
+                                            g ? ", " : "", SotcStats::kBindGateNames[g],
+                                            static_cast<unsigned long long>(
+                                                SotcStats::bind_gate_refused[g].exchange(0)));
+                    }
+                    for (uint32_t s = 0; s < SotcStats::UsSites; ++s) {
+                        si += std::snprintf(sites + si, sizeof(sites) - si, "%s%s %llu",
+                                            s ? ", " : "", SotcStats::kBindUnsafeSiteNames[s],
+                                            static_cast<unsigned long long>(
+                                                SotcStats::bind_unsafe_sites[s].exchange(0)));
+                    }
+                    std::fprintf(
+                        stderr,
+                        "SOTC BIND ELIGIBLE: ops %llu, eligible %llu, refused by gate [%s]; "
+                        "eligible fast-served %llu, not eligible but fast-served %llu, consulted "
+                        "%llu; heap dropped %llu; dropped after the gate check [copy/clear %llu, no "
+                        "user data %llu]; unsafe flushes by site [%s]\n",
+                        static_cast<unsigned long long>(SotcStats::bind_ops.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::bind_eligible.exchange(0)), gates,
+                        static_cast<unsigned long long>(SotcStats::bind_fast_eligible.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::bind_fast_refused.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::bind_consulted.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::bind_heap_dropped.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::bind_post_copy.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::bind_post_nodata.exchange(0)),
+                        sites);
+                }
                 if (SotcStats::kOpComputeBind) { // sotc: SOTC_OP_COMPUTE_BIND (sotc_stats.h)
                     std::fprintf(
                         stderr,
@@ -1497,6 +1534,16 @@ void VideoOutDriver::Flip(const Request& req) {
                                  SotcStats::bf_flat_copied.exchange(0)),
                              static_cast<unsigned long long>(
                                  SotcStats::bf_flat_reused.exchange(0)));
+                // sotc: which check refused the hits counted as "refused" above (BindRefuseSite).
+                char sites[200]{};
+                size_t si = 0;
+                for (uint32_t r = 0; r < SotcStats::RfSites; ++r) {
+                    si += std::snprintf(sites + si, sizeof(sites) - si, "%s%s %llu",
+                                        r ? ", " : "", SotcStats::kBindRefuseSiteNames[r],
+                                        static_cast<unsigned long long>(
+                                            SotcStats::bf_refuse[r].exchange(0)));
+                }
+                std::fprintf(stderr, "SOTC BIND FRAME refused by check [%s]\n", sites);
             }
             if (SotcStats::kSyncFast) { // sotc: SOTC_SYNC_FAST (sotc_stats.h)
                 const uint64_t lookups = SotcStats::sync_fast_lookups.exchange(0);
@@ -1577,6 +1624,18 @@ void VideoOutDriver::Flip(const Request& req) {
                              SotcStats::pr_throttle_ns.exchange(0) / 1e6 / frames,
                              static_cast<unsigned long long>(
                                  SotcStats::pr_verify_mismatches.exchange(0)));
+            }
+            // sotc: SOTC_PR_KEYS: the heap table keys (sotc_stats.h); silent while none is computed.
+            if (const uint64_t precomputed = SotcStats::pr_keys_precomputed.exchange(0),
+                used = SotcStats::pr_keys_used.exchange(0),
+                mismatch = SotcStats::pr_keys_mismatch.exchange(0);
+                precomputed + used + mismatch != 0) {
+                const double frames = static_cast<double>(std::max<size_t>(frame_ms.size(), 1));
+                ReportPrintf(report,
+                             "SOTC PR keys/frame: precomputed %.0f, used %.0f, verify mismatch "
+                             "%llu\n",
+                             precomputed / frames, used / frames,
+                             static_cast<unsigned long long>(mismatch));
             }
             if (const uint64_t sweeps = SotcStats::dma_sweeps.exchange(0)) {
                 const uint64_t ranges = SotcStats::dma_sweep_ranges.exchange(0);
@@ -2091,6 +2150,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcNativeResults::Report(report, seconds); // sotc: SOTC_NATIVE GPU-result consumers
             SotcNativeParticles::Report(report, seconds); // sotc: SOTC_NATIVE_PARTICLES=prev
             SotcNativeCopies::Report(report, seconds);    // sotc: the copies behind particles and masks
+            SotcWriteJournal::Report(report, seconds);    // sotc: SOTC_WRITE_JOURNAL (page filter, journal)
             SotcQueues::Report(report, seconds);        // sotc: SOTC_N5_QUEUES
             Vulkan::FrameGraph::Report(report, seconds); // sotc: SOTC_N5_GRAPH
             Vulkan::FrameGraph::ReportAsync(report, seconds); // sotc: SOTC_N5_ASYNC_COMPUTE=2
@@ -2103,6 +2163,13 @@ void VideoOutDriver::Flip(const Request& req) {
                     report += '\n';
                 }
             }
+            if (Vulkan::DescriptorHeapActive()) { // sotc: SOTC_DESCRIPTOR_HEAP (phase 1 counters)
+                char heap_line[256];
+                if (Vulkan::DescriptorHeapReport(heap_line, sizeof heap_line) != 0) {
+                    report += heap_line;
+                    report += '\n';
+                }
+            }
             if (VideoCore::TsharpSlotCache::Mode() != 0) { // sotc: SOTC_TSLOT
                 char tslot_line[1024];
                 if (VideoCore::TsharpSlotCache::Report(tslot_line, sizeof tslot_line, seconds) != 0) {
@@ -2111,6 +2178,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 }
             }
             SotcRbClass::Report(report, seconds); // sotc: SOTC_RB_CLASS
+            SotcDrawMerge::Report(report, seconds); // sotc: SOTC_DRAW_MERGE_STATS (runs of mergeable draws)
             { // sotc: draw architecture (docs/re-stutters/native/ARCH-DRAW.md), one line per part when on
                 char arch_line[1024];
                 const auto arch = [&](auto&& fn) {
@@ -2130,15 +2198,28 @@ void VideoOutDriver::Flip(const Request& req) {
                 if (SotcArch::Heap::On()) { // sotc: SOTC_HEAP guard counts and GPU verify records
                     arch(SotcArch::Heap::Report);
                     arch(SotcArch::TableMemo::Report); // sotc: SOTC_HEAP table memo (hits, misses by reason, binds)
+                    arch(SotcArch::TableMemo::BindSetReport); // sotc: SOTC_BINDSET (replays, kills by event, verify)
                 }
                 if (SotcArch::AddrTable::On()) {
                     arch(SotcArch::AddrTable::Report);
                 }
+                if (SotcArch::AddrTable::VertexOn()) { // sotc: SOTC_ADDR_VERTEX, table answers and fallbacks per path
+                    arch(SotcArch::AddrTable::ReportVertex);
+                }
                 if (SotcArch::SwitchMode("SOTC_PASSES") != 0) {
                     arch(SotcArch::Passes::Report);
                 }
+                if (SotcArch::SwitchMode("SOTC_BARRIER_STATIC") != 0) { // sotc: static barrier rule (passes.h)
+                    arch(SotcArch::Passes::BarrierStatic::BarrierReport);
+                }
+                if (SotcArch::GuestBarrier::Active()) { // sotc: SOTC_BARRIER_GUEST (guest sync points, guest_barrier.h)
+                    arch(SotcArch::GuestBarrier::Report);
+                }
             }
             SotcGen::Report(report, seconds); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
+            if (SotcSyncEvents::On()) { // sotc: SOTC_SYNC_EVENTS (journal, drain, bind skip)
+                SotcSyncEvents::Report(report, seconds);
+            }
             SotcPcPool::Report(report, seconds);      // sotc: SOTC_PC_POOL
             SotcRamReport::Report(report, presenter.get()); // sotc: SOTC_RAM_REPORT
             // sotc: SOTC_COMMIT_ON_DEMAND / SOTC_COMMIT_CHUNKS
@@ -2169,6 +2250,7 @@ void VideoOutDriver::Flip(const Request& req) {
             Vulkan::ReportPipeMemo(report, seconds);              // SOTC_PIPE_MEMO
             Vulkan::ReportPipeDirty(report, seconds); // SOTC_PIPE_DIRTY
             Vulkan::ReportPipeFast(report, seconds); // SOTC_PIPE_FAST
+            Vulkan::ReportOpSet(report, seconds);    // sotc: SOTC_OPSET_STATS
             Vulkan::ReportSpecMemo(report, seconds); // SOTC_SPEC_MEMO
             Shader::ReportBindlessCache(report, seconds); // SOTC_BINDLESS_CACHE_VERIFY
             Vulkan::ReportPipeGpl(report, seconds); // SOTC_PIPE_GPL

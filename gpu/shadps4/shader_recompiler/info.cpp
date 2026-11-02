@@ -269,6 +269,16 @@ void CombineBindlessCache(Info::BindlessCache& stored, const Info::BindlessCache
 }
 
 void Info::FillBindlessCache() {
+    // sotc: SOTC_BARRIER_STATIC. The static bit of the barrier rule: a written buffer (stores and atomics, GDS
+    // appends included) or a written image (storage writes and image atomics) makes the stage a writer. Computed here
+    // because this runs once the Info is complete, both after a translation and after a deserialization.
+    writes_memory = false;
+    for (const auto& buffer : buffers) {
+        writes_memory |= buffer.is_written;
+    }
+    for (const auto& image : images) {
+        writes_memory |= image.is_written;
+    }
     // The rules above read the cache when it is ready, so it is off while the answers are computed.
     bindless.ready = false;
     BindlessCache fresh{};

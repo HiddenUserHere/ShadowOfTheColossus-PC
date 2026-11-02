@@ -17,6 +17,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
+#include "video_core/renderer_vulkan/vk_descriptor_heap.h" // sotc: SOTC_DESCRIPTOR_HEAP
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -836,7 +837,7 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     // set: with every switch unset this block adds nothing and the device is the same as before.
     // sparseBinding, sparseResidencyBuffer and bufferDeviceAddress are already enabled below
     // whenever the device has them, so they need no extension here.
-    const int layout_switch = SotcArch::SwitchMode("SOTC_LAYOUT_UNIFIED");
+    const bool layout_switch = SotcArch::Layouts::Requested(); // sotc: auto (unset) probes too; =0 does not
     const int heap_switch = SotcArch::SwitchMode("SOTC_HEAP");
     const int mirror_switch = SotcArch::SwitchMode("SOTC_MIRROR");
     const int shader_addr_switch = SotcArch::SwitchMode("SOTC_SHADER_ADDR");
@@ -854,16 +855,24 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
 
     // VK_KHR_unified_image_layouts (SOTC_LAYOUT_UNIFIED; sotc_arch/layouts.cpp).
     bool layout_feature = false;
-    if (layout_switch != 0 && has_extension(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME)) {
+    const char* layout_reason = "SOTC_LAYOUT_UNIFIED=0";
+    if (layout_switch && has_extension(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME)) {
         const auto layout_chain = physical_device.getFeatures2<
             vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>();
         layout_feature = layout_chain.get<vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>()
                              .unifiedImageLayouts;
         sotc_unified_layouts =
             layout_feature && add_extension(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
+        layout_reason = sotc_unified_layouts ? "unifiedImageLayouts enabled"
+                        : layout_feature    ? "VK_KHR_unified_image_layouts not enabled"
+                                            : "unifiedImageLayouts not supported by the device";
+    } else if (layout_switch) {
+        layout_reason = "VK_KHR_unified_image_layouts missing";
     }
-    report_feature("unified image layouts", layout_switch != 0, layout_feature,
+    report_feature("unified image layouts", layout_switch, layout_feature,
                    sotc_unified_layouts);
+    // sotc: Layouts::Active() (Pick, barrier drops) reads this; the retry below may clear it again.
+    SotcArch::Layouts::NoteSupported(sotc_unified_layouts, layout_reason);
 
     // VK_EXT_descriptor_heap (SOTC_HEAP; sotc_arch/heap.cpp). Not combined with the descriptor
     // buffer switches: the heap is refused when either of them enabled VK_EXT_descriptor_buffer.
@@ -879,6 +888,44 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
             heap_feature && add_extension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
     }
     report_feature("descriptor heap", heap_switch != 0, heap_feature, sotc_descriptor_heap);
+
+    // sotc: SOTC_DESCRIPTOR_HEAP=1 (vk_descriptor_heap.h). The same extension and feature as SOTC_HEAP above,
+    // enabled here only when that switch did not enable them, and only when the limits fit the port's heaps.
+    // Refused with one log line otherwise. Never combined with the descriptor buffer switches.
+    descriptor_heap_mode = false;
+    if (DescriptorHeapRequest() != 0) {
+        std::string refusal;
+        if (descriptor_buffer_on) {
+            refusal = "SOTC_DESC_BUFFER or SOTC_N5_DESCBUF is on";
+        } else if (!has_extension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME)) {
+            refusal = "VK_EXT_descriptor_heap is not supported";
+        } else if (!maintenance_5) {
+            // sotc: the heap flag is a VkPipelineCreateFlags2 bit (VkPipelineCreateFlags2CreateInfo).
+            refusal = "VK_KHR_maintenance5 is not supported (VkPipelineCreateFlags2CreateInfo)";
+        } else {
+            const auto heap_chain = physical_device.getFeatures2<
+                vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceDescriptorHeapFeaturesEXT>();
+            const bool heap_on =
+                heap_chain.get<vk::PhysicalDeviceDescriptorHeapFeaturesEXT>().descriptorHeap;
+            const auto props_chain = physical_device.getProperties2<
+                vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDescriptorHeapPropertiesEXT>();
+            descriptor_heap_props = props_chain.get<vk::PhysicalDeviceDescriptorHeapPropertiesEXT>();
+            if (!heap_on) {
+                refusal = "descriptorHeap feature is false";
+            } else {
+                DescriptorHeapSizes sizes{};
+                refusal = DescriptorHeapLimitRefusal(descriptor_heap_props, sizes);
+            }
+        }
+        if (refusal.empty()) {
+            if (!sotc_descriptor_heap) {
+                sotc_descriptor_heap = add_extension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
+            }
+            descriptor_heap_mode = sotc_descriptor_heap;
+        } else {
+            LOG_WARNING(Render_Vulkan, "SOTC DESCRIPTOR_HEAP: off: {}", refusal);
+        }
+    }
 
     // Sparse buffers (SOTC_MIRROR; sotc_arch/mirror.cpp): core features, no extension. The bindings
     // go to the graphics queue family, which is created below in any case.
@@ -1313,7 +1360,12 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         }
         sotc_unified_layouts = false;
         sotc_descriptor_heap = false;
+        descriptor_heap_mode = false; // sotc: SOTC_DESCRIPTOR_HEAP goes with the extension
         sotc_device_generated_commands = false;
+        // sotc: the heap's GENERAL descriptors need the feature: refuse it again now that it is gone (it was
+        // checked above with the feature present; CheckRequirements only ever refuses).
+        SotcArch::Layouts::NoteSupported(false, "device creation refused the SOTC_* features");
+        SotcArch::Heap::CheckRequirements(bindless_images, bindless_samplers);
         device_chain.get<vk::DeviceCreateInfo>().enabledExtensionCount = arch_extension_base;
         auto [arch_result, arch_dev] = physical_device.createDeviceUnique(device_chain.get());
         device_result = arch_result;
@@ -1324,6 +1376,7 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         return false;
     }
     device = std::move(dev);
+    SotcArch::Layouts::LogDecision(); // sotc: the one line with the A1 decision (auto, on, verify or off)
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 

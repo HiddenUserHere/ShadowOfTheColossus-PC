@@ -30,9 +30,11 @@ public:
 
     void Create(vk::Device device, vk::Format surface_format);
 
+    /// sotc: input_layout is the layout the input view is in (see FsrPass::Render). ui and sky are of the
+    /// upscaler's images (SHADER_READ_ONLY); when they are absent they read input, in input_layout.
     void Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
-                Frame& output, Settings settings, vk::ImageView ui = {},
-                vk::ImageView sky = {});
+                Frame& output, Settings settings, vk::ImageView ui = {}, vk::ImageView sky = {},
+                vk::ImageLayout input_layout = vk::ImageLayout::eShaderReadOnlyOptimal);
 
 private:
     vk::UniquePipeline pipeline{};

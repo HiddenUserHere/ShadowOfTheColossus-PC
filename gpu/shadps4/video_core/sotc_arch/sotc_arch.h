@@ -21,6 +21,7 @@ class Scheduler;
 } // namespace Vulkan
 
 namespace VideoCore {
+struct Image;
 struct ImageView;
 class Sampler;
 class TextureCache;
@@ -51,9 +52,39 @@ void Report(char* out, u32 size, double seconds);
 // A1. Unified image layouts (switch SOTC_LAYOUT_UNIFIED). With VK_KHR_unified_image_layouts every image lives in
 // GENERAL; without it GENERAL is still used (correct, maybe slower on some hardware).
 namespace Layouts {
+/// The switch SOTC_LAYOUT_UNIFIED: 0 forces it off, 1 on (needs the feature), 2 verify (the old layouts are used
+/// and counted), unset or "auto" (the default): on when the feature is present and nothing refuses it.
+/// Requested() is false only for the forced off: the instance probes the feature whenever it may be used.
+bool Requested();
+/// True when the mode acts once the feature is there: =1 or auto. Supported() still has to hold (see Active).
 bool On();
-/// True when the device reports unifiedImageLayouts (probed by the instance).
+/// True when the device reports unifiedImageLayouts. Set once by the instance (NoteSupported), after the
+/// device is created: a refused device reports false again.
 bool Supported();
+/// sotc: the instance's report of the feature (vk_instance.cpp). false also after a device retry without it.
+/// `reason` is a string literal naming why, for the line LogDecision prints.
+void NoteSupported(bool supported, const char* reason = nullptr);
+/// True when the mode acts: On() and Supported(). Only then Pick returns GENERAL and barriers are dropped.
+/// Without the feature every layout is the one it was before (the fallback: no GENERAL attachments).
+bool Active();
+/// Prints the one startup line with the decision (on, verify or off) and its reason. Call once, after the device exists.
+void LogDecision();
+/// True for SOTC_LAYOUT_UNIFIED=2 with the feature: the drops are counted and the old barriers are kept.
+bool Verify();
+/// The layout a command, attachment, descriptor or barrier names for a texture-cache image: GENERAL when Active();
+/// the layout itself otherwise, and for present layouts always.
+vk::ImageLayout Pick(vk::ImageLayout layout);
+/// Non-GENERAL transitions the mode still emits, by the reason they stay (the SOTC LAYOUT report).
+enum class Residual : u8 {
+    Present,  ///< the swapchain image: PRESENT_SRC is required by the spec
+    Sdk,      ///< our copies handed to Streamline (DLSS-G) or FFX (FSR-FG) with declared states
+    Internal, ///< our own raw images: presenter frames, FSR/PP passes, ui shadow, shadow scratch
+    Count,
+};
+/// Counts one residual transition (the instrumented sites call it where the barrier is recorded).
+void NoteResidual(Residual reason, u64 count = 1);
+/// A kept barrier that orders a write or a first use (never dropped). SOTC LAYOUT "ordering" count.
+void NoteKeptWrite();
 } // namespace Layouts
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -197,8 +228,9 @@ bool UsesDescriptorHeap();
 void CheckRequirements(bool bindless_images, bool bindless_samplers);
 /// The heap is the N5 bindless arrays (vk_bindless.cpp): one runtime array per image key, slot 0 = null view.
 void Init(const Vulkan::Instance& instance);
-/// True when a stage cannot be a heap stage: Shader::HeapStaticRefusal, or a host rule (the composite and UI rules
-/// of BindTexturesFull, which the memo does not answer). The pipeline cache calls it before it picks the heap variant.
+/// True when a stage cannot be a heap stage: Shader::HeapStaticRefusal, or a host rule (the composite rule of
+/// BindTexturesFull, and the UI linear rule unless SOTC_HEAP_UI_LINEAR=1, which the memo answers per op). The pipeline
+/// cache calls it before it picks the heap variant.
 bool StageRefused(const Shader::Info& stage);
 /// sotc: SOTC_HEAP_COMPOSITE_OP=1 (read once). The composite rule of StageRefused is then not applied per program:
 /// the heap stage stays, and BindHeapImages sends each op the composite predicates act on (CompositeOf) to the classic
@@ -211,6 +243,26 @@ u32 NullSamplerIndex();
 u32 IndexOf(VideoCore::ImageView& view, u32 key, vk::ImageLayout layout);
 u32 IndexOfSampler(VideoCore::Sampler& sampler);
 } // namespace Heap
+
+// ---------------------------------------------------------------------------------------------------------------
+// sotc: the UI linear rule (SOTC_RENDER_RES names a size other than 1920x1080). A single-image stage whose one asset
+// texture is sampled with a point magnification has the sampler magnified bilinearly instead: the game draws its 1080p
+// 2D art with the point sampler, and a larger render size would show hard steps. The classic bind
+// (Rasterizer::UiLinearAsset, BindSamplers) and the heap resolve (TableMemo, ResolveFresh) take the decision from these
+// functions only, so both make the same one.
+namespace UiLinear {
+/// SOTC_RENDER_RES names another size than 1920x1080 (read once).
+bool RenderResOn();
+/// The static part of the rule, decided by the T# words of the stage: RenderResOn, one image (not an array), and a
+/// number format that is not an integer one.
+bool StageEligible(const Shader::Info& stage);
+/// The dynamic part, decided by the bound image: not a render or depth target, not a storage image, a VO surface, a
+/// binding target, nor a depth image.
+bool ImageEligible(const VideoCore::Image& image);
+/// sotc: SOTC_HEAP_UI_LINEAR=1 (read once): the heap resolve decides the rule per op (TableMemo), so the stage stays a
+/// heap stage (Heap::StageRefused does not refuse it).
+bool HeapOn();
+} // namespace UiLinear
 
 namespace TableMemo {
 /// The heap indices of one sharp table's T#/S# entries, in a per-frame ring on the GPU.
@@ -241,6 +293,29 @@ void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler);
 /// transitions and the bound flags of those images (the classic bind's second pass, without descriptors).
 IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& stage,
                    AmdGpu::BorderColorBuffer border_color, u64 bindless_gen, TableBinds* binds);
+
+/// sotc: SOTC_PR_KEYS. The memo key of one heap stage (table_memo.cpp KeyOf), computed ahead by a GpuPrep thread
+/// (PrepareDraw) from the op's flat buffer and border color base. The record is used by Resolve only for the stage
+/// pointer and border base it was made for; the words are the same ones KeyOf writes.
+struct PreKey {
+    /// KeyWordsOf of the largest stage the memo takes (16 images, 16 samplers); table_memo.cpp asserts it.
+    static constexpr u32 kMaxWords = 3 + 5 * 16 + 3 * 16;
+    const Shader::Info* stage{}; ///< the pipeline stage the key was computed for
+    u64 border{};                ///< border color base it was computed with
+    u64 hash{};                  ///< KeyOf's return value
+    u32 words{};                 ///< KeyWordsOf(stage); the entries past it are not read
+    bool valid{};
+    std::array<u64, kMaxWords> key{};
+};
+/// Pure (no shared state): KeyOf of `stage` into `out`, with `out.stage` and `out.border` set. Reads the stage's flat
+/// buffer through the calling thread's Shader::g_info_slot, so a GpuPrep thread must have its slot filled. false
+/// (out.valid false) when the key does not fit PreKey::kMaxWords.
+bool ComputeKey(const Shader::Info& stage, AmdGpu::BorderColorBuffer border_color, PreKey& out);
+/// Resolve with the key precomputed by ComputeKey when `pre` is valid for this stage and border base (SOTC_PR_KEYS);
+/// otherwise the key is computed here, as Resolve above does.
+IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& stage,
+                   AmdGpu::BorderColorBuffer border_color, u64 bindless_gen, TableBinds* binds,
+                   const PreKey* pre);
 /// sotc: SOTC_HEAP accounting of the stage binds of heap ops: skipped (the table covers the stage), or the classic
 /// bind ran (reason: 0 GPU verify, 1 render target or forced general, 2 stencil image, 3 rebind pending,
 /// 4 composite draw under SOTC_HEAP_COMPOSITE_OP).
@@ -248,6 +323,15 @@ void NoteBindSkipped();
 void NoteBindClassic(u32 reason);
 /// sotc: SOTC_HEAP_VS. The vertex heap stage of an op: skipped (true) or its classic bind ran (false, the fallback).
 void NoteVertexBind(bool skipped);
+/// sotc: SOTC_BINDSET (stage 1, table_memo.cpp): the mode, 0 off, 1 replay, 2 verify; 0 when the table memo is not up.
+/// A replay (mode 1) replays a stored BindSet without validating it, the events of bindset_events.h keep it valid.
+int BindSetMode();
+/// sotc: SOTC_BINDSET. Rasterizer::BindHeapImages skipped the transition of an image its backing already holds in the
+/// state the read needs (mode 1), or made it and checked the prediction (mode 2: barrier = Transit returned one).
+void NoteTransitSkipped();
+void NoteTransitVerify(bool barrier);
+/// sotc: SOTC_BINDSET. One line for the 5 s report (counters reset on read); empty when the layer is off.
+void BindSetReport(char* out, u32 size, double seconds);
 void Report(char* out, u32 size, double seconds);
 } // namespace TableMemo
 

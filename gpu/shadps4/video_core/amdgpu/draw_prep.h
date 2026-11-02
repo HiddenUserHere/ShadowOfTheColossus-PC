@@ -18,6 +18,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/op_footprint.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_PR_KEYS (TableMemo::PreKey)
 
 namespace Vulkan {
 
@@ -75,6 +76,9 @@ struct PrBuffer {
     u64 mapped{};    ///< ClampRangeSize(base, vsize); 0 when base or vsize is 0
     u64 size{};      ///< mapped, limited to the unbounded window: what BindBuffers binds
     bool computed{}; ///< false: BindBuffers reads this descriptor itself
+    /// sotc: SOTC_PR_PRED. ShaderAddrBufferAt on the pipeline's profile (the predicate BindBuffers
+    /// asks for each buffer). Computed for every buffer of a prepared stage, specials included.
+    bool shader_addressed{};
     u64 gen_sum{};   ///< SOTC_PR_GEN: SotcGen::Sum(base, vsize) read before the mapping check
 };
 
@@ -140,6 +144,11 @@ struct PreparedDraw {
     /// used by BindResources only while runtime_gen matches (see above), and with SOTC_PR_GEN also
     /// while every gen_sum still matches.
     PreparedResources resolved{};
+    /// sotc: SOTC_PR_KEYS. The memo keys of the pipeline's heap stages (PrepareDraw, packet
+    /// pipelines only): [0] the fragment-kind heap stage, [1] the vertex-kind one. BindResources
+    /// hands each to TableMemo::Resolve, which uses it only for the stage pointer it was made for.
+    /// Reset by every PrepareDraw (valid false unless computed for this op).
+    std::array<SotcArch::TableMemo::PreKey, 2> table_keys{};
 };
 
 } // namespace Vulkan

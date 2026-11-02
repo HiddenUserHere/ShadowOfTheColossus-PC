@@ -7,6 +7,7 @@
 
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
+#include "video_core/renderer_vulkan/vk_descriptor_heap.h" // sotc: SOTC_DESCRIPTOR_HEAP
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -133,6 +134,15 @@ DescriptorHeap::DescriptorHeap(const Instance& instance, Scheduler& scheduler,
     // sotc: with descriptor buffers the sets are not pooled; the ring replaces Commit.
     if (instance.IsDescriptorBufferEnabled() || instance.IsDescriptorBufferN5Enabled()) { // sotc: SOTC_N5_DESCBUF
         descriptor_buffer = std::make_unique<DescriptorBufferRing>(instance, scheduler);
+    }
+    // sotc: SOTC_DESCRIPTOR_HEAP=1: the heaps are allocated and probed here, and the probe logs the outcome. When
+    // the probe fails the pointer is reset and the port stays on the classic path.
+    if (instance.IsDescriptorHeapEnabled()) {
+        auto heap_buffers =
+            std::make_unique<DescriptorHeapBuffers>(instance, instance.GetDescriptorHeapProperties());
+        if (heap_buffers->Ok()) {
+            descriptor_heap_buffers = std::move(heap_buffers);
+        }
     }
 }
 

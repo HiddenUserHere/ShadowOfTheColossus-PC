@@ -503,6 +503,10 @@ public:
     /// sotc: any_overlap marks every image overlapping the range (DMA copies and fills).
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap = false);
 
+    /// sotc: SOTC_SYNC_EVENTS. Updates the CPU-changed images over [addr, addr + size) (draw
+    /// thread, submit start; see the .cpp). Returns the number of images updated.
+    u32 DrainImageEvents(VAddr addr, size_t size);
+
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
@@ -653,6 +657,18 @@ public:
     /// this op, without the lookups. Where UpdateImage would change nothing (TexUpdateIsNoOp) it does the LRU
     /// touch, the protect flush and the bind evidence only; otherwise it is UpdateImage.
     void TouchBoundImage(ImageId image_id);
+
+    /// sotc: SOTC_BINDSET. True when TouchBoundImage would do no UpdateImage for the image (TexUpdateIsNoOp).
+    [[nodiscard]] bool BoundImageUpdateIsNoOp(ImageId image_id);
+
+    /// sotc: SOTC_BINDSET. True when DecideRebase would now answer a mip-tail candidate differently by its time rule:
+    /// the image found for it is a full chain (not a tail) and IsSafeToDelete, so live_full no longer holds and a
+    /// tail would be made. No event reports the passing of time, so a candidate replay asks this.
+    [[nodiscard]] bool BindSetTailTimeStale(ImageId found_id) const;
+
+    /// sotc: SOTC_BINDSET. The no-op branch of TouchBoundImage alone: the LRU touch, the protect flush and the bind
+    /// evidence. A BindSet replay runs it for each bound image, whose update the events keep a no-op.
+    void BindSetTouchBound(ImageId image_id);
 
     /// sotc: the bind evidence UpdateImage records for a bound image (the diagnostics and the memory
     /// class / placement notes). Caller holds `mutex`.

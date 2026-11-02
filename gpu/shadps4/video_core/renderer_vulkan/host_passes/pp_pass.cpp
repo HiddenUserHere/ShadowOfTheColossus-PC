@@ -10,6 +10,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: A1 (Layouts::Residual)
 
 #include <boost/container/static_vector.hpp>
 
@@ -195,7 +196,8 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::Extent2D input_size, Frame& frame, Settings settings,
-                                vk::ImageView ui, vk::ImageView sky) {
+                                vk::ImageView ui, vk::ImageView sky,
+                                vk::ImageLayout input_layout) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -210,7 +212,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     const std::array<vk::RenderingAttachmentInfo, 1> attachments{{
         {
             .imageView = frame.image_view,
-            .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .imageLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
             .loadOp = vk::AttachmentLoadOp::eClear,
             .storeOp = vk::AttachmentStoreOp::eStore,
         },
@@ -230,17 +232,17 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     vk::DescriptorImageInfo image_info{
         .sampler = *sampler,
         .imageView = input,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = input_layout,
     };
     vk::DescriptorImageInfo ui_info{
         .sampler = *sampler,
         .imageView = ui ? ui : input,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = ui ? SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal) : input_layout,
     };
     vk::DescriptorImageInfo sky_info{
         .sampler = *sampler,
         .imageView = sky ? sky : input,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = sky ? SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal) : input_layout,
     };
     if (!sky) {
         settings.sky_sharpen = 0.0f;
@@ -305,12 +307,16 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
         .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .oldLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
         .newLayout = vk::ImageLayout::eGeneral,
         .image = frame.image,
         .subresourceRange = simple_subresource,
     };
 
+    if (post_barrier.newLayout != vk::ImageLayout::eGeneral ||
+        (post_barrier.oldLayout != vk::ImageLayout::eUndefined && post_barrier.oldLayout != vk::ImageLayout::eGeneral)) {
+        SotcArch::Layouts::NoteResidual(SotcArch::Layouts::Residual::Internal); // sotc: A1, a raw layout is named
+    }
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &post_barrier,

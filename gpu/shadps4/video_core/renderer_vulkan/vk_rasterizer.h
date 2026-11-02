@@ -185,6 +185,9 @@ public:
     /// sotc: copies the LOD feedback buffer to the host and clears it (sotc_lod_stats.h)
     void SotcLodFeedbackCycle();
     void OnFence();
+    /// sotc: SOTC_BARRIER_GUEST. A guest sync point (SotcArch::GuestBarrier::Sync as u32), draw thread, at its place in
+    /// the op stream: records one global memory barrier when a buffer write is pending (mode 1).
+    void GuestSyncPoint(u32 kind);
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -235,6 +238,10 @@ private:
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
                             const PreparedDraw* prepared = nullptr) const;
+    /// sotc: SOTC_DRAW_MERGE_STATS (sotc_draw_merge.h): the merge key of one recorded draw and its run. Measurement only.
+    void DrawMergeNote(const RenderState& state, const GraphicsPipeline* pipeline, bool is_indexed,
+                       bool indirect, VAddr arg_address, u32 stride, u32 max_count, VAddr count_address,
+                       const PreparedDraw* prepared);
     /// sotc: the former Update*State, split into a computation from the given registers (any
     /// thread; refuse: set instead of asserting on an unsupported restart index) and the
     /// DynamicState setters (draw thread).
@@ -358,11 +365,14 @@ private:
     /// sotc: SOTC_BIND_CACHE (vk_rasterizer.cpp, see BindCacheEntry below).
     bool BindCacheEligible(const Pipeline* pipeline) const;
     bool BindCacheEligible(const Pipeline* pipeline, const AmdGpu::Regs& regs) const;
+    /// sotc: SOTC_BIND_CACHE_FRAME counters: the first failing gate of BindCacheEligible (SotcStats::BindGate).
+    u32 BindCacheRefusal(const Pipeline* pipeline, const AmdGpu::Regs& regs) const;
     void BindCacheSync(const Pipeline* pipeline, bool eligible);
     bool TryBindCache(const Pipeline* pipeline, u64 hash, bool& uses_dma);
     void CommitBindCache(const Pipeline* pipeline, u64 hash, bool uses_dma,
                          size_t first_bound_buffer);
-    void BindCacheFlush(u32 reason);
+    /// `site`: the SotcStats::BindUnsafeSite of an unsafe flush (counted under SOTC_FPS only).
+    void BindCacheFlush(u32 reason, u32 site = 0);
     /// sotc: SOTC_BIND_CACHE_FRAME (vk_rasterizer.cpp, see BindCacheEntry below). The table form of
     /// BindCacheSync / TryBindCache / CommitBindCache / BindCacheInvalidate.
     void BindCacheSyncFrame(const Pipeline* pipeline, bool eligible);
@@ -496,7 +506,15 @@ private:
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool attachment_feedback_loop{};
+    /// The image side of the op's barrier (layouts and hazards of its images and render targets, Transit).
     bool needs_barrier{};
+    /// sotc: the buffer side of the op's barrier (per-binding overlap checks, addressed-write hazards). Off in
+    /// SOTC_BARRIER_STATIC=1, where the static rule decides the buffer side (passes.h).
+    bool buffer_barrier_need{};
+    /// sotc: SOTC_BARRIER_STATIC. The op's reads and writes (its shader stages write memory, Shader::Info::writes_memory),
+    /// recorded by DecideOpBarrier and read by ResetBindings (BarrierStatic::NoteOp).
+    bool op_static_reads{};
+    bool op_static_writes{};
     /// sotc: SOTC_DEPTH_RO. The depth buffer of this draw is sampled (depth aspect) while its
     /// stencil is written: one layout serves both.
     bool DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
@@ -758,6 +776,17 @@ private:
     bool sotc_addr_hazard{};
     bool GuestWriteOverlap(VAddr addr, u64 size);
     void MergeOpWrites(bool barrier_before_op);
+    /// sotc: SOTC_BARRIER_STATIC. The barrier decision before an op (the place of the old Passes::Decide call). Records
+    /// the op's static writes for ResetBindings. reads: the op binds or reads memory; writes: a stage writes memory.
+    bool DecideOpBarrier(bool reads, bool writes);
+    /// sotc: SOTC_BARRIER_GUEST. The safety net's decision for the op being bound (mode 1: the decision; verify: the
+    /// counted simulation of it, old_due is today's). Ranges come from bound_buffers, fixed_function_reads, guest_addr_writes.
+    bool GuestNetDecide(bool old_due);
+    /// sotc: SOTC_BARRIER_GUEST. The addressed writes of the op being bound (MergeOpWrites); ResetBindings marks them.
+    std::vector<std::pair<VAddr, VAddr>> guest_addr_writes;
+    /// sotc: SOTC_BARRIER_GUEST. Scratch lists of GuestNetDecide (kept to avoid a malloc per op).
+    std::vector<std::pair<VAddr, u64>> guest_reads_buf;
+    std::vector<std::pair<VAddr, u64>> guest_writes_buf;
     void NoteGuestWrite(VAddr addr, u64 size);
     /// sotc: SOTC_SHADER_ADDR, mirror coherence. Guest ranges the op being bound writes through the mirror (the
     /// shader-addressed written buffers, BindBuffers). ResetBindings copies them back into their buffers.
