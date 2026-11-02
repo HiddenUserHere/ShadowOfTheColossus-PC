@@ -351,6 +351,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (!SotcNative::TracksGuestPages()) {
         SotcNative::NoteSkippedReadback(image.info.guest_address, image.info.guest_size);
         image.flags &= ~ImageFlagBits::GpuModified;
+        NoteGpuFlagChange(image); // sotc: SOTC_BIND_CACHE_CONTENT
         // sotc: SOTC_BINDSET. A mip-tail decision reads the GPU-written mark of the images over its bytes.
         SotcArch::BindSet::PostRange(image.info.guest_address - image.info.sotc_dropped_bytes,
                                      image.info.guest_address + image.info.guest_size);
@@ -496,6 +497,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_writt
                 return;
             }
             image.flags &= ~(ImageFlagBits::GpuModified | ImageFlagBits::GpuDirty);
+            NoteGpuFlagChange(image); // sotc: SOTC_BIND_CACHE_CONTENT
             SotcArch::BindSet::PostRange(image.info.guest_address - image.info.sotc_dropped_bytes,
                                          image.info.guest_address + image.info.guest_size);
             SotcNative::NoteImageReused(); // counter for the report
@@ -3788,6 +3790,7 @@ void TextureCache::RunGarbageCollector() {
                     return;
                 }
                 image.flags &= ~ImageFlagBits::GpuModified;
+                NoteGpuFlagChange(image); // sotc: SOTC_BIND_CACHE_CONTENT
                 SotcArch::BindSet::PostRange(image.info.guest_address - image.info.sotc_dropped_bytes,
                                              image.info.guest_address + image.info.guest_size);
                 ++gpu_only_copies;

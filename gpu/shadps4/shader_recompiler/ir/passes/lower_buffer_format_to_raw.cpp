@@ -26,6 +26,41 @@ static bool IsBufferFormatStore(const IR::Inst& inst) {
     return inst.GetOpcode() == IR::Opcode::StoreBufferFormatF32;
 }
 
+// sotc: the data formats the load and store switches below handle. The V# and MTBUF data format
+// fields are 4 bits wide, so the only value outside the table is 15, which no format is defined
+// for. Such a descriptor is treated like a null sharp instead of aborting the translation.
+static bool IsKnownBufferDataFormat(const AmdGpu::DataFormat data_format) {
+    switch (data_format) {
+    case AmdGpu::DataFormat::Format8:
+    case AmdGpu::DataFormat::Format8_8:
+    case AmdGpu::DataFormat::Format8_8_8_8:
+    case AmdGpu::DataFormat::Format16:
+    case AmdGpu::DataFormat::Format16_16:
+    case AmdGpu::DataFormat::Format16_16_16_16:
+    case AmdGpu::DataFormat::Format10_11_11:
+    case AmdGpu::DataFormat::Format2_10_10_10:
+    case AmdGpu::DataFormat::Format32:
+    case AmdGpu::DataFormat::Format32_32:
+    case AmdGpu::DataFormat::Format32_32_32:
+    case AmdGpu::DataFormat::Format32_32_32_32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// sotc: 32-bit formats move raw dwords, so the number format does not change the loaded or stored
+// bits. An unexpected number format (Snorm, reachable from V#/MTBUF) is passed through.
+static void CheckRawNumberFormat(const FormatInfo& format_info) {
+    if (format_info.num_format != AmdGpu::NumberFormat::Uint &&
+        format_info.num_format != AmdGpu::NumberFormat::Sint &&
+        format_info.num_format != AmdGpu::NumberFormat::Float) {
+        AmdGpu::ReportFormatFallback("32-bit buffer number format",
+                                     u32(format_info.data_format),
+                                     u32(format_info.num_format));
+    }
+}
+
 static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, const IR::U32 address,
                                   const IR::BufferInstInfo info, const FormatInfo& format_info) {
     IR::Value interpreted;
@@ -79,9 +114,7 @@ static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, con
     case AmdGpu::DataFormat::Format32_32:
     case AmdGpu::DataFormat::Format32_32_32:
     case AmdGpu::DataFormat::Format32_32_32_32: {
-        ASSERT(format_info.num_format == AmdGpu::NumberFormat::Uint ||
-               format_info.num_format == AmdGpu::NumberFormat::Sint ||
-               format_info.num_format == AmdGpu::NumberFormat::Float);
+        CheckRawNumberFormat(format_info);
         interpreted = ir.LoadBufferF32(format_info.num_components, handle, address, info);
         break;
     }
@@ -178,9 +211,7 @@ static void StoreBufferFormat(IR::IREmitter& ir, const IR::Value handle, const I
     case AmdGpu::DataFormat::Format32_32:
     case AmdGpu::DataFormat::Format32_32_32:
     case AmdGpu::DataFormat::Format32_32_32_32: {
-        ASSERT(format_info.num_format == AmdGpu::NumberFormat::Uint ||
-               format_info.num_format == AmdGpu::NumberFormat::Sint ||
-               format_info.num_format == AmdGpu::NumberFormat::Float);
+        CheckRawNumberFormat(format_info);
         ir.StoreBufferF32(format_info.num_components, handle, address, real_value, info);
         break;
     }
@@ -212,8 +243,15 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
         .num_components = AmdGpu::NumComponents(data_format),
     };
 
-    if (data_format == AmdGpu::DataFormat::FormatInvalid) {
-        LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
+    if (data_format == AmdGpu::DataFormat::FormatInvalid ||
+        !IsKnownBufferDataFormat(data_format)) {
+        if (data_format == AmdGpu::DataFormat::FormatInvalid) {
+            LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
+        } else {
+            // sotc: reported once per combination; the access reads zero / is dropped, as for null.
+            AmdGpu::ReportFormatFallback("buffer data format", u32(data_format),
+                                         u32(format_info.num_format));
+        }
         if (IsBufferFormatLoad(inst)) {
             inst.ReplaceUsesWithAndRemove(
                 ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)));

@@ -483,7 +483,9 @@ struct Sampler {
         case AnisoRatio::Sixteen:
             return 16.0f;
         default:
-            UNREACHABLE();
+            // sotc: MAX_ANISO_RATIO 5..7 are not defined. Use no anisotropy, as for ratio 1.
+            ReportFormatFallback("max_aniso reserved", u32(max_aniso.Value()), 0);
+            return 1.0f;
         }
     }
 };

@@ -379,6 +379,10 @@ private:
     bool TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& uses_dma);
     void CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool uses_dma,
                               size_t first_bound_buffer);
+    /// sotc: SOTC_BIND_CACHE_PACKET=2 (PacketVerify, PacketAddrRefresh: declared after BindCacheFindFrame).
+    /// sotc: SOTC_BIND_CACHE_PACKET. The heap reason a heap stage's images would take the classic bind (1 target or
+    /// forced general, 2 stencil, 3 rebind pending, 4 composite), 0 when BindHeapImages binds them. Caller holds the lock.
+    u32 HeapDeclineReason(const Shader::Info& stage, const SotcArch::TableMemo::TableBinds& binds);
     void BindCacheInvalidateFrame(VAddr addr, u64 size, VideoCore::ImageId image);
     void BindCacheNoteLookup(const VideoCore::TextureCache::ImageDesc& desc,
                              VideoCore::ImageId image);
@@ -401,6 +405,11 @@ private:
     void BindCacheInvalidate(VAddr addr, u64 size, VideoCore::ImageId image = {});
     /// sotc: SOTC_BIND_CACHE_RANGES: BindCacheInvalidate for a written image and its guest range.
     void BindCacheInvalidateImage(VideoCore::ImageId image_id);
+    /// sotc: SOTC_BIND_CACHE_META. A metadata clear (skipped dispatch) of [addr, addr + size): drops or stamps only the
+    /// binds reading that range; flushes nothing else.
+    void BindCacheNoteMetaClear(VAddr addr, u64 size);
+    /// sotc: the backing of the image an image info names: the one that owns `view` (null when none does).
+    const void* ImageInfoBacking(VideoCore::ImageId id, vk::ImageView view);
 
     /// sotc: records vertex input, vertex and index buffers again when a submit happened since
     /// vertex_tick (the draw moved to a new command buffer).
@@ -431,7 +440,9 @@ private:
     u64 evict_poll{}; ///< sotc: FlushPeriodic commands without periodic submits
     std::chrono::steady_clock::time_point commands_since{};
 
-    bool IsComputeMetaClear(const Pipeline* pipeline);
+    /// clear_addr / clear_size (optional): the surface the skipped dispatch clears (sotc: SOTC_BIND_CACHE_META).
+    bool IsComputeMetaClear(const Pipeline* pipeline, VAddr* clear_addr = nullptr,
+                            u64* clear_size = nullptr);
     bool IsComputeImageCopy(const Pipeline* pipeline);
     bool IsComputeImageClear(const Pipeline* pipeline);
 
@@ -547,6 +558,17 @@ private:
         u64 size{};    ///< the clamped size BindBuffers used (0: nothing to touch)
         bool written{}; ///< never replayed: a written buffer is not eligible for the caches
     };
+    /// sotc: SOTC_BIND_CACHE_PACKET. Where a PacketAddr of a recorded bind came from: the stage (GetStages index) and
+    /// the buffer of its V#, the position of the PacketAddr, of its bind cache range and of its repair (kNoIndex when
+    /// the bind pushed none). PacketAddrRefresh recomputes them from the op's own V#.
+    static constexpr u32 kNoIndex = ~0u;
+    struct PacketAddrSrc {
+        u32 stage;
+        u32 desc;
+        u32 addr_index;
+        u32 range_index;
+        u32 repair_index;
+    };
     /// sotc: descriptor state of the previous graphics draw (SOTC_FAST_BIND). Valid only while
     /// the same command buffer, pipeline, push data and resource generations are current.
     struct FastBindState {
@@ -634,6 +656,9 @@ private:
         std::vector<vk::DescriptorBufferInfo> buffer_infos;
         std::vector<vk::DescriptorImageInfo> image_infos;
         std::vector<VideoCore::ImageId> image_info_images;
+        /// sotc: SOTC_BIND_CACHE_PACKET. Per image info, the backing that owns its view when the entry was made (null for
+        /// samplers and empty slots). A hit refuses an image whose backing is another one (SetBackingSamples swaps it).
+        std::vector<const void*> image_info_backings;
         std::vector<BoundBuffer> buffers;
         std::vector<BindCacheImage> images;
         std::vector<u32> lod_banks; ///< SotcLod::Mark of the full bind, repeated on a hit
@@ -667,6 +692,7 @@ private:
         u64 stream_gen{};
         u64 checked_tex_seq{};
         u64 checked_write_seq{};
+        u64 checked_flag_seq{}; ///< sotc: SOTC_BIND_CACHE_CONTENT: GpuFlagStamps() sequence the entry was last checked at
         u64 map_epoch{};
         u64 made_frame{};
         bool uses_stream{};    ///< holds a flat buffer copy in the stream ring
@@ -675,6 +701,8 @@ private:
         bool packet{};
         std::array<u64, 2> packet_flat{}; ///< flatbuf_address, flatbuf_fragment_address at the commit (no flat_slots)
         std::vector<PacketAddr> addr;
+        /// sotc: SOTC_BIND_CACHE_PACKET: where each `addr` came from (PacketAddrRefresh); empty without the switch.
+        std::vector<PacketAddrSrc> addr_src;
         bool map_dependent{};  ///< bound a T# the guest mapping rejected (a map can change that)
         /// Bound a mip-tail image: FindImage's tail choice depends on which overlapping images are
         /// GPU-written (VideoCore::gpu_modified_epoch), checked at the hit.
@@ -722,6 +750,16 @@ private:
     u64 bind_rec_write_seq{};         ///< write_stamps.Seq() when the bind began
     u64 bind_rec_map_epoch{};         ///< MapEpoch() when the bind began
     u64 bind_rec_gpu_epoch{};         ///< VideoCore::gpu_modified_epoch when the bind began
+    /// sotc: SOTC_BIND_CACHE_CONTENT. GpuFlagStamps() sequence and the verify state: the lookup's hold (a write today's
+    /// rule refuses and the content rule keeps), the entry it holds, and whether the current lookup kept a hit after a write.
+    u64 bind_rec_flag_seq{};          ///< GpuFlagStamps().Seq() when the bind began
+    bool bind_cache_hold{};           ///< the stamp check held the entry (mode 2): not dropped
+    bool bind_cache_verify_pending{}; ///< mode 2: a full bind follows a held lookup of bind_cache_verify_index
+    size_t bind_cache_verify_index{};
+    bool bind_cache_kept_write{};     ///< the lookup kept an entry across a GPU write (mode 1)
+    /// sotc: SOTC_BIND_CACHE_CONTENT=2. The full bind that followed a held lookup is compared with the held entry: counts
+    /// the differences by category (SotcStats::BindContentDiff). Changes no state.
+    void BindCacheVerify(const BindCacheEntry& old, size_t first_bound_buffer);
     bool bind_cache_tail_rec{};       ///< the bind found a mip-tail image
     std::vector<BindCacheFlatSlot> bind_cache_flat_rec; ///< flat buffer copies of the bind
     u32 cur_bind_stage{};             ///< index (in GetStages) of the stage being bound
@@ -798,6 +836,7 @@ private:
     /// sotc: SOTC_PACKET. The shader-addressed buffers of the packet op being bound (BindBuffers records them, reset
     /// by BindResources). CommitFastBind and the bind cache store them; a hit replays them (PacketAddrReplay).
     std::vector<PacketAddr> packet_addr_rec;
+    std::vector<PacketAddrSrc> packet_addr_src_rec; ///< sotc: SOTC_BIND_CACHE_PACKET, the sources of packet_addr_rec
     /// sotc: SOTC_PACKET. Touches the ranges of a packet op's bind again (a hit, in place of BindBuffers): Touch,
     /// the skipped-buffer counters and shader_addr_touch, as the full bind does.
     void PacketAddrReplay(const std::vector<PacketAddr>& ranges);
@@ -811,6 +850,9 @@ private:
     void BindCacheDropFrame(BindCacheEntry& entry, u32 reason);
     BindCacheEntry* BindCacheFindFrame(u64 key, const Pipeline* pipeline, u64 hash,
                                        u64 targets_key);
+    /// sotc: SOTC_BIND_CACHE_PACKET (declared here, after BindCacheEntry: they take it by reference).
+    bool PacketAddrRefresh(BindCacheEntry& entry);
+    void PacketVerify(const BindCacheEntry& ref, size_t first_bound_buffer);
     BindCacheState bind_cache_state{};
     u32 bind_cache_live{};
     u64 bind_cache_clock{};

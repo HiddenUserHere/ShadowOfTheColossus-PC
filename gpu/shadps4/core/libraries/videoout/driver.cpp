@@ -1444,6 +1444,43 @@ void VideoOutDriver::Flip(const Request& req) {
                         static_cast<unsigned long long>(SotcStats::bind_post_nodata.exchange(0)),
                         sites);
                 }
+                if (SotcStats::kFpsLog && SotcStats::kBindCacheRanges && SotcStats::kBindCacheMeta) { // sotc: SOTC_BIND_CACHE_META
+                    std::fprintf(stderr,
+                                 "SOTC META CLEAR narrowed: entries killed %llu, flushes avoided %llu "
+                                 "(clears %llu)\n",
+                                 static_cast<unsigned long long>(
+                                     SotcStats::meta_clear_entries_killed.exchange(0)),
+                                 static_cast<unsigned long long>(
+                                     SotcStats::meta_clear_flushes_avoided.exchange(0)),
+                                 static_cast<unsigned long long>(
+                                     SotcStats::meta_clear_narrowed.exchange(0)));
+                }
+                if (SotcStats::kBindCachePacket && SotcStats::kFpsLog) { // sotc: SOTC_BIND_CACHE_PACKET (sotc_stats.h)
+                    char misses[400]{}, mism[400]{};
+                    size_t mi = 0, mm = 0;
+                    for (uint32_t r = 0; r < SotcStats::PkMissReasons; ++r) {
+                        mi += std::snprintf(misses + mi, sizeof(misses) - mi, "%s%s %llu",
+                                            r ? ", " : "", SotcStats::kBindPacketMissNames[r],
+                                            static_cast<unsigned long long>(
+                                                SotcStats::pk_miss[r].exchange(0)));
+                    }
+                    for (uint32_t c = 0; c < SotcStats::PvCategories; ++c) {
+                        mm += std::snprintf(mism + mm, sizeof(mism) - mm, "%s%s %llu",
+                                            c ? ", " : "", SotcStats::kPacketVerifyNames[c],
+                                            static_cast<unsigned long long>(
+                                                SotcStats::pk_mismatch[c].exchange(0)));
+                    }
+                    std::fprintf(
+                        stderr,
+                        "SOTC BIND PACKET mode %d: ops %llu, eligible %llu, hits %llu, misses by "
+                        "reason [%s], verify checked %llu, mismatches by category [%s]\n",
+                        SotcStats::kBindCachePacket,
+                        static_cast<unsigned long long>(SotcStats::pk_ops.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::pk_eligible.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::pk_hits.exchange(0)), misses,
+                        static_cast<unsigned long long>(SotcStats::pk_verify_checks.exchange(0)),
+                        mism);
+                }
                 if (SotcStats::kOpComputeBind) { // sotc: SOTC_OP_COMPUTE_BIND (sotc_stats.h)
                     std::fprintf(
                         stderr,
@@ -1544,6 +1581,35 @@ void VideoOutDriver::Flip(const Request& req) {
                                             SotcStats::bf_refuse[r].exchange(0)));
                 }
                 std::fprintf(stderr, "SOTC BIND FRAME refused by check [%s]\n", sites);
+                if (SotcStats::kBindCacheContent) { // sotc: SOTC_BIND_CACHE_CONTENT (sotc_stats.h)
+                    char rules[80]{};
+                    size_t ri = 0;
+                    for (uint32_t r = 0; r < SotcStats::CrRules; ++r) {
+                        ri += std::snprintf(rules + ri, sizeof(rules) - ri, "%s%s %llu",
+                                            r ? ", " : "", SotcStats::kBindContentRuleNames[r],
+                                            static_cast<unsigned long long>(
+                                                SotcStats::bc_refused[r].exchange(0)));
+                    }
+                    char cats[160]{};
+                    size_t ci = 0;
+                    for (uint32_t c = 0; c < SotcStats::CdCats; ++c) {
+                        ci += std::snprintf(cats + ci, sizeof(cats) - ci, "%s%s %llu",
+                                            c ? ", " : "", SotcStats::kBindContentDiffNames[c],
+                                            static_cast<unsigned long long>(
+                                                SotcStats::bc_diff[c].exchange(0)));
+                    }
+                    std::fprintf(
+                        stderr,
+                        "SOTC BIND CONTENT: mode %d: hits kept after a write %llu, refused by rule "
+                        "[%s], verify checked %llu (skipped, moved during the bind %llu), "
+                        "differences by category [%s] in %llu binds\n",
+                        SotcStats::kBindCacheContent,
+                        static_cast<unsigned long long>(SotcStats::bc_kept.exchange(0)), rules,
+                        static_cast<unsigned long long>(SotcStats::bc_verified.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::bc_skipped_moved.exchange(0)),
+                        cats,
+                        static_cast<unsigned long long>(SotcStats::bc_diff_binds.exchange(0)));
+                }
             }
             if (SotcStats::kSyncFast) { // sotc: SOTC_SYNC_FAST (sotc_stats.h)
                 const uint64_t lookups = SotcStats::sync_fast_lookups.exchange(0);

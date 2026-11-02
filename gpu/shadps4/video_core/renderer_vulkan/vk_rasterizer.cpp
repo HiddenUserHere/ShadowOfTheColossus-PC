@@ -3321,6 +3321,9 @@ bool Rasterizer::BindResourceHash(const Pipeline* pipeline, u64& out) const {
     // constants: those pipelines return false and keep the full key.
     u64 hash = 0x4C32525300000001ULL;
     hash = XXH3_64bits_withSeed(&pipeline, sizeof(pipeline), hash);
+    // sotc: SOTC_BIND_CACHE_PACKET: the shader-addressed bases are left out of the key of a packet op (see below).
+    const bool addr_key = SotcStats::kBindCachePacket != 0 && pipeline->HasPacketRange() &&
+                          pipeline->GetProfile().shader_addr == 1;
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -3338,7 +3341,15 @@ bool Rasterizer::BindResourceHash(const Pipeline* pipeline, u64& out) const {
         hash = XXH3_64bits_withSeed(&ident, sizeof(ident), hash);
         for (const auto& desc : stage->buffers) {
             if (!desc.IsSpecial()) {
-                const auto sharp = desc.GetSharp(*stage);
+                auto sharp = desc.GetSharp(*stage);
+                // sotc: SOTC_BIND_CACHE_PACKET (mode 1/2, packet ops, shader address profile 1). A shader-addressed V#
+                // has no descriptor (BindBuffers writes none for it) and the shader reads its base from the flat buffer
+                // copy, which a hit re-copies; its range is recomputed by PacketAddrRefresh. So the base is not a key.
+                // Soundness: the list in the bind cache notes, the base's uses on the host path.
+                if (addr_key && Shader::ShaderAddrBufferAt(pipeline->GetProfile(), *stage,
+                                                           static_cast<u32>(&desc - stage->buffers.data()))) {
+                    sharp.base_address = 0;
+                }
                 hash = XXH3_64bits_withSeed(&sharp, sizeof(sharp), hash);
             }
         }
@@ -3752,6 +3763,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     sotc_op_writes.clear();
     sotc_addressed_writes.clear(); // sotc: SOTC_SHADER_ADDR, mirror coherence: this op's addressed writes only
     packet_addr_rec.clear();       // sotc: SOTC_PACKET: this op's shader-addressed buffers (BindBuffers)
+    packet_addr_src_rec.clear();   // sotc: SOTC_BIND_CACHE_PACKET: where those came from (for the bind cache entry)
     // sotc: SOTC_PACKET. The barrier rule of the end of this function (for the replays that return early).
     const auto packet_barrier = [&] {
         if (SotcArch::ShaderAddr::On()) {
@@ -3860,7 +3872,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // the addressed ranges, TryBindCacheFrame). Not the older cache, and not a heap stage: its index table is per op.
     // The heap check is the profile's flag, not only the stages found: a heap pipeline keeps its index table per op.
     const bool packet_heap_free = heap_stage == nullptr && !pipeline->GetProfile().heap_images;
-    const bool packet_cacheable = !packet_op || (SotcStats::kBindCacheFrame && packet_heap_free);
+    // sotc: SOTC_BIND_CACHE_PACKET=1/2. A heap pipeline's packet op (real heap, profile 1) takes the frame cache too. Its
+    // heap side is bound on a hit as the full bind binds it (after the lookup, see the hit below); the index table itself
+    // was resolved above for this op, and the heap block is filled for it. A heap stage that the classic bind takes
+    // (HeapDeclineReason) is never cached.
+    const bool packet_heap_cache = packet_op && !packet_heap_free && SotcStats::kBindCachePacket != 0 &&
+                                   pipeline->GetProfile().heap_images == 1;
+    const bool packet_cacheable =
+        !packet_op || (SotcStats::kBindCacheFrame && (packet_heap_free || packet_heap_cache));
     const bool cache_eligible =
         SotcStats::kBindCache && packet_cacheable &&
         (prepared ? prepared->cache_eligible : BindCacheEligible(pipeline));
@@ -3883,6 +3902,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             SotcStats::bind_gate_refused[gate].fetch_add(1, std::memory_order_relaxed);
         }
     }
+    if (SotcStats::kFpsLog && SotcStats::kBindCachePacket != 0 && packet_op) { // sotc: SOTC_BIND_CACHE_PACKET
+        SotcStats::pk_ops.fetch_add(1, std::memory_order_relaxed);
+        if (cache_eligible) {
+            SotcStats::pk_eligible.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // sotc: SOTC_BIND_CACHE_FRAME, or SOTC_BUFFER_MEMO alone (the memo without the frame cache)
     bind_memo_ok = (SotcStats::kBindCacheFrame || SotcStats::kBufferMemo) && cache_eligible;
     // sotc: SOTC_OP_COMPUTE_BIND. A dispatch eligible for the frame cache; mode 2 never takes a hit
@@ -3893,24 +3918,37 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         SotcStats::op_compute_eligible.fetch_add(1, std::memory_order_relaxed);
     }
     BindCacheEntry* verify_ref = nullptr;
+    BindCacheEntry* pk_verify_ref = nullptr; // sotc: SOTC_BIND_CACHE_PACKET=2, the entry a packet hit would take
     compute_written_image = {};
-    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
+    // sotc: the same evaluation order as the old condition (a copy wins over a metadata clear, which has the side effect
+    // of ClearMeta). The surface a metadata clear names is kept for BindCacheNoteMetaClear.
+    VAddr meta_clear_addr{};
+    u64 meta_clear_size{};
+    const bool is_image_copy = IsComputeImageCopy(pipeline);
+    const bool is_meta_clear =
+        !is_image_copy && IsComputeMetaClear(pipeline, &meta_clear_addr, &meta_clear_size);
+    const bool is_image_clear =
+        !is_image_copy && !is_meta_clear && IsComputeImageClear(pipeline);
+    if (is_image_copy || is_meta_clear || is_image_clear) {
         // sotc: SOTC_BIND_CACHE_RANGES: these replace the dispatch by an image copy / clear or a
         // metadata state change, with no write recorded by range: every cached bind dies.
         // sotc: SOTC_BIND_CACHE_FRAME: an image copy or clear is a GPU write to one image, which
         // is what BindCacheInvalidateImage drops the readers of (as Resolve and DepthStencilCopy
         // do); the metadata state change has no range and still flushes everything.
-        if (SotcStats::kBindCacheFrame && compute_written_image) {
+        // sotc: SOTC_BIND_CACHE_META. A metadata clear writes no memory (the dispatch is skipped below) and no
+        // bind reads the clear state (see SotcStats::kBindCacheMeta): only the binds reading its range are dropped.
+        if (is_meta_clear && SotcStats::kBindCacheRanges && SotcStats::kBindCacheMeta) {
+            BindCacheNoteMetaClear(meta_clear_addr, meta_clear_size);
+        } else if (SotcStats::kBindCacheFrame && compute_written_image) {
             BindCacheInvalidateImage(compute_written_image);
             if (SotcStats::kFpsLog) {
                 SotcStats::bf_narrowed.fetch_add(1, std::memory_order_relaxed);
             }
         } else if (SotcStats::kBindCacheRanges) {
             BindCacheFlush(SotcStats::BindCacheUnsafe,
-                           IsComputeImageCopy(pipeline)  ? SotcStats::UsCopy
-                           : IsComputeMetaClear(pipeline) ? SotcStats::UsMetaClear
-                                                          : SotcStats::UsImageClear);
+                           is_image_copy ? SotcStats::UsCopy
+                           : is_meta_clear ? SotcStats::UsMetaClear
+                                           : SotcStats::UsImageClear);
         }
         static const bool drop_trace = std::getenv("SOTC_DROP_TRACE") != nullptr;
         if (drop_trace) {
@@ -4120,18 +4158,67 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
                 verify_ref = found;
             }
         }
-        if (bool hit_dma = false; !compute_verify &&
+        // sotc: SOTC_BIND_CACHE_PACKET. A heap op whose images the classic bind takes is not cached: decided under the lock,
+        // before a hit binds anything. Mode 2 never takes a packet hit: the entry a hit would take is looked up here
+        // (its addressed ranges refreshed) and compared with the full bind after it (PacketVerify).
+        const bool pk_heap_declined = packet_heap_cache && [&] {
+            const auto texture_lock = texture_cache.BatchLock();
+            return (heap_stage && HeapDeclineReason(*heap_stage, heap_binds) != 0) ||
+                   (heap_vs_stage && HeapDeclineReason(*heap_vs_stage, heap_vs_binds) != 0);
+        }();
+        if (pk_heap_declined && SotcStats::kFpsLog) {
+            SotcStats::pk_miss[SotcStats::PkHeapDeclined].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (SotcStats::kBindCachePacket == 2 && packet_op && !pk_heap_declined) {
+            const u64 targets_key = bind_cache_state.targets_key;
+            BindCacheEntry* found =
+                BindCacheFindFrame(BindCacheFrameKey(pipeline, cache_hash, targets_key), pipeline,
+                                   cache_hash, targets_key);
+            if (found && found->valid && found->packet && found->flush_gen == bind_cache_flush_gen &&
+                found->buffer_version == buffer_cache.BindVersion()) {
+                if (PacketAddrRefresh(*found)) {
+                    pk_verify_ref = found;
+                } else if (SotcStats::kFpsLog) {
+                    SotcStats::pk_miss[SotcStats::PkAddrShape].fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        const bool pk_take_hit = !pk_heap_declined && !(SotcStats::kBindCachePacket == 2 && packet_op);
+        if (bool hit_dma = false; !compute_verify && pk_take_hit &&
                                   (SotcStats::kBindCacheFrame
                                        ? TryBindCacheFrame(pipeline, cache_hash, hit_dma)
                                        : TryBindCache(pipeline, cache_hash, hit_dma))) {
             if (compute_bind && SotcStats::kFpsLog) {
                 SotcStats::op_compute_hits.fetch_add(1, std::memory_order_relaxed);
             }
+            // sotc: SOTC_BIND_CACHE_PACKET. The heap side of the op, bound as the full bind binds it: the images of the
+            // index table (BindHeapImages cannot decline: checked above, under the same state), then the heap block.
+            // The table itself was resolved for this op before the lookup.
+            if (packet_heap_cache) {
+                // The decision was taken before the replay; a decline now would leave the images unbound, so it is logged.
+                const bool heap_bound =
+                    (!heap_stage || BindHeapImages(*heap_stage, heap_binds)) &&
+                    (!heap_vs_stage || BindHeapImages(*heap_vs_stage, heap_vs_binds));
+                if (!heap_bound) {
+                    static std::atomic<u32> declined_after_hit{};
+                    if (declined_after_hit.fetch_add(1, std::memory_order_relaxed) < 8) {
+                        LOG_ERROR(Render_Vulkan, "SOTC BIND PACKET: heap images declined after a cache hit");
+                    }
+                }
+                heap_block = {};
+                SotcArch::Heap::FillBlock(heap_block, heap_stage, bindless_slots);
+                if (heap_vs_stage) {
+                    heap_block.vs_table_address = heap_vs_address;
+                }
+            }
             // The arrays now hold this state: the next identical draw may take the fast bind.
             if (packet_op) { // sotc: SOTC_PACKET (TryBindCacheFrame replayed the packet's ranges)
                 packet_barrier();
                 if (SotcStats::kFpsLog) {
                     SotcStats::packet_cache_hits.fetch_add(1, std::memory_order_relaxed);
+                    if (SotcStats::kBindCachePacket) {
+                        SotcStats::pk_hits.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
             if (fast_eligible) {
@@ -4140,7 +4227,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             return true;
         }
         bind_cache_recording = true;
-        bind_cache_uncacheable = false;
+        // sotc: SOTC_BIND_CACHE_PACKET: a declined heap bind is not stored (its classic bind is not replayed).
+        bind_cache_uncacheable = pk_heap_declined;
         bind_cache_images_rec.clear();
         bind_cache_lod_rec.clear();
         bind_cache_ranges_rec.clear();
@@ -4153,6 +4241,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             bind_cache_map_dep_rec = false;
             bind_rec_tex_seq = texture_cache.ImageChangeSeq();
             bind_rec_write_seq = write_stamps.Seq();
+            bind_rec_flag_seq = VideoCore::GpuFlagStamps().Seq(); // sotc: SOTC_BIND_CACHE_CONTENT
             bind_rec_map_epoch = MapEpoch();
             bind_rec_gpu_epoch = VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
             bind_cache_tail_rec = false;
@@ -4252,6 +4341,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
                 textures_done = BindHeapImages(*stage, heap_vs_binds);
                 SotcArch::TableMemo::NoteVertexBind(textures_done);
             }
+            // sotc: SOTC_BIND_CACHE_PACKET. The classic bind of a heap stage writes descriptors and records images that a
+            // hit does not replay as heap binds: such an op is not stored.
+            if (!textures_done && packet_heap_cache && bind_cache_recording &&
+                (stage == heap_stage || stage == heap_vs_stage)) {
+                bind_cache_uncacheable = true;
+            }
             if (!textures_done) {
                 BindTextures(*stage, binding, set, pr_stage ? resolved : nullptr, pr_stage);
             }
@@ -4330,6 +4425,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         }
     }
 
+    // sotc: SOTC_BIND_CACHE_PACKET=2. The would-be hit compared with this full bind (before the commit below).
+    if (pk_verify_ref) {
+        PacketVerify(*pk_verify_ref, first_bound_buffer);
+    }
     if (fast_eligible) {
         CommitFastBind(pipeline, fast_hash, uses_dma);
     }
@@ -4350,6 +4449,164 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
 
 // sotc: SOTC_SHADER_ADDR ordering (see GuestWrite in vk_rasterizer.h). A range is live while its tag is not older
 // than the runtime's flush generation: the barrier recorded after it orders it for every later op.
+// sotc: SOTC_BIND_CACHE_PACKET. The addressed ranges of a packet entry, recomputed from the op's own V#s (the key has
+// no base for them, BindResourceHash). Rewrites the entry's PacketAddr, its bind cache range and repair, and the
+// bounds of its ranges, as BindBuffers and CommitBindCacheFrame would have made them for this op. false: the shape
+// changed (a range appeared or vanished, or a recorded position is gone); the entry is not used.
+bool Rasterizer::PacketAddrRefresh(BindCacheEntry& entry) {
+    if (!entry.pipeline || entry.addr_src.size() != entry.addr.size()) {
+        return false; // every PacketAddr of the entry must have its source, or some range would stay the old one
+    }
+    const auto stages = entry.pipeline->GetStages();
+    for (const auto& src : entry.addr_src) {
+        const Shader::Info* st = src.stage < stages.size() ? stages[src.stage] : nullptr;
+        if (!st || src.desc >= st->buffers.size() || src.addr_index >= entry.addr.size()) {
+            return false;
+        }
+        const auto sharp = st->buffers[src.desc].GetSharp(*st);
+        const VAddr vbase = sharp.base_address;
+        const u32 vsize = sharp.GetSize();
+        // As BindBuffers: the clamp to the mapping, 0 when the base or the size is 0.
+        const u64 size = vbase != 0 && vsize != 0 ? memory->ClampRangeSize(vbase, vsize) : 0;
+        if ((size != 0) != (src.range_index != kNoIndex)) {
+            return false;
+        }
+        if (src.range_index != kNoIndex) {
+            if (src.range_index >= entry.ranges.size()) {
+                return false;
+            }
+            entry.ranges[src.range_index] = {vbase, size};
+        }
+        if (src.repair_index != kNoIndex) {
+            if (src.repair_index >= entry.repairs.size()) {
+                return false;
+            }
+            entry.repairs[src.repair_index] = {vbase, vsize, size, nullptr, 0, false};
+        }
+        entry.addr[src.addr_index] = {vbase, size, false};
+    }
+    // The bounds of what the entry reads (CommitBindCacheFrame makes them the same way).
+    VAddr lo = ~VAddr{0}, hi = 0;
+    for (const auto& [addr, len] : entry.ranges) {
+        lo = std::min(lo, addr);
+        hi = std::max(hi, addr + len);
+    }
+    for (const auto& img : entry.images) {
+        lo = std::min(lo, img.guest_lo);
+        hi = std::max(hi, img.guest_hi);
+    }
+    entry.lo = lo;
+    entry.hi = hi;
+    return true;
+}
+
+// sotc: SOTC_BIND_CACHE_PACKET=2. The full bind of a packet op, compared with the entry a hit would have replayed (its
+// addressed ranges already refreshed, PacketAddrRefresh). Called before the commit, which then keeps the full bind's
+// result. A category is a mismatch when the hit would have bound something the full bind did not, or the reverse.
+void Rasterizer::PacketVerify(const BindCacheEntry& ref, size_t first_bound_buffer) {
+    bool bad[SotcStats::PvCategories]{};
+    // Descriptor writes, as the compute verify compares them: the info index names the buffer or image info.
+    bad[SotcStats::PvWrites] = ref.writes.size() != set_writes.size() ||
+                               ref.write_sets.size() != set_write_sets.size() ||
+                               ref.write_info.size() != set_writes.size();
+    for (size_t i = 0; !bad[SotcStats::PvWrites] && i < set_writes.size(); ++i) {
+        const auto& a = ref.writes[i];
+        const auto& b = set_writes[i];
+        const u32 info = b.descriptorType == vk::DescriptorType::eStorageBuffer
+                             ? 0x80000000u | static_cast<u32>(b.pBufferInfo - buffer_infos.data())
+                             : static_cast<u32>(b.pImageInfo - image_infos.data());
+        bad[SotcStats::PvWrites] = a.dstBinding != b.dstBinding ||
+                                   a.dstArrayElement != b.dstArrayElement ||
+                                   a.descriptorCount != b.descriptorCount ||
+                                   a.descriptorType != b.descriptorType ||
+                                   ref.write_sets[i] != set_write_sets[i] ||
+                                   ref.write_info[i] != info;
+    }
+    // Buffer infos: the stream ring copies (flat buffers, LDS, the block table) sit at their own offset in each op.
+    const vk::Buffer stream = buffer_cache.GetStreamBuffer().Handle();
+    bad[SotcStats::PvBufInfo] = ref.buffer_infos.size() != buffer_infos.size();
+    for (size_t i = 0; !bad[SotcStats::PvBufInfo] && i < buffer_infos.size(); ++i) {
+        const auto& a = ref.buffer_infos[i];
+        const auto& b = buffer_infos[i];
+        bad[SotcStats::PvBufInfo] = a.buffer != b.buffer || a.range != b.range ||
+                                    (a.buffer != stream && a.offset != b.offset);
+    }
+    // sotc: classify each differing image info (categories in sotc_stats.h). A backing change is the case a hit now
+    // refuses (TryBindCacheFrame), so PvImgInfo counts only the differences a hit would replay.
+    bad[SotcStats::PvImgInfo] = ref.image_infos.size() != image_infos.size();
+    if (ref.image_infos.size() == image_infos.size()) {
+        for (size_t i = 0; i < image_infos.size(); ++i) {
+            const auto& a = ref.image_infos[i];
+            const auto& b = image_infos[i];
+            const VideoCore::ImageId id_a = i < ref.image_info_images.size() ? ref.image_info_images[i] : VideoCore::ImageId{};
+            const VideoCore::ImageId id_b = image_info_images[i];
+            if (a.imageView == b.imageView && a.sampler == b.sampler && a.imageLayout == b.imageLayout) {
+                continue;
+            }
+            if (id_a != id_b) {
+                bad[SotcStats::PvImgImage] = true;
+            } else if (a.sampler != b.sampler) {
+                bad[SotcStats::PvImgSampler] = true;
+            } else if (a.imageView != b.imageView) {
+                const void* ref_backing =
+                    i < ref.image_info_backings.size() ? ref.image_info_backings[i] : nullptr;
+                if (ref_backing != ImageInfoBacking(id_b, b.imageView)) {
+                    bad[SotcStats::PvImgBacking] = true;
+                } else {
+                    bad[SotcStats::PvImgView] = true;
+                }
+            } else {
+                bad[SotcStats::PvImgLayout] = true;
+            }
+        }
+    }
+    bad[SotcStats::PvImgInfo] = bad[SotcStats::PvImgInfo] || bad[SotcStats::PvImgImage] ||
+                                bad[SotcStats::PvImgSampler] || bad[SotcStats::PvImgView] ||
+                                bad[SotcStats::PvImgLayout];
+    // Push data, without the viewport words (a hit takes this op's own).
+    Shader::PushData ref_push = ref.push_data;
+    ref_push.xoffset = push_data.xoffset;
+    ref_push.yoffset = push_data.yoffset;
+    ref_push.xscale = push_data.xscale;
+    ref_push.yscale = push_data.yscale;
+    bad[SotcStats::PvPush] = std::memcmp(&ref_push, &push_data, sizeof(ref_push)) != 0;
+    // Addressed ranges: the replay touches these.
+    bad[SotcStats::PvAddr] = ref.addr.size() != packet_addr_rec.size();
+    for (size_t i = 0; !bad[SotcStats::PvAddr] && i < packet_addr_rec.size(); ++i) {
+        const auto& a = ref.addr[i];
+        const auto& b = packet_addr_rec[i];
+        bad[SotcStats::PvAddr] = a.addr != b.addr || a.size != b.size || a.written != b.written;
+    }
+    // Records: the buffers the bind bound, and the images it looked up.
+    const size_t nb = bound_buffers.size() - first_bound_buffer;
+    bad[SotcStats::PvBuffers] = ref.buffers.size() != nb;
+    for (size_t i = 0; !bad[SotcStats::PvBuffers] && i < nb; ++i) {
+        const auto& a = ref.buffers[i];
+        const auto& b = bound_buffers[first_bound_buffer + i];
+        bad[SotcStats::PvBuffers] = a.buffer != b.buffer || a.offset != b.offset || a.size != b.size ||
+                                    a.is_written != b.is_written || a.addr != b.addr;
+    }
+    bad[SotcStats::PvImages] = ref.images.size() != bind_cache_images_rec.size();
+    for (size_t i = 0; !bad[SotcStats::PvImages] && i < bind_cache_images_rec.size(); ++i) {
+        const auto& a = ref.images[i];
+        const auto& b = bind_cache_images_rec[i];
+        bad[SotcStats::PvImages] =
+            a.id != b.id || a.layout != b.layout || a.stages != b.stages || a.access != b.access ||
+            a.range.base.level != b.range.base.level || a.range.base.layer != b.range.base.layer ||
+            a.range.extent.levels != b.range.extent.levels ||
+            a.range.extent.layers != b.range.extent.layers || a.guest_lo != b.guest_lo ||
+            a.guest_hi != b.guest_hi || a.uid != b.uid;
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::pk_verify_checks.fetch_add(1, std::memory_order_relaxed);
+        for (u32 c = 0; c < SotcStats::PvCategories; ++c) {
+            if (bad[c]) {
+                SotcStats::pk_mismatch[c].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+}
+
 bool Rasterizer::GuestWriteOverlap(VAddr addr, u64 size) {
     const u64 gen = runtime.FlushGeneration();
     const VAddr end = addr + size;
@@ -4711,6 +4968,75 @@ void Rasterizer::BindCacheInvalidateImage(VideoCore::ImageId image_id) {
     const auto& info = texture_cache.GetImage(image_id).info;
     const VAddr lo = info.guest_address - info.sotc_dropped_bytes;
     BindCacheInvalidate(lo, info.guest_address + info.guest_size - lo, image_id);
+}
+
+void Rasterizer::BindCacheNoteMetaClear(VAddr addr, u64 size) {
+    // sotc: SOTC_BIND_CACHE_META. Why the cache needs nothing more than the entries reading this range: the dispatch
+    // that clears the surface is skipped (BindResources returns before any draw or copy), so no memory and no image
+    // changes; TextureCache::ClearMeta only sets the clear state of the surface and moves meta_epoch. Cached binds read
+    // neither (the clear state is read by the render target paths, TestAndTouchMeta / IsMetaCleared, and by RsMemo,
+    // which do not use the bind cache), and IsMeta, which they consult, depends on the registered surfaces only.
+    // The range invalidation is the same one a write of this range makes: it is conservative, and it keeps the
+    // result right should a clear ever write.
+    if (SotcStats::kFpsLog) {
+        SotcStats::meta_clear_narrowed.fetch_add(1, std::memory_order_relaxed);
+        const VAddr end = addr + size;
+        const auto reads = [&](const BindCacheEntry& e) {
+            if (size == 0) {
+                return false;
+            }
+            for (const auto& [lo, len] : e.ranges) {
+                if (lo < end && addr < lo + len) {
+                    return true;
+                }
+            }
+            for (const auto& img : e.images) {
+                if (img.guest_lo < end && addr < img.guest_hi) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        u64 live = 0, killed = 0;
+        if (SotcStats::kBindCacheFrame) {
+            for (const auto& e : frame_cache) {
+                if (e.valid && e.flush_gen == bind_cache_flush_gen) {
+                    ++live;
+                    killed += reads(e);
+                }
+            }
+        } else {
+            for (const auto& e : bind_cache) {
+                if (e.valid) {
+                    ++live;
+                    killed += reads(e);
+                }
+            }
+        }
+        if (live) { // a flush would have emptied a non-empty cache
+            SotcStats::meta_clear_flushes_avoided.fetch_add(1, std::memory_order_relaxed);
+        }
+        SotcStats::meta_clear_entries_killed.fetch_add(killed, std::memory_order_relaxed);
+    }
+    BindCacheInvalidate(addr, size);
+}
+
+const void* Rasterizer::ImageInfoBacking(VideoCore::ImageId id, vk::ImageView view) {
+    if (!id) {
+        return nullptr;
+    }
+    auto& image = texture_cache.GetImage(id);
+    if (image.backing_images.size() == 1) {
+        return image.backing; // the only backing: the view can only be its own
+    }
+    for (const auto& backing : image.backing_images) {
+        for (const auto view_id : backing.image_view_ids) {
+            if (*texture_cache.GetImageView(view_id).image_view == view) {
+                return &backing;
+            }
+        }
+    }
+    return nullptr;
 }
 
 void Rasterizer::BindCacheNoteWrite(VAddr addr, u64 size) {
@@ -5190,21 +5516,47 @@ bool BindCacheStampsOk(const VideoCore::RangeStamps& writes,
                        const std::array<std::atomic<u64>, 4096>& image_stamps,
                        const VideoCore::TextureCache& textures, const Ranges& ranges,
                        const Images& images, const std::vector<std::pair<VAddr, VAddr>>& tex_watch,
-                       u64& checked_write, u64& checked_tex, u32& reason) {
+                       u64& checked_write, u64& checked_tex, u32& reason, int content,
+                       u64& checked_flag, bool& kept, bool& hold) {
+    // sotc: SOTC_BIND_CACHE_CONTENT. Today's rule (content 0): a GPU write to a range or image the entry reads refuses
+    // it. Content 1 and 2: a write refuses only when it changed the GPU-modified state of an image over one of the
+    // entry's lookup ranges (VideoCore::GpuFlagStamps: FindImage's mip-tail choice reads it). Any other write keeps the
+    // entry; its hit replays the image transitions and buffer barriers as it always did. Content 2 keeps today's
+    // decision: a write that today's rule refuses holds the entry (no checkpoint moves) for the full bind's comparison.
+    kept = false;
+    hold = false;
     // The checkpoint is the sequence number read before the stamps: an event published while
     // looking is newer than it and is found by the next check.
     const u64 write_seq = writes.Seq();
+    bool old_write = false; // today's rule: a write over a range or image the entry reads
     if (write_seq != checked_write) {
         for (const auto& [addr, size] : ranges) {
             if (writes.ChangedSince(addr, addr + size, checked_write)) {
-                reason = SotcStats::BfWrites;
-                return false;
+                old_write = true;
+                break;
             }
         }
         for (const auto& img : images) {
-            if (image_stamps[img.id.index % 4096].load(std::memory_order_relaxed) >
-                    checked_write ||
+            if (old_write) {
+                break;
+            }
+            if (image_stamps[img.id.index % 4096].load(std::memory_order_relaxed) > checked_write ||
                 writes.ChangedSince(img.guest_lo, img.guest_hi, checked_write)) {
+                old_write = true;
+            }
+        }
+    }
+    if (content == 0 && old_write) {
+        reason = SotcStats::BfWrites;
+        return false;
+    }
+    const u64 flag_seq = VideoCore::GpuFlagStamps().Seq();
+    if (content != 0 && flag_seq != checked_flag) {
+        for (const auto& [lo, hi] : tex_watch) {
+            if (VideoCore::GpuFlagStamps().ChangedSince(lo, hi, checked_flag)) {
+                if (SotcStats::kFpsLog) {
+                    SotcStats::bc_refused[SotcStats::CrFlag].fetch_add(1, std::memory_order_relaxed);
+                }
                 reason = SotcStats::BfWrites;
                 return false;
             }
@@ -5219,8 +5571,23 @@ bool BindCacheStampsOk(const VideoCore::RangeStamps& writes,
             }
         }
     }
+    // Only after the other checks: a held entry is one the content rule would otherwise keep.
+    if (old_write) {
+        kept = true;
+        if (content == 2) {
+            hold = true;
+            if (SotcStats::kFpsLog) {
+                SotcStats::bc_refused[SotcStats::CrHold].fetch_add(1, std::memory_order_relaxed);
+            }
+            reason = SotcStats::BfWrites;
+            return false;
+        }
+    }
     checked_write = write_seq;
     checked_tex = tex_seq;
+    if (content != 0) {
+        checked_flag = flag_seq;
+    }
     return true;
 }
 } // namespace
@@ -5230,14 +5597,22 @@ bool Rasterizer::BindCacheStampsFresh(BindCacheEntry& entry, u32& reason) {
         reason = SotcStats::BfMapping;
         return false;
     }
-    if (entry.tail_dependent &&
+    // sotc: SOTC_BIND_CACHE_CONTENT. A mip-tail entry's dependence on the GPU-modified state is checked over its lookup
+    // ranges (BindCacheStampsOk), not by the epoch that every first GPU write moves.
+    const int content = SotcStats::kBindCacheContent;
+    if (content == 0 && entry.tail_dependent &&
         entry.gpu_epoch != VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed)) {
         reason = SotcStats::BfImages;
         return false;
     }
-    return BindCacheStampsOk(write_stamps, write_image_stamps, texture_cache, entry.ranges,
-                             entry.images, entry.tex_watch, entry.checked_write_seq,
-                             entry.checked_tex_seq, reason);
+    bool kept = false, hold = false;
+    const bool ok = BindCacheStampsOk(write_stamps, write_image_stamps, texture_cache, entry.ranges,
+                                      entry.images, entry.tex_watch, entry.checked_write_seq,
+                                      entry.checked_tex_seq, reason, content,
+                                      entry.checked_flag_seq, kept, hold);
+    bind_cache_kept_write |= kept;
+    bind_cache_hold |= hold;
+    return ok;
 }
 
 bool Rasterizer::BindCacheEntryFresh(BindCacheEntry& entry, u32& reason) {
@@ -5346,15 +5721,32 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
             SotcStats::bf_distinct_keys.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    bind_cache_kept_write = false; // sotc: SOTC_BIND_CACHE_CONTENT, per lookup
+    bind_cache_hold = false;
+    bind_cache_verify_pending = false;
     BindCacheEntry* entry = BindCacheFindFrame(lookup_key, pipeline, hash, targets_key);
     const auto miss = [&](u32 reason) {
         if (stats) {
             SotcStats::bf_miss[reason].fetch_add(1, std::memory_order_relaxed);
+            if (SotcStats::kBindCachePacket && pipeline->HasPacketRange()) { // sotc: SOTC_BIND_CACHE_PACKET
+                SotcStats::pk_miss[reason].fetch_add(1, std::memory_order_relaxed);
+            }
         }
         return false;
     };
     // The entry is found and no longer valid: dropped, the full bind makes a new one.
     const auto stale = [&](u32 reason) {
+        // sotc: SOTC_BIND_CACHE_CONTENT=2. Today's rule drops the entry for a write the content rule keeps: it is held
+        // instead (the full bind follows and CommitBindCacheFrame compares its result with the held entry).
+        if (bind_cache_hold) {
+            bind_cache_hold = false;
+            bind_cache_verify_pending = true;
+            bind_cache_verify_index = static_cast<size_t>(entry - frame_cache.data());
+            if (stats) {
+                SotcStats::bc_kept.fetch_add(1, std::memory_order_relaxed);
+            }
+            return miss(reason);
+        }
         BindCacheDropFrame(*entry, reason);
         return miss(reason);
     };
@@ -5422,6 +5814,14 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
                 }
             }
         }
+    }
+    // sotc: SOTC_BIND_CACHE_PACKET. The addressed ranges of a packet entry are this op's: the key left their base out, so
+    // they are recomputed from the op's V#s before any check or replay below (PacketAddrRefresh).
+    if (entry->packet && SotcStats::kBindCachePacket != 0 && !PacketAddrRefresh(*entry)) {
+        if (stats) {
+            SotcStats::pk_miss[SotcStats::PkAddrShape].fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
     }
     u64 current_tick = scheduler.CurrentTick();
     bool replay = entry->stamp_tick != current_tick;
@@ -5528,6 +5928,19 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
                 return refuse(false, SotcStats::RfImage);
             }
         }
+        // sotc: SOTC_BIND_CACHE_PACKET=2 found image info mismatches of this kind: SetBackingSamples swaps an image's
+        // backing without a new uid, and the entry's descriptors name the view of the backing it was made with. A hit
+        // would bind that view (and the old memory) where the full bind names the current backing's view: refused.
+        if (entry->image_info_backings.size() != entry->image_info_images.size()) {
+            return refuse(false, SotcStats::RfImage);
+        }
+        for (size_t i = 0; i < entry->image_info_images.size(); ++i) {
+            const VideoCore::ImageId id = entry->image_info_images[i];
+            if (id && static_cast<const void*>(texture_cache.GetImage(id).backing) !=
+                          entry->image_info_backings[i]) {
+                return refuse(false, SotcStats::RfImage);
+            }
+        }
         // The side effects of BindTextures' second pass: bound for this draw (BeginRendering's
         // feedback test, ResetBindings), and in the layout the descriptors name, with a barrier
         // when another command changed it since.
@@ -5617,6 +6030,9 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
     }
     if (stats) {
         SotcStats::bind_cache_hits.fetch_add(1, std::memory_order_relaxed);
+        if (bind_cache_kept_write) { // sotc: SOTC_BIND_CACHE_CONTENT, a hit kept across a GPU write
+            SotcStats::bc_kept.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     // sotc: SOTC_PACKET. The hit's addressed ranges are this op's: CommitFastBind keeps them for the fast binds.
     packet_addr_rec.assign(entry->addr.begin(), entry->addr.end());
@@ -5659,17 +6075,23 @@ void Rasterizer::CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool u
     // (including what this very bind did, e.g. creating an image) is not trusted.
     u64 checked_write = bind_rec_write_seq;
     u64 checked_tex = bind_rec_tex_seq;
-    if (u32 reason; (bind_cache_map_dep_rec && bind_rec_map_epoch != MapEpoch()) ||
-                    (bind_cache_tail_rec &&
-                     bind_rec_gpu_epoch !=
-                         VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed)) ||
-                    !BindCacheStampsOk(write_stamps, write_image_stamps, texture_cache,
-                                       bind_cache_ranges_rec, bind_cache_images_rec, tex_watch,
-                                       checked_write, checked_tex, reason)) {
-        if (SotcStats::kFpsLog) {
-            SotcStats::bf_not_stored_moved.fetch_add(1, std::memory_order_relaxed);
-        }
-        return;
+    u64 checked_flag = bind_rec_flag_seq;
+    // sotc: SOTC_BIND_CACHE_CONTENT. Mode 2 stores what mode 0 stores (its rule decides here); mode 1 stores by the
+    // content rule. The verification below is independent of the store decision.
+    const int content = SotcStats::kBindCacheContent;
+    const int rule = content == 2 ? 0 : content;
+    bool kept = false, hold = false;
+    u32 reason = 0;
+    bool stored = !(bind_cache_map_dep_rec && bind_rec_map_epoch != MapEpoch());
+    if (stored && rule == 0) {
+        stored = !(bind_cache_tail_rec &&
+                   bind_rec_gpu_epoch != VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed));
+    }
+    if (stored) {
+        stored = BindCacheStampsOk(write_stamps, write_image_stamps, texture_cache,
+                                   bind_cache_ranges_rec, bind_cache_images_rec, tex_watch,
+                                   checked_write, checked_tex, reason, rule, checked_flag, kept,
+                                   hold);
     }
     const u64 key = BindCacheFrameKey(pipeline, hash, state.targets_key);
     const size_t base = static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> 52);
@@ -5702,6 +6124,33 @@ void Rasterizer::CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool u
             occupied = true;
             best_score = score;
         }
+    }
+    // sotc: SOTC_BIND_CACHE_CONTENT=2. The full bind that a held lookup led here is compared with the entry that lookup
+    // held (same key, same slot), unless the result moved over its tex watch during the bind.
+    const bool verify = content == 2 && bind_cache_verify_pending &&
+                        chosen == bind_cache_verify_index && frame_keys[chosen] == key;
+    bind_cache_verify_pending = false;
+    if (verify) {
+        bool moved = false;
+        for (const auto& [lo, hi] : tex_watch) {
+            if (VideoCore::GpuFlagStamps().ChangedSince(lo, hi, bind_rec_flag_seq)) {
+                moved = true;
+                break;
+            }
+        }
+        if (moved) {
+            if (SotcStats::kFpsLog) {
+                SotcStats::bc_skipped_moved.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            BindCacheVerify(frame_cache[chosen], first_bound_buffer);
+        }
+    }
+    if (!stored) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::bf_not_stored_moved.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
     }
     auto* entry = &frame_cache[chosen];
     if (occupied) {
@@ -5743,11 +6192,19 @@ void Rasterizer::CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool u
     entry->repairs.assign(bind_cache_repairs_rec.begin(), bind_cache_repairs_rec.end());
     entry->samplers.assign(bind_cache_samplers_rec.begin(), bind_cache_samplers_rec.end());
     entry->tex_watch.assign(tex_watch.begin(), tex_watch.end());
+    // sotc: SOTC_BIND_CACHE_PACKET. The backing each image info's view belongs to (a hit checks it).
+    entry->image_info_backings.resize(image_infos.size());
+    for (size_t i = 0; i < image_infos.size(); ++i) {
+        entry->image_info_backings[i] =
+            ImageInfoBacking(image_info_images[i], image_infos[i].imageView);
+    }
     // sotc: SOTC_PACKET. A packet op's hit refreshes the packet words (flat_slots, or these two when there are none)
     // and replays its addressed ranges (TryBindCacheFrame).
     entry->packet = pipeline->HasPacketRange();
     entry->packet_flat = {draw_packet.flatbuf_address, draw_packet.flatbuf_fragment_address};
     entry->addr.assign(packet_addr_rec.begin(), packet_addr_rec.end());
+    // sotc: SOTC_BIND_CACHE_PACKET: where each of them came from (PacketAddrRefresh on a hit of another base).
+    entry->addr_src.assign(packet_addr_src_rec.begin(), packet_addr_src_rec.end());
     entry->made_tick = state.tick;
     entry->stamp_tick = state.tick; // the full bind just made this tick's stamps
     entry->stamp_epoch = 0;         // block stamps due at the first hit
@@ -5769,12 +6226,131 @@ void Rasterizer::CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool u
     entry->gpu_epoch = bind_rec_gpu_epoch;
     entry->checked_write_seq = checked_write;
     entry->checked_tex_seq = checked_tex;
+    entry->checked_flag_seq = checked_flag; // sotc: SOTC_BIND_CACHE_CONTENT
     entry->made_frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
     entry->valid = true;
     frame_keys[chosen] = key;
     if (SotcStats::kFpsLog) {
         SotcStats::bf_stored.fetch_add(1, std::memory_order_relaxed);
         SotcStats::bf_live.store(bind_cache_live, std::memory_order_relaxed);
+    }
+}
+
+void Rasterizer::BindCacheVerify(const BindCacheEntry& old, size_t first_bound_buffer) {
+    // sotc: SOTC_BIND_CACHE_CONTENT=2. The full bind's records and descriptors (still in the members and records the
+    // commit reads) against the entry a hit would have replayed: kept by the content rule, held here. Counted by
+    // category; nothing is changed.
+    u32 diffs = 0;
+    const auto diff = [&](SotcStats::BindContentDiff cat) { diffs |= 1u << cat; };
+    // Descriptors: the buffer and image infos, the image each one came from, the set writes that name them.
+    if (buffer_infos.size() != old.buffer_infos.size() ||
+        image_infos.size() != old.image_infos.size() || set_writes.size() != old.writes.size() ||
+        old.write_info.size() != old.writes.size() || image_info_images.size() < image_infos.size()) {
+        diff(SotcStats::CdDescriptors);
+    } else {
+        // The stream ring copies (flat buffers, LDS, the block table) sit at their own offset in each op, as in
+        // PacketVerify: a hit re-copies them, so only their buffer and range must match.
+        const vk::Buffer stream = buffer_cache.GetStreamBuffer().Handle();
+        for (size_t i = 0; i < buffer_infos.size(); ++i) {
+            const auto& a = buffer_infos[i];
+            const auto& b = old.buffer_infos[i];
+            if (a.buffer != b.buffer || (a.buffer != stream && a.offset != b.offset) || a.range != b.range) {
+                diff(SotcStats::CdDescriptors);
+                break;
+            }
+        }
+        for (size_t i = 0; i < image_infos.size(); ++i) {
+            const auto& a = image_infos[i];
+            const auto& b = old.image_infos[i];
+            if (a.sampler != b.sampler || a.imageView != b.imageView ||
+                a.imageLayout != b.imageLayout || image_info_images[i] != old.image_info_images[i]) {
+                diff(SotcStats::CdDescriptors);
+                break;
+            }
+        }
+        for (size_t i = 0; i < set_writes.size(); ++i) {
+            const auto& w = set_writes[i];
+            const auto& o = old.writes[i];
+            const u32 info =
+                w.descriptorType == vk::DescriptorType::eStorageBuffer
+                    ? 0x80000000u | static_cast<u32>(w.pBufferInfo - buffer_infos.data())
+                    : static_cast<u32>(w.pImageInfo - image_infos.data());
+            if (w.dstBinding != o.dstBinding || w.descriptorType != o.descriptorType ||
+                w.descriptorCount != o.descriptorCount || info != old.write_info[i]) {
+                diff(SotcStats::CdDescriptors);
+                break;
+            }
+        }
+    }
+    if (std::memcmp(&push_data, &old.push_data, sizeof(push_data)) != 0) {
+        diff(SotcStats::CdPush);
+    }
+    // Bound buffer records: the ranges and their barrier flags, as the hit replays them.
+    const size_t num_buffers = bound_buffers.size() - first_bound_buffer;
+    if (num_buffers != old.buffers.size()) {
+        diff(SotcStats::CdBuffers);
+    } else {
+        for (size_t i = 0; i < num_buffers; ++i) {
+            const auto& a = bound_buffers[first_bound_buffer + i];
+            const auto& b = old.buffers[i];
+            if (a.buffer != b.buffer || a.offset != b.offset || a.size != b.size ||
+                a.is_written != b.is_written || a.addr != b.addr) {
+                diff(SotcStats::CdBuffers);
+                break;
+            }
+        }
+    }
+    // Image records: the layout, stages, access and range each image is transited to, and its identity.
+    if (bind_cache_images_rec.size() != old.images.size()) {
+        diff(SotcStats::CdImages);
+    } else {
+        for (size_t i = 0; i < old.images.size(); ++i) {
+            const auto& a = bind_cache_images_rec[i];
+            const auto& b = old.images[i];
+            if (a.id != b.id || a.layout != b.layout || a.stages != b.stages ||
+                a.access != b.access || a.uid != b.uid || a.guest_lo != b.guest_lo ||
+                a.guest_hi != b.guest_hi || std::memcmp(&a.range, &b.range, sizeof(a.range)) != 0) {
+                diff(SotcStats::CdImages);
+                break;
+            }
+        }
+    }
+    // The other records a hit replays: LOD banks, samplers, bindless heap references.
+    if (bind_cache_lod_rec != old.lod_banks) {
+        diff(SotcStats::CdOther);
+    }
+    if (bind_cache_samplers_rec.size() != old.samplers.size()) {
+        diff(SotcStats::CdOther);
+    } else {
+        for (size_t i = 0; i < old.samplers.size(); ++i) {
+            const auto& a = bind_cache_samplers_rec[i];
+            const auto& b = old.samplers[i];
+            if (a.handle != b.handle || a.slot != b.slot || a.is_depth != b.is_depth) {
+                diff(SotcStats::CdOther);
+                break;
+            }
+        }
+    }
+    if (bind_bindless_rec.size() != old.bindless_refs.size() ||
+        bind_bindless_gen != old.bindless_gen) {
+        diff(SotcStats::CdOther);
+    }
+    // The watched ranges: they decide what later writes refuse, not what the bind is.
+    if (bind_cache_ranges_rec.size() != old.ranges.size() ||
+        !std::equal(bind_cache_ranges_rec.begin(), bind_cache_ranges_rec.end(), old.ranges.begin()) ||
+        bind_cache_tex_watch_rec != old.tex_watch) {
+        diff(SotcStats::CdRanges);
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::bc_verified.fetch_add(1, std::memory_order_relaxed);
+        if (diffs) {
+            SotcStats::bc_diff_binds.fetch_add(1, std::memory_order_relaxed);
+        }
+        for (u32 c = 0; c < SotcStats::CdCats; ++c) {
+            if (diffs & (1u << c)) {
+                SotcStats::bc_diff[c].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
 }
 
@@ -6322,7 +6898,7 @@ void Rasterizer::SotcMirrorToBuffer(VAddr addr, u64 size) {
                          vk::AccessFlagBits2::eTransferWrite);
 }
 
-bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
+bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline, VAddr* clear_addr, u64* clear_size) {
     if (!pipeline->IsCompute()) {
         return false;
     }
@@ -6361,6 +6937,10 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
             if (!desc.IsSpecial() && desc.is_written && texture_cache.ClearMeta(address)) {
                 // Assume all slices were updates
                 LOG_TRACE(Render_Vulkan, "Metadata update skipped");
+                if (clear_addr && clear_size) { // sotc: SOTC_BIND_CACHE_META, the range the dispatch would have written
+                    *clear_addr = address;
+                    *clear_size = desc.GetSharp(info).GetSize();
+                }
                 return true;
             }
         }
@@ -6887,6 +7467,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (bind_cache_recording && SotcStats::kBindCacheXtick) {
                     // The mapping under the range is checked at each hit (mapping_changed), as for a descriptor.
                     bind_cache_repairs_rec.push_back({vbase, vsize, size, nullptr, 0, false});
+                }
+                // sotc: SOTC_BIND_CACHE_PACKET. Where this PacketAddr's range and repair are, so a hit of an entry
+                // made with the base out of its key rewrites them (PacketAddrRefresh). A written one is never cached.
+                if (bind_cache_recording && SotcStats::kBindCachePacket != 0 && !desc.is_written) {
+                    packet_addr_src_rec.push_back(
+                        {cur_bind_stage, buf_index, static_cast<u32>(packet_addr_rec.size() - 1),
+                         size != 0 ? static_cast<u32>(bind_cache_ranges_rec.size() - 1) : kNoIndex,
+                         SotcStats::kBindCacheXtick ? static_cast<u32>(bind_cache_repairs_rec.size() - 1)
+                                                    : kNoIndex});
                 }
                 if (desc.is_written) {
                     Passes::NoteWrite(); // sotc: SOTC_PASSES: a write the pass rule must see
@@ -7676,8 +8265,10 @@ static bool TransitSettled(const VideoCore::Image& image, vk::ImageLayout layout
 // feedback loop, ResetBindings clears it through bound_images), the transition (its barrier), the texture usage bit.
 // Not made, as the heap stage has none of it: descriptors, storage images (HeapStaticRefusal), samplers (the table
 // holds their heap indices), the bind cache and the texture block records (a heap op takes neither).
-bool Rasterizer::BindHeapImages(const Shader::Info& stage, const SotcArch::TableMemo::TableBinds& binds) {
-    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass, as BindTextures
+// sotc: SOTC_BIND_CACHE_PACKET. The decision of BindHeapImages, separated so that a cache hit can take it before it
+// binds anything: 0 the table's images are bound here, else the reason of the classic bind (the same codes as
+// NoteBindClassic). Reads the images: the caller holds the texture cache lock.
+u32 Rasterizer::HeapDeclineReason(const Shader::Info& stage, const SotcArch::TableMemo::TableBinds& binds) {
     // Decided before anything changes: the cases the classic bind handles with its own transitions.
     for (u32 i = 0; i < binds.count; ++i) {
         if (!binds.image[i]) {
@@ -7685,18 +8276,15 @@ bool Rasterizer::BindHeapImages(const Shader::Info& stage, const SotcArch::Table
         }
         const auto& image = texture_cache.GetImage(binds.image[i]);
         if (image.binding.needs_rebind) {
-            SotcArch::TableMemo::NoteBindClassic(3);
-            return false;
+            return 3;
         }
         // A render target of this draw, or an image forced to general: the feedback loop (classic second pass).
         if (image.binding.is_target || image.binding.force_general) {
-            SotcArch::TableMemo::NoteBindClassic(1);
-            return false;
+            return 1;
         }
         // A stencil image: its transition depends on the draw's depth registers (DepthSampledAsAttachment).
         if (image.info.props.has_stencil) {
-            SotcArch::TableMemo::NoteBindClassic(2);
-            return false;
+            return 2;
         }
     }
     // sotc: SOTC_HEAP_COMPOSITE_OP. The composite draws (hudless capture, DLSS composite, the probe) run their side
@@ -7705,9 +8293,17 @@ bool Rasterizer::BindHeapImages(const Shader::Info& stage, const SotcArch::Table
     if (SotcArch::Heap::CompositeOpOn()) {
         const CompositeKinds composite = CompositeOf(stage, binds.image.data(), binds.count, cb_descs[0].first);
         if (composite.hudless || composite.dlss || composite.probe) {
-            SotcArch::TableMemo::NoteBindClassic(4);
-            return false;
+            return 4;
         }
+    }
+    return 0;
+}
+
+bool Rasterizer::BindHeapImages(const Shader::Info& stage, const SotcArch::TableMemo::TableBinds& binds) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass, as BindTextures
+    if (const u32 reason = HeapDeclineReason(stage, binds)) {
+        SotcArch::TableMemo::NoteBindClassic(reason);
+        return false;
     }
     for (u32 i = 0; i < binds.count; ++i) {
         if (!binds.image[i]) {

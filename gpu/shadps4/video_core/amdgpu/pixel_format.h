@@ -10,6 +10,13 @@
 
 namespace AmdGpu {
 
+// sotc: guest descriptors (V#, T#, S#, MTBUF) can carry field combinations the hardware format
+// table does not define. Instead of aborting the translation, the caller substitutes a fallback
+// and reports it here. Logs once per (site, a, b) and then at each power-of-two hit count, so a
+// run shows which fallbacks fired. Thread-safe; numeric values only (NameOf() asserts on unknown
+// values).
+void ReportFormatFallback(std::string_view site, u32 a, u32 b);
+
 // Table 8.13 Data and Image Formats [Sea Islands Series Instruction Set Architecture]
 enum class DataFormat : u32 {
     FormatInvalid = 0,
@@ -171,7 +178,10 @@ private:
         case CompSwizzle::Alpha:
             return data[3];
         default:
-            UNREACHABLE();
+            // sotc: DST_SEL 2 and 3 are reserved encodings. Read them as SEL_0, the value an
+            // all-zero selector gives.
+            ReportFormatFallback("dst_sel reserved", u32(swizzle), 0);
+            return T(0);
         }
     }
 
@@ -356,7 +366,10 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            // sotc: SNORM_NZ is only defined for the 8- and 16-bit formats. Elsewhere, no
+            // conversion: the value stays the plain integer the Sint remap of the number format gives.
+            ReportFormatFallback("snorm_nz conversion", u32(data_fmt), u32(num_fmt));
+            return NumberConversion::None;
         }
     }
     default:

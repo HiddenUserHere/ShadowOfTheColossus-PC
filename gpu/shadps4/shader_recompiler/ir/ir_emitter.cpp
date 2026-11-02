@@ -9,6 +9,7 @@
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/opcodes.h"
 #include "shader_recompiler/ir/value.h"
+#include "video_core/amdgpu/pixel_format.h"
 
 namespace Shader::IR {
 namespace {
@@ -974,7 +975,10 @@ U32 IREmitter::Pack4x8(const AmdGpu::NumberFormat number_format, const Value& ve
     case AmdGpu::NumberFormat::Sint:
         return Inst<U32>(Opcode::PackSint4x8, vector);
     default:
-        UNREACHABLE_MSG("Unsupported 4x8 number format: {}", number_format);
+        // sotc: 8-bit formats with a Float number format (reachable from V#/MTBUF). Pass the
+        // bits through as Uint, the same rule RemapNumberFormat applies to Format8.
+        AmdGpu::ReportFormatFallback("pack 4x8 number format", u32(number_format), 0);
+        return Inst<U32>(Opcode::PackUint4x8, vector);
     }
 }
 
@@ -989,7 +993,9 @@ Value IREmitter::Unpack4x8(const AmdGpu::NumberFormat number_format, const U32& 
     case AmdGpu::NumberFormat::Sint:
         return Inst(Opcode::UnpackSint4x8, value);
     default:
-        UNREACHABLE_MSG("Unsupported 4x8 number format: {}", number_format);
+        // sotc: see Pack4x8. Float on 8-bit formats reads the bits as Uint.
+        AmdGpu::ReportFormatFallback("unpack 4x8 number format", u32(number_format), 0);
+        return Inst(Opcode::UnpackUint4x8, value);
     }
 }
 
@@ -998,7 +1004,10 @@ U32 IREmitter::Pack10_11_11(const AmdGpu::NumberFormat number_format, const Valu
     case AmdGpu::NumberFormat::Float:
         return Inst<U32>(Opcode::PackUfloat10_11_11, vector);
     default:
-        UNREACHABLE_MSG("Unsupported 10_11_11 number format: {}", number_format);
+        // sotc: 10_11_11 is only defined as float (reachable from V#/MTBUF with an integer or
+        // normalized number format). Use its only interpretation.
+        AmdGpu::ReportFormatFallback("pack 10_11_11 number format", u32(number_format), 0);
+        return Inst<U32>(Opcode::PackUfloat10_11_11, vector);
     }
 }
 
@@ -1013,7 +1022,10 @@ U32 IREmitter::Pack2_10_10_10(const AmdGpu::NumberFormat number_format, const Va
     case AmdGpu::NumberFormat::Sint:
         return Inst<U32>(Opcode::PackSint2_10_10_10, vector);
     default:
-        UNREACHABLE_MSG("Unsupported 2_10_10_10 number format: {}", number_format);
+        // sotc: 2_10_10_10 has no Float number format (reachable from V#/MTBUF). Pass the bits
+        // through as Uint.
+        AmdGpu::ReportFormatFallback("pack 2_10_10_10 number format", u32(number_format), 0);
+        return Inst<U32>(Opcode::PackUint2_10_10_10, vector);
     }
 }
 
@@ -1028,7 +1040,9 @@ Value IREmitter::Unpack2_10_10_10(const AmdGpu::NumberFormat number_format, cons
     case AmdGpu::NumberFormat::Sint:
         return Inst(Opcode::UnpackSint2_10_10_10, value);
     default:
-        UNREACHABLE_MSG("Unsupported 2_10_10_10 number format: {}", number_format);
+        // sotc: see Pack2_10_10_10. Float reads the bits as Uint.
+        AmdGpu::ReportFormatFallback("unpack 2_10_10_10 number format", u32(number_format), 0);
+        return Inst(Opcode::UnpackUint2_10_10_10, value);
     }
 }
 
@@ -1037,7 +1051,9 @@ Value IREmitter::Unpack10_11_11(const AmdGpu::NumberFormat number_format, const 
     case AmdGpu::NumberFormat::Float:
         return Inst(Opcode::UnpackUfloat10_11_11, value);
     default:
-        UNREACHABLE_MSG("Unsupported 10_11_11 number format: {}", number_format);
+        // sotc: see Pack10_11_11.
+        AmdGpu::ReportFormatFallback("unpack 10_11_11 number format", u32(number_format), 0);
+        return Inst(Opcode::UnpackUfloat10_11_11, value);
     }
 }
 

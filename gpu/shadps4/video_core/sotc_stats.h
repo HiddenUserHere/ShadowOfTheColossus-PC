@@ -124,6 +124,19 @@ inline const bool kBindCacheRanges = [] {
 /// sotc: SOTC_BIND_CACHE_RANGES counters (SOTC_FPS only): entries dropped by written ranges, and
 /// the writes checked against a non-empty cache.
 inline std::atomic<uint64_t> bind_cache_range_entries{0}, bind_cache_range_writes{0};
+/// sotc: SOTC_BIND_CACHE_META (default 1, needs SOTC_BIND_CACHE_RANGES; 0: a metadata clear flushes the whole cache as
+/// before). A metadata clear that the bind path skips writes no memory and changes no image; it only moves the clear
+/// state of a surface (TextureCache::ClearMeta), which no cached bind reads. The cache is therefore left alone except
+/// for the binds reading the cleared surface's own range (Rasterizer::BindCacheNoteMetaClear).
+inline const bool kBindCacheMeta = [] {
+    const char* v = std::getenv("SOTC_BIND_CACHE_META");
+    return !v || v[0] != '0';
+}();
+/// sotc: SOTC_BIND_CACHE_META counters (SOTC_FPS only): metadata clears narrowed, the ones that would have flushed a
+/// non-empty cache (flushes avoided), and the entries that read the cleared range (entries killed, counted by
+/// overlap; in the frame cache they are refused by their stamps on the next lookup).
+inline std::atomic<uint64_t> meta_clear_narrowed{0}, meta_clear_flushes_avoided{0},
+    meta_clear_entries_killed{0};
 /// sotc: SOTC_OP_COMPUTE_BIND (default 0; needs SOTC_BIND_CACHE, _RANGES, _XTICK and _FRAME, read
 /// here on their own, not from the other inline flags). 1: a read-only dispatch (no written buffer,
 /// no storage image, no DMA pointer, no shared memory) takes the frame bind cache as a read-only
@@ -238,6 +251,76 @@ inline std::atomic<uint64_t> bf_memo_hits{0}, bf_memo_misses{0}, bf_memo_repaire
 /// hold a frame's worth?), and the entries live in the table.
 inline std::atomic<uint64_t> bf_flat_copied{0}, bf_flat_reused{0}, bf_distinct_keys{0},
     bf_frames{0}, bf_live{0};
+/// sotc: SOTC_BIND_CACHE_PACKET (default 0; needs SOTC_BIND_CACHE, _RANGES, _XTICK and _FRAME, read here on their own).
+/// 1: the packet ops of heap pipelines (profile heap_images 1) take the frame bind cache too: a hit re-resolves nothing
+/// of the heap table (Rasterizer::BindResources resolves it before the lookup) but binds the heap images and the heap
+/// block of the op; and the key of a packet op leaves out the base address of its shader-addressed V#s, a hit
+/// refreshes their ranges from the op's own V#s (Rasterizer::PacketAddrRefresh). 2 (verify): the same, but a would-be
+/// hit is never taken: the full bind runs and its result is compared with the entry (Rasterizer::PacketVerify).
+/// Unset or 0: unchanged.
+inline const int kBindCachePacket = [] {
+    const auto on = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && v[0] == '1';
+    };
+    if (!(on("SOTC_BIND_CACHE") && on("SOTC_BIND_CACHE_RANGES") && on("SOTC_BIND_CACHE_XTICK") &&
+          on("SOTC_BIND_CACHE_FRAME"))) {
+        return 0;
+    }
+    const char* v = std::getenv("SOTC_BIND_CACHE_PACKET");
+    return v && v[0] == '2' ? 2 : (v && v[0] == '1' ? 1 : 0);
+}();
+/// sotc: SOTC_BIND_CACHE_CONTENT (default 0; needs the SOTC_BIND_CACHE_FRAME switches, read here on their own). 0: a GPU
+/// write to a range or image an entry reads drops it (today's rule). 1: a GPU write drops an entry only when it changes the
+/// GPU-modified state of an image over one of the entry's lookup ranges (what FindImage's mip-tail choice reads, see
+/// VideoCore::GpuFlagStamps); the other writes change no bind result, and a hit replays the image transitions and buffer
+/// barriers as it always did. 2 (verify): today's rule decides every bind: a would-be hit is not taken, the entry is held
+/// for the comparison, and the full bind's result is compared with it (Rasterizer::BindCacheVerify) by category.
+/// Unset or 0: unchanged.
+inline const int kBindCacheContent = [] {
+    const auto on = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && v[0] == '1';
+    };
+    if (!(on("SOTC_BIND_CACHE") && on("SOTC_BIND_CACHE_RANGES") && on("SOTC_BIND_CACHE_XTICK") &&
+          on("SOTC_BIND_CACHE_FRAME"))) {
+        return 0;
+    }
+    const char* v = std::getenv("SOTC_BIND_CACHE_CONTENT");
+    return v && v[0] == '2' ? 2 : (v && v[0] == '1' ? 1 : 0);
+}();
+/// sotc: SOTC_BIND_CACHE_CONTENT counters (SOTC_FPS only). Rules that refused a hit: the GPU-modified state of an image
+/// over a lookup range (flag), and mode 2's held entries (verify: today's rule would drop it). Verify categories: the
+/// descriptors, the push data, the bound buffer records, the image records, the other bind records (LOD banks, samplers,
+/// bindless), and the watched ranges (which change no result).
+enum BindContentRule : uint32_t { CrFlag, CrHold, CrRules };
+inline constexpr const char* kBindContentRuleNames[CrRules] = {"flag", "verify-hold"};
+enum BindContentDiff : uint32_t { CdDescriptors, CdPush, CdBuffers, CdImages, CdOther, CdRanges, CdCats };
+inline constexpr const char* kBindContentDiffNames[CdCats] = {
+    "descriptors", "push", "buffers", "images", "other", "ranges"};
+inline std::atomic<uint64_t> bc_kept{0}, bc_refused[CrRules]{}, bc_verified{0},
+    bc_skipped_moved{0}, bc_diff[CdCats]{}, bc_diff_binds{0};
+/// sotc: SOTC_BIND_CACHE_PACKET counters (SOTC_FPS only): packet ops that reached the bind, the eligible ones, hits,
+/// misses by reason (the TryBindCacheFrame reasons, then the heap declined and the addressed shape changed), verify
+/// checks (mode 2), and the verify mismatches by category.
+enum BindPacketMiss : uint32_t { PkHeapDeclined = BfReasons, PkAddrShape, PkMissReasons };
+inline constexpr const char* kBindPacketMissNames[PkMissReasons] = {
+    "no entry", "flush", "buffers", "stream", "writes", "images", "mapping", "refused",
+    "heap declined", "addr shape"};
+inline std::atomic<uint64_t> pk_ops{0}, pk_eligible{0}, pk_hits{0}, pk_verify_checks{0};
+inline std::atomic<uint64_t> pk_miss[PkMissReasons]{};
+/// PvImgInfo counts the image infos a hit would replay wrongly (image, sampler, view or layout). The four PvImg*
+/// categories classify every differing image info (each counted once per op): a different image; the same image
+/// with a view of another backing (PvImgBacking: a hit now refuses it); a view not owned by any backing of the
+/// image (PvImgView); the same view with another layout (PvImgLayout). PvImgSampler: a sampler handle changed.
+enum PacketVerifyCategory : uint32_t {
+    PvWrites, PvBufInfo, PvImgInfo, PvPush, PvAddr, PvBuffers, PvImages,
+    PvImgImage, PvImgSampler, PvImgView, PvImgLayout, PvImgBacking, PvCategories
+};
+inline constexpr const char* kPacketVerifyNames[PvCategories] = {
+    "writes", "buffer infos", "image infos", "push", "addr", "buffers", "images",
+    "img image", "img sampler", "img view", "img layout", "img backing"};
+inline std::atomic<uint64_t> pk_mismatch[PvCategories]{};
 /// sotc: SOTC_RS_MEMO=1 (default off): a draw into the same render targets as the draw before it,
 /// in the render pass that draw began, takes that draw's render state instead of looking its
 /// targets up again (Rasterizer::RsMemoPrepare / RsMemoBegin, vk_rasterizer.cpp). Unset or 0:

@@ -378,7 +378,9 @@ vk::SamplerReductionMode FilterMode(AmdGpu::FilterMode mode) {
     case AmdGpu::FilterMode::Max:
         return vk::SamplerReductionMode::eMax;
     default:
-        UNREACHABLE();
+        // sotc: FILTER_MODE 3 is reserved. Use the zero encoding (Blend).
+        AmdGpu::ReportFormatFallback("filter_mode reserved", u32(mode), 0);
+        return vk::SamplerReductionMode::eWeightedAverage;
     }
 }
 
@@ -391,7 +393,9 @@ vk::SamplerMipmapMode MipFilter(AmdGpu::MipFilter filter) {
     case AmdGpu::MipFilter::None:
         return vk::SamplerMipmapMode::eNearest;
     default:
-        UNREACHABLE();
+        // sotc: MIP_FILTER 3 is reserved. Use the zero encoding (None).
+        AmdGpu::ReportFormatFallback("mip_filter reserved", u32(filter), 0);
+        return vk::SamplerMipmapMode::eNearest;
     }
 }
 

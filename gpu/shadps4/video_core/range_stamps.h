@@ -131,4 +131,13 @@ private:
     std::unique_ptr<std::atomic<u64>[]> mid_;
 };
 
+/// sotc: SOTC_BIND_CACHE_CONTENT. The ranges whose GPU-modified state changed: an image got its first GPU write, or its
+/// mark was cleared (readback, native reuse, mip-tail reuse). FindImage's mip-tail choice reads that state of the images
+/// over its bytes, and it is what a GPU write changes that a cached bind reads (Rasterizer::BindCacheStampsOk). Noted by
+/// MarkGpuModified and by the clears (NoteGpuFlagChange, image.h).
+inline RangeStamps& GpuFlagStamps() {
+    static RangeStamps stamps;
+    return stamps;
+}
+
 } // namespace VideoCore

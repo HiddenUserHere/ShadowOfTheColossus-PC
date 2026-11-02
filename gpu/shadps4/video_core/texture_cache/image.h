@@ -11,10 +11,12 @@
 #include "video_core/texture_cache/image_view.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <deque>
 #include <optional>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
+#include "video_core/range_stamps.h" // sotc: SOTC_BIND_CACHE_CONTENT (GpuFlagStamps)
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_TEX (MarkGpuModified)
 #include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_LAYOUT_UNIFIED (SotcArch::Layouts)
 #include "video_core/sotc_arch/bindset_events.h" // sotc: SOTC_BINDSET (the first GPU write moves candidates' Range)
@@ -285,6 +287,21 @@ void NoteMipTailWrite(const Image& image);
 /// per-frame report).
 void ImageChurnReport();
 
+/// sotc: SOTC_BIND_CACHE_CONTENT. The GPU-modified state of an image changed over its chain's guest bytes (the range the
+/// BindSet posts below uses): GpuFlagStamps notes it for the binds that looked those bytes up. Only noted when the
+/// switch is set (its stamps have no reader otherwise): the default build pays nothing for it.
+inline void NoteGpuFlagChange(const Image& image) {
+    static const bool content_on = [] {
+        const char* v = std::getenv("SOTC_BIND_CACHE_CONTENT");
+        return v && v[0] != '0';
+    }();
+    if (!content_on) {
+        return;
+    }
+    GpuFlagStamps().Note(image.info.guest_address - image.info.sotc_dropped_bytes,
+                         image.info.guest_address + image.info.guest_size);
+}
+
 inline void MarkGpuModified(Image& image, bool bump_epoch = true) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         // sotc: SOTC_GEN_BIND / SOTC_GEN_TEX: the image's range becomes GPU-written: its generation
@@ -299,6 +316,7 @@ inline void MarkGpuModified(Image& image, bool bump_epoch = true) {
             NoteMipTailWrite(image);
         }
         image.flags |= ImageFlagBits::GpuModified;
+        NoteGpuFlagChange(image); // sotc: SOTC_BIND_CACHE_CONTENT
         // sotc: SOTC_BINDSET. The mip-tail candidates over these bytes read the GPU-written mark of the images there
         // (DecideRebase: any_gpu), so the candidates overlapping the range are killed (Range). Posted after the mark is
         // set (the link gate reads the links after the change). The epoch above moves on the same write for every

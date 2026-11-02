@@ -2,10 +2,30 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <map>
+#include <mutex>
+#include <string>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "video_core/amdgpu/pixel_format.h"
 
 namespace AmdGpu {
+
+// sotc: see pixel_format.h. Counts are kept per "site a b" key; the first hit and every
+// power-of-two hit after it are logged.
+void ReportFormatFallback(std::string_view site, u32 a, u32 b) {
+    static std::mutex mutex;
+    static std::map<std::string, u32> hits;
+    const std::string key = fmt::format("{} {} {}", site, a, b);
+    std::scoped_lock lock{mutex};
+    const u32 count = ++hits[key];
+    if ((count & (count - 1)) == 0) {
+        LOG_WARNING(Render_Recompiler,
+                    "Guest descriptor combination not in the format table: {} (a={}, b={}), "
+                    "fallback used, hit {} time(s)",
+                    site, a, b, count);
+    }
+}
 
 std::string_view NameOf(DataFormat fmt) {
     switch (fmt) {
