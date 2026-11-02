@@ -258,6 +258,7 @@ static size_t VerifyReport(char* out, u32 size, double seconds) {
     const u32 zero = take(mapped, Shader::ShaderAddrVerifyMismatchZero);
     const u32 slots = take(mapped, Shader::ShaderAddrVerifySlots);
     const u32 uncompared = take(mapped, Shader::ShaderAddrVerifyUncompared);
+    const u32 uncompared_nonzero = take(mapped, Shader::ShaderAddrVerifyUncomparedNonZero);
     const u32 kept = std::min(slots, Shader::ShaderAddrVerifyCapacity);
 
     constexpr size_t kMaxListed = 16;
@@ -297,10 +298,11 @@ static size_t VerifyReport(char* out, u32 size, double seconds) {
         out, size,
         "SOTC SHADER_ADDR verify: %llu loads compared in %.1f s, %llu lanes differ (%llu with address "
         "value 0: non-resident or out-of-window page; %llu with a non-zero address value), %llu loads not "
-        "compared (V# range), %u records kept, %u dropped",
+        "compared (V# range; %llu lanes of them with a non-zero descriptor value), %u records kept, %u dropped",
         static_cast<unsigned long long>(compared), seconds, static_cast<unsigned long long>(mismatch),
         static_cast<unsigned long long>(zero), static_cast<unsigned long long>(mismatch - std::min(mismatch, zero)),
-        static_cast<unsigned long long>(uncompared), kept, slots - kept);
+        static_cast<unsigned long long>(uncompared), static_cast<unsigned long long>(uncompared_nonzero), kept,
+        slots - kept);
     return n < 0 ? 0 : std::min(static_cast<size_t>(n), static_cast<size_t>(size) - 1);
 }
 

@@ -5,6 +5,7 @@
 // are written against: change it only together with every implementation.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/amdgpu/regs_texture.h" // AmdGpu::BorderColorBuffer
+#include "video_core/texture_cache/types.h" // sotc: VideoCore::ImageId, SubresourceRange (TableMemo::TableBinds)
 
 namespace Vulkan {
 class Instance;
@@ -204,6 +206,15 @@ struct IndexTable {
     vk::DeviceAddress device_address;
     u32 count;
 };
+/// sotc: the images one stage's index table binds in this op (SOTC_HEAP real mode). Entry i matches stage.images[i]:
+/// the bound image (the depth image of a stencil one), its view range as the classic bind's transition uses it, and
+/// the null image when the T# is null (image id invalid).
+constexpr u32 kMaxBindImages = 16;
+struct TableBinds {
+    u32 count{};
+    std::array<VideoCore::ImageId, kMaxBindImages> image{};
+    std::array<VideoCore::SubresourceRange, kMaxBindImages> range{};
+};
 bool On();
 /// Creates the per-tick index ring (rasterizer constructor, when On()).
 void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler);
@@ -211,8 +222,16 @@ void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler);
 /// the texture cache once). Layout: entry i = heap index of stage.images[i], entry images.size()+j = heap index of
 /// stage.samplers[j], Heap::NullImageIndex(key) for a null T#. device_address 0 = refused (the draw path binds as today).
 /// Valid for the current tick.
+/// bindless_gen: Rasterizer::BindlessGeneration of this op; an entry stored under another generation is not replayed.
+/// binds: sotc: SOTC_HEAP real mode only (nullptr otherwise). Set to the images of this op, after a hit has been
+/// validated and its per-bind UpdateImage run (TouchBoundImage), or after a resolution. The caller then does the
+/// transitions and the bound flags of those images (the classic bind's second pass, without descriptors).
 IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& stage,
-                   AmdGpu::BorderColorBuffer border_color);
+                   AmdGpu::BorderColorBuffer border_color, u64 bindless_gen, TableBinds* binds);
+/// sotc: SOTC_HEAP accounting of the stage binds of heap ops: skipped (the table covers the stage), or the classic
+/// bind ran (reason: 0 GPU verify, 1 render target or forced general, 2 stencil image, 3 rebind pending).
+void NoteBindSkipped();
+void NoteBindClassic(u32 reason);
 void Report(char* out, u32 size, double seconds);
 } // namespace TableMemo
 

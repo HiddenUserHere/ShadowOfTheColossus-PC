@@ -2677,6 +2677,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         // sotc: SOTC_HEAP: a variant is a program of its own, so its hash differs (the program, memo and key caches).
         params.variant = stage_out == SwStage::Fragment ? fragment_variant : other_variant;
         if (params.variant != Shader::StageVariantDefault) {
+            params.guest_hash = params.hash; // sotc: Info::pgm_hash stays the game's hash
             params.hash = HashCombine(params.hash, params.variant);
         }
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
@@ -2806,6 +2807,7 @@ bool PipelineCache::RefreshComputeKey() {
     if (profile.heap_images && profile.support_int64) {
         auto heap_params = cs_params;
         heap_params.variant = Shader::StageVariantHeap;
+        heap_params.guest_hash = cs_params.hash;
         heap_params.hash = HashCombine(cs_params.hash, heap_params.variant);
         std::tie(infos[0], modules[0], compute_key.value) =
             GetProgram(HwStage::Compute, SwStage::Compute, heap_params, binding);
@@ -2821,6 +2823,7 @@ bool PipelineCache::RefreshComputeKey() {
         auto plain_params = cs_params;
         if (profile.shader_addr != 0) {
             plain_params.variant = Shader::StageVariantPlain;
+            plain_params.guest_hash = cs_params.hash;
             plain_params.hash = HashCombine(cs_params.hash, plain_params.variant);
         }
         std::tie(infos[0], modules[0], compute_key.value) =
@@ -2881,7 +2884,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     if (spv_out) {
         *spv_out = std::move(spv);
     } else {
-        RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+        RegisterShaderBinary(std::move(spv), info.CacheHash(), perm_idx); // sotc: the variant's own slot
     }
     phase(4);
 

@@ -381,6 +381,9 @@ static constexpr u32 ShaderAddrVerifyMismatch = 4;
 static constexpr u32 ShaderAddrVerifyMismatchZero = 8;
 static constexpr u32 ShaderAddrVerifySlots = 12;
 static constexpr u32 ShaderAddrVerifyUncompared = 16;
+/// 20 = lanes of uncompared loads whose descriptor value is non-zero (mode 1 returns 0 there); each also takes a record
+/// with device address ~0.
+static constexpr u32 ShaderAddrVerifyUncomparedNonZero = 20;
 static constexpr u32 ShaderAddrVerifyRecordsOffset = 32;
 static constexpr u32 ShaderAddrVerifyRecordSize = 72;
 static constexpr u32 ShaderAddrVerifyCapacity = 1024;

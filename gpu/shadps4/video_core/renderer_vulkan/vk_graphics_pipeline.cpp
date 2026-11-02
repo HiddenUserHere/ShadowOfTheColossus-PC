@@ -892,6 +892,19 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
                            ? vk::DescriptorSetLayoutCreateFlagBits::eDescriptorBufferEXT
                            : vk::DescriptorSetLayoutCreateFlagBits{};
     // sotc: SOTC_PACKET: a packet pipeline's range holds the DrawPacket after PushData (no slot words).
+    if (packet_range && uses_slot_words) {
+        for (const auto* stage : stages) {
+            if (stage) {
+                LOG_CRITICAL(Render_Vulkan,
+                             "packet+slot words: stage {} pgm {:#x} variant {} heap {} bindless samplers {} "
+                             "images {} samplers {} images bindless {} preloading {}",
+                             u32(stage->sw_stage), stage->pgm_hash, u32(stage->variant),
+                             Shader::Backend::SPIRV::UsesHeapImages(*stage, profile),
+                             Shader::UsesBindlessSamplers(*stage), stage->images.size(),
+                             stage->samplers.size(), Shader::UsesBindlessImages(*stage), preloading);
+            }
+        }
+    }
     ASSERT_MSG(!(packet_range && uses_slot_words),
                "packet pipeline with bindless slot words (the heap replaces them)");
     const vk::PushConstantRange push_constants = {

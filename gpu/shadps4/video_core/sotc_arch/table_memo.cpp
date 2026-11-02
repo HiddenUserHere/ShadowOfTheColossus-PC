@@ -42,6 +42,14 @@
 // bit, the LOD marks, and GetSampler. Not made: the layout transition (A1 keeps every image in GENERAL), the
 // per-draw flags of ResetBindings. A hit stamps the found images' access ticks as TryTextureBlock does.
 //
+// Real mode (SOTC_HEAP=1, binds != nullptr in Resolve): the classic bind of the heap stage is skipped (the
+// Rasterizer's BindHeapImages). Resolve then also covers what the classic second pass does per bind: a hit runs
+// TouchBoundImage on each bound image (UpdateImage's work, or its touch and bind evidence where that is a no-op),
+// then checks the entry again; the entry records the bound image and view range of each T#, and Resolve hands
+// them to the caller. The caller makes the bound flags, the barriers (Runtime::Transit) and the bound list.
+// Hits are refused when the heap generation moved (a view was released or evicted) or the depth image of a
+// stencil image changed. Counted: the skipped and the classic stage binds (NoteBindSkipped, NoteBindClassic).
+//
 // Switch: SOTC_HEAP (0 off, 1 on, 2 verify: a hit is resolved again and the indices compared; the fresh ones are
 // used). Unset: none of this runs.
 
@@ -96,6 +104,8 @@ struct ImageRecord {
     /// valid, so a hit checks the mapping again (CheckHit). Other nulls are decided by the key words.
     bool unmapped{};
     bool lod{};
+    /// sotc: bound is the depth image of found (a stencil attachment read through it).
+    bool redirect{};
     u32 lod_bank{};
     VideoCore::ImageId found{};
     VideoCore::ImageId bound{};
@@ -103,6 +113,8 @@ struct ImageRecord {
     u64 bound_uid{};
     VAddr addr{};
     u64 addr_gen{};
+    /// sotc: the view range of the bind (the transition of the classic bind uses it).
+    VideoCore::SubresourceRange range{};
 };
 
 struct Entry {
@@ -115,6 +127,8 @@ struct Entry {
     u64 bind_generation{};
     u64 gpu_epoch{};
     u64 sampler_generation{};
+    /// sotc: the heap generation of the op that resolved it (a release since then makes it stale).
+    u64 bindless_gen{};
     u32 num_images{};
     u32 num_bindings{};
     std::array<ImageRecord, kMaxImages> images{};
@@ -149,6 +163,10 @@ struct Counters {
     std::atomic<u64> ring_overflow{};
     std::atomic<u64> verify{};
     std::atomic<u64> verify_mismatch{};
+    /// sotc: SOTC_HEAP real mode: heap-stage ops whose classic texture bind was skipped, and those that ran it
+    /// (by reason, see NoteBindClassic).
+    std::atomic<u64> bind_skipped{};
+    std::array<std::atomic<u64>, 4> bind_classic{};
 };
 
 struct State {
@@ -261,7 +279,11 @@ Entry& SlotFor(u64 hash, const std::array<u64, kKeyWords>& key, u32 words) {
 }
 
 // Why a stored entry no longer answers, or Miss::None when it does. Checks only; nothing is changed.
-Miss CheckHit(VideoCore::TextureCache& tc, const Entry& e) {
+Miss CheckHit(VideoCore::TextureCache& tc, const Entry& e, u64 bindless_gen) {
+    // A released or evicted heap slot since the resolution: the indices may name a slot given back.
+    if (e.bindless_gen != bindless_gen) {
+        return Miss::Generation;
+    }
     if (e.candidate && (tc.BindGeneration() != e.bind_generation ||
                         VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed) != e.gpu_epoch)) {
         return Miss::Candidate;
@@ -283,9 +305,13 @@ Miss CheckHit(VideoCore::TextureCache& tc, const Entry& e) {
         if (tc.ImageAddrGeneration(r.addr) != r.addr_gen) {
             return Miss::Generation;
         }
-        const VideoCore::Image* found = tc.TryGetImage(r.found, r.found_uid);
+        VideoCore::Image* found = tc.TryGetImage(r.found, r.found_uid);
         const VideoCore::Image* bound = tc.TryGetImage(r.bound, r.bound_uid);
         if (!found || !bound) {
+            return Miss::Generation;
+        }
+        // The depth image of a stencil one can appear or go away (the bind redirects through it, as TryTextureBlock).
+        if (tc.GetAssociatedDepth(*found) != (r.redirect ? r.bound : VideoCore::ImageId{})) {
             return Miss::Generation;
         }
         const auto dirty = VideoCore::ImageFlagBits::Dirty;
@@ -302,11 +328,12 @@ Miss CheckHit(VideoCore::TextureCache& tc, const Entry& e) {
 // entries of the index table and `rec` with what a later hit checks. `store` is cleared when this resolution
 // must not be replayed (an overlap resolution, a stencil image, a rebind).
 void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
-                  AmdGpu::BorderColorBuffer border_color, std::array<u32, kMaxBindings>& out,
-                  Entry& rec, bool& store) {
+                  AmdGpu::BorderColorBuffer border_color, u64 bindless_gen,
+                  std::array<u32, kMaxBindings>& out, Entry& rec, bool& store) {
     store = true;
     rec.num_images = static_cast<u32>(stage.images.size());
     rec.has_samplers = !stage.samplers.empty();
+    rec.bindless_gen = bindless_gen;
     rec.bind_generation = tc.BindGeneration();
     rec.gpu_epoch = VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
     rec.candidate = false;
@@ -401,6 +428,8 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
         // The heap descriptor is written in GENERAL: the memo makes no layout transition, so SOTC_HEAP needs
         // SOTC_LAYOUT_UNIFIED (every texture-cache image in GENERAL).
         out[index] = Heap::IndexOf(view, Shader::BindlessImageKeyOf(stage, image_desc), vk::ImageLayout::eGeneral);
+        r.range = desc.view_info.range; // the classic bind's transition range
+        r.redirect = r.bound != r.found;
     }
 
     for (u32 j = 0; j < stage.samplers.size(); ++j) {
@@ -460,6 +489,15 @@ IndexTable Publish(Entry* entry, const std::array<u32, kMaxBindings>& indices, u
     return {s.ring->BufferDeviceAddress() + offset, count};
 }
 
+// The images of an entry for the op (SOTC_HEAP real mode): the bound image of each non-null T#, with its range.
+void FillBinds(const Entry& e, TableBinds* binds) {
+    binds->count = e.num_images;
+    for (u32 i = 0; i < e.num_images; ++i) {
+        binds->image[i] = e.images[i].null ? VideoCore::ImageId{} : e.images[i].bound;
+        binds->range[i] = e.images[i].range;
+    }
+}
+
 } // namespace
 
 bool On() {
@@ -486,7 +524,7 @@ void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler) {
 }
 
 IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& stage,
-                   AmdGpu::BorderColorBuffer border_color) {
+                   AmdGpu::BorderColorBuffer border_color, u64 bindless_gen, TableBinds* binds) {
     if (!s.ready) {
         return {};
     }
@@ -506,7 +544,18 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
     Entry* hit = FindEntry(hash, key, words);
     Miss miss = Miss::Absent;
     if (hit) {
-        miss = CheckHit(texture_cache, *hit);
+        miss = CheckHit(texture_cache, *hit, bindless_gen);
+        // sotc: SOTC_HEAP real mode. The classic second pass runs UpdateImage on every bound image at every bind, so a
+        // hit does it too (TouchBoundImage: the same work where it changes nothing). The check runs again after it:
+        // the update may dirty an image or give back a heap slot, and then the op resolves afresh.
+        if (miss == Miss::None && binds) {
+            for (u32 i = 0; i < hit->num_images; ++i) {
+                if (!hit->images[i].null) {
+                    texture_cache.TouchBoundImage(hit->images[i].bound);
+                }
+            }
+            miss = CheckHit(texture_cache, *hit, bindless_gen);
+        }
     }
     std::array<u32, kMaxBindings> hit_indices{};
     if (hit && miss == Miss::None) {
@@ -524,6 +573,9 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
             }
         }
         if (mode != 2) {
+            if (binds) {
+                FillBinds(*hit, binds);
+            }
             return Publish(hit, hit->indices, count, tick);
         }
         hit_indices = hit->indices;
@@ -543,7 +595,7 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
     std::array<u32, kMaxBindings> indices{};
     Entry fresh{};
     bool store = false;
-    ResolveFresh(texture_cache, stage, border_color, indices, fresh, store);
+    ResolveFresh(texture_cache, stage, border_color, bindless_gen, indices, fresh, store);
     if (hit && miss == Miss::None) {
         s.counters.verify.fetch_add(1, std::memory_order_relaxed);
         if (!std::equal(hit_indices.begin(), hit_indices.begin() + count, indices.begin())) {
@@ -556,6 +608,9 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
             hit->valid = false; // a stale answer must not be replayed
         }
         s.counters.not_stored.fetch_add(1, std::memory_order_relaxed);
+        if (binds) {
+            FillBinds(fresh, binds);
+        }
         return Publish(nullptr, indices, count, tick);
     }
     fresh.valid = true;
@@ -567,7 +622,18 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
     Entry& slot = SlotFor(hash, key, words);
     slot = fresh;
     s.counters.stores.fetch_add(1, std::memory_order_relaxed);
+    if (binds) {
+        FillBinds(slot, binds);
+    }
     return Publish(&slot, indices, count, tick);
+}
+
+void NoteBindSkipped() {
+    s.counters.bind_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteBindClassic(u32 reason) {
+    s.counters.bind_classic[reason & 3].fetch_add(1, std::memory_order_relaxed);
 }
 
 void Report(char* out, u32 size, double seconds) {
@@ -591,7 +657,8 @@ void Report(char* out, u32 size, double seconds) {
         "SOTC TABLEMEMO %.1f s: lookups %llu, hits %llu (%.0f%%), misses: absent %llu, "
         "generation %llu, dirty %llu, sampler %llu, candidate %llu, unmapped %llu; refused %llu, "
         "not stored %llu; stored %llu, evicted %llu, live %u/%u; null answers %llu (unmapped T# %llu); "
-        "ring overflow %llu; verify %llu, mismatches %llu\n",
+        "ring overflow %llu; verify %llu, mismatches %llu; stage binds skipped %llu, classic "
+        "(verify %llu, target %llu, stencil %llu, rebind %llu)\n",
         seconds, static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(hits),
         lookups ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0,
         static_cast<unsigned long long>(take(s.counters.miss_absent)),
@@ -608,7 +675,12 @@ void Report(char* out, u32 size, double seconds) {
         static_cast<unsigned long long>(take(s.counters.null_unmapped)),
         static_cast<unsigned long long>(take(s.counters.ring_overflow)),
         static_cast<unsigned long long>(take(s.counters.verify)),
-        static_cast<unsigned long long>(take(s.counters.verify_mismatch)));
+        static_cast<unsigned long long>(take(s.counters.verify_mismatch)),
+        static_cast<unsigned long long>(take(s.counters.bind_skipped)),
+        static_cast<unsigned long long>(take(s.counters.bind_classic[0])),
+        static_cast<unsigned long long>(take(s.counters.bind_classic[1])),
+        static_cast<unsigned long long>(take(s.counters.bind_classic[2])),
+        static_cast<unsigned long long>(take(s.counters.bind_classic[3])));
 }
 
 } // namespace SotcArch::TableMemo

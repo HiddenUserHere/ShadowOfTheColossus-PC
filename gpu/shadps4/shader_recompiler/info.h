@@ -8,6 +8,7 @@
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
+#include "common/hash.h"
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/copy_shader.h"
@@ -168,10 +169,16 @@ struct Info : InfoPersistent {
 
     Info() = default;
     Info(HwStage stage_, SwStage l_stage_, ShaderParams params)
-        : InfoPersistent(stage_, l_stage_, params.hash) {
+        : InfoPersistent(stage_, l_stage_, params.guest_hash != 0 ? params.guest_hash : params.hash) {
         PgmBase() = params.Base();
         UserData() = params.user_data;
         variant = params.variant;
+    }
+
+    /// sotc: SOTC_HEAP. The key of this program in the caches (program cache, binaries on disk, bind cache): pgm_hash
+    /// with the variant mixed in as the pipeline cache does (ShaderParams::hash), pgm_hash itself for the default.
+    u64 CacheHash() const noexcept {
+        return variant == StageVariantDefault ? pgm_hash : HashCombine(pgm_hash, u64{variant});
     }
 
     std::span<const u32>& UserData() noexcept {

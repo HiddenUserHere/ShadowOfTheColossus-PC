@@ -2834,7 +2834,7 @@ namespace {
 /// sotc: SOTC_BIND_CACHE_FRAME. A stage's identity for the bind cache key: its shader and the
 /// descriptor layout (kinds and order) a cached entry's writes name.
 u64 BindCacheStageIdentity(const Shader::Info& stage) {
-    const u64 words[3] = {stage.pgm_hash,
+    const u64 words[3] = {stage.CacheHash(), // sotc: a variant's layout differs (SOTC_HEAP)
                           (u64{stage.buffers.size()} << 40) | (u64{stage.images.size()} << 20) |
                               u64{stage.samplers.size()},
                           static_cast<u64>(stage.sw_stage)};
@@ -3228,6 +3228,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     const bool packet_op = pipeline->HasPacketRange();
     // sotc: the slot words are filled (and pushed, Pipeline::BindResources) only for a pipeline that has them.
     slot_words_op = pipeline->HasSlotWords();
+    // sotc: SOTC_HEAP_GPU_VERIFY (heap profile 2) fills the slot words of a heap pipeline too: the verify compares them.
+    slot_words_fill = slot_words_op || pipeline->GetProfile().heap_images == 2;
     shader_addr_touch = false;
     sotc_addr_hazard = false;
     sotc_op_writes.clear();
@@ -3263,6 +3265,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // table. The packet has one table address, so a pipeline with two heap stages is refused (counted, logged).
     // A table that the memo refuses (device address 0) is refused too: the op is dropped, not drawn from address 0.
     const Shader::Info* heap_stage = nullptr;
+    // sotc: SOTC_HEAP real mode (profile 1): the heap stage's images are bound from its index table (BindHeapImages).
+    SotcArch::TableMemo::TableBinds heap_binds{};
+    bool heap_real = false;
     if (packet_op) {
         for (const auto* stage : pipeline->GetStages()) {
             if (stage && Shader::Backend::SPIRV::UsesHeapImages(*stage, pipeline->GetProfile())) {
@@ -3281,8 +3286,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // so the heap branch below does not overwrite it.
     draw_packet.index_table_address = SotcArch::ShaderAddr::VerifyAddress();
     if (heap_stage) {
-        const auto table = SotcArch::TableMemo::Resolve(texture_cache, *heap_stage,
-                                                        liverpool->DrawRegs().ta_bc_base);
+        heap_real = pipeline->GetProfile().heap_images == 1;
+        const auto table = SotcArch::TableMemo::Resolve(
+            texture_cache, *heap_stage, liverpool->DrawRegs().ta_bc_base, BindlessGeneration(),
+            heap_real ? &heap_binds : nullptr);
         if (table.device_address == 0) {
             static std::atomic<u64> table_refused{};
             if (table_refused.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -3647,7 +3654,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             const SotcTrace::ScopeMin trace_step{"bind textures", stage->images.size()}; // sotc
             const SotcOpPhases::Scope ph{SotcOpPhases::PhBindTextures}; // sotc: SOTC_OP_PHASES
             const SotcStats::SplitTimer textures_split{SotcStats::SplitBindTextures};
-            BindTextures(*stage, binding, set, pr_stage ? resolved : nullptr, pr_stage);
+            // sotc: SOTC_HEAP. The heap stage of the op takes its images from the index table in real mode; the classic
+            // bind runs when BindHeapImages declines (counted there) and in the GPU verify (counted here).
+            bool textures_done = false;
+            if (stage == heap_stage) {
+                if (heap_real) {
+                    textures_done = BindHeapImages(heap_binds);
+                } else {
+                    SotcArch::TableMemo::NoteBindClassic(0);
+                }
+            }
+            if (!textures_done) {
+                BindTextures(*stage, binding, set, pr_stage ? resolved : nullptr, pr_stage);
+            }
         }
         uses_dma |= stage->uses_dma;
     }
@@ -6665,7 +6684,7 @@ bool Rasterizer::MakeTextureBlockKey(const Shader::Info& stage, u32 set,
     u32 n = 0;
     k[n++] = u64{stage.images.size()} | u64{stage.samplers.size()} << 8 | u64{set} << 16 |
              u64(static_cast<u32>(stage.sw_stage)) << 24;
-    k[n++] = stage.pgm_hash;
+    k[n++] = stage.CacheHash(); // sotc: a variant's layout differs (SOTC_HEAP)
     const VAddr bc_base = liverpool->DrawRegs().ta_bc_base.Address();
     k[n++] = bc_base;
     for (u32 index = 0; index < stage.images.size(); ++index) {
@@ -6870,7 +6889,7 @@ bool Rasterizer::TryTextureBlock(const Shader::Info& stage, const TexBlockKey& k
         if (memo.bindless_push[d]) {
             const u32 heap_slot = memo.bindless_push[d] - 1u;
             const VideoCore::BindlessRef& ref = memo.bindless_block[d];
-            if (slot_words_op) { // sotc: a pipeline without slot words (SOTC_PACKET) never pushes them
+            if (slot_words_fill) { // sotc: a pipeline without slot words (SOTC_PACKET) never pushes them
                 const u32 shift = (heap_slot & 1) * 16;
                 auto& word = bindless_slots.image_words[heap_slot / 2];
                 word = (word & ~(0xFFFFu << shift)) | (ref.slot << shift);
@@ -6902,6 +6921,54 @@ bool Rasterizer::TryTextureBlock(const Shader::Info& stage, const TexBlockKey& k
         bind_cache_uncacheable = true;
     }
     BindSamplers(stage, binding, set, ui_asset);
+    return true;
+}
+
+// sotc: SOTC_HEAP real mode. The classic bind's second pass for the images of a heap stage, without descriptors. The
+// index table holds the bound image and range each T# resolved to (TableMemo::Resolve ran the first pass's lookups and,
+// for a hit, the per-bind UpdateImage). What is left is done here: the bound flag (BeginRendering reads it to see a
+// feedback loop, ResetBindings clears it through bound_images), the transition (its barrier), the texture usage bit.
+// Not made, as the heap stage has none of it: descriptors, storage images (HeapStaticRefusal), samplers (the table
+// holds their heap indices), the bind cache and the texture block records (a heap op takes neither).
+bool Rasterizer::BindHeapImages(const SotcArch::TableMemo::TableBinds& binds) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass, as BindTextures
+    // Decided before anything changes: the cases the classic bind handles with its own transitions.
+    for (u32 i = 0; i < binds.count; ++i) {
+        if (!binds.image[i]) {
+            continue;
+        }
+        const auto& image = texture_cache.GetImage(binds.image[i]);
+        if (image.binding.needs_rebind) {
+            SotcArch::TableMemo::NoteBindClassic(3);
+            return false;
+        }
+        // A render target of this draw, or an image forced to general: the feedback loop (classic second pass).
+        if (image.binding.is_target || image.binding.force_general) {
+            SotcArch::TableMemo::NoteBindClassic(1);
+            return false;
+        }
+        // A stencil image: its transition depends on the draw's depth registers (DepthSampledAsAttachment).
+        if (image.info.props.has_stencil) {
+            SotcArch::TableMemo::NoteBindClassic(2);
+            return false;
+        }
+    }
+    for (u32 i = 0; i < binds.count; ++i) {
+        if (!binds.image[i]) {
+            continue;
+        }
+        auto& image = texture_cache.GetImage(binds.image[i]);
+        image.binding.is_bound = 1u;
+        // The layout is the sampled one of the image's kind, as the classic bind names it (GENERAL under the unified layouts).
+        const auto new_layout = image.info.props.is_depth
+                                    ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                    : vk::ImageLayout::eShaderReadOnlyOptimal;
+        needs_barrier |= runtime.Transit(&image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
+                                         vk::AccessFlagBits2::eShaderRead, binds.range[i]);
+        image.usage.texture |= 1u;
+        bound_images.emplace_back(binds.image[i]);
+    }
+    SotcArch::TableMemo::NoteBindSkipped();
     return true;
 }
 
@@ -7639,7 +7706,7 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
                         }
                     }
                 }
-                if (slot_words_op) { // sotc: a pipeline without slot words (SOTC_PACKET) never pushes them
+                if (slot_words_fill) { // sotc: a pipeline without slot words (SOTC_PACKET) never pushes them
                     const u32 shift = (heap_slot & 1) * 16;
                     auto& word = bindless_slots.image_words[heap_slot / 2];
                     word = (word & ~(0xFFFFu << shift)) | (ref.slot << shift);
@@ -7788,7 +7855,7 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
         }
         if (bindless) {
             // sotc: the shader reads the heap index from this slot of the push constants.
-            if (slot_words_op) { // sotc: a pipeline without slot words (SOTC_PACKET) never pushes them
+            if (slot_words_fill) { // sotc: a pipeline without slot words (SOTC_PACKET) never pushes them
                 const u32 slot = bindless_range.base + sampler_index;
                 const u32 shift = (slot & 1) * 16;
                 auto& word = bindless_slots.words[slot / 2];

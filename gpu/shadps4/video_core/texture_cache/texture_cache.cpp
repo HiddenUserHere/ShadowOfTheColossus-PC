@@ -1994,6 +1994,21 @@ static bool TexUpdateIsNoOp(const Image& image) {
     return image.track_addr == begin && image.track_addr_end == begin + image.info.guest_size;
 }
 
+// sotc: SOTC_HEAP real mode. The bind's UpdateImage for an image of the index table, as FindTexture's update
+// makes it: the same work as TexUpdateIsNoOp allows to be skipped, and the same order.
+void TextureCache::TouchBoundImage(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    if (!TexUpdateIsNoOp(image)) {
+        UpdateImage(image_id);
+        return;
+    }
+    std::unique_lock lk{mutex, std::defer_lock};
+    LockCounted(lk);
+    TouchImage(image);
+    FlushTexProtect(); // as RefreshImage does first
+    NoteBoundImage(image);
+}
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, bool update) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {

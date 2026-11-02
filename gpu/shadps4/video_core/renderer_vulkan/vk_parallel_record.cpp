@@ -4,12 +4,14 @@
 // sotc: N5 parallel recording counters (vk_parallel_record.h). The pass decisions are in
 // vk_recorder.cpp (PassSecondary); nothing here changes what is recorded.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string_view>
+#include <thread>
 
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_parallel_record.h"
@@ -44,6 +46,14 @@ struct Counters {
     std::atomic<u64> packet_draws{};            ///< draws in the scanned passes
     std::atomic<u64> stitch_ns{};               ///< owner: execute secondary + replay at EndRendering
     std::atomic<u64> stitch_count{};            ///< owner: stitches timed
+    // sotc: SOTC_PASS_WORKERS / SOTC_PASS_VERIFY (ReportPool)
+    std::array<std::atomic<u64>, static_cast<size_t>(LaStop::Count)> la_stop{};
+    std::atomic<u64> la_prepared{};             ///< passes the look-ahead handed to a worker
+    std::atomic<u64> la_depth_sum{};            ///< sum of the open passes at each prepare
+    std::atomic<u64> la_depth_max{};            ///< largest number of open passes at a prepare
+    std::atomic<u64> verify_checked{};          ///< jobs checked at their EndRendering
+    std::atomic<u64> verify_state_bad{};        ///< snapshot differs from the consumer table
+    std::atomic<u64> verify_run_bad{};          ///< worker block hash differs from the reference
 };
 Counters cnt;
 
@@ -54,7 +64,11 @@ constexpr std::array<const char*, kBlockCategories> kBlockNames{
 };
 
 constexpr std::array<const char*, static_cast<size_t>(Fallback::Count)> kFallbackNames{
-    "formats", "dropped", "stopped", "timeout", "chunks", "block", "fewdraws",
+    "formats", "dropped", "stopped", "timeout", "chunks", "block", "fewdraws", "workers", "ring",
+};
+
+constexpr std::array<const char*, static_cast<size_t>(LaStop::Count)> kLaNames{
+    "other", "prune", "queue", "ring", "incomplete",
 };
 
 u64 Take(std::atomic<u64>& a) {
@@ -167,6 +181,93 @@ void ReportPacket(std::string& out, double seconds) {
     out += line;
 }
 
+/// sotc: SOTC_PASS_WORKERS / SOTC_PASS_VERIFY, one line for the pool window (it replaces the N5 line
+/// in Report) and one for the verify checks. Takes every counter of the window.
+void ReportPool(std::string& out, double seconds, int workers) {
+    const u64 parallel = Take(cnt.parallel);
+    std::array<u64, static_cast<size_t>(Fallback::Count)> fallback{};
+    u64 inline_total = 0;
+    for (size_t i = 0; i < fallback.size(); ++i) {
+        fallback[i] = Take(cnt.fallback[i]);
+        inline_total += fallback[i];
+    }
+    std::array<u64, kBlockCategories> block{};
+    for (size_t i = 0; i < block.size(); ++i) {
+        block[i] = Take(cnt.block[i]);
+    }
+    const u64 jobs = Take(cnt.jobs);
+    const u64 ops = Take(cnt.ops);
+    const u64 worker_ns = Take(cnt.worker_ns);
+    const u64 owner_wait_ns = Take(cnt.owner_wait_ns);
+    std::array<u64, static_cast<size_t>(LaStop::Count)> stops{};
+    u64 stop_total = 0;
+    for (size_t i = 0; i < stops.size(); ++i) {
+        stops[i] = Take(cnt.la_stop[i]);
+        stop_total += stops[i];
+    }
+    const u64 prepared = Take(cnt.la_prepared);
+    const u64 depth_sum = Take(cnt.la_depth_sum);
+    const u64 depth_max = Take(cnt.la_depth_max);
+    const u64 checked = Take(cnt.verify_checked);
+    const u64 state_bad = Take(cnt.verify_state_bad);
+    const u64 run_bad = Take(cnt.verify_run_bad);
+    if (parallel == 0 && inline_total == 0 && stop_total == 0 && prepared == 0 && checked == 0) {
+        return;
+    }
+    const double sec = seconds > 0.0 ? seconds : 1.0;
+    const double workers_d = workers > 0 ? static_cast<double>(workers) : 1.0;
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "N5 pool (SOTC_PASS_WORKERS=%d, look-ahead %s): passes on workers %llu (%.1f/s), "
+                  "inline %llu (",
+                  workers, workers >= 2 ? "on" : "off", static_cast<unsigned long long>(parallel),
+                  static_cast<double>(parallel) / sec, static_cast<unsigned long long>(inline_total));
+    out += buf;
+    for (size_t i = 0; i < fallback.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "%s%s %llu", i ? ", " : "", kFallbackNames[i],
+                      static_cast<unsigned long long>(fallback[i]));
+        out += buf;
+    }
+    out += "), block ";
+    for (size_t i = 0; i < block.size(); ++i) {
+        if (block[i] != 0) {
+            std::snprintf(buf, sizeof(buf), "%s %llu ", kBlockNames[i],
+                          static_cast<unsigned long long>(block[i]));
+            out += buf;
+        }
+    }
+    const double avg_depth = prepared ? static_cast<double>(depth_sum) / static_cast<double>(prepared) : 0.0;
+    std::snprintf(buf, sizeof(buf),
+                  "| look-ahead prepared %llu, open passes avg %.2f max %llu, stop events (",
+                  static_cast<unsigned long long>(prepared), avg_depth,
+                  static_cast<unsigned long long>(depth_max));
+    out += buf;
+    for (size_t i = 0; i < stops.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "%s%s %llu", i ? ", " : "", kLaNames[i],
+                      static_cast<unsigned long long>(stops[i]));
+        out += buf;
+    }
+    const double ops_per_job = jobs ? static_cast<double>(ops) / static_cast<double>(jobs) : 0.0;
+    const double worker_ms_per_job =
+        jobs ? static_cast<double>(worker_ns) / 1e6 / static_cast<double>(jobs) : 0.0;
+    std::snprintf(buf, sizeof(buf),
+                  ") | jobs %llu, ops/job %.1f, worker %.3f ms/job (%.1f%% busy of %d), owner wait "
+                  "%.3f ms/s\n",
+                  static_cast<unsigned long long>(jobs), ops_per_job, worker_ms_per_job,
+                  100.0 * static_cast<double>(worker_ns) / 1e9 / sec / workers_d, workers,
+                  static_cast<double>(owner_wait_ns) / 1e6 / sec);
+    out += buf;
+    if (Verify()) {
+        std::snprintf(buf, sizeof(buf),
+                      "N5 verify (SOTC_PASS_VERIFY=1): checked %llu, state mismatch %llu, block hash "
+                      "mismatch %llu (the parallel result is used)\n",
+                      static_cast<unsigned long long>(checked),
+                      static_cast<unsigned long long>(state_bad),
+                      static_cast<unsigned long long>(run_bad));
+        out += buf;
+    }
+}
+
 } // namespace
 
 bool PacketRecord() {
@@ -192,6 +293,72 @@ void NotePacketPass(bool descriptor_free, u64 draws) noexcept {
 void NoteStitch(u64 ns) noexcept {
     cnt.stitch_ns.fetch_add(ns, std::memory_order_relaxed);
     cnt.stitch_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+int Workers() {
+    static const int value = [] {
+        const char* v = std::getenv("SOTC_PASS_WORKERS");
+        if (!v || !v[0]) {
+            return 1;
+        }
+        const char* sec = std::getenv("SOTC_PASS_SEC");
+        if (!sec || sec[0] != '1') {
+            LOG_WARNING(Render, "SOTC_PASS_WORKERS: needs SOTC_PASS_SEC=1, one pass worker");
+            return 1;
+        }
+        int n = 1;
+        if (std::string_view{v} == "auto") {
+            const unsigned cores = std::thread::hardware_concurrency();
+            n = static_cast<int>(std::min(4U, std::max(1U, cores / 4)));
+        } else {
+            n = std::atoi(v);
+        }
+        n = std::clamp(n, 1, 8);
+        LOG_INFO(Render, "SOTC_PASS_WORKERS={}: {} pass worker(s), up to {} passes open at once", v,
+                 n, n);
+        return n;
+    }();
+    return value;
+}
+
+bool Verify() {
+    static const bool value = [] {
+        const char* v = std::getenv("SOTC_PASS_VERIFY");
+        const bool on = v && v[0] == '1';
+        if (on) {
+            LOG_INFO(Render, "SOTC_PASS_VERIFY=1: pass jobs checked against the consumer table and a "
+                             "block hash; the parallel result is used");
+        }
+        return on;
+    }();
+    return value;
+}
+
+bool Counted() {
+    return Enabled() || Workers() > 1 || Verify();
+}
+
+void NoteLookahead(LaStop why) noexcept {
+    cnt.la_stop[static_cast<size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteLookaheadPrepare(u64 depth) noexcept {
+    cnt.la_prepared.fetch_add(1, std::memory_order_relaxed);
+    cnt.la_depth_sum.fetch_add(depth, std::memory_order_relaxed);
+    u64 seen = cnt.la_depth_max.load(std::memory_order_relaxed);
+    while (depth > seen &&
+           !cnt.la_depth_max.compare_exchange_weak(seen, depth, std::memory_order_relaxed)) {
+    }
+}
+
+void NoteVerify(bool state_ok, bool run_ok) noexcept {
+    cnt.verify_checked.fetch_add(1, std::memory_order_relaxed);
+    if (!state_ok) {
+        cnt.verify_state_bad.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!run_ok) {
+        cnt.verify_run_bad.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 int Mode() {
@@ -255,6 +422,11 @@ void NoteEmit(u8 category, u32 bytes, u64 ns) noexcept {
 void Report(std::string& out, double seconds) {
     ReportEmit(out, seconds);
     ReportPacket(out, seconds); // sotc: SOTC_PASS_RECORD + SOTC_PACKET
+    if (Workers() > 1 || Verify()) {
+        // sotc: SOTC_PASS_WORKERS / SOTC_PASS_VERIFY: the pool line replaces the N5 line
+        ReportPool(out, seconds, Workers());
+        return;
+    }
     if (!Enabled()) {
         return;
     }

@@ -51,7 +51,10 @@ static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 41u : 138
                                        (Shader::StageBindingsEnabled() ? 1000u : 0u) +
                                        (BindlessSamplersRequested() ? 2000u : 0u) +
                                        (SrtPhiDisabled() ? 4000u : 0u);
-static constexpr u32 ShaderMetaVersion = 21u;
+// sotc: 22 (from 21): the record ends with the stage variant (SOTC_HEAP). Without it a cached Plain or Heap
+// program came back as Default, so its layout disagreed with its binary (slot-word assert, device lost).
+// 23: a variant's pgm_hash is the game's hash again (Info::CacheHash keys the caches), so 22's variant records differ.
+static constexpr u32 ShaderMetaVersion = 23u;
 static const u32 PipelineKeyVersion =
     3u + (Shader::StageBindingsEnabled() ? 1000u : 0u) + (BindlessSamplersRequested() ? 2000u : 0u);
 } // namespace Serialization
@@ -230,7 +233,7 @@ void RegisterShaderMeta(const Shader::Info& info,
     }
     {
         std::scoped_lock lock{collided_mutex};
-        if (collided_bins.contains(BinaryId(info.pgm_hash, perm_idx))) {
+        if (collided_bins.contains(BinaryId(info.CacheHash(), perm_idx))) {
             collided_perms.insert(perm_hash);
             return;
         }
@@ -506,7 +509,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         WarmUpTimer timer{warmup_times.load};
         Storage::DataBase::Instance().Load(
             Storage::BlobType::ShaderBinary,
-            fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx), spv);
+            fmt::format("{:#018x}_{}", program->info.CacheHash(), perm_idx), spv);
     }
     if (spv.empty()) {
         return false;
@@ -527,7 +530,8 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         }
     }
 
-    auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
+    // sotc: keyed like GetProgram (ShaderParams::hash): a variant has its own entry under the game's pgm_hash.
+    auto [it_pgm, new_program] = program_cache.try_emplace(program->info.CacheHash());
     if (new_program) {
         {
             WarmUpTimer timer{warmup_times.modules};
@@ -761,6 +765,7 @@ void Info::Serialize(Serialization::Archive& ar) const {
     info.Write(this, sizeof(InfoPersistent));
     info.Write(FlatBuf());
     srt_info.Serialize(ar);
+    info.Write(variant); // sotc: SOTC_HEAP, not part of InfoPersistent
 }
 
 bool Info::Deserialize(Serialization::Archive& ar) {
@@ -780,7 +785,11 @@ bool Info::Deserialize(Serialization::Archive& ar) {
         }
     }
 
-    return srt_info.Deserialize(ar);
+    if (!srt_info.Deserialize(ar)) {
+        return false;
+    }
+    info.Read(variant); // sotc: SOTC_HEAP, see Serialize
+    return true;
 }
 
 void Gcn::FetchShaderData::Serialize(Serialization::Archive& ar) const {

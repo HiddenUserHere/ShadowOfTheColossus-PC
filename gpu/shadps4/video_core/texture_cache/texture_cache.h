@@ -649,6 +649,11 @@ public:
         NoteBoundImage(image);
     }
 
+    /// sotc: SOTC_HEAP (real mode): the per-bind part of UpdateImage for an image that the index table binds in
+    /// this op, without the lookups. Where UpdateImage would change nothing (TexUpdateIsNoOp) it does the LRU
+    /// touch, the protect flush and the bind evidence only; otherwise it is UpdateImage.
+    void TouchBoundImage(ImageId image_id);
+
     /// sotc: the bind evidence UpdateImage records for a bound image (the diagnostics and the memory
     /// class / placement notes). Caller holds `mutex`.
     void NoteBoundImage(const Image& image) {

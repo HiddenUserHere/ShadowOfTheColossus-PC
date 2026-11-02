@@ -264,6 +264,11 @@ private:
                      const PreparedResources* pr = nullptr, const PrStage* pr_stage = nullptr);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set,
                       const PreparedResources* pr = nullptr, const PrStage* pr_stage = nullptr);
+    /// sotc: SOTC_HEAP real mode, the heap stage of an op. Makes what the classic bind's second pass makes for the
+    /// stage's images (bound flags, transitions, bound list, usage) from the index table's images, with no descriptors.
+    /// Returns false, having made nothing, when the classic bind must run instead (a render target, a stencil image,
+    /// a rebind pending); the reason is counted.
+    bool BindHeapImages(const SotcArch::TableMemo::TableBinds& binds);
 
     /// sotc: SOTC_TEX_BLOCK=1 (default off; 2 also runs the full bind and compares). A stage's
     /// texture block (its image descriptors and samplers) is memoized by the raw T#/S# words it
@@ -471,6 +476,9 @@ private:
     Shader::BindlessSamplerSlots bindless_slots{}; // sotc: SOTC_BINDLESS_SAMP, pushed after push_data
     /// sotc: the pipeline of this op has slot words (Pipeline::HasSlotWords): only then are the slot words filled.
     bool slot_words_op{};
+    /// sotc: the slot words are filled for this op: slot_words_op, or the GPU verify of a heap pipeline (which compares
+    /// them with the index table; it has no slot words to push, the heap block carries them).
+    bool slot_words_fill{};
     /// sotc: SOTC_N5_BINDLESS: the heap of the sampled images (null unless the mode is on).
     std::unique_ptr<VideoCore::BindlessImages> bindless_images;
 

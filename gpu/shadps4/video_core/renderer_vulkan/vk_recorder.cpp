@@ -129,7 +129,7 @@ bool WaitNoSpin() {
 }
 
 // sotc: SOTC_FUTEX_WAIT=1 (Windows only, off by default): the consumer's idle wait (on wake_seq),
-// Sync (sync_done) and PassSecondary::WaitJob (done_seq) sleep in WaitOnAddress, and the producer
+// Sync (sync_done) and PassSecondary::WaitJob (done_gen) sleep in WaitOnAddress, and the producer
 // side wakes them after it stores the word they wait on. The sleep compares the value the waiter
 // read, so a store that came first is seen at once: no wake is lost. The timeout is a safety net,
 // and timed-out sleeps whose condition already held are counted (safety_met).
@@ -962,19 +962,32 @@ bool CommandRecorder::IsFake(VkCommandBuffer cmdbuf) noexcept {
 }
 
 // sotc: SOTC_PASS_SEC. The consumer finds a dynamic rendering pass (BeginRendering .. EndRendering)
-// with more than SOTC_PASS_SEC_MIN draws and no block a secondary cannot hold. It starts the pass on
-// the primary with secondary contents and hands the pass blocks to the worker thread, which records
-// them into one secondary command buffer while the consumer goes on with the next blocks. At the
-// EndRendering the consumer waits for that secondary, executes it, ends the pass and replays the
-// state.
+// with more than SOTC_PASS_SEC_MIN draws and no block a secondary cannot hold. The pass is recorded
+// into a secondary command buffer by a worker thread while the consumer goes on with the blocks
+// before it. The primary begins the pass with secondary contents and executes the secondary at the
+// EndRendering, after the worker finished it.
+//
+// Several passes can be open at once (SOTC_PASS_WORKERS=N, ParallelRecord::Workers): open is the list
+// of passes handed to the workers, in stream order, at most N. The consumer still walks the stream in
+// order and is the only thread that touches the primary: it begins each pass, executes its secondary
+// and ends it, and it runs barriers, copies and everything else itself, in order.
+//
+// The look-ahead (LookAhead) is what lets passes overlap. It walks the published part of the stream
+// beyond the consumer position and prepares the next passes, so their workers start before the
+// consumer reaches them. It cannot read the consumer's replay table at a later position, so it keeps
+// a copy of that table (la_table) and advances the copy over the same blocks. It stops, and resumes
+// later, where the copy cannot follow: at a block of category Other (BeginRecorded, submits and the
+// other closures that can call Bind or PassSubmitted, which change the table), at an insert that
+// would prune, at a pass whose end is not published yet, and when the open passes or the chunk ring
+// are full. Visit drops the copy when the walk reaches its cursor; the next LookAhead rebuilds it.
 //
 // A secondary inherits no state, so the worker first replays the latest block of each state key
 // (the replay table, one entry per command buffer and key). Those blocks are not copied: a table
 // entry pins the chunk of its block and the chunk before it (its data comes before the command), so
 // the block stays valid in place until the entry is replaced or dropped. Each chunk has two pin
-// counts: table_pins, touched by the consumer only, and job_pins, atomic, released by the worker when
-// a job is recorded. A chunk with a pin left is deferred (CommandRecorder::ReleaseChunk) instead of
-// recycled.
+// counts: table_pins, touched by the consumer only (la_table holds them too), and job_pins, atomic,
+// released by the worker when a job is recorded. A chunk with a pin left is deferred
+// (CommandRecorder::ReleaseChunk) instead of recycled.
 //
 // The table only holds command buffers that are still open: an entry goes when its command buffer is
 // submitted (Submitted) or begins again (Forget). If the table fills up, Prune drops the entries of
@@ -984,9 +997,15 @@ bool CommandRecorder::IsFake(VkCommandBuffer cmdbuf) noexcept {
 // Executing a secondary leaves the primary's bound state undefined, so the table is replayed on the
 // primary after each secondary pass too.
 //
-// Secondary command buffers come from a pool shared by the worker (commit) and the consumer
-// (release). A secondary is held while its job is recorded and until the submit that executes it
-// completes (its tick), so the pool never hands out a buffer the GPU still reads.
+// Secondary command buffers come from one pool per worker. A secondary is held while its job is
+// recorded and until the submit that executes it completes (its tick), so a pool never hands out a
+// buffer the GPU still reads. Each pool has its own mutex; the consumer releases into it.
+//
+// SOTC_PASS_VERIFY=1 (ParallelRecord::Verify): every job is checked. At the start of the pass the
+// consumer compares the job's state snapshot with its own replay table (same entries, same order),
+// and the worker hashes each block it executes (identity, category, size, invoke, payload bytes),
+// which the consumer compared with a reference hash taken before the job was handed out. The
+// parallel result is always the one used; the checks only count mismatches.
 class PassSecondary {
 public:
     PassSecondary(CommandRecorder& rec, const Instance& instance, Semaphore* work_semaphore,
@@ -1003,6 +1022,10 @@ public:
     bool Handle(CommandRecorder::Chunk* chunk, u32 pos, CommandRecorder::Chunk* previous,
                 CommandRecorder::BlockHeader* header, const CommandRecorder::StateMeta* meta,
                 std::stop_token stop);
+
+    /// Consumer thread, for every block the walk reaches. When the walk reaches the cursor of the
+    /// look-ahead, its copy of the table is dropped (the next LookAhead rebuilds it).
+    void Visit(CommandRecorder::Chunk* chunk, u32 pos);
 
     /// Consumer thread: the replay state of fake is no longer needed (its session was submitted, or
     /// it begins again)
@@ -1022,6 +1045,9 @@ private:
     static constexpr size_t kMaxEntries = 1024; ///< table size at which Prune drops entries
     static constexpr size_t kMaxScanChunks = 8; ///< a pass spanning more chunks stays on the primary
     static constexpr auto kMaxScanWait = std::chrono::milliseconds{5};
+    /// sotc: the look-ahead and a new pass stop when the chunk ring is this close to full
+    static constexpr u32 kRingHeadroom = 32;
+    static constexpr u64 kHashSeed = 0xcbf29ce484222325ull;
 
     struct TableKey {
         VkCommandBuffer cmd{};
@@ -1047,9 +1073,12 @@ private:
         u64 seq;
     };
 
+    using StateTable = std::unordered_map<TableKey, StateEntry, TableKeyHash>;
+
     struct Scan {
         bool found{};
         bool bad{}; ///< a block the secondary cannot hold, or the scan gave up
+        bool incomplete{}; ///< sotc: non-blocking scan: the producer has not published the end yet
         // sotc: SOTC_N5_PARALLEL: why the scan gave up, and the blocking category (ScanBlock)
         ParallelRecord::Fallback reason{ParallelRecord::Fallback::ScanBlock};
         u8 block{0xFF};
@@ -1061,9 +1090,20 @@ private:
         std::vector<Chunk*> chunks; ///< the chunks the pass spans, the first one holding BeginRendering
     };
 
+    /// sotc: what the consumer or the look-ahead decided for a BeginRendering that starts a pass
+    struct Decision {
+        enum class Kind : u8 { Parallel, Inline, Incomplete, Stop, Dry };
+        Kind kind{Kind::Inline};
+        ParallelRecord::Fallback reason{ParallelRecord::Fallback::ScanBlock};
+        u8 block{0xFF};
+        Scan scan;
+    };
+
     struct Job {
         VkCommandBuffer fake{};
         PassFormats formats{};
+        Chunk* block_chunk{}; ///< the BeginRendering block, to find the job when the walk reaches it
+        u32 block_pos{};
         Chunk* begin_chunk{}; ///< first block after the BeginRendering
         u32 begin_pos{};
         Chunk* end_chunk{}; ///< the EndRendering
@@ -1071,6 +1111,12 @@ private:
         std::vector<StateEntry> state; ///< replayed before the pass blocks, in sequence order
         std::vector<Chunk*> pinned;    ///< job_pins held, released by the worker
         u64 seq{};
+        u32 worker{};             ///< the worker that recorded the job
+        bool started{};           ///< consumer: the BeginRendering ran on the primary
+        bool state_ok{true};      ///< verify: the snapshot equals the consumer table at the start
+        u64 ref_hash{};           ///< verify: reference hash of the blocks, taken by the consumer
+        u64 run_hash{};           ///< verify: hash of the blocks the worker executed
+        std::atomic<bool> done{}; ///< set by the worker after its last access to the job
         VkCommandBuffer secondary{};
     };
 
@@ -1078,49 +1124,129 @@ private:
     struct Awaiting {
         VkCommandBuffer fake;
         VkCommandBuffer secondary;
+        u32 worker;
     };
 
-    bool TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::stop_token stop);
-    bool ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& scan);
+    struct Worker {
+        std::unique_ptr<CommandPool> pool; ///< secondary command buffers of this worker
+        std::mutex pool_mutex;
+        std::thread thread;
+    };
+
+    Decision Decide(Chunk* chunk, u32 pos, BlockHeader* header, std::stop_token stop, bool walk);
+    bool TryStart(Chunk* chunk, u32 pos, Chunk* previous, BlockHeader* header,
+                  std::stop_token stop);
+    bool ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& scan, bool wait);
+    Job* MakeJob(Chunk* chunk, u32 pos, BlockHeader* header, const Scan& scan,
+                 const StateTable& src);
+    void StartJob(Job* job, BlockHeader* header);
+    void Enqueue(Job* job);
+    void LookAhead(Chunk* chunk, u32 pos, Chunk* previous);
+    void RebuildLookAhead(Chunk* chunk, u32 pos, Chunk* previous);
+    void ClearLookAhead();
+    bool LookAheadInsert(Chunk* chunk, Chunk* prev, BlockHeader* header, const StateMeta* meta);
     void Insert(Chunk* chunk, Chunk* previous, BlockHeader* header, const StateMeta* meta);
     void Prune(VkCommandBuffer keep);
     void ClearTable();
-    void Finish(BlockHeader* end);
+    void Finish(Chunk* chunk, u32 pos, Chunk* previous, BlockHeader* end);
     void Replay(VkCommandBuffer fake);
-    void WaitJob(u64 seq);
-    void WorkerLoop();
-    void Record(Job* job);
+    void WaitJob(const Job* job);
+    void WorkerLoop(u32 index);
+    void Record(Job* job, u32 index);
+    /// Calls fn(header) for the state blocks of the job, then for the pass blocks, in order
+    template <typename Fn>
+    static void ForEachBlock(const Job* job, Fn&& fn);
+    static void MixBlock(u64& hash, const BlockHeader* header);
     static void Pin(Chunk* chunk, Chunk* prev);
     static void Unpin(Chunk* chunk, Chunk* prev);
     static void PinJob(Job* job, Chunk* chunk);
 
     CommandRecorder& rec;
     u32 min_draws;
-    std::unique_ptr<CommandPool> pool; ///< secondary command buffers, pool_mutex guards them
-    std::mutex pool_mutex;
-    std::thread worker;
-    /// consumer: the latest state block of each command buffer and key
-    std::unordered_map<TableKey, StateEntry, TableKeyHash> table;
-    /// consumer: command buffers Prune took entries from; their passes stay on the primary
-    std::unordered_set<VkCommandBuffer> dropped;
-    std::vector<Awaiting> awaiting; ///< consumer: secondaries waiting for their submit
-    u64 seq{};
-    Job* active{}; ///< consumer thread: the pass being consumed
-    u64 job_seq{};
+    u32 workers_n; ///< sotc: SOTC_PASS_WORKERS: worker threads, and passes open at once
+    bool verify_on;
+    std::vector<std::unique_ptr<Worker>> workers;
+    /// Jobs handed to the workers and not yet recorded, in stream order (guarded by mutex)
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<Job*> queue;
     bool stopping{};
-    std::atomic<u64> done_seq{0};
+    /// Counts every finished recording; WaitJob waits on it, and each job's done flag says which
+    std::atomic<u64> done_gen{0};
+
+    // Consumer thread: the replay table and the passes in flight
+    StateTable table;
+    /// command buffers Prune took entries from; their passes stay on the primary
+    std::unordered_set<VkCommandBuffer> dropped;
+    std::vector<Awaiting> awaiting; ///< secondaries waiting for their submit
+    /// Passes handed out and not finished, in stream order. The front one is active when the walk is
+    /// inside a pass; every job after it was prepared by the look-ahead and not started yet.
+    std::deque<Job*> open;
+    Job* active{}; ///< the pass the walk is inside (started, not finished)
+    u64 seq{};
+    u64 job_seq{};
+
+    // Consumer thread: the look-ahead. Its copy la_table is the replay table at la_pos (the next block
+    // to process), with the same pins as table; la_prev is the chunk before la_chunk.
+    bool la_valid{};
+    Chunk* la_chunk{};
+    Chunk* la_prev{};
+    u32 la_pos{};
+    u64 la_seq{};
+    StateTable la_table;
+    bool la_incomplete{}; ///< the last LookAhead stopped at unpublished blocks
+    u32 la_retry{};       ///< blocks walked inside a pass, to retry an incomplete look-ahead now and then
 };
+
+template <typename Fn>
+void PassSecondary::ForEachBlock(const Job* job, Fn&& fn) {
+    for (const StateEntry& entry : job->state) {
+        fn(entry.header);
+    }
+    Chunk* c = job->begin_chunk;
+    u32 p = job->begin_pos;
+    while (c != job->end_chunk || p != job->end_pos) {
+        auto* h = reinterpret_cast<BlockHeader*>(c->data + p);
+        if (h->kind == BlockKind::End) {
+            c = c->next.load(std::memory_order_acquire);
+            p = 0;
+            continue;
+        }
+        if (h->kind == BlockKind::Command) {
+            fn(h);
+        }
+        p += h->size;
+    }
+}
+
+void PassSecondary::MixBlock(u64& hash, const BlockHeader* header) {
+    // FNV-1a over the block identity, its header fields and its payload bytes
+    const auto mix = [&hash](u64 v) { hash = (hash ^ v) * 0x100000001B3ull; };
+    mix(reinterpret_cast<uintptr_t>(header));
+    mix(u64{header->size} | (u64{static_cast<u8>(header->kind)} << 32) |
+        (u64{static_cast<u8>(header->category)} << 40) | (u64{header->aux} << 48));
+    mix(reinterpret_cast<uintptr_t>(header->invoke));
+    const u8* payload = reinterpret_cast<const u8*>(header + 1);
+    const size_t bytes = header->size - sizeof(BlockHeader);
+    for (size_t i = 0; i < bytes; ++i) {
+        hash = (hash ^ payload[i]) * 0x100000001B3ull;
+    }
+}
 
 PassSecondary::PassSecondary(CommandRecorder& rec_, const Instance& instance,
                              Semaphore* work_semaphore, u32 min_draws_)
-    : rec{rec_}, min_draws{min_draws_},
-      pool{std::make_unique<CommandPool>(instance, work_semaphore,
-                                         vk::CommandBufferLevel::eSecondary)} {
-    // Started last: the worker reads the members above
-    worker = std::thread{[this] { WorkerLoop(); }};
+    : rec{rec_}, min_draws{min_draws_}, workers_n{static_cast<u32>(ParallelRecord::Workers())},
+      verify_on{ParallelRecord::Verify()} {
+    for (u32 i = 0; i < workers_n; ++i) {
+        auto worker = std::make_unique<Worker>();
+        worker->pool = std::make_unique<CommandPool>(instance, work_semaphore,
+                                                     vk::CommandBufferLevel::eSecondary);
+        workers.push_back(std::move(worker));
+    }
+    // Started last: the workers read the members above
+    for (u32 i = 0; i < workers_n; ++i) {
+        workers[i]->thread = std::thread{[this, i] { WorkerLoop(i); }};
+    }
 }
 
 PassSecondary::~PassSecondary() {
@@ -1129,11 +1255,18 @@ PassSecondary::~PassSecondary() {
         stopping = true;
     }
     cv.notify_all();
-    if (worker.joinable()) {
-        worker.join();
+    // The workers record what is queued, then stop
+    for (auto& worker : workers) {
+        if (worker->thread.joinable()) {
+            worker->thread.join();
+        }
     }
-    delete active;
+    for (Job* job : open) {
+        delete job;
+    }
+    open.clear();
     active = nullptr;
+    ClearLookAhead();
     ClearTable();
 }
 
@@ -1181,7 +1314,7 @@ void PassSecondary::Insert(Chunk* chunk, Chunk* previous, BlockHeader* header,
 
 void PassSecondary::Prune(VkCommandBuffer keep) {
     // Entries of the command buffer being inserted into stay. The others go, and their passes fall
-    // back to the primary (TryStart), because a partial replay would be wrong.
+    // back to the primary (Decide), because a partial replay would be wrong.
     for (auto it = table.begin(); it != table.end();) {
         if (it->first.cmd != keep) {
             Unpin(it->second.chunk, it->second.prev);
@@ -1223,8 +1356,9 @@ void PassSecondary::Submitted(std::span<const vk::CommandBuffer> fakes, u64 sign
             continue;
         }
         {
-            std::scoped_lock lk{pool_mutex};
-            pool->Release(vk::CommandBuffer{entry.secondary}, signal_tick);
+            Worker& worker = *workers[entry.worker];
+            std::scoped_lock lk{worker.pool_mutex};
+            worker.pool->Release(vk::CommandBuffer{entry.secondary}, signal_tick);
         }
         awaiting[i] = awaiting.back();
         awaiting.pop_back();
@@ -1238,22 +1372,76 @@ void PassSecondary::ClearTable() {
     table.clear();
 }
 
+void PassSecondary::ClearLookAhead() {
+    for (const auto& [key, entry] : la_table) {
+        Unpin(entry.chunk, entry.prev);
+    }
+    la_table.clear();
+    la_valid = false;
+    la_chunk = nullptr;
+    la_prev = nullptr;
+    la_pos = 0;
+}
+
+void PassSecondary::RebuildLookAhead(Chunk* chunk, u32 pos, Chunk* previous) {
+    // The consumer table is exact at the walk position, so the copy starts equal to it
+    ClearLookAhead();
+    la_table.reserve(table.size());
+    for (const auto& [key, entry] : table) {
+        la_table.emplace(key, entry);
+        Pin(entry.chunk, entry.prev);
+    }
+    la_seq = seq;
+    la_chunk = chunk;
+    la_prev = previous;
+    la_pos = pos;
+    la_valid = true;
+}
+
+bool PassSecondary::LookAheadInsert(Chunk* chunk, Chunk* prev, BlockHeader* header,
+                                    const StateMeta* meta) {
+    // The same rule as Insert, without the prune: a prune is left to the consumer (false)
+    const TableKey table_key{meta->cmd, meta->key};
+    if (const auto it = la_table.find(table_key); it != la_table.end()) {
+        Unpin(it->second.chunk, it->second.prev);
+        it->second = StateEntry{header, meta, chunk, prev, ++la_seq};
+        Pin(chunk, prev);
+        return true;
+    }
+    if (la_table.size() >= kMaxEntries) {
+        return false;
+    }
+    la_table.emplace(table_key, StateEntry{header, meta, chunk, prev, ++la_seq});
+    Pin(chunk, prev);
+    return true;
+}
+
+void PassSecondary::Visit(Chunk* chunk, u32 pos) {
+    if (la_valid && chunk == la_chunk && pos == la_pos) {
+        ClearLookAhead();
+    }
+}
+
 bool PassSecondary::Handle(Chunk* chunk, u32 pos, Chunk* previous, BlockHeader* header,
                            const StateMeta* meta, std::stop_token stop) {
     if (active != nullptr) {
         if (chunk == active->end_chunk && pos == active->end_pos) {
-            Finish(header);
+            Finish(chunk, pos, previous, header);
             return true;
         }
         // A block of the pass: the worker runs it, but a state block stays in the table
         if (meta != nullptr) {
             Insert(chunk, previous, header, meta);
         }
+        // sotc: the producer may have published the next pass since the look-ahead last looked
+        if (la_incomplete && (++la_retry & 63) == 0) {
+            LookAhead(chunk, pos + header->size, previous);
+        }
         return true;
     }
     if (header->category == BlockCategory::BeginRendering &&
         header->aux == CommandRecorder::kBeginPassAux) {
-        return TryStart(chunk, pos, header, stop);
+        return TryStart(chunk, pos, previous, header, stop);
     }
     if (meta != nullptr) {
         Insert(chunk, previous, header, meta);
@@ -1261,12 +1449,13 @@ bool PassSecondary::Handle(Chunk* chunk, u32 pos, Chunk* previous, BlockHeader* 
     return false;
 }
 
-bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& scan) {
+bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& scan, bool wait) {
     // Reads the pass blocks as the producer publishes them, so the pass is complete before it is
     // handed over. The scan gives up (scan.bad, the pass stays on the primary) at a block the
     // secondary cannot hold, after kMaxScanChunks chunks, and after kMaxScanWait without a new block:
     // the producer may wait for the consumer (chunk recycling, a submit) before it ends the pass.
-    // Returns false when shutdown interrupts the wait.
+    // A scan that does not wait (look-ahead) returns with scan.incomplete at the first unpublished
+    // block. Returns false when shutdown interrupts the wait.
     Chunk* c = chunk;
     u32 p = pos;
     scan.chunks.push_back(c);
@@ -1276,6 +1465,10 @@ bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& 
     while (true) {
         const u32 committed = c->committed.load(std::memory_order_acquire);
         if (p >= committed) {
+            if (!wait) {
+                scan.incomplete = true;
+                return true;
+            }
             if (stop.stop_requested()) {
                 return false;
             }
@@ -1325,7 +1518,7 @@ bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& 
             ++scan.draws;
             break;
         case BlockCategory::BindDescriptors:
-            ++scan.descriptors; // sotc: SOTC_PASS_RECORD packet shape (TryStart), same handling as below
+            ++scan.descriptors; // sotc: SOTC_PASS_RECORD packet shape (Decide), same handling as below
             break;
         case BlockCategory::BindPipeline:
         case BlockCategory::PushConstants:
@@ -1345,62 +1538,75 @@ bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& 
     }
 }
 
-bool PassSecondary::TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::stop_token stop) {
-    auto* begin = reinterpret_cast<BeginPayload*>(header + 1);
-    const bool counted = ParallelRecord::Enabled(); // sotc: SOTC_N5_PARALLEL counters
-    const bool packet = ParallelRecord::PacketRecord(); // sotc: SOTC_PASS_RECORD + SOTC_PACKET counters
-    if (!begin->formats.valid || dropped.contains(begin->cmdbuf)) {
-        if (SotcStats::kCmdStats) {
-            SotcStats::passes_fallback.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (counted) {
-            ParallelRecord::NoteFallback(begin->formats.valid
-                                             ? ParallelRecord::Fallback::Dropped
-                                             : ParallelRecord::Fallback::FormatsInvalid);
-        }
-        return false;
+PassSecondary::Decision PassSecondary::Decide(Chunk* chunk, u32 pos, BlockHeader* header,
+                                              std::stop_token stop, bool walk) {
+    // Everything that decides whether a pass goes to a worker. The scan reads published blocks only:
+    // with walk false (look-ahead) it returns Incomplete instead of waiting for the producer.
+    Decision d;
+    const auto* begin = reinterpret_cast<const BeginPayload*>(header + 1);
+    if (!begin->formats.valid) {
+        d.kind = Decision::Kind::Inline;
+        d.reason = ParallelRecord::Fallback::FormatsInvalid;
+        return d;
     }
-    Scan scan;
-    if (!ScanPass(chunk, pos + header->size, stop, scan)) {
-        if (counted) {
-            ParallelRecord::NoteFallback(ParallelRecord::Fallback::ScanStopped);
-        }
-        return false;
+    if (dropped.contains(begin->cmdbuf)) {
+        d.kind = Decision::Kind::Inline;
+        d.reason = ParallelRecord::Fallback::Dropped;
+        return d;
     }
-    if (scan.bad) {
-        if (SotcStats::kCmdStats) {
-            SotcStats::passes_fallback.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (counted) {
-            ParallelRecord::NoteFallback(scan.reason, scan.block);
-        }
-        return false;
+    if (!ScanPass(chunk, pos + header->size, stop, d.scan, walk)) {
+        d.kind = Decision::Kind::Stop;
+        d.reason = ParallelRecord::Fallback::ScanStopped;
+        return d;
     }
-    if (packet) {
-        ParallelRecord::NotePacketPass(scan.descriptors == 0, scan.draws);
+    if (d.scan.incomplete) {
+        d.kind = Decision::Kind::Incomplete;
+        return d;
     }
-    if (scan.draws <= min_draws) {
-        if (counted) {
-            ParallelRecord::NoteFallback(ParallelRecord::Fallback::FewDraws);
-        }
-        return false;
+    if (d.scan.bad) {
+        d.kind = Decision::Kind::Inline;
+        d.reason = d.scan.reason;
+        d.block = d.scan.block;
+        return d;
     }
-
+    if (walk && ParallelRecord::PacketRecord()) { // sotc: SOTC_PASS_RECORD + SOTC_PACKET counters
+        ParallelRecord::NotePacketPass(d.scan.descriptors == 0, d.scan.draws);
+    }
+    if (d.scan.draws <= min_draws) {
+        d.kind = Decision::Kind::Inline;
+        d.reason = ParallelRecord::Fallback::FewDraws;
+        return d;
+    }
     // sotc: SOTC_N5_PARALLEL=2 (dry run): the pass passed every check of the parallel path. It is
     // counted and left to the owner, which records it serially as in mode 0. The scan read the
     // blocks only, so nothing is consumed. The BeginRendering is not marked secondary.
-    if (ParallelRecord::Dry()) {
-        ParallelRecord::NoteWouldParallel(scan.draws, scan.blocks);
-        return false;
+    if (walk && ParallelRecord::Dry()) {
+        d.kind = Decision::Kind::Dry;
+        return d;
     }
+    if (rec.chunks_in_flight.load(std::memory_order_acquire) + kRingHeadroom >=
+        CommandRecorder::MaxChunksInFlight) {
+        d.kind = Decision::Kind::Inline;
+        d.reason = ParallelRecord::Fallback::Ring;
+        return d;
+    }
+    if (open.size() >= workers_n) {
+        d.kind = Decision::Kind::Inline;
+        d.reason = ParallelRecord::Fallback::Workers;
+        return d;
+    }
+    d.kind = Decision::Kind::Parallel;
+    return d;
+}
 
-    // The primary begins the pass with secondary contents and executes the secondary at its end
-    begin->info.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
-    header->invoke(header + 1);
-
+PassSecondary::Job* PassSecondary::MakeJob(Chunk* chunk, u32 pos, BlockHeader* header,
+                                           const Scan& scan, const StateTable& src) {
+    const auto* begin = reinterpret_cast<const BeginPayload*>(header + 1);
     auto* job = new Job;
     job->fake = begin->cmdbuf;
     job->formats = begin->formats;
+    job->block_chunk = chunk;
+    job->block_pos = pos;
     job->begin_chunk = chunk;
     job->begin_pos = pos + header->size;
     job->end_chunk = scan.end_chunk;
@@ -1409,7 +1615,7 @@ bool PassSecondary::TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::st
     for (Chunk* c : scan.chunks) {
         PinJob(job, c);
     }
-    for (const auto& [key, entry] : table) {
+    for (const auto& [key, entry] : src) {
         if (key.cmd != job->fake) {
             continue;
         }
@@ -1419,31 +1625,214 @@ bool PassSecondary::TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::st
     }
     std::sort(job->state.begin(), job->state.end(),
               [](const StateEntry& a, const StateEntry& b) { return a.seq < b.seq; });
+    if (verify_on) {
+        // Taken before the job is queued: no worker reads the blocks yet
+        u64 hash = kHashSeed;
+        ForEachBlock(job, [&hash](BlockHeader* block) { MixBlock(hash, block); });
+        job->ref_hash = hash;
+    }
+    return job;
+}
 
-    active = job;
+void PassSecondary::Enqueue(Job* job) {
     {
         std::scoped_lock lk{mutex};
         queue.push_back(job);
     }
     cv.notify_one();
-    if (counted) {
+}
+
+void PassSecondary::StartJob(Job* job, BlockHeader* header) {
+    // The primary begins the pass with secondary contents and executes the secondary at its end
+    auto* begin = reinterpret_cast<BeginPayload*>(header + 1);
+    begin->info.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+    header->invoke(header + 1);
+    job->started = true;
+    active = job;
+    if (verify_on) {
+        // The snapshot must be the consumer table at this point: same entries, same order
+        std::vector<StateEntry> real;
+        for (const auto& [key, entry] : table) {
+            if (key.cmd == job->fake) {
+                real.push_back(entry);
+            }
+        }
+        std::sort(real.begin(), real.end(),
+                  [](const StateEntry& a, const StateEntry& b) { return a.seq < b.seq; });
+        bool same = real.size() == job->state.size();
+        for (size_t i = 0; same && i < real.size(); ++i) {
+            same = real[i].header == job->state[i].header && real[i].meta == job->state[i].meta &&
+                   real[i].chunk == job->state[i].chunk && real[i].prev == job->state[i].prev;
+        }
+        job->state_ok = same;
+    }
+    if (ParallelRecord::Counted()) {
         ParallelRecord::NotePassParallel(); // sotc: SOTC_N5_PARALLEL counters
     }
     if (SotcStats::kCmdStats) {
         SotcStats::passes_secondary.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+bool PassSecondary::TryStart(Chunk* chunk, u32 pos, Chunk* previous, BlockHeader* header,
+                             std::stop_token stop) {
+    const bool counted = ParallelRecord::Counted(); // sotc: SOTC_N5_PARALLEL / pool counters
+    // The look-ahead prepared this pass: its job is the first one still to start
+    if (!open.empty()) {
+        Job* job = open.front();
+        if (!job->started && job->block_chunk == chunk && job->block_pos == pos) {
+            StartJob(job, header);
+            LookAhead(chunk, pos + header->size, previous);
+            return true;
+        }
+        // sotc: the look-ahead prepared a later pass, so this one was passed over as ineligible (it
+        // stays on the primary, the walk never reorders passes); counted as a slot fallback
+        if (counted) {
+            ParallelRecord::NoteFallback(ParallelRecord::Fallback::Workers);
+        }
+        return false;
+    }
+
+    const Decision d = Decide(chunk, pos, header, stop, /*walk=*/true);
+    switch (d.kind) {
+    case Decision::Kind::Stop:
+        if (counted) {
+            ParallelRecord::NoteFallback(ParallelRecord::Fallback::ScanStopped);
+        }
+        return false;
+    case Decision::Kind::Dry:
+        if (counted) {
+            ParallelRecord::NoteWouldParallel(d.scan.draws, d.scan.blocks);
+        }
+        return false;
+    case Decision::Kind::Inline:
+        if (counted) {
+            ParallelRecord::NoteFallback(d.reason, d.block);
+        }
+        if (SotcStats::kCmdStats && d.reason != ParallelRecord::Fallback::FewDraws &&
+            d.reason != ParallelRecord::Fallback::Workers &&
+            d.reason != ParallelRecord::Fallback::Ring) {
+            SotcStats::passes_fallback.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    case Decision::Kind::Incomplete:
+    case Decision::Kind::Parallel:
+        break;
+    }
+    if (d.kind == Decision::Kind::Incomplete) {
+        return false; // not reachable with wait, kept for the switch
+    }
+
+    Job* job = MakeJob(chunk, pos, header, d.scan, table);
+    open.push_back(job);
+    StartJob(job, header); // the primary begins the pass, then a worker may take the job
+    Enqueue(job);
+    LookAhead(chunk, pos + header->size, previous);
     return true;
 }
 
-void PassSecondary::WaitJob(u64 job_seq_) {
-    if (FutexWaitOn()) { // sotc: SOTC_FUTEX_WAIT
-        FutexWaitAtLeast(done_seq, job_seq_);
+void PassSecondary::LookAhead(Chunk* chunk, u32 pos, Chunk* previous) {
+    // Walks the published blocks after the cursor and prepares the passes it finds, while there is a
+    // free slot for each. Never waits: the first unpublished block ends the walk (la_incomplete).
+    if (workers_n < 2 || ParallelRecord::Dry()) {
         return;
     }
-    u64 done = done_seq.load(std::memory_order_acquire);
-    while (done < job_seq_) {
-        done_seq.wait(done, std::memory_order_acquire);
-        done = done_seq.load(std::memory_order_acquire);
+    if (!la_valid) {
+        // The copy is rebuilt only when no prepared pass is left to start (the walk is at the
+        // cursor). An active pass is the walk's own; anything else prepared must start first.
+        if (open.size() > (active != nullptr ? 1U : 0U)) {
+            return;
+        }
+        RebuildLookAhead(chunk, pos, previous);
+    }
+    la_incomplete = false;
+    const bool counted = ParallelRecord::Counted();
+    while (true) {
+        Chunk* c = la_chunk;
+        const u32 start = la_pos;
+        const u32 committed = c->committed.load(std::memory_order_acquire);
+        if (start >= committed) {
+            la_incomplete = true;
+            return;
+        }
+        auto* h = reinterpret_cast<BlockHeader*>(c->data + start);
+        if (h->kind == BlockKind::End) {
+            // NextChunk links the next chunk before it publishes the End block
+            la_prev = c;
+            la_chunk = c->next.load(std::memory_order_acquire);
+            la_pos = 0;
+            continue;
+        }
+        if (h->kind == BlockKind::Data) {
+            la_pos = start + h->size;
+            continue;
+        }
+        const StateMeta* meta = nullptr;
+        u32 p = start;
+        if (h->kind == BlockKind::Meta) {
+            // A state block: its Meta and command block are reserved together, in one chunk
+            const u32 next = start + h->size;
+            if (next >= committed) {
+                la_incomplete = true;
+                return;
+            }
+            meta = reinterpret_cast<const StateMeta*>(h + 1);
+            p = next;
+            h = reinterpret_cast<BlockHeader*>(c->data + p);
+        }
+        if (h->kind != BlockKind::Command) {
+            la_incomplete = true;
+            return;
+        }
+        if (h->category == BlockCategory::Other) {
+            // Bind, submits and other closures change the table through Forget: the walk does them
+            if (counted) {
+                ParallelRecord::NoteLookahead(ParallelRecord::LaStop::Other);
+            }
+            return;
+        }
+        if (h->category == BlockCategory::BeginRendering &&
+            h->aux == CommandRecorder::kBeginPassAux) {
+            if (open.size() >= workers_n) {
+                if (counted) {
+                    ParallelRecord::NoteLookahead(ParallelRecord::LaStop::Queue);
+                }
+                return;
+            }
+            if (rec.chunks_in_flight.load(std::memory_order_acquire) + kRingHeadroom >=
+                CommandRecorder::MaxChunksInFlight) {
+                if (counted) {
+                    ParallelRecord::NoteLookahead(ParallelRecord::LaStop::Ring);
+                }
+                return;
+            }
+            const Decision d = Decide(c, p, h, std::stop_token{}, /*walk=*/false);
+            if (d.kind == Decision::Kind::Incomplete) {
+                la_incomplete = true;
+                if (counted) {
+                    ParallelRecord::NoteLookahead(ParallelRecord::LaStop::Incomplete);
+                }
+                return;
+            }
+            if (d.kind == Decision::Kind::Parallel) {
+                // The snapshot is the copy at the BeginRendering: the blocks before it are applied
+                Job* job = MakeJob(c, p, h, d.scan, la_table);
+                open.push_back(job);
+                Enqueue(job);
+                if (counted) {
+                    ParallelRecord::NoteLookaheadPrepare(open.size());
+                }
+            }
+            // Any other decision: the pass stays on the primary and the walk decides it again
+        }
+        if (meta != nullptr && !LookAheadInsert(c, la_prev, h, meta)) {
+            // The consumer prunes at this insert; the copy stops here until the walk gets there
+            if (counted) {
+                ParallelRecord::NoteLookahead(ParallelRecord::LaStop::Prune);
+            }
+            return;
+        }
+        la_pos = p + h->size;
     }
 }
 
@@ -1462,36 +1851,61 @@ void PassSecondary::Replay(VkCommandBuffer fake) {
     }
 }
 
-void PassSecondary::Finish(BlockHeader* end) {
+void PassSecondary::WaitJob(const Job* job) {
+    // The worker stores job->done, then bumps done_gen and wakes the waiters. The consumer reads the
+    // generation before it checks done, so a completion in between changes the value it sleeps on.
+    while (!job->done.load(std::memory_order_acquire)) {
+        const u64 gen = done_gen.load(std::memory_order_acquire);
+        if (job->done.load(std::memory_order_acquire)) {
+            break;
+        }
+        if (FutexWaitOn()) { // sotc: SOTC_FUTEX_WAIT
+            FutexSleepRec(done_gen, gen);
+        } else {
+            done_gen.wait(gen, std::memory_order_acquire);
+        }
+    }
+}
+
+void PassSecondary::Finish(Chunk* chunk, u32 pos, Chunk* previous, BlockHeader* end) {
     Job* job = active;
+    const u32 next_pos = pos + end->size;
     // sotc: SOTC_N5_PARALLEL: the owner's wait for the worker (clock reads only when counted)
-    const bool counted = ParallelRecord::Enabled();
+    const bool counted = ParallelRecord::Counted();
     const auto wait_t0 =
         counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    WaitJob(job->seq);
+    WaitJob(job);
     if (counted) {
         ParallelRecord::NoteOwnerWait(static_cast<u64>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                  wait_t0)
                 .count()));
     }
+    if (verify_on) {
+        ParallelRecord::NoteVerify(job->state_ok, job->ref_hash == job->run_hash);
+    }
     // sotc: SOTC_PASS_RECORD + SOTC_PACKET: the stitch (execute, EndRendering, replay), clock reads only then
     const bool stitch = ParallelRecord::PacketRecord();
     const u64 stitch_t0 = stitch ? ParallelRecord::NowNs() : 0;
     const VkCommandBuffer primary = rec.Real(job->fake);
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdExecuteCommands(primary, 1, &job->secondary);
-    awaiting.push_back(Awaiting{job->fake, job->secondary});
+    awaiting.push_back(Awaiting{job->fake, job->secondary, job->worker});
     end->invoke(end + 1); // EndRendering on the primary
     Replay(job->fake);
     if (stitch) {
         ParallelRecord::NoteStitch(ParallelRecord::NowNs() - stitch_t0);
     }
+    if (!open.empty() && open.front() == job) {
+        open.pop_front();
+    }
     delete job;
     active = nullptr;
     rec.SweepDeferred();
+    // A slot is free: the look-ahead prepares the next pass now, while the walk goes on
+    LookAhead(chunk, next_pos, previous);
 }
 
-void PassSecondary::WorkerLoop() {
+void PassSecondary::WorkerLoop(u32 index) {
     Common::SetCurrentThreadName("shadPS4:PassSecondary");
     SotcStats::RegisterThreadRole(SotcStats::RolePassSecondary); // sotc: SOTC_FPS accounting
     while (true) {
@@ -1505,21 +1919,23 @@ void PassSecondary::WorkerLoop() {
             job = queue.front();
             queue.pop_front();
         }
-        Record(job);
+        Record(job, index);
     }
 }
 
-void PassSecondary::Record(Job* job) {
+void PassSecondary::Record(Job* job, u32 index) {
+    Worker& worker = *workers[index];
     // sotc: SOTC_N5_PARALLEL: worker time and commands replayed (clock reads only when counted)
-    const bool counted = ParallelRecord::Enabled();
+    const bool counted = ParallelRecord::Counted();
     const auto job_t0 =
         counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     u64 ops = 0;
+    u64 run_hash = kHashSeed;
     VkCommandBuffer secondary{};
     {
-        std::scoped_lock lk{pool_mutex};
-        secondary = static_cast<VkCommandBuffer>(pool->Commit());
-        pool->Hold(vk::CommandBuffer{secondary});
+        std::scoped_lock lk{worker.pool_mutex};
+        secondary = static_cast<VkCommandBuffer>(worker.pool->Commit());
+        worker.pool->Hold(vk::CommandBuffer{secondary});
     }
 
     VkCommandBufferInheritanceRenderingInfo rendering{};
@@ -1540,28 +1956,18 @@ void PassSecondary::Record(Job* job) {
     ASSERT_MSG(begun == VK_SUCCESS, "SOTC_PASS_SEC: vkBeginCommandBuffer failed: {}",
                static_cast<u32>(begun));
 
-    // Commands of the fake handle now go to this secondary (CommandRecorder::Real)
+    // Commands of the fake handle now go to this secondary (CommandRecorder::Real). The thread-local
+    // override is per worker, so several passes of one command buffer can be recorded at once.
     tls_pass_fake = job->fake;
     tls_pass_real = secondary;
-    for (const StateEntry& entry : job->state) {
-        entry.header->invoke(entry.header + 1);
+    ForEachBlock(job, [&](BlockHeader* header) {
+        // The hash is taken before the block runs: running it may destroy its payload
+        if (verify_on) {
+            MixBlock(run_hash, header);
+        }
+        header->invoke(header + 1);
         ++ops;
-    }
-    Chunk* c = job->begin_chunk;
-    u32 p = job->begin_pos;
-    while (c != job->end_chunk || p != job->end_pos) {
-        auto* h = reinterpret_cast<BlockHeader*>(c->data + p);
-        if (h->kind == BlockKind::End) {
-            c = c->next.load(std::memory_order_acquire);
-            p = 0;
-            continue;
-        }
-        if (h->kind == BlockKind::Command) {
-            h->invoke(h + 1);
-            ++ops;
-        }
-        p += h->size;
-    }
+    });
     tls_pass_fake = nullptr;
     tls_pass_real = nullptr;
 
@@ -1569,6 +1975,8 @@ void PassSecondary::Record(Job* job) {
     ASSERT_MSG(ended == VK_SUCCESS, "SOTC_PASS_SEC: vkEndCommandBuffer failed: {}",
                static_cast<u32>(ended));
     job->secondary = secondary;
+    job->worker = index;
+    job->run_hash = run_hash;
     if (counted) {
         ParallelRecord::NoteWorkerJob(
             ops, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1581,12 +1989,13 @@ void PassSecondary::Record(Job* job) {
         pinned->job_pins.fetch_sub(1, std::memory_order_release);
     }
     job->pinned.clear();
-    if (FutexWaitOn()) { // sotc: SOTC_FUTEX_WAIT: WaitJob sleeps on done_seq
-        done_seq.store(job->seq, std::memory_order_seq_cst);
-        FutexWakeRec(done_seq, true);
+    // Last access to job: the consumer may delete it once it sees done
+    job->done.store(true, std::memory_order_release);
+    done_gen.fetch_add(1, std::memory_order_seq_cst);
+    if (FutexWaitOn()) { // sotc: SOTC_FUTEX_WAIT: WaitJob sleeps on done_gen
+        FutexWakeRec(done_gen, true);
     } else {
-        done_seq.store(job->seq, std::memory_order_release);
-        done_seq.notify_all();
+        done_gen.notify_all();
     }
 }
 
@@ -2073,6 +2482,10 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         const u64 sotc_busy_start = (SotcStats::kFpsLog || SotcTrace::kOn) ? SotcStats::NowNs() : 0;
         while (pos < committed) {
             auto* header = reinterpret_cast<BlockHeader*>(chunk->data + pos);
+            // sotc: SOTC_PASS_WORKERS: the look-ahead drops its copy of the table when the walk reaches it
+            if (pass != nullptr) {
+                pass->Visit(chunk, pos);
+            }
             if (header->kind == BlockKind::End) {
                 Chunk* next = chunk->next.load(std::memory_order_acquire);
                 // Commands in next may still refer to data in chunk, so keep that chunk until the

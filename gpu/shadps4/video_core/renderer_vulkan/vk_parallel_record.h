@@ -8,11 +8,12 @@
 // records them into a secondary command buffer, and the owner (the recorder's consumer thread)
 // keeps every synchronization decision: barriers, copies and dispatches are never inside a pass, the
 // BeginRendering carries VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT, and the owner executes
-// the secondary at EndRendering in sequence order. This file only counts what that path does, so the
-// next step (more workers, pass look-ahead) can be sized from measurements.
+// the secondary at EndRendering in sequence order. This file only counts what that path does; the
+// pass decisions, the worker pool and the look-ahead are in PassSecondary (vk_recorder.cpp).
 //
-// Threads: NoteFallback, NotePassParallel and NoteOwnerWait run on the owner (consumer) thread;
-// NoteWorkerJob runs on the worker thread; Report may run on any thread. Counters are atomics.
+// Threads: NoteFallback, NotePassParallel, NoteOwnerWait, NoteLookahead and NoteLookaheadPrepare run
+// on the owner (consumer) thread; NoteWorkerJob runs on a worker thread; NoteVerify runs on the owner;
+// Report may run on any thread. Counters are atomics.
 
 #include <string>
 
@@ -30,8 +31,43 @@ enum class Fallback : u8 {
     ScanChunks,     ///< the pass spans more chunks than the scan takes
     ScanBlock,      ///< a block a secondary cannot hold (see the block category counts)
     FewDraws,       ///< the pass has no more draws than SOTC_PASS_SEC_MIN
+    Workers,        ///< sotc: SOTC_PASS_WORKERS: every open-pass slot is taken
+    Ring,           ///< sotc: the chunk ring is nearly full, a new pass would pin more chunks
     Count,
 };
+
+/// Why the look-ahead stopped (a stop event: the same stop can be counted again at the next call)
+enum class LaStop : u8 {
+    Other,      ///< a block of category Other (BeginRecorded, submits): the walk runs it
+    Prune,      ///< an insert that needs a prune of the replay table: the walk does it
+    Queue,      ///< every open-pass slot is taken
+    Ring,       ///< the chunk ring is nearly full
+    Incomplete, ///< the producer has not published the end of the next pass yet
+    Count,
+};
+
+/// SOTC_PASS_WORKERS=N (1..8, or "auto" = min(4, logical cores / 4)): the pass worker threads, and
+/// how many passes are open at once; the look-ahead runs from N = 2. Unset: 1 (one worker, no
+/// look-ahead). Needs SOTC_PASS_SEC=1; otherwise 1. Read once.
+int Workers();
+
+/// SOTC_PASS_VERIFY=1: every pass job is checked (state snapshot against the consumer table, and the
+/// blocks the worker executed against a reference hash). Read once.
+bool Verify();
+
+/// The counters and the clock reads of the pass path are on: Enabled(), or more than one worker, or
+/// Verify().
+bool Counted();
+
+/// Owner: the look-ahead stopped for why (PassSecondary::LookAhead).
+void NoteLookahead(LaStop why) noexcept;
+
+/// Owner: the look-ahead prepared a pass; depth is the number of open passes after it.
+void NoteLookaheadPrepare(u64 depth) noexcept;
+
+/// Owner, at each EndRendering of a verified job: state_ok is the snapshot check at the start of the
+/// pass, run_ok the worker's block hash against the reference.
+void NoteVerify(bool state_ok, bool run_ok) noexcept;
 
 /// SOTC_N5_PARALLEL=1 (parallel) or 2 (dry run), with SOTC_NATIVE on, SOTC_N5_GRAPH set,
 /// SOTC_PARALLEL_RECORD=1 and SOTC_PASS_SEC=1 (the pass secondaries). Read once; logs once which

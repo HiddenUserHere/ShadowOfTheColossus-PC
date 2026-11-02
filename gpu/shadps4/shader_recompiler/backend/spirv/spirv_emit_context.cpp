@@ -1252,6 +1252,39 @@ Id EmitContext::ShaderAddrVerifyLoad(u32 handle, Id index, u32 elem_size, Pointe
     // Outside the block (the descriptor read is 0 there under robustness): not compared.
     const Id uncompared_merge = BdaBeginIf(OpLogicalNot(U1[1], valid));
     add_word(ShaderAddrVerifyUncompared, ConstU32(1u));
+    // An address-path load returns 0 here: a non-zero descriptor value is a real divergence of mode 1. It is counted
+    // and recorded with device address ~0 (the access was invalid, no address was read).
+    for (u32 i = 0; i < count; i++) {
+        const Id desc_bits{bits(desc_values[i])};
+        const Id nonzero_merge = BdaBeginIf(OpINotEqual(U1[1], desc_bits, u64_zero_value));
+        add_word(ShaderAddrVerifyUncomparedNonZero, ConstU32(1u));
+        const Id slot{add_word(ShaderAddrVerifySlots, ConstU32(1u))};
+        const Id fits{OpULessThan(U1[1], slot, ConstU32(ShaderAddrVerifyCapacity))};
+        const Id record_merge = BdaBeginIf(fits);
+        const Id record{OpIAdd(
+            U64, debug_base,
+            OpIAdd(U64,
+                   OpIMul(U64, OpUConvert(U64, slot),
+                          Constant(U64, static_cast<u64>(ShaderAddrVerifyRecordSize))),
+                   Constant(U64, static_cast<u64>(ShaderAddrVerifyRecordsOffset))))};
+        const auto field = [&](u32 offset, Id value, Id type, u32 size) {
+            OpStore(BdaPointer(OpIAdd(U64, record, Constant(U64, static_cast<u64>(offset))), type),
+                    value, spv::MemoryAccessMask::Aligned, size);
+        };
+        field(0, Constant(U64, info.pgm_hash), U64, 8);
+        field(8, Constant(U64, ~0ULL), U64, 8);
+        field(16, guest_base, U64, 8);
+        field(24, OpUConvert(U64, block_size), U64, 8);
+        field(32, u64_zero_value, U64, 8);
+        field(40, desc_bits, U64, 8);
+        field(48, ConstU32(static_cast<u32>(hw_stage)), U32[1], 4);
+        field(52, ConstU32(handle), U32[1], 4);
+        field(56, index, U32[1], 4);
+        field(60, ConstU32(i), U32[1], 4);
+        field(64, ConstU32(elem_size), U32[1], 4);
+        BdaEndIf(record_merge);
+        BdaEndIf(nonzero_merge);
+    }
     BdaEndIf(uncompared_merge);
 
     const Id merge = BdaBeginIf(valid);

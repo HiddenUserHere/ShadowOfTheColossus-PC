@@ -27,6 +27,9 @@ struct ShaderParams {
     /// sotc: SOTC_HEAP stage variant (StageVariantDefault unless the pipeline cache chose another). A variant other than
     /// the default is mixed into hash by the caller, so every cache keyed by hash keeps the variants apart.
     u8 variant{StageVariantDefault};
+    /// sotc: the guest program's own hash when `hash` has a variant mixed in (0 otherwise). Info::pgm_hash takes it, so
+    /// the rules that name game shaders by hash (HLE, TAA, vegetation, LOD...) see every variant as the same program.
+    u64 guest_hash{};
 
     VAddr Base() const noexcept {
         return reinterpret_cast<VAddr>(code.data());
