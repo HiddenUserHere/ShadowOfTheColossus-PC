@@ -168,9 +168,8 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
       is_compute{is_compute_} {
     stage_sets = !is_compute && profile.stage_bindings;
-    // sotc: SOTC_PACKET: the shader reads the DrawPacket when it was built with addresses or with a heap stage (the
-    // heap stage is known once the stages are set: see the layout of each pipeline).
-    packet_range = profile.shader_addr != 0;
+    // sotc: SOTC_PACKET: packet_range is not set here. It is decided by the stages of the pipeline when its layout is
+    // built (a stage reads the DrawPacket when it has a shader-addressed buffer or is the heap stage).
 }
 
 Pipeline::~Pipeline() = default;
@@ -438,7 +437,8 @@ void VerifyN5Set(const Instance& instance, DescriptorHeap& desc_heap,
 void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> write_sets,
                              const Shader::PushData& push_data,
                              const Shader::BindlessSamplerSlots& bindless_slots,
-                             const SotcArch::DrawPacket* packet) const {
+                             const SotcArch::DrawPacket* packet,
+                             const SotcArch::HeapBlock* heap_block) const {
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
@@ -452,10 +452,12 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
     auto& cache = dynamic.push_constant_cache;
     static_assert(sizeof(Shader::PushData) <= DynamicState::PushConstantCache::MaxBytes);
     static_assert(PacketPushBytes <= DynamicState::PushConstantCache::MaxBytes);
+    static_assert(Shader::HeapPushBytes <= DynamicState::PushConstantCache::MaxBytes);
     // sotc: SOTC_PACKET: a packet pipeline pushes PushData and the DrawPacket as one block. Other
     // pipelines push PushData alone, byte for byte as before.
+    // sotc: SOTC_HEAP: a pipeline whose profile has the heap pushes the heap block too (HeapPushBytes, 192 bytes).
     // Left uninitialized on purpose: a packet block is written in full before any read.
-    std::array<u8, PacketPushBytes> packet_block;
+    std::array<u8, Shader::HeapPushBytes> packet_block;
     const void* block = &push_data;
     u32 size = static_cast<u32>(sizeof(push_data));
     if (packet_range) {
@@ -464,6 +466,12 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
         std::memcpy(packet_block.data() + PacketPushOffset, packet, sizeof(*packet));
         block = packet_block.data();
         size = PacketPushBytes;
+        if (profile.heap_images != 0) {
+            const SotcArch::HeapBlock empty{};
+            std::memcpy(packet_block.data() + Shader::HeapBlockOffset,
+                        heap_block ? heap_block : &empty, sizeof(SotcArch::HeapBlock));
+            size = Shader::HeapPushBytes;
+        }
     }
     const bool same = kDedupState && cache.generation == dynamic.generation &&
                       cache.layout == pipeline_layout && cache.stages == stage_flags &&

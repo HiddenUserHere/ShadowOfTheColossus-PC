@@ -6838,6 +6838,37 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
            (rbx_owed_count.load(std::memory_order_relaxed) != 0 && RbxOwedIntersects(addr, size));
 }
 
+bool BufferCache::WrittenAlreadyGpuModified(VAddr addr, u64 size) {
+    // sotc: the gates of AddGpuModified's early returns. Native mode only: with tracking, a GPU write
+    // makes guest bytes stale (readbacks), so the written bind keeps its full path there (addr_table.cpp).
+    static const bool nogrow_skip = [] {
+        const char* v = std::getenv("SOTC_GPUMOD_NOGROW_SKIP");
+        return !v || v[0] != '0';
+    }();
+    if (size == 0 || SotcNative::TracksGuestPages() || rb_exact_env || rb_prefetch_env || rb_group_env ||
+        !nogrow_skip || SotcPcRing::FullRingMode() == 4 || SotcPcRing::FullRingMode() == 5) {
+        return false;
+    }
+    // Tracker GPU bits: what the written sync sets (ForEachUploadRange, is_written). Gpu_modified_ranges:
+    // what AddGpuModified adds. Both set means AddGpuModified would change nothing.
+    if (!IsRegionGpuModified(addr, size)) {
+        return false;
+    }
+    std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+    return gpu_modified_ranges.Contains(addr, size);
+}
+
+void BufferCache::NoteWrittenFast(VAddr addr, u64 size) {
+    // sotc: the part of ObtainBuffer's written path that a range already GPU-modified still needs: the bind
+    // memo's bump (AddGpuModified), the in-flight readback walk (empty in native mode) and the current-write
+    // record (current_writes is read by the readback paths only). The residency check and the sync are
+    // skipped by the caller (the table's placed and clean bits). NoteHostWrite(8) is not repeated: the
+    // BindBuffers skip branch makes the same mem_epoch bump (NoteHostWrite 7) for every written bind.
+    SotcGen::Bump(addr, size);
+    MarkInflightReadbacksDirty(addr, size, StaleReason::GpuWrite);
+    RecordCurrentWrite(addr, size, 0, true, true);
+}
+
 void BufferCache::SynchronizeDmaBuffers() {
     const SotcPcRing::SweepScope ring_sweep; // sotc: SOTC_PC_RING, uploads here are sweeps
     const SyncReason sync_reason{3}; // sotc: SOTC_TRACE reason 3 (DMA sweep)

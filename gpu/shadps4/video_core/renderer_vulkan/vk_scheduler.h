@@ -203,7 +203,9 @@ struct DynamicState {
     /// sotc: the push constants last written by Pipeline::BindResources. Shared by all pipelines,
     /// so it lives here rather than in a pipeline.
     struct PushConstantCache {
-        static constexpr u32 MaxBytes = 128; ///< Vulkan's guaranteed maxPushConstantsSize
+        /// Vulkan guarantees 128; the heap pipelines push 192 (Shader::HeapPushBytes), the size the probe requires
+        /// with bindless slots (vk_instance.cpp).
+        static constexpr u32 MaxBytes = 192;
         u64 generation{};                    ///< 0: nothing recorded
         vk::PipelineLayout layout{};
         vk::ShaderStageFlags stages{};

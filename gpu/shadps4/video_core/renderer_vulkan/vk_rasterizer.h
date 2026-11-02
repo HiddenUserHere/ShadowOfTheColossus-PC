@@ -469,6 +469,8 @@ private:
     std::vector<u32> set_write_sets; ///< sotc: descriptor set of each set_writes entry
     Shader::PushData push_data;
     Shader::BindlessSamplerSlots bindless_slots{}; // sotc: SOTC_BINDLESS_SAMP, pushed after push_data
+    /// sotc: the pipeline of this op has slot words (Pipeline::HasSlotWords): only then are the slot words filled.
+    bool slot_words_op{};
     /// sotc: SOTC_N5_BINDLESS: the heap of the sampled images (null unless the mode is on).
     std::unique_ptr<VideoCore::BindlessImages> bindless_images;
 
@@ -717,9 +719,27 @@ private:
     /// sotc: SOTC_PACKET (ARCH-DRAW section 12). The push packet of the op being bound: BindResources fills the
     /// window words and the index table, BindBuffers the flat buffer addresses; the pipelines push it.
     SotcArch::DrawPacket draw_packet{};
+    /// sotc: SOTC_HEAP. The heap block of the op being bound (debug buffer address, GPU verify's classic words), filled
+    /// by BindResources after the textures are bound and pushed by the pipelines after the packet.
+    SotcArch::HeapBlock heap_block{};
     /// sotc: SOTC_SHADER_ADDR. This op binds a shader-addressed buffer (no bound_buffers entry), so it touches
     /// memory: Passes::Decide must see it (BindResources resets it).
     bool shader_addr_touch{};
+    /// sotc: SOTC_SHADER_ADDR ordering. Guest ranges written by buffer ops since the last recorded barrier (tagged
+    /// with the runtime's FlushGeneration they belong to), the ranges this op writes (merged when its bind ends), and
+    /// whether this op touches a range written before it: only then does it need the barrier. A blanket barrier per
+    /// addressed op ended the render pass at every draw (35 times more render passes).
+    struct GuestWrite {
+        VAddr begin;
+        VAddr end;
+        u64 gen;
+    };
+    std::vector<GuestWrite> sotc_guest_writes;
+    std::vector<std::pair<VAddr, VAddr>> sotc_op_writes;
+    bool sotc_addr_hazard{};
+    bool GuestWriteOverlap(VAddr addr, u64 size);
+    void MergeOpWrites(bool barrier_before_op);
+    void NoteGuestWrite(VAddr addr, u64 size);
     /// sotc: SOTC_SHADER_ADDR, mirror coherence. Guest ranges the op being bound writes through the mirror (the
     /// shader-addressed written buffers, BindBuffers). ResetBindings copies them back into their buffers.
     struct AddressedWrite {

@@ -2126,6 +2126,9 @@ void VideoOutDriver::Flip(const Request& req) {
                 if (SotcArch::ShaderAddr::On()) {
                     arch(SotcArch::ShaderAddr::Report);
                 }
+                if (SotcArch::Heap::On()) { // sotc: SOTC_HEAP guard counts and GPU verify records
+                    arch(SotcArch::Heap::Report);
+                }
                 if (SotcArch::AddrTable::On()) {
                     arch(SotcArch::AddrTable::Report);
                 }

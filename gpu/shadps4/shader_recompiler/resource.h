@@ -339,6 +339,37 @@ static constexpr u32 ShaderAddrArenaSizeOffset = 104;
 static constexpr u32 ShaderAddrMirrorSizeOffset = 120;
 static_assert(sizeof(PushData) == 56, "the SotcArch packet starts at 56 (PacketPushOffset)");
 
+/// sotc: SOTC_HEAP push block of a heap pipeline (sotc_arch.h, SotcArch::HeapBlock): PushData (0..55), the DrawPacket
+/// (56..127; the index table address is its word at 64), then the heap block at 128..191: a u64 device address of the
+/// heap debug buffer, and in GPU verify (profile.heap_images == 2) the classic slot words of the stage, compacted.
+/// 192 bytes: the push constant limit the probe requires with bindless slots (vk_instance.cpp).
+/// Compact classic words (verify): sampler s is the 16-bit half (s & 1) of word s / 2 (words 0..5, s < 12), image slot
+/// j (relative to the stage's image range base) the half (j & 1) of word 6 + j / 2 (words 6..13, j < 12).
+static constexpr u32 HeapPushBytes = 192;
+static constexpr u32 HeapBlockOffset = 128;
+static constexpr u32 HeapDebugOffset = 128;
+static constexpr u32 HeapVerifyWordsOffset = 136;
+static constexpr u32 HeapVerifySamplerWords = 6;
+static constexpr u32 HeapVerifyImageWords = 8;
+/// Heap capacities the guard checks against (vk_bindless.h BindlessImageCapacity, texture_cache/sampler.h Capacity;
+/// heap.cpp checks they agree).
+static constexpr u32 HeapImageCapacity = 4096;
+static constexpr u32 HeapSamplerCapacity = 4096;
+/// Layout of the heap debug buffer (heap.cpp reads it on the host): u32 at 0 = guard hits (index >= capacity, null
+/// used), 4 = image accesses compared, 8 = image mismatches, 12 = sampler accesses compared, 16 = sampler mismatches,
+/// 20 = record slots taken (may exceed the capacity). Records of HeapRecordSize bytes from 32. Record fields: pgm hash
+/// u64 @0, table address u64 @8, hw stage u32 @16, kind u32 @20 (0 image, 1 sampler, 2 guard), number u32 @24 (image or
+/// sampler index), classic value u32 @28, table value u32 @32, table entry u32 @36.
+static constexpr u32 HeapDebugCompareImage = 4;
+static constexpr u32 HeapDebugMismatchImage = 8;
+static constexpr u32 HeapDebugCompareSampler = 12;
+static constexpr u32 HeapDebugMismatchSampler = 16;
+static constexpr u32 HeapDebugSlots = 20;
+static constexpr u32 HeapDebugGuard = 0;
+static constexpr u32 HeapRecordsOffset = 32;
+static constexpr u32 HeapRecordSize = 40;
+static constexpr u32 HeapRecordCapacity = 1024;
+
 /// sotc: SOTC_SHADER_ADDR=2 (verify). The debug buffer address is a u64 push member at byte 64, the packet's
 /// index_table_address (DrawPacket, PacketPushOffset + 8). A verify stage has no bindless words, so 56..71 is free.
 static constexpr u32 ShaderAddrVerifyDebugOffset = 64;

@@ -405,6 +405,26 @@ public:
         }
         return last < NumImagePages && page_images[last].load(std::memory_order_acquire) != 0;
     }
+    /// sotc: SOTC_ADDR_TABLE. Exact, lock-free: true unless every page of [addr, addr + size) is free of
+    /// registered images (no step, unlike HasImagesInRange). Ranges over 256 pages answer true. Used to skip
+    /// InvalidateMemoryFromGPU, which does nothing without an image over the range. page_images changes
+    /// under the texture cache mutex, so a registration racing this check is seen by the next write.
+    [[nodiscard]] bool HasImagesExact(VAddr addr, u64 size) const {
+        if (size == 0) {
+            return false;
+        }
+        const u64 first = addr >> Traits::PAGE_BITS;
+        const u64 last = (addr + size - 1) >> Traits::PAGE_BITS;
+        if (last - first > 256) {
+            return true;
+        }
+        for (u64 page = first; page <= last; ++page) {
+            if (page >= NumImagePages || page_images[page].load(std::memory_order_acquire) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     TileManager& GetTileManager() noexcept {
         return tile_manager;

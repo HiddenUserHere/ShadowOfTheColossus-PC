@@ -563,7 +563,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // sotc: SOTC_HEAP (the index table per draw, heap_images) and SOTC_SHADER_ADDR (buffer addresses
         // from the V# words; mode 2 = verify, a different profile and so a different cache key). Both off:
         // the profile is the one of today.
-        .heap_images = SotcArch::Heap::On(),
+        .heap_images = SotcArch::Heap::ProfileValue(),
         .shader_addr = SotcArch::ShaderAddr::Mode(),
     };
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
@@ -2642,8 +2642,14 @@ bool PipelineCache::RefreshGraphicsStages() {
     Shader::Backend::Bindings binding{};
     // sotc: SOTC_HEAP stage variants (ShaderParams::variant). The fragment is the heap stage of the pipeline when it
     // qualifies (fragment_variant); the other stages are then plain (other_variant). Both default unless the switch is on.
-    u8 fragment_variant = Shader::StageVariantDefault;
-    u8 other_variant = Shader::StageVariantDefault;
+    // sotc: SOTC_SHADER_ADDR: a stage that is not the heap stage is plain too (non_heap_variant). Slot words and shader
+    // addresses cannot share the push bytes (the packet is 56..128), and a bindless stage never takes addresses
+    // (ShaderAddrBuffer), so the stages that would have slot words take descriptors instead and their buffers can be
+    // addressed. Without the switch this is the default, as before.
+    const u8 non_heap_variant =
+        profile.shader_addr != 0 ? Shader::StageVariantPlain : Shader::StageVariantDefault;
+    u8 fragment_variant = non_heap_variant;
+    u8 other_variant = non_heap_variant;
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
@@ -2692,7 +2698,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         if (heap_fs && !SotcArch::Heap::StageRefused(*heap_fs)) {
             other_variant = Shader::StageVariantPlain;
         } else if (heap_fs || !translation_pending) {
-            fragment_variant = Shader::StageVariantDefault;
+            fragment_variant = non_heap_variant;
             binding = binding_before_fragment;
             bind_stage(HwStage::Fragment, SwStage::Fragment);
         }
@@ -2810,8 +2816,15 @@ bool PipelineCache::RefreshComputeKey() {
         }
     }
     if (!compute_bound) {
+        // sotc: SOTC_SHADER_ADDR: without the heap the compute stage is plain, as the graphics stages are (see
+        // RefreshGraphicsStages). Its variant is mixed into the hash like the heap variant above.
+        auto plain_params = cs_params;
+        if (profile.shader_addr != 0) {
+            plain_params.variant = Shader::StageVariantPlain;
+            plain_params.hash = HashCombine(cs_params.hash, plain_params.variant);
+        }
         std::tie(infos[0], modules[0], compute_key.value) =
-            GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
+            GetProgram(HwStage::Compute, SwStage::Compute, plain_params, binding);
     }
     return true;
 }

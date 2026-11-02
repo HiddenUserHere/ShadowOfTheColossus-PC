@@ -70,9 +70,11 @@ struct Profile {
     /// pads the 68-byte profiles of older caches with this byte off, the 64-byte ones through bda.
     bool bindless_images{};
     /// sotc: SOTC_HEAP: a stage whose images and samplers are all in the bindless heap takes their heap
-    /// indices from the index table of the draw (UsesHeapImages), not from push slots. Sits in the
-    /// padding byte after bindless_images, so the profile keeps its size (vk_pipeline_serialization.cpp).
-    bool heap_images{};
+    /// indices from the index table of the draw (UsesHeapImages), not from push slots. 0 off, 1 on, 2 on with
+    /// the GPU verify (SOTC_HEAP_GPU_VERIFY): the classic slot words are compared with the table in the shader
+    /// (heap verify records). Sits in the padding byte after bindless_images (was a bool), so the profile keeps
+    /// its size (vk_pipeline_serialization.cpp).
+    u8 heap_images{};
     /// sotc: SOTC_SHADER_ADDR mode (SotcArch::ShaderAddr::Mode): 0 off, 1 guest buffers that are neither formatted
     /// nor coherent take their base and size from their V# words in the flat buffer, and their window bases from
     /// the push block (ShaderAddrBuffer in runtime_info.h), 2 verify: as 1, but each such buffer keeps its

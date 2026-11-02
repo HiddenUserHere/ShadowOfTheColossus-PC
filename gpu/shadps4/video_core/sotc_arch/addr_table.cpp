@@ -20,6 +20,7 @@
 #include "video_core/sotc_arch/addr_table.h"
 #include "video_core/sotc_arch/shader_addr.h"
 #include "video_core/sotc_arch/sotc_arch.h"
+#include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (TracksGuestPages: the written fast path)
 
 namespace SotcArch::AddrTable {
 
@@ -60,9 +61,15 @@ std::atomic<u64> g_failed{};         // Touch calls refused, and chunks that cou
 std::atomic<u64> g_uploads{};        // dirty chunks copied to the table
 std::atomic<u64> g_upload_bytes{};
 std::atomic<u64> g_fast{};           // read Touch calls answered from the clean state (no ObtainBuffer)
+std::atomic<u64> g_fast_written{};   // written Touch calls answered from the clean state (native, already GPU-modified)
 std::atomic<u64> g_slow_unplaced{};  // slow read Touch calls: a page of the range was not placed
 std::atomic<u64> g_slow_dirty{};     // slow read Touch calls: all placed, some page not clean
-std::atomic<u64> g_slow_written{};   // slow written Touch calls (always slow, see Touch)
+std::atomic<u64> g_slow_written{};   // slow written Touch calls, all reasons (the four below and verify)
+std::atomic<u64> g_slow_w_untracked{}; // slow written: a tracked mode (readbacks), always the full path
+std::atomic<u64> g_slow_w_unplaced{}; // slow written: a page of the range was not placed
+std::atomic<u64> g_slow_w_dirty{};    // slow written: all placed, some page not clean
+std::atomic<u64> g_slow_w_new{};      // slow written: native, placed and clean, but not yet GPU-modified (first write)
+std::atomic<u64> g_slow_w_verify{};   // slow written: SOTC_SHADER_ADDR=2 runs the full path on a fast-ready bind
 std::atomic<u64> g_reverts{};        // slow Touch calls whose clean bits a concurrent Dirty made stale
 std::atomic<u64> g_dirty_calls{};    // ClearClean calls (Dirty, DirtyPages, OnPlace, OnRemove, written binds)
 std::atomic<u64> g_would_fast{};     // SOTC_SHADER_ADDR=2: reads the fast path would have answered
@@ -297,25 +304,37 @@ vk::DeviceAddress Base() {
     return g_state ? g_state->base : 0;
 }
 
-// Why a page that Touch marks clean cannot be stale (the readers are Touch's fast path and the slow path's set; the
-// writers are Dirty / DirtyPages, OnPlace, OnRemove, and the written binds). All bitmap and sequence accesses are
-// seq_cst, so they have one total order S.
+// What "clean" means. A clean page has no guest byte changed since its last sync without that sync taking the
+// change, and its device entries are the shadow's. It is not "the bytes equal guest memory": in native mode
+// (SOTC_NATIVE=1) a GPU write never copies its bytes to guest memory (DownloadMemory returns at once) and never
+// touches an entry, so a GPU write does not make a page dirty there. In the tracked modes a GPU write does make
+// the guest bytes stale (readbacks copy GPU bytes into guest memory later), so a written bind clears the bits
+// there, before its GPU write.
+//
+// Why a page that Touch marks clean cannot be stale (the readers are Touch's fast paths and the slow path's set; the
+// writers are Dirty / DirtyPages, OnPlace, OnRemove, NoteCpuBytesChanged, and the tracked-mode written binds). All
+// bitmap and sequence accesses are seq_cst, so they have one total order S.
 //  1. A change of guest bytes or of the device entries clears the bits, and the clear comes after the change in the
 //     writer's program order: a CPU bit rises in UpdateStateAndProtection under the region mutex, and the guest's own
 //     write goes through only after the page is unprotected (after that call); the announce drain runs on the draw
 //     thread before the binds of its submit; NoteCpuBytesChanged runs after its copy; OnPlace/OnRemove change the
-//     entries; a written bind clears before its GPU write (which the draw orders after it).
+//     entries; a tracked-mode written bind clears before its GPU write (which the draw orders after it).
+//     A native written bind changes neither guest bytes nor entries, so it needs no clear.
 //  2. ClearClean bumps g_dirty_seq (b) BEFORE it clears the bits (c).
-//  3. A slow read Touch takes s1 = g_dirty_seq, then the sync (its copy of the bytes), then sets its bits (t), then
-//     takes s2 = g_dirty_seq; when s2 != s1 it clears its bits again.
+//  3. A slow Touch (read, or native written) takes s1 = g_dirty_seq, then the sync (its copy of the bytes), then
+//     sets its bits (t), then takes s2 = g_dirty_seq; when s2 != s1 it clears its bits again.
 //  4. Race: a CPU write W that the sync's copy did not see. Its change is after the copy, so b is after s1 in S.
 //     If c precedes t, then b precedes t and s2 comes after t, so s2 sees b and the bits are cleared again. If c
 //     follows t, the bits are clear after c. Either way the bits are clear after Touch returns, unless no W happened.
 //  5. The sync leaves a page with a CPU bit only when it did not take it; Touch then does not set the bits (the
 //     IsRegionCpuModified check). A device entry that a failed chunk upload has not reached (AnyDirtyLocked) also
 //     blocks the set, so a clean page always has its shadow entries on the device.
-// So a page is clean only while its guest bytes and its device entries are the ones its last sync left, and a read
-// that finds all its pages placed and clean has nothing to upload.
+//  6. A fast written Touch (native, placed, clean, range already GPU-modified: WrittenAlreadyGpuModified) runs no
+//     sync and sets no bit: it needs none, because the range has no CPU bit (clean) and its GPU-modified state is
+//     already recorded (tracker bits and gpu_modified_ranges, both checked). Its later effects are NoteWrittenFast's
+//     and the BindBuffers skip branch's mem_epoch bump, which a fast read does not need.
+// So a page is clean only while no unsynced guest change and no entry change has happened to it since its last
+// sync, and a bind that finds all its pages placed and clean has nothing to upload.
 bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size,
            bool is_written) {
     State* s = g_state.get();
@@ -331,8 +350,10 @@ bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr ad
     }
     const u64 first = (addr - WindowBase) >> PageShift;
     const u64 last = (addr - WindowBase + size - 1) >> PageShift;
-    // Fast path: bit reads only. A written range always takes the slow path (what the cheap call would need is in
-    // the report of this change; the GPU-modified and current-write bookkeeping of ObtainBuffer is not cheap).
+    // Fast paths: bit reads only. A read with all pages placed and clean has nothing to upload. A written range
+    // with all pages placed and clean is fast in native mode when the range is already GPU-modified: it changes
+    // no guest byte and no entry, and adds no GPU-modified state (WrittenAlreadyGpuModified), so only the bookkeeping
+    // NoteWrittenFast keeps runs. Every other written bind takes the full ObtainBuffer path.
     bool all_placed = true;
     bool all_clean = true;
     ForWords(first, last, [&](u64 w, u64 mask) {
@@ -343,20 +364,43 @@ bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr ad
             all_clean = false;
         }
     });
-    const bool eligible = !is_written && all_placed && all_clean;
+    const bool placed_clean = all_placed && all_clean;
+    const bool native = !SotcNative::TracksGuestPages(); // SOTC_NATIVE=1
+    const bool read_fast = !is_written && placed_clean;
+    const bool written_fast = is_written && native && placed_clean && cache.WrittenAlreadyGpuModified(addr, size);
     // SOTC_SHADER_ADDR=2 runs the slow path every time (so the verify measures the real path), and counts the fast
     // path it would have taken and whether the slow path wrote the entries the fast path would have kept.
     const bool verify = ShaderAddr::Verify();
-    if (eligible && !verify) {
-        g_fast.fetch_add(1, std::memory_order_relaxed);
+    if ((read_fast || written_fast) && !verify) {
+        // A fast Touch makes no residency check, so it stamps the blocks as one does (the eviction of an
+        // idle block must not take a block this bind reads; ObtainBuffer's memo hit does the same).
+        cache.NoteBindUse(addr, size);
+        if (is_written) {
+            cache.NoteWrittenFast(addr, size);
+            g_fast_written.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_fast.fetch_add(1, std::memory_order_relaxed);
+        }
         return true;
     }
     if (is_written) {
         g_slow_written.fetch_add(1, std::memory_order_relaxed);
-        // A GPU write changes the bytes behind the pages: they are not clean any more (before the bind, so the
-        // draw that follows cannot read them clean).
-        ClearClean(addr, size);
-    } else if (!eligible) {
+        if (verify && written_fast) {
+            g_slow_w_verify.fetch_add(1, std::memory_order_relaxed);
+        } else if (!native) {
+            g_slow_w_untracked.fetch_add(1, std::memory_order_relaxed);
+        } else if (!all_placed) {
+            g_slow_w_unplaced.fetch_add(1, std::memory_order_relaxed);
+        } else if (!all_clean) {
+            g_slow_w_dirty.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_slow_w_new.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!native) {
+            // Tracked modes: a GPU write makes the guest bytes stale (readbacks), so the bits go before the draw.
+            ClearClean(addr, size);
+        }
+    } else if (!read_fast) {
         (all_placed ? g_slow_dirty : g_slow_unplaced).fetch_add(1, std::memory_order_relaxed);
     }
     const u64 seq_before = g_dirty_seq.load(std::memory_order_seq_cst); // s1
@@ -371,7 +415,7 @@ bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr ad
     bool clean_ok = false;
     {
         std::scoped_lock lock{g_mutex};
-        const bool compare = verify && eligible;
+        const bool compare = verify && (read_fast || written_fast);
         static thread_local std::vector<u64> before;
         if (compare) {
             before.assign(s->shadow.begin() + first, s->shadow.begin() + last + 1);
@@ -384,7 +428,9 @@ bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr ad
                 g_would_fast_bad.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        clean_ok = !is_written && !AnyDirtyLocked(*s, first, last);
+        // A native written sync is a read sync for the bits: it takes the CPU bits, sets the GPU bits, and changes
+        // no guest byte. A tracked-mode written bind leaves the bits clear (its GPU bytes are not the guest's).
+        clean_ok = (native || !is_written) && !AnyDirtyLocked(*s, first, last);
     }
     // A CPU bit left in the range after the sync (not taken by it) keeps the pages dirty.
     if (clean_ok && cache.IsRegionCpuModified(addr, size)) {
@@ -483,6 +529,12 @@ void Report(char* out, u32 size, double seconds) {
     const u64 slow_unplaced = g_slow_unplaced.exchange(0, std::memory_order_relaxed);
     const u64 slow_dirty = g_slow_dirty.exchange(0, std::memory_order_relaxed);
     const u64 slow_written = g_slow_written.exchange(0, std::memory_order_relaxed);
+    const u64 fast_written = g_fast_written.exchange(0, std::memory_order_relaxed);
+    const u64 w_untracked = g_slow_w_untracked.exchange(0, std::memory_order_relaxed);
+    const u64 w_unplaced = g_slow_w_unplaced.exchange(0, std::memory_order_relaxed);
+    const u64 w_dirty = g_slow_w_dirty.exchange(0, std::memory_order_relaxed);
+    const u64 w_new = g_slow_w_new.exchange(0, std::memory_order_relaxed);
+    const u64 w_verify = g_slow_w_verify.exchange(0, std::memory_order_relaxed);
     const u64 reverts = g_reverts.exchange(0, std::memory_order_relaxed);
     const u64 dirty_calls = g_dirty_calls.exchange(0, std::memory_order_relaxed);
     const u64 would_fast = g_would_fast.exchange(0, std::memory_order_relaxed);
@@ -501,12 +553,16 @@ void Report(char* out, u32 size, double seconds) {
         return;
     }
     std::snprintf(out + n, size - static_cast<u32>(n),
-                  ". CLEAN: fast %llu, slow not placed %llu, slow dirty %llu, slow written %llu, reverts %llu, "
-                  "dirty marks %llu (%.0f/s), SHADER_ADDR=2 would-be fast %llu (entries differ %llu)",
+                  ". CLEAN: fast %llu, slow not placed %llu, slow dirty %llu, reverts %llu, "
+                  "dirty marks %llu (%.0f/s), written fast %llu, written slow %llu (untracked %llu, not placed %llu, "
+                  "dirty %llu, first %llu, SHADER_ADDR=2 %llu), SHADER_ADDR=2 would-be fast %llu (entries differ %llu)",
                   static_cast<unsigned long long>(fast), static_cast<unsigned long long>(slow_unplaced),
-                  static_cast<unsigned long long>(slow_dirty), static_cast<unsigned long long>(slow_written),
-                  static_cast<unsigned long long>(reverts), static_cast<unsigned long long>(dirty_calls),
-                  seconds > 0.0 ? dirty_calls / seconds : 0.0, static_cast<unsigned long long>(would_fast),
+                  static_cast<unsigned long long>(slow_dirty), static_cast<unsigned long long>(reverts),
+                  static_cast<unsigned long long>(dirty_calls), seconds > 0.0 ? dirty_calls / seconds : 0.0,
+                  static_cast<unsigned long long>(fast_written), static_cast<unsigned long long>(slow_written),
+                  static_cast<unsigned long long>(w_untracked), static_cast<unsigned long long>(w_unplaced),
+                  static_cast<unsigned long long>(w_dirty), static_cast<unsigned long long>(w_new),
+                  static_cast<unsigned long long>(w_verify), static_cast<unsigned long long>(would_fast),
                   static_cast<unsigned long long>(would_fast_bad));
 }
 

@@ -27,13 +27,24 @@ using Sirit::Id;
 ///                                                 BindlessImageKeyOf key (the value the host writes
 ///                                                 into the push slot of that image today)
 ///   entry images.size() + s                      = heap index of sampler s (the sampler heap)
-/// The table address is a u64 in the push constant block: member HeapIndexTableMember, a uvec2 at byte
-/// offset 64 = PacketPushOffset + 8 (DrawPacket::index_table_address, sotc_arch.h), low word first. Bytes
-/// 56..63 (flatbuf_address in the packet) are not declared by a heap stage. Heap indices never hold
-/// Heap::InvalidIndex: the host maps a null T# to a valid null descriptor index of the heap.
+/// The table address is a u64 in the push constant block: member HeapIndexTableMember, a u64 at byte offset 64
+/// = PacketPushOffset + 8 (DrawPacket::index_table_address, sotc_arch.h). Bytes 56..63 (flatbuf_address in the
+/// packet) are not declared by a heap stage. Heap indices never hold Heap::InvalidIndex: the host maps a null T#
+/// to a valid null descriptor index of the heap.
+/// sotc: the heap push struct (DefineHeapPushDataBlock): members 0..6 as PushData, member 7 the table address at 64,
+/// member 8 the debug buffer address at 128 (HeapDebugOffset), and in GPU verify members 9..22 the classic words
+/// at 136..191 (resource.h). The guard (HeapGuard) clamps every table index to the null slot past the capacity.
 bool UsesHeapImages(const Info& info, const Profile& profile);
+
+/// sotc: SOTC_SHADER_ADDR. True when the stage reads the DrawPacket window words, that is when one of its guest buffers
+/// is addressed from its V# words (ShaderAddrBuffer). The emitter declares the window words exactly when this is true,
+/// and the host's pipeline layout takes the packet range exactly when some stage says so (vk_graphics_pipeline.cpp,
+/// vk_compute_pipeline.cpp), so the two never disagree.
+bool UsesShaderAddr(const Profile& profile, const Info& info);
 constexpr u32 HeapIndexTableMember = 7;
 constexpr u32 HeapIndexTableOffset = 64;
+constexpr u32 HeapDebugMember = 8;
+constexpr u32 HeapVerifyFirstMember = 9;
 
 struct VectorIds {
     [[nodiscard]] Id& operator[](u32 index) {
@@ -436,6 +447,21 @@ public:
     /// sotc: SOTC_HEAP: the u32 index of table entry `entry`. The table is the draw's index table,
     /// its 64-bit address in the push member HeapIndexTableMember (see UsesHeapImages).
     Id LoadTableIndex(u32 entry);
+    /// sotc: SOTC_HEAP: the heap index an image access uses: the table entry, guarded (HeapGuard); in GPU verify the
+    /// classic slot (relative to the image range, `slot` absolute) is used instead and compared with the entry.
+    Id LoadHeapImageIndex(u32 entry, u32 slot);
+    /// sotc: SOTC_HEAP: the heap index of sampler `index` (the table entry after the images), as LoadHeapImageIndex.
+    Id LoadHeapSamplerIndex(u32 entry, u32 index);
+    /// sotc: SOTC_HEAP: the index `raw` clamped to the null slot 0 when it is past `capacity` (counted and recorded).
+    Id HeapGuard(Id raw, u32 capacity, u32 entry);
+    /// sotc: SOTC_HEAP verify: the 16-bit compact classic slot at bit `shift` (0 or 16) of push member `member`.
+    Id LoadHeapClassic(u32 member, u32 shift);
+    /// sotc: SOTC_HEAP: appends one record to the debug buffer when `bad` (the guard or a verify mismatch).
+    void HeapRecord(Id bad, u32 kind, u32 number, Id classic, Id raw, u32 entry, u32 count_word);
+    /// sotc: SOTC_HEAP: the debug buffer's base address (push member HeapDebugMember).
+    Id HeapDebugBase();
+    /// sotc: SOTC_HEAP: atomic add of `value` to the debug word at `offset`; returns the old value.
+    Id HeapAdd(Id debug_base, u32 offset, Id value);
 
     struct SpirvAttribute {
         union {
@@ -527,6 +553,8 @@ private:
     void DefineVertexBlock();
     void DefineOutputs();
     void DefinePushDataBlock();
+    /// sotc: SOTC_HEAP: the push struct of a heap stage (see UsesHeapImages).
+    void DefineHeapPushDataBlock();
     void DefineBuffers();
     void DefineImagesAndSamplers();
     void DefineSharedMemory();

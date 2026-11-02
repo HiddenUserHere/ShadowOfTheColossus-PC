@@ -812,6 +812,7 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
     u32 binding{};
     uses_bindless_samplers = false;
     uses_slot_words = false; // sotc: SOTC_HEAP
+    packet_range = false;    // sotc: SOTC_PACKET, set by the stages below
 
     for (const auto* stage : stages) {
         if (!stage) {
@@ -859,7 +860,9 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
         // sotc: SOTC_HEAP: a heap stage reads its indices from the index table (the packet's), so it needs the heap set
         // but no slot words, and the pipeline has the packet range. Every other bindless stage reads slot words.
         const bool heap_stage = Shader::Backend::SPIRV::UsesHeapImages(*stage, profile);
-        if (heap_stage) {
+        // sotc: SOTC_PACKET: a stage that addresses a buffer from its V# words reads the window words of the packet, and
+        // so does the heap stage (its index table). Only then does the pipeline get the packet range.
+        if (heap_stage || Shader::Backend::SPIRV::UsesShaderAddr(profile, *stage)) {
             packet_range = true;
         }
         uses_slot_words |= (bindless || bindless_images) && !heap_stage;
@@ -894,7 +897,9 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
     const vk::PushConstantRange push_constants = {
         .stageFlags = AllGraphicsStageBits,
         .offset = 0,
-        .size = packet_range ? PacketPushBytes : static_cast<u32>(sizeof(Shader::PushData)),
+        // sotc: SOTC_HEAP: a heap profile's packet range also holds the heap block (HeapPushBytes).
+        .size = packet_range ? (profile.heap_images != 0 ? Shader::HeapPushBytes : PacketPushBytes)
+                             : static_cast<u32>(sizeof(Shader::PushData)),
     };
     // sotc: SOTC_BINDLESS_SAMP: the sampler slots follow PushData, in a layout with a bindless stage.
     const vk::PushConstantRange slot_push_constants = {

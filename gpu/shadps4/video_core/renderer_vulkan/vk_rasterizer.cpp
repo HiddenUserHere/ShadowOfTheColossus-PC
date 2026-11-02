@@ -1425,7 +1425,7 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     auto& ui = image_infos[hudless_ui_info];
     ui.imageView = hudless_clear.rt_view;
     ui.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
-    pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet);
+    pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
     RenderState hudless_state = state;
     auto& attachment = hudless_state.color_attachments[0];
     attachment.image_view = target.rt_view;
@@ -2007,7 +2007,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
         if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
-            pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet);
+            pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
         }
     }
     {
@@ -2184,7 +2184,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         {
             const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
             if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
-                pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet);
+                pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
             }
         }
         {
@@ -2255,7 +2255,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
         if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
-            pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet);
+            pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
         }
     }
     {
@@ -2591,7 +2591,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     scheduler.EndRendering();
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
-        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet);
+        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -2689,7 +2689,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     scheduler.EndRendering();
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
-        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet);
+        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -3226,17 +3226,20 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // addresses of an earlier tick). The arena window is 0: the ring-8 runs are many (SotcGuestMemory keeps a map of
     // runs), one window cannot describe them, so every shader-addressed range goes through the mirror.
     const bool packet_op = pipeline->HasPacketRange();
+    // sotc: the slot words are filled (and pushed, Pipeline::BindResources) only for a pipeline that has them.
+    slot_words_op = pipeline->HasSlotWords();
     shader_addr_touch = false;
+    sotc_addr_hazard = false;
+    sotc_op_writes.clear();
     sotc_addressed_writes.clear(); // sotc: SOTC_SHADER_ADDR, mirror coherence: this op's addressed writes only
     packet_addr_rec.clear();       // sotc: SOTC_PACKET: this op's shader-addressed buffers (BindBuffers)
-    // sotc: SOTC_SHADER_ADDR: the buffer writes recorded before this op, which a shader-addressed read of this op must
-    // be ordered after (see the end of this function).
-    const bool barrier_pending_before = runtime.MemoryBarrierPending();
     // sotc: SOTC_PACKET. The barrier rule of the end of this function (for the replays that return early).
     const auto packet_barrier = [&] {
-        if (SotcArch::ShaderAddr::On() &&
-            (shader_addr_touch ? barrier_pending_before : runtime.AddressedWritePending())) {
-            needs_barrier = true;
+        if (SotcArch::ShaderAddr::On()) {
+            if (sotc_addr_hazard) {
+                needs_barrier = true;
+            }
+            MergeOpWrites(needs_barrier);
         }
     };
     if (packet_op) {
@@ -3648,6 +3651,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         }
         uses_dma |= stage->uses_dma;
     }
+    // sotc: SOTC_HEAP: the heap block of this op, after every stage's textures are bound (the classic slots of the
+    // verify exist only then). The debug buffer address goes in every heap op; the words only in GPU verify.
+    heap_block = {};
+    if (packet_op && pipeline->GetProfile().heap_images != 0) {
+        SotcArch::Heap::FillBlock(heap_block, heap_stage, bindless_slots);
+    }
     // sotc: SOTC_N5_BINDLESS: the vector was sized for every image, and the heap images write no
     // descriptor: keep the writes made (the bind cache and the descriptor update count them).
     // sotc: SOTC_SHADER_ADDR: a shader-addressed buffer keeps its slot in the sizing above but writes no descriptor,
@@ -3660,9 +3669,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // runtime's per-buffer check never asks for the barrier that orders it after the buffer writes recorded before
     // it (SOTC_PASSES=0 ignores shader_addr_touch). Those writes are pending in the runtime's memory barrier: the
     // op flushes it when it touches memory by address, and any later op flushes it when an address write is pending.
-    if (SotcArch::ShaderAddr::On() &&
-        (shader_addr_touch ? barrier_pending_before : runtime.AddressedWritePending())) {
-        needs_barrier = true;
+    if (SotcArch::ShaderAddr::On()) {
+        if (sotc_addr_hazard) {
+            needs_barrier = true;
+        }
+        MergeOpWrites(needs_barrier);
     }
 
     if (uses_dma) {
@@ -3725,6 +3736,39 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     return true;
 }
 
+// sotc: SOTC_SHADER_ADDR ordering (see GuestWrite in vk_rasterizer.h). A range is live while its tag is not older
+// than the runtime's flush generation: the barrier recorded after it orders it for every later op.
+bool Rasterizer::GuestWriteOverlap(VAddr addr, u64 size) {
+    const u64 gen = runtime.FlushGeneration();
+    const VAddr end = addr + size;
+    bool hit = false;
+    std::erase_if(sotc_guest_writes, [&](const GuestWrite& w) {
+        if (w.gen < gen) {
+            return true;
+        }
+        hit |= w.begin < end && addr < w.end;
+        return false;
+    });
+    return hit;
+}
+
+// sotc: the op's own writes become visible to the later ops. When the op records a barrier first (FlushBarriers
+// runs after this bind and before its draw), the writes belong to the interval after that barrier.
+void Rasterizer::MergeOpWrites(bool barrier_before_op) {
+    const u64 gen = runtime.FlushGeneration() + (barrier_before_op ? 1 : 0);
+    for (const auto& [begin, end] : sotc_op_writes) {
+        sotc_guest_writes.push_back({begin, end, gen});
+    }
+    sotc_op_writes.clear();
+}
+
+// sotc: a buffer write outside a bind (DMA fill or copy) that a later shader-addressed read must order after.
+void Rasterizer::NoteGuestWrite(VAddr addr, u64 size) {
+    if (SotcArch::ShaderAddr::On() && size != 0) {
+        sotc_guest_writes.push_back({addr, addr + size, runtime.FlushGeneration()});
+    }
+}
+
 void Rasterizer::PacketAddrReplay(const std::vector<PacketAddr>& ranges) {
     // sotc: SOTC_PACKET. What BindBuffers does for each shader-addressed buffer of a full bind, for a replayed one: no
     // descriptor, the range touched (Touch, or the mirror's Touch in mirror mode), and the skip counted without
@@ -3732,6 +3776,9 @@ void Rasterizer::PacketAddrReplay(const std::vector<PacketAddr>& ranges) {
     // writes a buffer, so the write side (Passes::NoteWrite, NoteAddressedWrite, the mirror copy back) never replays.
     shader_addr_touch = !ranges.empty();
     for (const auto& r : ranges) {
+        if (r.size != 0) {
+            sotc_addr_hazard |= GuestWriteOverlap(r.addr, r.size);
+        }
         if (!SotcArch::ShaderAddr::Verify()) {
             SotcArch::ShaderAddr::NoteSkip(r.size, r.written);
         }
@@ -5916,16 +5963,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                      buffer_infos.capacity(), n5_bda, n5_buffers);
         }
     }
-    // sotc: SOTC_SHADER_ADDR (A3, sotc_arch/shader_addr.cpp). The pipeline's profile (SetBindProfile, BindResources)
-    // gives Shader::ShaderAddrBuffer, the same predicate the recompiler uses: a buffer it addresses from its V# words
-    // takes no ObtainBuffer and no descriptor here. Block-table stages keep their own path. Mode 2 runs the old path
-    // and verifies each such bind after ObtainBuffer.
-    // The mirror window must exist: the shader reads these ranges through it (its bounds are the packet's mirror
-    // words). The profile flag is set before the mirror is initialized, so the bind checks the windows themselves.
-    const Shader::Profile* shader_addr_profile =
-        SotcArch::ShaderAddr::On() && (SotcArch::AddrTable::On() || !SotcArch::Mirror::Windows().empty()) && !bda_stage
-            ? SotcArch::ShaderAddr::BindProfile()
-            : nullptr;
+    // sotc: SOTC_SHADER_ADDR (A3, sotc_arch/shader_addr.cpp). The predicate is the shader's: Shader::ShaderAddrBuffer
+    // on the pipeline's profile (SetBindProfile, BindResources) and this stage's Info, the same call the emitter makes
+    // (UsesShaderAddr). It takes no run state: a block-table stage is no exception (the emitter addresses its guest
+    // buffers too), and a missing mirror window is not a reason to bind a descriptor the shader never reads (the
+    // touch below counts that case). A buffer it addresses from its V# words takes no ObtainBuffer and no descriptor
+    // here. Mode 2 runs the old path and verifies each such bind after ObtainBuffer.
+    const Shader::Profile* shader_addr_profile = SotcArch::ShaderAddr::BindProfile();
+    if (shader_addr_profile && shader_addr_profile->shader_addr == 0) {
+        shader_addr_profile = nullptr;
+    }
     const auto shader_addressed = [&](const Shader::BufferResource& desc) {
         return shader_addr_profile && Shader::ShaderAddrBuffer(*shader_addr_profile, stage, desc);
     };
@@ -6035,8 +6082,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             const u32 buf_index = static_cast<u32>(&desc - stage.buffers.data());
             // sotc: SOTC_BDA: a slot the table serves is a guest buffer that is neither texel nor
             // coherent (DefineBuffers emits no descriptor for it, so the shader never reads one).
-            const bool bda_slot =
-                bda_stage && !desc.is_formatted && desc.GetSharp(stage).mtype != 3;
+            // sotc: SOTC_SHADER_ADDR: a buffer the shader addresses from its V# words reads no table slot (the emitter's
+            // bda flag, ShaderAddrBuffer), so it is no table slot here either.
+            const bool bda_slot = bda_stage && !desc.is_formatted && desc.GetSharp(stage).mtype != 3 &&
+                                  !shader_addressed(desc);
             // sotc: SOTC_N5_BDA_BUFFERS. DefineBuffers declares no variable for a table slot, so the
             // shader never reads its descriptor: mode 1 writes none (drop_desc: no buffer info, no
             // set write, also for a size-0 bind), mode 2 writes it and counts the drop.
@@ -6109,6 +6158,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     }
                 }
                 shader_addr_touch = true; // Passes::Decide: this op touches memory with no bound_buffers entry
+                if (size != 0) { // sotc: ordering against the buffer writes before this op (GuestWriteOverlap)
+                    sotc_addr_hazard |= GuestWriteOverlap(vbase, size);
+                    if (desc.is_written) {
+                        sotc_op_writes.emplace_back(vbase, vbase + size);
+                    }
+                }
                 // sotc: SOTC_PACKET. A replayed bind (bind cache, fast bind) touches the same range again (PacketAddrReplay).
                 // Only a shader-addressed buffer of a packet op comes here (its profile is the packet's), so this is
                 // always a packet op.
@@ -6134,8 +6189,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (shader_addressed(desc) && !SotcArch::ShaderAddr::Verify()) {
                 SotcArch::ShaderAddr::NoteSkip(size, desc.is_written);
                 if (desc.is_written && size != 0) {
-                    texture_cache.InvalidateMemoryFromGPU(vbase, size);
-                    Core::MemoryManager::NoteHostWrite(vbase, size, 7, stage.pgm_hash);
+                    // sotc: InvalidateMemoryFromGPU does nothing without an image over the range, and takes the texture
+                    // cache mutex to find that out. The lock-free page check skips it for the usual written range.
+                    if (texture_cache.HasImagesExact(vbase, size)) {
+                        texture_cache.InvalidateMemoryFromGPU(vbase, size);
+                    }
+                    Core::MemoryManager::NoteHostWrite(vbase, size, 7, stage.pgm_hash); // sotc: also the mem_epoch bump of a fast written Touch
                     if (SotcStats::kBindCacheRanges) {
                         BindCacheInvalidate(vbase, size);
                     }
@@ -6389,6 +6448,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 }
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
+                if (SotcArch::ShaderAddr::On() && size != 0) {
+                    // sotc: a descriptor access after an addressed write of the same bytes: the runtime's per-buffer
+                    // check does not see that write, so the guest ranges order it.
+                    if (GuestWriteOverlap(vbase, size)) {
+                        needs_barrier = true;
+                    }
+                    if (desc.is_written) {
+                        sotc_op_writes.emplace_back(vbase, vbase + size);
+                    }
+                }
                 // sotc: SOTC_SHADER_ADDR, SotcMirrorAfterOp: a range written through this descriptor is copied into the
                 // mirror after the op. In mode 2 the shader-addressed ranges are written through their descriptor too.
                 if (!shader_addressed(desc) || SotcArch::ShaderAddr::Verify()) {
@@ -6801,9 +6870,11 @@ bool Rasterizer::TryTextureBlock(const Shader::Info& stage, const TexBlockKey& k
         if (memo.bindless_push[d]) {
             const u32 heap_slot = memo.bindless_push[d] - 1u;
             const VideoCore::BindlessRef& ref = memo.bindless_block[d];
-            const u32 shift = (heap_slot & 1) * 16;
-            auto& word = bindless_slots.image_words[heap_slot / 2];
-            word = (word & ~(0xFFFFu << shift)) | (ref.slot << shift);
+            if (slot_words_op) { // sotc: a pipeline without slot words (SOTC_PACKET) never pushes them
+                const u32 shift = (heap_slot & 1) * 16;
+                auto& word = bindless_slots.image_words[heap_slot / 2];
+                word = (word & ~(0xFFFFu << shift)) | (ref.slot << shift);
+            }
             if (bindless_images && ref.slot != 0) {
                 bind_bindless_rec.push_back(ref);
                 bindless_images->Use(ref.key, ref.slot);
@@ -7568,9 +7639,11 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
                         }
                     }
                 }
-                const u32 shift = (heap_slot & 1) * 16;
-                auto& word = bindless_slots.image_words[heap_slot / 2];
-                word = (word & ~(0xFFFFu << shift)) | (ref.slot << shift);
+                if (slot_words_op) { // sotc: a pipeline without slot words (SOTC_PACKET) never pushes them
+                    const u32 shift = (heap_slot & 1) * 16;
+                    auto& word = bindless_slots.image_words[heap_slot / 2];
+                    word = (word & ~(0xFFFFu << shift)) | (ref.slot << shift);
+                }
                 if (ref.slot != 0) {
                     bind_bindless_rec.push_back(ref);
                 }
@@ -7715,10 +7788,12 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
         }
         if (bindless) {
             // sotc: the shader reads the heap index from this slot of the push constants.
-            const u32 slot = bindless_range.base + sampler_index;
-            const u32 shift = (slot & 1) * 16;
-            auto& word = bindless_slots.words[slot / 2];
-            word = (word & ~(0xFFFFu << shift)) | (heap_slot << shift);
+            if (slot_words_op) { // sotc: a pipeline without slot words (SOTC_PACKET) never pushes them
+                const u32 slot = bindless_range.base + sampler_index;
+                const u32 shift = (slot & 1) * 16;
+                auto& word = bindless_slots.words[slot / 2];
+                word = (word & ~(0xFFFFu << shift)) | (heap_slot << shift);
+            }
             continue;
         }
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
@@ -8065,6 +8140,9 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    if (!is_gds) {
+        NoteGuestWrite(address, num_bytes); // sotc: SOTC_SHADER_ADDR ordering
+    }
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
@@ -8106,6 +8184,9 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (!dst_gds) {
+        NoteGuestWrite(dst, num_bytes); // sotc: SOTC_SHADER_ADDR ordering
+    }
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {

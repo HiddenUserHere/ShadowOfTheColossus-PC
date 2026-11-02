@@ -215,6 +215,14 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// sotc: SOTC_ADDR_TABLE written fast path (addr_table.cpp). True when a GPU write of [addr, addr + size)
+    /// adds no GPU-modified state: native mode (SOTC_NATIVE=1), no readback switch on, and the range is already
+    /// GPU-modified (tracker bits and gpu_modified_ranges). Pure check; draw thread.
+    [[nodiscard]] bool WrittenAlreadyGpuModified(VAddr addr, u64 size);
+    /// sotc: what ObtainBuffer's written path still does for such a range (SotcGen::Bump, the in-flight readback
+    /// walk, the current-write record). Call only when WrittenAlreadyGpuModified returned true.
+    void NoteWrittenFast(VAddr addr, u64 size);
+
     /// sotc: sum of the write generations over the span (vk_shader_hle.cpp); false when a tracking
     /// region over it does not exist.
     [[nodiscard]] bool SyncGeneration(VAddr addr, u64 size, u64& gen) const;

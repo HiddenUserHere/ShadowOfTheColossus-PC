@@ -616,7 +616,8 @@ void PipelineCache::WarmUp() {
             // sotc: SOTC_HEAP and SOTC_SHADER_ADDR (the last two bytes, 66 and 67; measured with clang:
             // sizeof(Shader::Profile) is 68). Anything but 1 is off, as for the flags above.
             auto& heap_images = profile_data[offsetof(Shader::Profile, heap_images)];
-            heap_images = heap_images == 1 ? 1 : 0;
+            // sotc: 2 is the GPU verify (SOTC_HEAP_GPU_VERIFY): kept, or its profile would load the wrong SPIR-V.
+            heap_images = heap_images <= 2 ? heap_images : 0;
             // sotc: shader_addr is the mode (0, 1 or 2); anything else is off, as for the flags above.
             auto& shader_addr = profile_data[offsetof(Shader::Profile, shader_addr)];
             // sotc: 3 and 4 are the table modes of SOTC_ADDR_TABLE (addr_table.h); without them a saved profile

@@ -911,9 +911,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     // Buffer device address is enabled above (Vulkan 1.2 features). Only reported here.
     const bool bda_present = vk12_features.bufferDeviceAddress;
     sotc_buffer_device_address =
-        bda_present && (mirror_switch != 0 || shader_addr_switch != 0 || packet_switch != 0);
+        bda_present && (mirror_switch != 0 || shader_addr_switch != 0 || packet_switch != 0 || heap_switch != 0);
     report_feature("buffer device address",
-                   mirror_switch != 0 || shader_addr_switch != 0 || packet_switch != 0, bda_present,
+                   mirror_switch != 0 || shader_addr_switch != 0 || packet_switch != 0 || heap_switch != 0, bda_present,
                    sotc_buffer_device_address);
     // Any of the extensions above that was enabled: the device is created again without them if
     // the driver refuses the device (see the retry after the queue retry).

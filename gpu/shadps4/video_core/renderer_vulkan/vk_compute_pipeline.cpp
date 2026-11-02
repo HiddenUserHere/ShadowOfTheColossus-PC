@@ -64,9 +64,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     // sotc: SOTC_HEAP: a heap stage reads its indices from the index table (the packet's): the heap set, no slot words,
     // and the packet range. Otherwise the bindless stage reads slot words, as before.
     const bool heap_stage = Shader::Backend::SPIRV::UsesHeapImages(*info, profile);
-    if (heap_stage) {
-        packet_range = true;
-    }
+    // sotc: SOTC_PACKET: the packet range only when the stage reads the packet (heap stage or shader-addressed buffer).
+    packet_range = heap_stage || Shader::Backend::SPIRV::UsesShaderAddr(profile, *info);
     uses_slot_words = uses_bindless_samplers && !heap_stage;
     for (const auto& sampler : info->samplers) {
         if (uses_bindless_samplers) {
@@ -86,7 +85,9 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     const vk::PushConstantRange push_constants = {
         .stageFlags = vk::ShaderStageFlagBits::eCompute,
         .offset = 0,
-        .size = packet_range ? PacketPushBytes : static_cast<u32>(sizeof(Shader::PushData)),
+        // sotc: SOTC_HEAP: a heap profile's packet range also holds the heap block (HeapPushBytes).
+        .size = packet_range ? (profile.heap_images != 0 ? Shader::HeapPushBytes : PacketPushBytes)
+                             : static_cast<u32>(sizeof(Shader::PushData)),
     };
 
     // sotc: descriptor buffers replace push descriptors (the two layout flags are exclusive).

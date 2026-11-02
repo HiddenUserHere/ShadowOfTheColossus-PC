@@ -32,10 +32,10 @@ class Instance;
 class Scheduler;
 class DescriptorHeap;
 
-/// sotc: SOTC_PACKET (ARCH-DRAW.md part 4). A pipeline whose shaders read the DrawPacket (profile
-/// shader_addr or heap_images) has its push range extended: PushData at offset 0, then the packet at
-/// PacketPushOffset. The offset is sizeof(PushData) because such a pipeline has no bindless slot words.
-/// 56 + 64 = 120 bytes, inside the 128 bytes Vulkan guarantees.
+/// sotc: SOTC_PACKET (ARCH-DRAW.md part 4). A pipeline with a stage that reads the DrawPacket (a shader-addressed
+/// buffer, or the heap stage; Pipeline::packet_range) has its push range extended: PushData at offset 0, then the
+/// packet at PacketPushOffset. The offset is sizeof(PushData) because such a pipeline has no bindless slot words.
+/// 56 + 72 = 128 bytes, the push constant budget Vulkan guarantees.
 inline constexpr u32 PacketPushOffset = sizeof(Shader::PushData);
 inline constexpr u32 PacketPushBytes = PacketPushOffset + sizeof(SotcArch::DrawPacket);
 static_assert(PacketPushBytes <= 128, "the packet push range must fit the guaranteed 128 bytes");
@@ -163,14 +163,21 @@ public:
     bool HasPacketRange() const noexcept {
         return packet_range;
     }
+    /// sotc: SOTC_N5_BINDLESS / SOTC_BINDLESS_SAMP: true when some stage reads its slot words from the push constants
+    /// (BindlessSamplerSlots). Only such a pipeline gets them filled and pushed; never with the packet range.
+    bool HasSlotWords() const noexcept {
+        return uses_slot_words;
+    }
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     /// `write_sets[i]` is the descriptor set of `set_writes[i]`, used only with UsesStageSets().
-    /// sotc: `packet` is required when HasPacketRange() and ignored otherwise.
+    /// sotc: `packet` is required when HasPacketRange() and ignored otherwise. `heap_block` is the heap block of the
+    /// draw (sotc_arch.h, HeapBlock): read when the profile has the heap (heap_images), zeros when null.
     void BindResources(DescriptorWrites& set_writes, std::span<const u32> write_sets,
                        const Shader::PushData& push_data,
                        const Shader::BindlessSamplerSlots& bindless_slots,
-                       const SotcArch::DrawPacket* packet = nullptr) const;
+                       const SotcArch::DrawPacket* packet = nullptr,
+                       const SotcArch::HeapBlock* heap_block = nullptr) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
@@ -207,8 +214,9 @@ protected:
     /// stage reads its indices from the index table instead, so it needs the heap set but no slot words.
     bool uses_slot_words{};
     bool stage_sets{}; ///< sotc: a graphics pipeline with one descriptor set per stage
-    /// sotc: SOTC_PACKET: the push range carries the DrawPacket (PacketPushBytes). Set from the profile (shader
-    /// addresses), and for a pipeline with a heap stage (set when its layout is built).
+    /// sotc: SOTC_PACKET: the push range carries the DrawPacket (PacketPushBytes). Set when the layout is built: true
+    /// when a stage has a shader-addressed buffer (UsesShaderAddr) or is the heap stage. Never true together with
+    /// uses_slot_words (the packet and the slot words share bytes 56..128).
     bool packet_range{};
     vk::DeviceSize desc_layout_size{};             ///< sotc: descriptor buffer size of one set
     std::vector<vk::DeviceSize> desc_binding_offsets; ///< sotc: by binding number, in the set

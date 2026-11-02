@@ -103,7 +103,9 @@ bool ShaderAddrTableMode(const Profile& profile) {
     return profile.shader_addr >= 3;
 }
 
-// sotc: SOTC_SHADER_ADDR: any guest buffer of the shader takes its address from the shader.
+} // Anonymous namespace
+
+// sotc: SOTC_SHADER_ADDR: any guest buffer of the shader takes its address from the shader (spirv_emit_context.h).
 bool UsesShaderAddr(const Profile& profile, const Info& info) {
     for (const auto& desc : info.buffers) {
         if (ShaderAddrBuffer(profile, info, desc)) {
@@ -113,14 +115,14 @@ bool UsesShaderAddr(const Profile& profile, const Info& info) {
     return false;
 }
 
-} // Anonymous namespace
-
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_, Info& info_,
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    // sotc: SOTC_SHADER_ADDR buffers need physical pointers as well (UsesShaderAddr).
-    if (info.uses_dma || info.HasBdaBlockTable() || UsesShaderAddr(profile, info)) {
+    // sotc: SOTC_SHADER_ADDR buffers need physical pointers as well (UsesShaderAddr). So does a heap stage: its
+    // index table and debug buffer are read and written through physical pointers (LoadTableIndex, HeapRecord).
+    const bool heap = UsesHeapImages(info, profile);
+    if (info.uses_dma || info.HasBdaBlockTable() || UsesShaderAddr(profile, info) || heap) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -128,7 +130,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     String(fmt::format("{:#x}", info.pgm_hash));
 
     AddCapability(spv::Capability::Shader);
-    if (UsesShaderAddr(profile, info)) { // sotc: SOTC_SHADER_ADDR: 64-bit pointers (as emit_spirv.cpp does for the block table)
+    if (UsesShaderAddr(profile, info) || heap) { // sotc: SOTC_SHADER_ADDR: 64-bit pointers (as emit_spirv.cpp does for the block table)
         AddCapability(spv::Capability::Int64);
         AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
         AddExtension("SPV_KHR_physical_storage_buffer");
@@ -855,7 +857,48 @@ void EmitContext::DefineOutputs() {
     }
 }
 
+void EmitContext::DefineHeapPushDataBlock() {
+    // sotc: SOTC_HEAP. A heap stage reads no sampler or image words: its indices come from the index table. The
+    // struct is PushData, then the table address (member 7 at 64, where DrawPacket::index_table_address is), the debug
+    // buffer address (member 8 at 128), and in GPU verify the 14 classic words at 136 (resource.h). The old layout put
+    // the table address at 56 (the sampler word 0), so a heap stage read the packet's flatbuf address as its table.
+    const bool verify = profile.heap_images == 2;
+    std::vector<Id> members{F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]};
+    members.push_back(U64); // member 7: the table address
+    members.push_back(U64); // member 8: the debug buffer address
+    if (verify) {
+        for (u32 word = 0; word < Shader::HeapVerifySamplerWords + Shader::HeapVerifyImageWords; ++word) {
+            members.push_back(U32[1]); // members 9..22
+        }
+    }
+    const Id struct_type{Name(TypeStruct(std::span<const Id>(members)), "AuxData")};
+    Decorate(struct_type, spv::Decoration::Block);
+    MemberDecorate(struct_type, PushData::XOffsetIndex, spv::Decoration::Offset, 0U);
+    MemberDecorate(struct_type, PushData::YOffsetIndex, spv::Decoration::Offset, 4U);
+    MemberDecorate(struct_type, PushData::XScaleIndex, spv::Decoration::Offset, 8U);
+    MemberDecorate(struct_type, PushData::YScaleIndex, spv::Decoration::Offset, 12U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 16U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
+    MemberDecorate(struct_type, HeapIndexTableMember, spv::Decoration::Offset, HeapIndexTableOffset);
+    MemberDecorate(struct_type, HeapDebugMember, spv::Decoration::Offset, Shader::HeapDebugOffset);
+    if (verify) {
+        for (u32 word = 0; word < Shader::HeapVerifySamplerWords + Shader::HeapVerifyImageWords; ++word) {
+            MemberDecorate(struct_type, HeapVerifyFirstMember + word, spv::Decoration::Offset,
+                           Shader::HeapVerifyWordsOffset + 4 * word);
+        }
+    }
+    push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
+    Name(push_data_block, "push_data");
+    interfaces.push_back(push_data_block);
+}
+
 void EmitContext::DefinePushDataBlock() {
+    // sotc: SOTC_HEAP: the heap stage's own push struct (see DefineHeapPushDataBlock).
+    if (UsesHeapImages(info, profile)) {
+        DefineHeapPushDataBlock();
+        return;
+    }
     // Create push constants block for instance steps rates
     // sotc: a bindless stage also reads the sampler slots, pushed right after PushData
     // (BindlessSamplerSlots). Other stages keep the block as it was.
@@ -1764,19 +1807,109 @@ void EmitContext::DefineImagesAndSamplers() {
 }
 
 Id EmitContext::LoadTableIndex(u32 entry) {
-    // sotc: SOTC_HEAP: the table address is the uvec2 push member at HeapIndexTableOffset (low word
-    // first, as LoadBdaBlock reads its words); entry i is one u32 at address + 4 * i.
-    const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[2]), push_data_block,
+    // sotc: SOTC_HEAP: the table address is the u64 push member HeapIndexTableMember (byte 64); entry i is one u32
+    // at address + 4 * i. The index is the same in every invocation of a draw: it comes from push data and a constant
+    // entry, so it is dynamically uniform and needs no NonUniform decoration.
+    const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), push_data_block,
                                ConstU32(HeapIndexTableMember))};
-    const Id table{OpBitcast(U64, OpLoad(U32[2], ptr))};
+    const Id table{OpLoad(U64, ptr)};
     const Id address{OpIAdd(U64, table, Constant(U64, static_cast<u64>(entry) * sizeof(u32)))};
     return OpLoad(U32[1], BdaPointer(address, U32[1]), spv::MemoryAccessMask::Aligned, 4U);
+}
+
+Id EmitContext::HeapDebugBase() {
+    return OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), push_data_block,
+                                     ConstU32(HeapDebugMember)));
+}
+
+Id EmitContext::HeapAdd(Id debug_base, u32 offset, Id value) {
+    const Id scope{ConstU32(static_cast<u32>(spv::Scope::Device))};
+    const Id ptr{BdaPointer(OpIAdd(U64, debug_base, Constant(U64, static_cast<u64>(offset))), U32[1])};
+    return OpAtomicIAdd(U32[1], ptr, scope, u32_zero_value, value);
+}
+
+Id EmitContext::LoadHeapClassic(u32 member, u32 shift) {
+    // The compact classic words (resource.h): a 16-bit slot in the low (shift 0) or high (shift 16) half.
+    const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]), push_data_block,
+                               ConstU32(member))};
+    return OpBitFieldUExtract(U32[1], OpLoad(U32[1], ptr), ConstU32(shift), ConstU32(16U));
+}
+
+void EmitContext::HeapRecord(Id bad, u32 kind, u32 number, Id classic, Id raw, u32 entry, u32 count_word) {
+    // sotc: SOTC_HEAP. A branch on `bad` only: the record is written by one invocation's branch, and the slot
+    // counter may pass the capacity (a slot past it is dropped, and counted in HeapDebugSlots).
+    const Id merge{BdaBeginIf(bad)};
+    const Id debug_base{HeapDebugBase()};
+    HeapAdd(debug_base, count_word, ConstU32(1u));
+    const Id slot{HeapAdd(debug_base, HeapDebugSlots, ConstU32(1u))};
+    const Id fits{OpULessThan(U1[1], slot, ConstU32(Shader::HeapRecordCapacity))};
+    const Id record_merge{BdaBeginIf(fits)};
+    const Id record_offset{OpIMul(U64, OpUConvert(U64, slot), Constant(U64, u64{Shader::HeapRecordSize}))};
+    const Id record{OpIAdd(U64, debug_base,
+                           OpIAdd(U64, record_offset, Constant(U64, u64{Shader::HeapRecordsOffset})))};
+    const auto field = [&](u32 offset, Id value, Id type, u32 size) {
+        OpStore(BdaPointer(OpIAdd(U64, record, Constant(U64, static_cast<u64>(offset))), type), value,
+                spv::MemoryAccessMask::Aligned, size);
+    };
+    field(0, Constant(U64, info.pgm_hash), U64, 8);
+    field(8,
+          OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), push_data_block,
+                                    ConstU32(HeapIndexTableMember))),
+          U64, 8);
+    field(16, ConstU32(static_cast<u32>(hw_stage)), U32[1], 4);
+    field(20, ConstU32(kind), U32[1], 4);
+    field(24, ConstU32(number), U32[1], 4);
+    field(28, classic, U32[1], 4);
+    field(32, raw, U32[1], 4);
+    field(36, ConstU32(entry), U32[1], 4);
+    BdaEndIf(record_merge);
+    BdaEndIf(merge);
+}
+
+Id EmitContext::HeapGuard(Id raw, u32 capacity, u32 entry) {
+    // sotc: SOTC_HEAP guard (both modes). An index at or past the heap capacity names no descriptor: it is counted
+    // (HeapDebugGuard) and recorded (kind 2), and the null slot 0 is used instead, so the shader reads no
+    // out-of-range descriptor.
+    const Id past{OpLogicalNot(U1[1], OpULessThan(U1[1], raw, ConstU32(capacity)))};
+    HeapRecord(past, 2, entry, raw, raw, entry, Shader::HeapDebugGuard);
+    return OpSelect(U32[1], past, u32_zero_value, raw);
+}
+
+Id EmitContext::LoadHeapImageIndex(u32 entry, u32 slot) {
+    const Id raw{LoadTableIndex(entry)};
+    if (profile.heap_images != 2) {
+        return HeapGuard(raw, Shader::HeapImageCapacity, entry);
+    }
+    // sotc: SOTC_HEAP GPU verify. The classic slot is the index used (the rendering stays as the classic bind); the
+    // table value is compared with it, and a difference is recorded (kind 0).
+    const u32 rel = slot - Shader::GetBindlessImageRange(info.sw_stage).base;
+    ASSERT_MSG(rel < Shader::HeapVerifyImageWords * 2, "heap verify: image slot outside the compact words");
+    const Id classic{LoadHeapClassic(HeapVerifyFirstMember + Shader::HeapVerifySamplerWords + rel / 2,
+                                     (rel & 1) * 16)};
+    HeapAdd(HeapDebugBase(), Shader::HeapDebugCompareImage, ConstU32(1u));
+    HeapRecord(OpINotEqual(U1[1], classic, raw), 0, entry, classic, raw, entry,
+               Shader::HeapDebugMismatchImage);
+    return HeapGuard(classic, Shader::HeapImageCapacity, entry);
+}
+
+Id EmitContext::LoadHeapSamplerIndex(u32 entry, u32 index) {
+    const Id raw{LoadTableIndex(entry)};
+    if (profile.heap_images != 2) {
+        return HeapGuard(raw, Shader::HeapSamplerCapacity, entry);
+    }
+    // sotc: SOTC_HEAP GPU verify, as LoadHeapImageIndex (kind 1). Sampler s is compact sampler s.
+    ASSERT_MSG(index < Shader::HeapVerifySamplerWords * 2, "heap verify: sampler outside the compact words");
+    const Id classic{LoadHeapClassic(HeapVerifyFirstMember + index / 2, (index & 1) * 16)};
+    HeapAdd(HeapDebugBase(), Shader::HeapDebugCompareSampler, ConstU32(1u));
+    HeapRecord(OpINotEqual(U1[1], classic, raw), 1, index, classic, raw, entry,
+               Shader::HeapDebugMismatchSampler);
+    return HeapGuard(classic, Shader::HeapSamplerCapacity, entry);
 }
 
 Id EmitContext::LoadSampler(u32 index) {
     if (uses_heap_images) {
         // sotc: SOTC_HEAP: sampler s is the entry after the images of the stage (UsesHeapImages).
-        const Id heap_index{LoadTableIndex(static_cast<u32>(info.images.size()) + index)};
+        const Id heap_index{LoadHeapSamplerIndex(static_cast<u32>(info.images.size()) + index, index)};
         const Id sampler_ptr{OpAccessChain(sampler_pointer_type, bindless_sampler_array, heap_index)};
         return OpLoad(sampler_type, sampler_ptr);
     }

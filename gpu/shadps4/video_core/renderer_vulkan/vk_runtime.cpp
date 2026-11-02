@@ -913,6 +913,7 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
     addressed_write_pending = false; // sotc: SOTC_SHADER_ADDR, the barrier that ordered it is recorded
+    ++flush_gen;
 
     image_barriers.clear();
     for (std::size_t i = 0; i < active_resources; ++i) {

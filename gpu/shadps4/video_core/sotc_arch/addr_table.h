@@ -16,9 +16,11 @@
 // writes the entries of the whole range from the single (buffer, offset) it returns.
 //
 // Clean state (sotc: SOTC_ADDR_TABLE fast path). Each table page has two bits: placed (its entry is not 0) and clean
-// (the entries on the device are the shadow's, and the bytes behind them match guest memory as of the last sync of the
-// page). A read Touch of a range whose pages are all placed and clean returns at once, with no ObtainBuffer. Events
-// that make a clean page stale clear its bit (Dirty, OnPlace, OnRemove); see addr_table.cpp for the ordering proof.
+// (the entries on the device are the shadow's, and no guest byte of the page changed since the last sync of the page
+// without that sync taking the change). A Touch of a range whose pages are all placed and clean returns at once, with
+// no ObtainBuffer, when it is a read, or a written range in native mode that is already GPU-modified. Events that make
+// a clean page stale clear its bit (Dirty, OnPlace, OnRemove, and in the tracked modes a written bind); see
+// addr_table.cpp for the ordering proof and for why a native GPU write keeps the bits.
 #pragma once
 
 #include "common/types.h"
@@ -60,6 +62,8 @@ vk::DeviceAddress Base();
 /// no device address, or the buffer cache refuses it (counted; the shader then reads zero for those pages).
 /// A read of a range whose pages are all placed and clean returns true at once (no ObtainBuffer); SOTC_SHADER_ADDR=2
 /// still runs the slow path and only counts the fast path it would have taken.
+/// A written range takes the fast path only in native mode (SOTC_NATIVE=1), with its pages placed and clean and
+/// already GPU-modified (BufferCache::WrittenAlreadyGpuModified); then it runs NoteWrittenFast and no sync.
 bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size, bool is_written);
 
 /// The buffer cache placed [addr, addr+size) at device address device_addr (any thread). Only the shadow changes; the

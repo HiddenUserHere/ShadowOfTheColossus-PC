@@ -26,6 +26,7 @@ class TextureCache;
 
 namespace Shader {
 struct Info;
+struct BindlessSamplerSlots;
 }
 
 namespace SotcArch {
@@ -158,9 +159,26 @@ vk::DeviceAddress Expected(VAddr base, u64 size);
 
 // ---------------------------------------------------------------------------------------------------------------
 // A4. Global descriptor heap (switch SOTC_HEAP) and per-table index memo.
+/// sotc: the heap push block (Shader::HeapBlockOffset, 64 bytes): the heap debug buffer's device address, and in GPU
+/// verify the classic slot words of the heap stage, compacted for the shader (layout: resource.h, HeapVerifyWords).
+struct HeapBlock {
+    u64 debug_address;
+    u32 words[14];
+};
+static_assert(sizeof(HeapBlock) == 64, "HeapBlock must fill Shader::HeapPushBytes - Shader::HeapBlockOffset");
+
 namespace Heap {
 /// SOTC_HEAP=1 (or 2) and its requirements met (CheckRequirements). Off means the pipelines are built as today.
 bool On();
+/// The profile value (Shader::Profile::heap_images): 0 off, 1 heap, 2 heap with the GPU verify (SOTC_HEAP_GPU_VERIFY=1).
+u8 ProfileValue();
+/// The heap debug buffer's device address (0 when heap is off or the buffer could not be made).
+vk::DeviceAddress DebugAddress();
+/// Fills block for one draw: the debug address, and in GPU verify the classic slot words of `stage` (the draw's heap
+/// stage, nullptr: none) compacted from this draw's bindless slots (see HeapBlock).
+void FillBlock(HeapBlock& block, const Shader::Info* stage, const Shader::BindlessSamplerSlots& slots);
+/// One report line into out (the debug buffer's counters and the first distinct records); resets the counters.
+void Report(char* out, u32 size, double seconds);
 /// True when VK_EXT_descriptor_heap is used; false: descriptor indexing fallback.
 bool UsesDescriptorHeap();
 /// Called once by the instance, after the bindless flags are set. SOTC_HEAP needs SOTC_N5_BINDLESS=1,
