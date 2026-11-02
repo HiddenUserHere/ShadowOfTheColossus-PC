@@ -436,6 +436,7 @@ private:
             std::vector<u32> spv;
             bool stale{}; ///< the worker's specialization differs from spec (permutation)
             bool failed{}; ///< translation asserted (tables reused by the game meanwhile)
+            Shader::Info::BindlessCache bindless_answers{}; ///< sotc: the permutation's answers (CombineBindlessCache)
         };
         std::unique_ptr<Translate> translate; ///< a translation job
     };

@@ -349,6 +349,9 @@ static constexpr u32 HeapPushBytes = 192;
 static constexpr u32 HeapBlockOffset = 128;
 static constexpr u32 HeapDebugOffset = 128;
 static constexpr u32 HeapVerifyWordsOffset = 136;
+/// sotc: SOTC_HEAP_VS: the table address of a vertex heap stage is the u64 at byte 136 (member 9 of the heap push
+/// struct). It shares the bytes of the GPU verify words, which SOTC_HEAP_VS never runs with (heap.cpp VertexOn).
+static constexpr u32 HeapVsTableOffset = 136;
 static constexpr u32 HeapVerifySamplerWords = 6;
 static constexpr u32 HeapVerifyImageWords = 8;
 /// Heap capacities the guard checks against (vk_bindless.h BindlessImageCapacity, texture_cache/sampler.h Capacity;

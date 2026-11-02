@@ -558,6 +558,10 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
+    // sotc: a permutation added to a program that exists: its bindless answers must agree with the program's.
+    if (!new_program) {
+        Shader::CombineBindlessCache(it_pgm.value()->info.bindless, program->info.bindless);
+    }
     // The specialization must reference the cached program's info, not the temporary one.
     spec.info = &it_pgm.value()->info;
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
@@ -770,6 +774,7 @@ void Info::Serialize(Serialization::Archive& ar) const {
 
 bool Info::Deserialize(Serialization::Archive& ar) {
     Serialization::Reader info{ar};
+    bindless.ready = false; // sotc: the record replaces the Info; its answers are filled below
 
     info.Read(this, sizeof(Shader::InfoPersistent));
     info.Read(FlatBuf());
@@ -789,6 +794,8 @@ bool Info::Deserialize(Serialization::Archive& ar) {
         return false;
     }
     info.Read(variant); // sotc: SOTC_HEAP, see Serialize
+    // sotc: the record is complete: the bindless answers, as the translation fixed them for this flat buffer.
+    FillBindlessCache();
     return true;
 }
 

@@ -62,6 +62,8 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
 
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
                              RuntimeInfo& runtime_info, const Profile& profile) {
+    // sotc: a translation starts from an Info whose bindless answers are not known yet (see FillBindlessCache).
+    info.bindless.ready = false;
     // Ensure first instruction is expected.
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] != token_mov_vcchi) {
@@ -142,6 +144,8 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Optimization::CollectShaderInfoPass(program, profile);
     Shader::IR::DumpProgram(program, info);
+    // sotc: the Info is complete: its bindless answers are fixed here, before the SPIR-V is emitted from it.
+    info.FillBindlessCache();
 
     return program;
 }

@@ -70,6 +70,7 @@
 #include "../../../../sotc/native/native_particles.h" // sotc: SOTC_NATIVE_PARTICLES report
 #include "../../../../sotc/native/native_copies.h"   // sotc: PC-native GPU result copies report
 namespace SotcNativeHooks { void Report(std::string& out, double seconds); } // sotc: native_hooks.cpp
+namespace Shader { void ReportBindlessCache(std::string& out, double seconds); } // sotc: SOTC_BINDLESS_CACHE_VERIFY (info.cpp)
 #include "../../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST report
 #include "../../../../sotc/rb_class.h"    // sotc: SOTC_RB_CLASS report
 #include "video_core/texture_cache/image.h" // sotc: SOTC_IMG_POOLED / SOTC_IMG_CREATE_AHEAD report
@@ -2128,6 +2129,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 }
                 if (SotcArch::Heap::On()) { // sotc: SOTC_HEAP guard counts and GPU verify records
                     arch(SotcArch::Heap::Report);
+                    arch(SotcArch::TableMemo::Report); // sotc: SOTC_HEAP table memo (hits, misses by reason, binds)
                 }
                 if (SotcArch::AddrTable::On()) {
                     arch(SotcArch::AddrTable::Report);
@@ -2168,6 +2170,7 @@ void VideoOutDriver::Flip(const Request& req) {
             Vulkan::ReportPipeDirty(report, seconds); // SOTC_PIPE_DIRTY
             Vulkan::ReportPipeFast(report, seconds); // SOTC_PIPE_FAST
             Vulkan::ReportSpecMemo(report, seconds); // SOTC_SPEC_MEMO
+            Shader::ReportBindlessCache(report, seconds); // SOTC_BINDLESS_CACHE_VERIFY
             Vulkan::ReportPipeGpl(report, seconds); // SOTC_PIPE_GPL
             AmdGpu::ReportCpLabelSkip(report, seconds);           // SOTC_CP_LABEL_SKIP
             SotcLabels::ReportLabels(report, seconds);            // SOTC_LABELS_HONEST

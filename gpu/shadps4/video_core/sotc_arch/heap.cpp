@@ -243,6 +243,18 @@ bool On() {
     return env_on && !g_refused.load(std::memory_order_relaxed);
 }
 
+bool VertexOn() {
+    // sotc: SOTC_HEAP_VS, read once. GPU verify refuses it (sotc_arch.h).
+    static const bool on = SwitchMode("SOTC_HEAP_VS") == 1 && SwitchMode("SOTC_HEAP") != 0 && !GpuVerify();
+    return on && On();
+}
+
+bool CompositeOpOn() {
+    // sotc: SOTC_HEAP_COMPOSITE_OP=1, read once (see sotc_arch.h).
+    static const bool on = SwitchMode("SOTC_HEAP_COMPOSITE_OP") == 1;
+    return on;
+}
+
 bool UsesDescriptorHeap() {
     // VK_EXT_descriptor_heap is left for later: the emitted SPIR-V is the runtime-array form only.
     return false;

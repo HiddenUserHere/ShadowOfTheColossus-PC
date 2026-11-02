@@ -21,8 +21,8 @@
 namespace Shader {
 
 // sotc: SOTC_SHADER_ADDR. Shared with the host (runtime_info.h): the same guest buffers keep their descriptors.
-bool ShaderAddrBuffer(const Profile& profile, const Info& info, const BufferResource& desc) {
-    if (!profile.shader_addr || !profile.support_int64 || !info.has_flatbuf) {
+bool ShaderAddrCandidate(const Info& info, const BufferResource& desc) {
+    if (!info.has_flatbuf) {
         return false;
     }
     // The window words sit where the bindless slot words are: such a stage keeps its descriptors.
@@ -38,6 +38,24 @@ bool ShaderAddrBuffer(const Profile& profile, const Info& info, const BufferReso
     // with that draw's V#, and a different answer leaves the shader reading a descriptor that was never bound
     // (device lost). So no V# field (such as MTYPE 3, coherent) may enter it.
     return true;
+}
+
+bool ShaderAddrBuffer(const Profile& profile, const Info& info, const BufferResource& desc) {
+    if (!profile.shader_addr || !profile.support_int64) {
+        return false;
+    }
+    return ShaderAddrCandidate(info, desc);
+}
+
+// sotc: the cached answer per buffer once the Info is complete (Info::bindless), the rule otherwise.
+bool ShaderAddrBufferAt(const Profile& profile, const Info& info, u32 index) {
+    if (!profile.shader_addr || !profile.support_int64) {
+        return false;
+    }
+    if (info.bindless.ready && index < info.buffers.size()) {
+        return ((info.bindless.shader_addr_buffers >> index) & 1) != 0;
+    }
+    return ShaderAddrCandidate(info, info.buffers[index]);
 }
 
 } // namespace Shader
@@ -863,6 +881,8 @@ void EmitContext::DefineHeapPushDataBlock() {
     // buffer address (member 8 at 128), and in GPU verify the 14 classic words at 136 (resource.h). The old layout put
     // the table address at 56 (the sampler word 0), so a heap stage read the packet's flatbuf address as its table.
     const bool verify = profile.heap_images == 2;
+    // sotc: SOTC_HEAP_VS. A vertex heap stage has its table address at member 9 (byte 136); GPU verify never has one.
+    const bool vs_table = !verify && info.sw_stage == Shader::SwStage::Vertex;
     std::vector<Id> members{F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]};
     members.push_back(U64); // member 7: the table address
     members.push_back(U64); // member 8: the debug buffer address
@@ -870,6 +890,8 @@ void EmitContext::DefineHeapPushDataBlock() {
         for (u32 word = 0; word < Shader::HeapVerifySamplerWords + Shader::HeapVerifyImageWords; ++word) {
             members.push_back(U32[1]); // members 9..22
         }
+    } else if (vs_table) {
+        members.push_back(U64); // member 9: the vertex heap stage's table address
     }
     const Id struct_type{Name(TypeStruct(std::span<const Id>(members)), "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
@@ -887,6 +909,8 @@ void EmitContext::DefineHeapPushDataBlock() {
             MemberDecorate(struct_type, HeapVerifyFirstMember + word, spv::Decoration::Offset,
                            Shader::HeapVerifyWordsOffset + 4 * word);
         }
+    } else if (vs_table) {
+        MemberDecorate(struct_type, HeapVsTableMember, spv::Decoration::Offset, Shader::HeapVsTableOffset);
     }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
@@ -1702,26 +1726,15 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
 }
 
 bool UsesHeapImages(const Info& info, const Profile& profile) {
-    // sotc: SOTC_HEAP. Only whole stages switch: a stage with an image or sampler outside the heap
-    // keeps its push slots, and the table is then never read. The table load needs 64-bit integers.
+    // sotc: SOTC_HEAP. The table load needs 64-bit integers, and the profile switches the heap.
     if (!profile.heap_images || !profile.support_int64) {
         return false;
     }
-    // sotc: SOTC_HEAP. Only the heap variant of a stage (chosen by the pipeline cache, which also applies the
-    // host rules) is a heap stage, and a stage with a static refusal never is.
-    if (info.variant != StageVariantHeap || HeapStaticRefusal(info)) {
-        return false;
+    // sotc: the stage rule (Shader::HeapStageRule), cached once the Info is complete.
+    if (info.bindless.ready) {
+        return info.bindless.heap_stage;
     }
-    if (info.images.empty() && info.samplers.empty()) {
-        return false;
-    }
-    for (u32 i = 0; i < info.images.size(); ++i) {
-        // Storage images stay on their descriptors: the index table carries sampled images only.
-        if (info.images[i].is_written || BindlessImageSlotOf(info, i) == NO_BINDLESS_IMAGE_SLOT) {
-            return false;
-        }
-    }
-    return info.samplers.empty() || UsesBindlessSamplers(info);
+    return Shader::HeapStageRule(info);
 }
 
 void EmitContext::DefineImagesAndSamplers() {
@@ -1839,12 +1852,17 @@ void EmitContext::DefineImagesAndSamplers() {
     }
 }
 
+u32 HeapTableMember(const Info& info) {
+    // sotc: SOTC_HEAP_VS. A vertex heap stage reads its table address at byte 136, every other heap stage at byte 64.
+    return info.sw_stage == Shader::SwStage::Vertex ? HeapVsTableMember : HeapIndexTableMember;
+}
+
 Id EmitContext::LoadTableIndex(u32 entry) {
-    // sotc: SOTC_HEAP: the table address is the u64 push member HeapIndexTableMember (byte 64); entry i is one u32
-    // at address + 4 * i. The index is the same in every invocation of a draw: it comes from push data and a constant
-    // entry, so it is dynamically uniform and needs no NonUniform decoration.
+    // sotc: SOTC_HEAP: the table address is the u64 push member of the stage (HeapTableMember: byte 64, or 136 for a
+    // vertex heap stage); entry i is one u32 at address + 4 * i. The index is the same in every invocation of a draw:
+    // it comes from push data and a constant entry, so it is dynamically uniform and needs no NonUniform decoration.
     const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), push_data_block,
-                               ConstU32(HeapIndexTableMember))};
+                               ConstU32(HeapTableMember(info)))};
     const Id table{OpLoad(U64, ptr)};
     const Id address{OpIAdd(U64, table, Constant(U64, static_cast<u64>(entry) * sizeof(u32)))};
     return OpLoad(U32[1], BdaPointer(address, U32[1]), spv::MemoryAccessMask::Aligned, 4U);
@@ -1887,7 +1905,7 @@ void EmitContext::HeapRecord(Id bad, u32 kind, u32 number, Id classic, Id raw, u
     field(0, Constant(U64, info.pgm_hash), U64, 8);
     field(8,
           OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), push_data_block,
-                                    ConstU32(HeapIndexTableMember))),
+                                    ConstU32(HeapTableMember(info)))),
           U64, 8);
     field(16, ConstU32(static_cast<u32>(hw_stage)), U32[1], 4);
     field(20, ConstU32(kind), U32[1], 4);

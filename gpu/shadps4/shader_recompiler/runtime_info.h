@@ -22,6 +22,12 @@ struct Info;
 /// spirv_emit_context.cpp). Shared by the SPIR-V emitter and the host, so both agree on the bindings.
 /// Formatted and coherent (MTYPE 3) buffers keep their descriptors.
 bool ShaderAddrBuffer(const Profile& profile, const Info& info, const BufferResource& desc);
+/// sotc: ShaderAddrBuffer of info.buffers[index]: the cached Info part once the Info is complete (Info::bindless),
+/// the rule otherwise. The per draw callers use this one.
+bool ShaderAddrBufferAt(const Profile& profile, const Info& info, u32 index);
+/// sotc: the Info part of ShaderAddrBuffer (no profile switch): has_flatbuf, no bindless slot words, and the buffer's
+/// own fields. ShaderAddrBuffer is the profile switches and this; FillBindlessCache caches this per buffer.
+bool ShaderAddrCandidate(const Info& info, const BufferResource& desc);
 
 enum class HwStage : u32 {
     Fragment,

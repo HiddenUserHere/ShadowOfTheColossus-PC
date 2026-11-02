@@ -268,7 +268,7 @@ private:
     /// stage's images (bound flags, transitions, bound list, usage) from the index table's images, with no descriptors.
     /// Returns false, having made nothing, when the classic bind must run instead (a render target, a stencil image,
     /// a rebind pending); the reason is counted.
-    bool BindHeapImages(const SotcArch::TableMemo::TableBinds& binds);
+    bool BindHeapImages(const Shader::Info& stage, const SotcArch::TableMemo::TableBinds& binds);
 
     /// sotc: SOTC_TEX_BLOCK=1 (default off; 2 also runs the full bind and compares). A stage's
     /// texture block (its image descriptors and samplers) is memoized by the raw T#/S# words it
@@ -402,7 +402,18 @@ private:
     void ResetBindings(bool is_compute);
     void CaptureTextures();
     static bool TaaOff(); ///< sotc: DLSS on (super resolution), vk_rasterizer.cpp
-    u32 CompositeUiIndex(); ///< sotc: which of the composite's two images is the UI layer
+    /// sotc: the composite draws BindTexturesFull acts on, from the stage's bound images in binding order (ids, count)
+    /// and the first color buffer. One predicate for two users: BindTexturesFull runs the side effects, and
+    /// BindHeapImages sends such an op to the classic bind under SOTC_HEAP_COMPOSITE_OP.
+    struct CompositeKinds {
+        bool hudless{};  ///< hudless_ui_info is set (SOTC_FG_HUDLESS with frame generation on)
+        bool dlss{};     ///< DLSS super resolution: NoteComposite and NoteUiShadow
+        bool probe{};    ///< SOTC_DLSS_PROBE logs the fragment
+        u32 ui_index{};  ///< which of the two images is the UI layer (for hudless and dlss)
+    };
+    CompositeKinds CompositeOf(const Shader::Info& stage, const VideoCore::ImageId* ids, u32 count,
+                               VideoCore::ImageId cb0);
+    u32 CompositeUiIndex(VideoCore::ImageId first); ///< sotc: which of the composite's two images is the UI layer
     void MaybeDumpImages(u64 pgm_hash);
     void FlushPeriodic();
     u64 commands_tick{};

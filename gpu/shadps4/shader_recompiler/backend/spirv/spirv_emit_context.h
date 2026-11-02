@@ -45,6 +45,10 @@ constexpr u32 HeapIndexTableMember = 7;
 constexpr u32 HeapIndexTableOffset = 64;
 constexpr u32 HeapDebugMember = 8;
 constexpr u32 HeapVerifyFirstMember = 9;
+/// sotc: SOTC_HEAP_VS. The push member of a vertex heap stage's table address (Shader::HeapVsTableOffset, byte 136).
+/// HeapTableMember gives the member of a heap stage: HeapIndexTableMember, or this one for a vertex stage.
+constexpr u32 HeapVsTableMember = 9;
+u32 HeapTableMember(const Info& info);
 
 struct VectorIds {
     [[nodiscard]] Id& operator[](u32 index) {

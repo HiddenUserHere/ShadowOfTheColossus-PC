@@ -165,13 +165,21 @@ vk::DeviceAddress Expected(VAddr base, u64 size);
 /// verify the classic slot words of the heap stage, compacted for the shader (layout: resource.h, HeapVerifyWords).
 struct HeapBlock {
     u64 debug_address;
-    u32 words[14];
+    union {
+        /// sotc: SOTC_HEAP_VS: the index table address of the vertex heap stage (Shader::HeapVsTableOffset, byte 136).
+        /// Real mode only: the classic words are GPU verify's, and SOTC_HEAP_VS never runs with it.
+        u64 vs_table_address;
+        u32 words[14];
+    };
 };
 static_assert(sizeof(HeapBlock) == 64, "HeapBlock must fill Shader::HeapPushBytes - Shader::HeapBlockOffset");
 
 namespace Heap {
 /// SOTC_HEAP=1 (or 2) and its requirements met (CheckRequirements). Off means the pipelines are built as today.
 bool On();
+/// sotc: SOTC_HEAP_VS=1 (read once): a vertex stage may be a heap stage as well as the fragment. Needs On(), and is off
+/// with GPU verify (SOTC_HEAP_GPU_VERIFY=1), whose verify words take the bytes where the vertex table goes.
+bool VertexOn();
 /// The profile value (Shader::Profile::heap_images): 0 off, 1 heap, 2 heap with the GPU verify (SOTC_HEAP_GPU_VERIFY=1).
 u8 ProfileValue();
 /// The heap debug buffer's device address (0 when heap is off or the buffer could not be made).
@@ -192,6 +200,10 @@ void Init(const Vulkan::Instance& instance);
 /// True when a stage cannot be a heap stage: Shader::HeapStaticRefusal, or a host rule (the composite and UI rules
 /// of BindTexturesFull, which the memo does not answer). The pipeline cache calls it before it picks the heap variant.
 bool StageRefused(const Shader::Info& stage);
+/// sotc: SOTC_HEAP_COMPOSITE_OP=1 (read once). The composite rule of StageRefused is then not applied per program:
+/// the heap stage stays, and BindHeapImages sends each op the composite predicates act on (CompositeOf) to the classic
+/// bind, which runs the composite side effects. Off: the per-program refusal, as before.
+bool CompositeOpOn();
 u32 NullImageIndex(u32 key);
 u32 NullSamplerIndex();
 /// The view's slot in the array of `key` for `layout` (acquired when missing; released by the view's destructor
@@ -222,16 +234,20 @@ void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler);
 /// the texture cache once). Layout: entry i = heap index of stage.images[i], entry images.size()+j = heap index of
 /// stage.samplers[j], Heap::NullImageIndex(key) for a null T#. device_address 0 = refused (the draw path binds as today).
 /// Valid for the current tick.
-/// bindless_gen: Rasterizer::BindlessGeneration of this op; an entry stored under another generation is not replayed.
+/// bindless_gen: Rasterizer::BindlessGeneration of this op. An entry validated under another generation is checked
+/// slot by slot (each heap slot it names must still hold its view) before it is replayed.
 /// binds: sotc: SOTC_HEAP real mode only (nullptr otherwise). Set to the images of this op, after a hit has been
 /// validated and its per-bind UpdateImage run (TouchBoundImage), or after a resolution. The caller then does the
 /// transitions and the bound flags of those images (the classic bind's second pass, without descriptors).
 IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& stage,
                    AmdGpu::BorderColorBuffer border_color, u64 bindless_gen, TableBinds* binds);
 /// sotc: SOTC_HEAP accounting of the stage binds of heap ops: skipped (the table covers the stage), or the classic
-/// bind ran (reason: 0 GPU verify, 1 render target or forced general, 2 stencil image, 3 rebind pending).
+/// bind ran (reason: 0 GPU verify, 1 render target or forced general, 2 stencil image, 3 rebind pending,
+/// 4 composite draw under SOTC_HEAP_COMPOSITE_OP).
 void NoteBindSkipped();
 void NoteBindClassic(u32 reason);
+/// sotc: SOTC_HEAP_VS. The vertex heap stage of an op: skipped (true) or its classic bind ran (false, the fallback).
+void NoteVertexBind(bool skipped);
 void Report(char* out, u32 size, double seconds);
 } // namespace TableMemo
 

@@ -3265,20 +3265,26 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // table. The packet has one table address, so a pipeline with two heap stages is refused (counted, logged).
     // A table that the memo refuses (device address 0) is refused too: the op is dropped, not drawn from address 0.
     const Shader::Info* heap_stage = nullptr;
+    // sotc: SOTC_HEAP_VS: the vertex heap stage of the pipeline (its table goes to the heap block, not the packet).
+    const Shader::Info* heap_vs_stage = nullptr;
     // sotc: SOTC_HEAP real mode (profile 1): the heap stage's images are bound from its index table (BindHeapImages).
     SotcArch::TableMemo::TableBinds heap_binds{};
+    SotcArch::TableMemo::TableBinds heap_vs_binds{};
     bool heap_real = false;
     if (packet_op) {
         for (const auto* stage : pipeline->GetStages()) {
             if (stage && Shader::Backend::SPIRV::UsesHeapImages(*stage, pipeline->GetProfile())) {
-                if (heap_stage) {
+                // sotc: one heap stage of each kind: the fragment or compute stage, and the vertex stage (SOTC_HEAP_VS).
+                const bool vertex = stage->sw_stage == Shader::SwStage::Vertex;
+                const Shader::Info*& kind_stage = vertex ? heap_vs_stage : heap_stage;
+                if (kind_stage) {
                     static std::atomic<u64> two_heap_stages{};
                     if (two_heap_stages.fetch_add(1, std::memory_order_relaxed) < 8) {
-                        LOG_ERROR(Render_Vulkan, "SOTC HEAP: two heap stages in one pipeline, op dropped");
+                        LOG_ERROR(Render_Vulkan, "SOTC HEAP: two heap stages of one kind in one pipeline, op dropped");
                     }
                     return false;
                 }
-                heap_stage = stage;
+                kind_stage = stage;
             }
         }
     }
@@ -3299,6 +3305,25 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             return false;
         }
         draw_packet.index_table_address = table.device_address;
+    }
+    // sotc: SOTC_HEAP_VS. The vertex table is resolved like the fragment's; its address goes into the heap block after
+    // FillBlock. A vertex heap stage exists only in real mode (VertexOn refuses GPU verify), so its binds are always
+    // taken (BindHeapImages below).
+    u64 heap_vs_address = 0;
+    if (heap_vs_stage) {
+        ASSERT_MSG(pipeline->GetProfile().heap_images == 1, "SOTC HEAP_VS: a vertex heap stage needs the real heap");
+        const auto table = SotcArch::TableMemo::Resolve(texture_cache, *heap_vs_stage,
+                                                        liverpool->DrawRegs().ta_bc_base, BindlessGeneration(),
+                                                        &heap_vs_binds);
+        if (table.device_address == 0) {
+            static std::atomic<u64> vs_table_refused{};
+            if (vs_table_refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_ERROR(Render_Vulkan, "SOTC HEAP_VS: no index table for vertex stage (pgm {:#x}), op dropped",
+                          heap_vs_stage->pgm_hash);
+            }
+            return false;
+        }
+        heap_vs_address = table.device_address;
     }
     // sotc: SOTC_BIND_CACHE: flush the cached binds when the state they were made in moved, or
     // when this bind is not a read-only graphics bind (its writes and copies run before them).
@@ -3659,10 +3684,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             bool textures_done = false;
             if (stage == heap_stage) {
                 if (heap_real) {
-                    textures_done = BindHeapImages(heap_binds);
+                    textures_done = BindHeapImages(*stage, heap_binds);
                 } else {
                     SotcArch::TableMemo::NoteBindClassic(0);
                 }
+            } else if (stage == heap_vs_stage) {
+                // sotc: SOTC_HEAP_VS. Its own fallback: the classic bind runs when BindHeapImages declines (counted there).
+                textures_done = BindHeapImages(*stage, heap_vs_binds);
+                SotcArch::TableMemo::NoteVertexBind(textures_done);
             }
             if (!textures_done) {
                 BindTextures(*stage, binding, set, pr_stage ? resolved : nullptr, pr_stage);
@@ -3675,6 +3704,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     heap_block = {};
     if (packet_op && pipeline->GetProfile().heap_images != 0) {
         SotcArch::Heap::FillBlock(heap_block, heap_stage, bindless_slots);
+        // sotc: SOTC_HEAP_VS: the vertex table (real mode: the block's words are zero, so this is their only content).
+        if (heap_vs_stage) {
+            heap_block.vs_table_address = heap_vs_address;
+        }
     }
     // sotc: SOTC_N5_BINDLESS: the vector was sized for every image, and the heap images write no
     // descriptor: keep the writes made (the bind cache and the descriptor update count them).
@@ -5993,7 +6026,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         shader_addr_profile = nullptr;
     }
     const auto shader_addressed = [&](const Shader::BufferResource& desc) {
-        return shader_addr_profile && Shader::ShaderAddrBuffer(*shader_addr_profile, stage, desc);
+        return shader_addr_profile &&
+               Shader::ShaderAddrBufferAt(*shader_addr_profile, stage,
+                                          static_cast<u32>(&desc - stage.buffers.data()));
     };
     for (const auto& desc : stage.buffers) {
         if (desc.IsSpecial()) {
@@ -6562,9 +6597,45 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
 // sotc: the final composite samples the UI layer and the scene: UI first in the base game's
 // shader, scene first in the PS4 Pro one (0x9e6767fc). The UI layer is the output-size sRGB image.
-u32 Rasterizer::CompositeUiIndex() {
-    const auto& first = texture_cache.GetImage(image_bindings[0].first);
+u32 Rasterizer::CompositeUiIndex(VideoCore::ImageId first_id) {
+    const auto& first = texture_cache.GetImage(first_id);
     return first.info.pixel_format == vk::Format::eR16G16B16A16Sfloat ? 1 : 0;
+}
+
+// sotc: the composite predicates of BindTexturesFull (hudless capture, DLSS composite, SOTC_DLSS_PROBE log). The same
+// function answers BindHeapImages (SOTC_HEAP_COMPOSITE_OP), so the heap path sends exactly the draws the classic bind
+// would act on to that bind. Pure: no state is changed here. The caller holds the texture cache lock.
+Rasterizer::CompositeKinds Rasterizer::CompositeOf(const Shader::Info& stage, const VideoCore::ImageId* ids,
+                                                   u32 count, VideoCore::ImageId cb0) {
+    // sotc: TakeHudless: the final composite samples the UI layer (an sRGB render target) and the
+    // fp16 scene, nothing else. Off unless SOTC_FG_HUDLESS=1: with FSR 3 the generated frames of
+    // the title screen (faded logo) and of loading screens (the scene left behind the opaque UI
+    // layer shows through) came out wrong, the real frame's UI not put back over them.
+    static const bool hudless_on = [] {
+        const char* v = std::getenv("SOTC_FG_HUDLESS");
+        return v && v[0] == '1';
+    }();
+    // sotc: SOTC_DLSS_PROBE=1 logs each fragment shader that draws into a video out surface once.
+    static const bool dlss_probe = std::getenv("SOTC_DLSS_PROBE") != nullptr;
+    CompositeKinds k{};
+    if (stage.sw_stage != Shader::SwStage::Fragment) {
+        return k;
+    }
+    k.probe = dlss_probe && cb0 && texture_cache.GetImage(cb0).usage.vo_surface;
+    if (count != 2 || !ids[0] || !ids[1]) {
+        return k;
+    }
+    k.ui_index = CompositeUiIndex(ids[0]);
+    const auto& ui = texture_cache.GetImage(ids[k.ui_index]);
+    const auto& scene = texture_cache.GetImage(ids[k.ui_index ^ 1]);
+    const bool composite_images = ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
+                                  scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat;
+    k.hudless = hudless_on && composite_images && FrameGen::Current() != FrameGen::Mode::Off;
+    // sotc: DLSS super resolution: the game's final composite samples the UI layer (an sRGB render
+    // target) and the tonemapped fp16 scene, nothing else, into a video out surface.
+    k.dlss = Dlssg::SuperResolution() && cb0 && texture_cache.GetImage(cb0).usage.vo_surface &&
+             composite_images;
+    return k;
 }
 
 
@@ -6930,7 +7001,7 @@ bool Rasterizer::TryTextureBlock(const Shader::Info& stage, const TexBlockKey& k
 // feedback loop, ResetBindings clears it through bound_images), the transition (its barrier), the texture usage bit.
 // Not made, as the heap stage has none of it: descriptors, storage images (HeapStaticRefusal), samplers (the table
 // holds their heap indices), the bind cache and the texture block records (a heap op takes neither).
-bool Rasterizer::BindHeapImages(const SotcArch::TableMemo::TableBinds& binds) {
+bool Rasterizer::BindHeapImages(const Shader::Info& stage, const SotcArch::TableMemo::TableBinds& binds) {
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass, as BindTextures
     // Decided before anything changes: the cases the classic bind handles with its own transitions.
     for (u32 i = 0; i < binds.count; ++i) {
@@ -6950,6 +7021,16 @@ bool Rasterizer::BindHeapImages(const SotcArch::TableMemo::TableBinds& binds) {
         // A stencil image: its transition depends on the draw's depth registers (DepthSampledAsAttachment).
         if (image.info.props.has_stencil) {
             SotcArch::TableMemo::NoteBindClassic(2);
+            return false;
+        }
+    }
+    // sotc: SOTC_HEAP_COMPOSITE_OP. The composite draws (hudless capture, DLSS composite, the probe) run their side
+    // effects in the classic bind (BindTexturesFull). The heap shader reads its images from the table, so that bind
+    // serves it as it serves the other fallbacks; the op is not heap for this bind only. Off: the program was refused.
+    if (SotcArch::Heap::CompositeOpOn()) {
+        const CompositeKinds composite = CompositeOf(stage, binds.image.data(), binds.count, cb_descs[0].first);
+        if (composite.hudless || composite.dlss || composite.probe) {
+            SotcArch::TableMemo::NoteBindClassic(4);
             return false;
         }
     }
@@ -7587,31 +7668,26 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
         }
     }
 
-    // sotc: TakeHudless: the final composite samples the UI layer (an sRGB render target) and the
-    // fp16 scene, nothing else. Off unless SOTC_FG_HUDLESS=1: with FSR 3 the generated frames of
-    // the title screen (faded logo) and of loading screens (the scene left behind the opaque UI
-    // layer shows through) came out wrong, the real frame's UI not put back over them.
-    static const bool hudless_on = [] {
-        const char* v = std::getenv("SOTC_FG_HUDLESS");
-        return v && v[0] == '1';
-    }();
-    if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
-        image_bindings[0].first && image_bindings[1].first &&
-        FrameGen::Current() != FrameGen::Mode::Off) {
-        const u32 ui_i = CompositeUiIndex();
-        const auto& ui = texture_cache.GetImage(image_bindings[ui_i].first);
-        const auto& scene = texture_cache.GetImage(image_bindings[ui_i ^ 1].first);
-        if (ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
-            scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
-            hudless_ui_info = static_cast<s32>(first_image_idx + ui_i);
+    // sotc: the composite predicates (CompositeOf: TakeHudless, DLSS, the probe), the same ones BindHeapImages asks.
+    // (Only a fragment stage can be one: the ids are not gathered for the others.)
+    CompositeKinds composite{};
+    if (stage.sw_stage == Shader::SwStage::Fragment) {
+        boost::container::small_vector<VideoCore::ImageId, 8> bound_ids;
+        for (const auto& [id, desc] : image_bindings) {
+            bound_ids.push_back(id);
         }
+        composite = CompositeOf(stage, bound_ids.data(), static_cast<u32>(bound_ids.size()), cb_descs[0].first);
+    }
+    // sotc: TakeHudless. Off unless SOTC_FG_HUDLESS=1 (see CompositeOf): the UI texture of the composite is
+    // put back over the generated frames.
+    if (composite.hudless) {
+        hudless_ui_info = static_cast<s32>(first_image_idx + composite.ui_index);
     }
 
     // sotc: SOTC_DLSS_PROBE=1 logs each fragment shader that draws into a video out surface once:
     // its images (format, size, render target or not), to find the final composite.
     static const bool dlss_probe = std::getenv("SOTC_DLSS_PROBE") != nullptr;
-    if (dlss_probe && stage.sw_stage == Shader::SwStage::Fragment && cb_descs[0].first &&
-        texture_cache.GetImage(cb_descs[0].first).usage.vo_surface) {
+    if (composite.probe) {
         static std::unordered_set<std::string> seen;
         std::string line = fmt::format("{:#x}", stage.pgm_hash);
         {
@@ -7634,26 +7710,16 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
         }
     }
 
-    // sotc: DLSS super resolution: the game's final composite samples the UI layer (an sRGB render
-    // target) and the tonemapped fp16 scene, nothing else, into a video out surface.
-    if (Dlssg::SuperResolution() && stage.sw_stage == Shader::SwStage::Fragment &&
-        image_bindings.size() == 2 && image_bindings[0].first && image_bindings[1].first &&
-        cb_descs[0].first) {
-        const u32 ui_i = CompositeUiIndex();
-        const auto& ui = texture_cache.GetImage(image_bindings[ui_i].first);
-        const auto& scene = texture_cache.GetImage(image_bindings[ui_i ^ 1].first);
-        if (texture_cache.GetImage(cb_descs[0].first).usage.vo_surface &&
-            ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
-            scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
-            bind_cache_uncacheable = true; // sotc: SOTC_BIND_CACHE
-            Dlssg::NoteComposite(image_bindings[ui_i ^ 1].first, image_bindings[ui_i].first,
-                                 texture_cache);
-            NoteUiShadow();
-            static bool logged = false;
-            if (!std::exchange(logged, true)) {
-                std::fprintf(stderr, "SOTC DLSS: composite shader %#llx\n",
-                             static_cast<unsigned long long>(stage.pgm_hash));
-            }
+    // sotc: DLSS super resolution: the game's final composite (CompositeOf) hands its two images to the upscaler.
+    if (composite.dlss) {
+        const u32 ui_i = composite.ui_index;
+        bind_cache_uncacheable = true; // sotc: SOTC_BIND_CACHE
+        Dlssg::NoteComposite(image_bindings[ui_i ^ 1].first, image_bindings[ui_i].first, texture_cache);
+        NoteUiShadow();
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            std::fprintf(stderr, "SOTC DLSS: composite shader %#llx\n",
+                         static_cast<unsigned long long>(stage.pgm_hash));
         }
     }
 
@@ -7670,7 +7736,7 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
         if (bindless_images && array_size == 1) {
             const u32 heap_slot = Shader::BindlessImageSlotOf(stage, image_index);
             if (heap_slot != Shader::NO_BINDLESS_IMAGE_SLOT) {
-                const u32 key = Shader::BindlessImageKeyOf(stage, stage.images[image_index]);
+                const u32 key = Shader::BindlessImageKeyAt(stage, image_index);
                 const vk::ImageLayout layout = image_infos[image_info_idx].imageLayout;
                 // sotc: SOTC_TSLOT: a T# whose cached answer still holds (same image, view info, and
                 // the heap holds the view in this layout) takes its slot without the view lookup.

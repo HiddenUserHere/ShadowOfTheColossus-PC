@@ -114,8 +114,9 @@ u32 BindlessImages::Evict(u32 key) {
     u64 oldest = ~0ULL;
     for (u32 slot = 1; slot < next_slot[key]; ++slot) {
         const Slot& s = slots[key][slot];
-        if (s.state == SlotState::Live && s.last_use < oldest) {
-            oldest = s.last_use;
+        const u64 last_use = std::atomic_ref<u64>(const_cast<u64&>(s.last_use)).load(std::memory_order_relaxed);
+        if (s.state == SlotState::Live && last_use < oldest) {
+            oldest = last_use;
             victim = slot;
         }
     }
@@ -148,6 +149,13 @@ void BindlessImages::Use(u32 key, u32 slot) {
         s.last_use = scheduler.CurrentTick();
         ++served;
     }
+}
+
+void BindlessImages::NoteUse(u32 key, u32 slot) {
+    if (slot == 0 || slot >= BindlessImageCapacity) {
+        return;
+    }
+    std::atomic_ref<u64>(slots[key][slot].last_use).store(scheduler.CurrentTick(), std::memory_order_relaxed);
 }
 
 void BindlessImages::Release(u32 key, u32 slot, vk::ImageView view) {

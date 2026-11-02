@@ -1303,6 +1303,7 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
         auto new_info = Shader::Info(t.hw_stage, t.sw_stage, params);
         t.module = CompileModule(new_info, runtime_info, params.code, t.perm_idx, binding,
                                  &worker_pools, &t.spv);
+        t.bindless_answers = new_info.bindless; // sotc: merged into the program when installed
         // The command processor made spec from the tables of its draw; the module was made from
         // what the tables hold now. Different: installing it under spec would bind wrong code.
         const Shader::StageSpecialization worker_spec{new_info, t.runtime_info, profile,
@@ -1355,6 +1356,8 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
     RegisterShaderBinary(std::move(t.spv), t.hash, perm_idx);
     RegisterShaderMeta(program.info, t.spec->fetch_shader_data, *t.spec,
                        HashCombine(t.hash, perm_idx), perm_idx);
+    // sotc: the new permutation's bindless answers must agree with the program's (CombineBindlessCache).
+    Shader::CombineBindlessCache(program.info.bindless, t.bindless_answers);
     program.AddPermut(t.module, std::move(*t.spec));
 }
 
@@ -2650,6 +2653,8 @@ bool PipelineCache::RefreshGraphicsStages() {
         profile.shader_addr != 0 ? Shader::StageVariantPlain : Shader::StageVariantDefault;
     u8 fragment_variant = non_heap_variant;
     u8 other_variant = non_heap_variant;
+    // sotc: SOTC_HEAP_VS: the vertex stage's variant (bind_vertex below). Equal to other_variant with the switch off.
+    u8 vertex_variant = non_heap_variant;
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
@@ -2675,7 +2680,9 @@ bool PipelineCache::RefreshGraphicsStages() {
 
         auto params = AmdGpu::GetParams(*pgm);
         // sotc: SOTC_HEAP: a variant is a program of its own, so its hash differs (the program, memo and key caches).
-        params.variant = stage_out == SwStage::Fragment ? fragment_variant : other_variant;
+        params.variant = stage_out == SwStage::Fragment  ? fragment_variant
+                         : stage_out == SwStage::Vertex ? vertex_variant
+                                                        : other_variant;
         if (params.variant != Shader::StageVariantDefault) {
             params.guest_hash = params.hash; // sotc: Info::pgm_hash stays the game's hash
             params.hash = HashCombine(params.hash, params.variant);
@@ -2691,8 +2698,8 @@ bool PipelineCache::RefreshGraphicsStages() {
     // sotc: SOTC_HEAP: the fragment is bound as the heap candidate. It stays the heap stage when it passes the
     // recompiler's static rules and the host's (Heap::StageRefused), and then the other stages are plain. A refused
     // fragment is bound again as today, and the pipeline keeps the bindless path of its other stages.
+    const auto binding_before_fragment = binding;
     if (profile.heap_images && profile.support_int64) {
-        const auto binding_before_fragment = binding;
         fragment_variant = Shader::StageVariantHeap;
         bind_stage(HwStage::Fragment, SwStage::Fragment);
         const auto* heap_fs = infos[static_cast<u32>(SwStage::Fragment)];
@@ -2711,6 +2718,55 @@ bool PipelineCache::RefreshGraphicsStages() {
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
     key.num_color_attachments = std::bit_width(key.mrt_mask);
 
+    // sotc: SOTC_HEAP_VS. The vertex stage is bound as a heap candidate, after the stages bound before it (the fragment,
+    // and in tessellation the hull and eval stages). It stays heap when the static and host rules pass
+    // (Heap::StageRefused). A packet pipeline has no slot words, so the heap vertex needs every other stage plain:
+    // with a heap fragment they are plain already; without one, the fragment is bound again as plain when it is the
+    // only stage before the vertex, and a hull or eval stage with slot words refuses the vertex. The stages bound after
+    // the vertex take the plain variant once it is heap. Switch off: the vertex is bound as the others, as before.
+    const bool heap_vs_on = profile.heap_images != 0 && profile.support_int64 && SotcArch::Heap::VertexOn();
+    const auto bind_vertex = [&](HwStage stage_in, bool fragment_only_before) -> bool {
+        if (!heap_vs_on) {
+            vertex_variant = other_variant;
+            return bind_stage(stage_in, SwStage::Vertex);
+        }
+        // Slot words: a default (descriptor and slot-word) stage that binds bindless resources.
+        const auto slot_words = [](const Shader::Info* info) {
+            return info && info->variant == Shader::StageVariantDefault &&
+                   (Shader::UsesBindlessSamplers(*info) || Shader::UsesBindlessImages(*info));
+        };
+        // The fragment is the only stage before the vertex here: it is bound again as plain when it has slot words.
+        if (fragment_only_before && fragment_variant != Shader::StageVariantHeap &&
+            slot_words(infos[static_cast<u32>(SwStage::Fragment)])) {
+            fragment_variant = Shader::StageVariantPlain;
+            binding = binding_before_fragment;
+            bind_stage(HwStage::Fragment, SwStage::Fragment);
+            if (translation_pending) {
+                return false;
+            }
+        }
+        if (slot_words(infos[static_cast<u32>(SwStage::Fragment)]) ||
+            slot_words(infos[static_cast<u32>(SwStage::TessellationControl)]) ||
+            slot_words(infos[static_cast<u32>(SwStage::TessellationEval)])) {
+            vertex_variant = other_variant;
+            return bind_stage(stage_in, SwStage::Vertex);
+        }
+        const auto binding_before_vertex = binding;
+        vertex_variant = Shader::StageVariantHeap;
+        bind_stage(stage_in, SwStage::Vertex);
+        const auto* heap_vs = infos[static_cast<u32>(SwStage::Vertex)];
+        if (heap_vs && !SotcArch::Heap::StageRefused(*heap_vs)) {
+            other_variant = Shader::StageVariantPlain;
+            return !translation_pending;
+        }
+        if (heap_vs || !translation_pending) {
+            vertex_variant = other_variant;
+            binding = binding_before_vertex;
+            return bind_stage(stage_in, SwStage::Vertex);
+        }
+        return false;
+    };
+
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
         if (!instance.IsGeometryStageSupported()) {
@@ -2721,7 +2777,7 @@ bool PipelineCache::RefreshGraphicsStages() {
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
-        if (!bind_stage(HwStage::Export, SwStage::Vertex)) {
+        if (!bind_vertex(HwStage::Export, true)) {
             return false;
         }
         if (!bind_stage(HwStage::Geometry, SwStage::Geometry)) {
@@ -2738,7 +2794,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         if (!bind_stage(HwStage::Vertex, SwStage::TessellationEval)) {
             return false;
         }
-        if (!bind_stage(HwStage::Local, SwStage::Vertex)) {
+        if (!bind_vertex(HwStage::Local, false)) {
             return false;
         }
         break;
@@ -2760,7 +2816,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         if (!bind_stage(HwStage::Export, SwStage::TessellationEval)) {
             return false;
         }
-        if (!bind_stage(HwStage::Local, SwStage::Vertex)) {
+        if (!bind_vertex(HwStage::Local, false)) {
             return false;
         }
         if (!bind_stage(HwStage::Geometry, SwStage::Geometry)) {
@@ -2768,7 +2824,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::Vs:
-        bind_stage(HwStage::Vertex, SwStage::Vertex);
+        bind_vertex(HwStage::Vertex, true);
         break;
     default:
         LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
@@ -3288,6 +3344,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         auto runtime_info = rt;
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        // sotc: the new permutation's bindless answers must agree with the program's (CombineBindlessCache).
+        Shader::CombineBindlessCache(info.bindless, new_info.bindless);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));

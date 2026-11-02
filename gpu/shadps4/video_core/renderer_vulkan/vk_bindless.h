@@ -91,6 +91,10 @@ public:
     /// Marks a live `slot` of `key` used by the current tick: it is not evicted before that tick
     /// has finished on the GPU. Every bind that names a slot calls it when it names it.
     void Use(u32 key, u32 slot);
+    /// sotc: SOTC_HEAP. Use without the lock, for a TableMemo hit replaying a slot it checked (Holds or an unchanged
+    /// generation): only the last-use tick moves, so Evict does not take a slot submitted draws still read. Called
+    /// on the draw thread, the only thread that evicts (IndexOf); the tick is an atomic word for the other readers.
+    void NoteUse(u32 key, u32 slot);
 
     /// Gives `slot` of `key` back when it is live and holds `view` (otherwise a no-op: the view
     /// lost the slot to an eviction). Slot 0 (null) is never released. The slot is cleared after the

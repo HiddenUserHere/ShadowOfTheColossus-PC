@@ -30,6 +30,8 @@
 //  - per image: ImageAddrGeneration of its guest address, and both the found and the bound image are still the
 //    registered images (their uid), neither is dirty and the bound one does not need a rebind;
 //  - per sampler: SamplerGeneration (a destroyed sampler bumps it);
+//  - per image slot (sotc, after a heap generation change only): each heap slot the entry names still holds the
+//    view it was made for (BindlessImages::Holds). The generation alone is global and moves on every view release;
 //  - a mip-tail candidate also needs BindGeneration and gpu_modified_epoch unchanged.
 //
 // Refused (no table, the draw path binds as today): storage or array images, mip fallbacks, fmasks, samplers the
@@ -47,8 +49,9 @@
 // TouchBoundImage on each bound image (UpdateImage's work, or its touch and bind evidence where that is a no-op),
 // then checks the entry again; the entry records the bound image and view range of each T#, and Resolve hands
 // them to the caller. The caller makes the bound flags, the barriers (Runtime::Transit) and the bound list.
-// Hits are refused when the heap generation moved (a view was released or evicted) or the depth image of a
-// stencil image changed. Counted: the skipped and the classic stage binds (NoteBindSkipped, NoteBindClassic).
+// Hits are refused when a heap slot the entry names no longer holds its view (after a heap generation change; the
+// miss is counted as "slot"), or the depth image of a stencil image changed. Counted: the skipped and the classic
+// stage binds (NoteBindSkipped, NoteBindClassic).
 //
 // Switch: SOTC_HEAP (0 off, 1 on, 2 verify: a hit is resolved again and the indices compared; the fresh ones are
 // used). Unset: none of this runs.
@@ -68,6 +71,7 @@
 #include "core/memory.h"
 #include "shader_recompiler/info.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/vk_bindless.h" // sotc: BindlessImages::Holds (per-slot validity of a hit)
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -96,7 +100,7 @@ constexpr u64 kRingAlign = 16;
 static_assert(sizeof(AmdGpu::Image) == 4 * sizeof(u64));
 static_assert(sizeof(AmdGpu::Sampler) == 2 * sizeof(u64));
 
-enum class Miss : u8 { None, Absent, Candidate, Generation, Dirty, Sampler, Unmapped };
+enum class Miss : u8 { None, Absent, Candidate, Generation, Slot, Dirty, Sampler, Unmapped };
 
 struct ImageRecord {
     bool null{};
@@ -115,6 +119,10 @@ struct ImageRecord {
     u64 addr_gen{};
     /// sotc: the view range of the bind (the transition of the classic bind uses it).
     VideoCore::SubresourceRange range{};
+    /// sotc: the heap key of the image and the view its heap slot (the Entry's index of this image) held when the
+    /// op resolved. A hit after a heap generation change checks that the slot still holds this view (SlotsMiss).
+    u32 key{};
+    vk::ImageView view{};
 };
 
 struct Entry {
@@ -127,7 +135,8 @@ struct Entry {
     u64 bind_generation{};
     u64 gpu_epoch{};
     u64 sampler_generation{};
-    /// sotc: the heap generation of the op that resolved it (a release since then makes it stale).
+    /// sotc: the heap generation the entry was last validated at. A release or an eviction moves the generation
+    /// (global), and then the entry is checked slot by slot (SlotsMiss) and, when it holds, adopts the new one.
     u64 bindless_gen{};
     u32 num_images{};
     u32 num_bindings{};
@@ -150,6 +159,8 @@ struct Counters {
     std::atomic<u64> miss_absent{};
     std::atomic<u64> miss_candidate{};
     std::atomic<u64> miss_generation{};
+    /// sotc: a heap generation change where a slot the entry names no longer holds its view (SlotsMiss).
+    std::atomic<u64> miss_slot{};
     std::atomic<u64> miss_dirty{};
     std::atomic<u64> miss_sampler{};
     std::atomic<u64> miss_unmapped{};
@@ -166,7 +177,11 @@ struct Counters {
     /// sotc: SOTC_HEAP real mode: heap-stage ops whose classic texture bind was skipped, and those that ran it
     /// (by reason, see NoteBindClassic).
     std::atomic<u64> bind_skipped{};
-    std::array<std::atomic<u64>, 4> bind_classic{};
+    std::array<std::atomic<u64>, 5> bind_classic{};
+    /// sotc: SOTC_HEAP_VS: ops with a heap vertex stage whose image binds were skipped, and those that fell back to the
+    /// classic bind (NoteVertexBind).
+    std::atomic<u64> vs_skipped{};
+    std::atomic<u64> vs_classic{};
 };
 
 struct State {
@@ -190,6 +205,10 @@ int Mode() {
 // The composite and UI rules that BindTexturesFull applies outside the memo (vk_rasterizer.cpp: TakeHudless,
 // DLSS probe, UiLinearAsset). A stage they can touch takes the draw path.
 bool CompositeRule(const Shader::Info& stage) {
+    // sotc: SOTC_HEAP_COMPOSITE_OP=1: the composite draws are sent to the classic bind per op (BindHeapImages).
+    if (Heap::CompositeOpOn()) {
+        return false;
+    }
     static const bool probe = [] {
         const char* h = std::getenv("SOTC_FG_HUDLESS");
         return (h && h[0] == '1') || std::getenv("SOTC_DLSS_PROBE") != nullptr;
@@ -278,11 +297,37 @@ Entry& SlotFor(u64 hash, const std::array<u64, kKeyWords>& key, u32 words) {
     return *victim;
 }
 
+// The heap generation moved since the entry was validated (a view was released or a slot evicted, anywhere in the
+// heap). The entry still answers while each slot it names holds the view it was made for: a slot that another view
+// took, or one given back and not yet reclaimed, is what the generation guards against. Checked per slot, so a
+// change elsewhere in the heap does not force a fresh resolution. Checks only; the heap lock is taken per image.
+Miss SlotsMiss(const Entry& e) {
+    VideoCore::BindlessImages* heap = VideoCore::BindlessImages::Active();
+    if (!heap) {
+        return Miss::Generation;
+    }
+    for (u32 i = 0; i < e.num_images; ++i) {
+        const ImageRecord& r = e.images[i];
+        if (r.null) { // the null slot holds no view and its index is static
+            continue;
+        }
+        const u32 slot = e.indices[i];
+        // Slot 0 with a non-null record: the heap was full (or absent) when it resolved. Not replayed.
+        if (slot == 0 || !heap->Holds(r.key, slot, r.view, vk::ImageLayout::eGeneral)) {
+            return Miss::Slot;
+        }
+    }
+    return Miss::None;
+}
+
 // Why a stored entry no longer answers, or Miss::None when it does. Checks only; nothing is changed.
 Miss CheckHit(VideoCore::TextureCache& tc, const Entry& e, u64 bindless_gen) {
-    // A released or evicted heap slot since the resolution: the indices may name a slot given back.
+    // A released or evicted heap slot since the entry was validated: the indices may name a slot given back.
     if (e.bindless_gen != bindless_gen) {
-        return Miss::Generation;
+        const Miss slot_miss = SlotsMiss(e);
+        if (slot_miss != Miss::None) {
+            return slot_miss;
+        }
     }
     if (e.candidate && (tc.BindGeneration() != e.bind_generation ||
                         VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed) != e.gpu_epoch)) {
@@ -343,6 +388,9 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
         const auto& image_desc = stage.images[index];
         ImageRecord& r = rec.images[index];
         r = {};
+        // The heap key of the image: static per stage image, computed once for the op (every path below uses it).
+        const u32 key = Shader::BindlessImageKeyAt(stage, index);
+        r.key = key;
         const AmdGpu::Image tsharp = image_desc.GetSharp(stage);
         if (tsharp.lod_hw_cnt_en) {
             r.lod = true;
@@ -351,7 +399,7 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
         }
         if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
             r.null = true;
-            out[index] = Heap::NullImageIndex(Shader::BindlessImageKeyOf(stage, image_desc));
+            out[index] = Heap::NullImageIndex(key);
             s.counters.null_answers.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -364,7 +412,7 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
             r.null = true;
             r.unmapped = valid_enums;
             r.addr = tsharp.Address();
-            out[index] = Heap::NullImageIndex(Shader::BindlessImageKeyOf(stage, image_desc));
+            out[index] = Heap::NullImageIndex(key);
             s.counters.null_answers.fetch_add(1, std::memory_order_relaxed);
             if (valid_enums) {
                 s.counters.null_unmapped.fetch_add(1, std::memory_order_relaxed);
@@ -383,7 +431,7 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
         r.found = tc.FindTextureIdentity(tkey, desc).image_id;
         if (!r.found) {
             store = false;
-            out[index] = Heap::NullImageIndex(Shader::BindlessImageKeyOf(stage, image_desc));
+            out[index] = Heap::NullImageIndex(key);
             r.null = true;
             s.counters.null_answers.fetch_add(1, std::memory_order_relaxed);
             continue;
@@ -412,7 +460,7 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
             store = false;
             r.bound = tc.FindImage(desc);
             if (!r.bound) {
-                out[index] = Heap::NullImageIndex(Shader::BindlessImageKeyOf(stage, image_desc));
+                out[index] = Heap::NullImageIndex(key);
                 r.null = true;
                 s.counters.null_answers.fetch_add(1, std::memory_order_relaxed);
                 continue;
@@ -427,7 +475,9 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
         r.bound_uid = bound.image_uid;
         // The heap descriptor is written in GENERAL: the memo makes no layout transition, so SOTC_HEAP needs
         // SOTC_LAYOUT_UNIFIED (every texture-cache image in GENERAL).
-        out[index] = Heap::IndexOf(view, Shader::BindlessImageKeyOf(stage, image_desc), vk::ImageLayout::eGeneral);
+        out[index] = Heap::IndexOf(view, key, vk::ImageLayout::eGeneral);
+        // The view IndexOf wrote (the slot holds it in eGeneral): SlotsMiss checks the slot still holds it.
+        r.view = view.image_view ? *view.image_view : vk::ImageView{};
         r.range = desc.view_info.range; // the classic bind's transition range
         r.redirect = r.bound != r.found;
     }
@@ -561,8 +611,16 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
     if (hit && miss == Miss::None) {
         s.counters.hits.fetch_add(1, std::memory_order_relaxed);
         hit->last_use = ++s.use_counter;
+        // The slots were checked against this generation (CheckHit): later ops at it skip the per-slot check.
+        hit->bindless_gen = bindless_gen;
+        // The replayed slots count as used now, as IndexOf's Use does on a fresh resolution: otherwise Evict could
+        // take a slot whose last use is old while the draws of this tick still read it.
+        VideoCore::BindlessImages* heap = VideoCore::BindlessImages::Active();
         for (u32 i = 0; i < hit->num_images; ++i) {
             const ImageRecord& r = hit->images[i];
+            if (heap && !r.null) {
+                heap->NoteUse(r.key, hit->indices[i]);
+            }
             if (r.lod) {
                 SotcLod::Mark(r.lod_bank); // the first pass marks every bind
             }
@@ -584,6 +642,7 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
         case Miss::Absent: s.counters.miss_absent.fetch_add(1, std::memory_order_relaxed); break;
         case Miss::Candidate: s.counters.miss_candidate.fetch_add(1, std::memory_order_relaxed); break;
         case Miss::Generation: s.counters.miss_generation.fetch_add(1, std::memory_order_relaxed); break;
+        case Miss::Slot: s.counters.miss_slot.fetch_add(1, std::memory_order_relaxed); break;
         case Miss::Dirty: s.counters.miss_dirty.fetch_add(1, std::memory_order_relaxed); break;
         case Miss::Sampler: s.counters.miss_sampler.fetch_add(1, std::memory_order_relaxed); break;
         case Miss::Unmapped: s.counters.miss_unmapped.fetch_add(1, std::memory_order_relaxed); break;
@@ -633,7 +692,12 @@ void NoteBindSkipped() {
 }
 
 void NoteBindClassic(u32 reason) {
-    s.counters.bind_classic[reason & 3].fetch_add(1, std::memory_order_relaxed);
+    // sotc: 4 is the composite op (SOTC_HEAP_COMPOSITE_OP); anything past the array counts there too.
+    s.counters.bind_classic[std::min<u32>(reason, 4u)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteVertexBind(bool skipped) {
+    (skipped ? s.counters.vs_skipped : s.counters.vs_classic).fetch_add(1, std::memory_order_relaxed);
 }
 
 void Report(char* out, u32 size, double seconds) {
@@ -655,14 +719,16 @@ void Report(char* out, u32 size, double seconds) {
     std::snprintf(
         out, size,
         "SOTC TABLEMEMO %.1f s: lookups %llu, hits %llu (%.0f%%), misses: absent %llu, "
-        "generation %llu, dirty %llu, sampler %llu, candidate %llu, unmapped %llu; refused %llu, "
+        "generation %llu, slot %llu, dirty %llu, sampler %llu, candidate %llu, unmapped %llu; refused %llu, "
         "not stored %llu; stored %llu, evicted %llu, live %u/%u; null answers %llu (unmapped T# %llu); "
         "ring overflow %llu; verify %llu, mismatches %llu; stage binds skipped %llu, classic "
-        "(verify %llu, target %llu, stencil %llu, rebind %llu)\n",
+        "(verify %llu, target %llu, stencil %llu, rebind %llu, composite %llu); heap vertex skipped %llu, "
+        "classic %llu\n",
         seconds, static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(hits),
         lookups ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0,
         static_cast<unsigned long long>(take(s.counters.miss_absent)),
         static_cast<unsigned long long>(take(s.counters.miss_generation)),
+        static_cast<unsigned long long>(take(s.counters.miss_slot)),
         static_cast<unsigned long long>(take(s.counters.miss_dirty)),
         static_cast<unsigned long long>(take(s.counters.miss_sampler)),
         static_cast<unsigned long long>(take(s.counters.miss_candidate)),
@@ -680,7 +746,10 @@ void Report(char* out, u32 size, double seconds) {
         static_cast<unsigned long long>(take(s.counters.bind_classic[0])),
         static_cast<unsigned long long>(take(s.counters.bind_classic[1])),
         static_cast<unsigned long long>(take(s.counters.bind_classic[2])),
-        static_cast<unsigned long long>(take(s.counters.bind_classic[3])));
+        static_cast<unsigned long long>(take(s.counters.bind_classic[3])),
+        static_cast<unsigned long long>(take(s.counters.bind_classic[4])),
+        static_cast<unsigned long long>(take(s.counters.vs_skipped)),
+        static_cast<unsigned long long>(take(s.counters.vs_classic)));
 }
 
 } // namespace SotcArch::TableMemo

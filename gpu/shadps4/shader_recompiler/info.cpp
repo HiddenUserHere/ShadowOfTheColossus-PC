@@ -8,7 +8,10 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <string>
 #include "common/elf_info.h"
+#include "common/logging/classes.h"
 #include "core/memory.h"
 #include "shader_recompiler/info.h"
 
@@ -54,6 +57,10 @@ bool BindlessSamplersEnabled() {
 }
 
 bool UsesBindlessSamplers(const Info& info) {
+    // sotc: the cached answer of a complete Info (FillBindlessCache); the rule below is its source.
+    if (info.bindless.ready) {
+        return info.bindless.bindless_samplers;
+    }
     // sotc: SOTC_HEAP: a plain stage of a heap pipeline reads its samplers through descriptors.
     if (!BindlessSamplersEnabled() || info.samplers.empty() || info.variant == StageVariantPlain) {
         return false;
@@ -117,7 +124,38 @@ u32 BindlessImageKeyOf(const Info& info, const ImageResource& image) noexcept {
     return base + shape + (image.is_written ? NUM_BINDLESS_SAMPLED_IMAGE_KEYS : 0u);
 }
 
+// sotc: SOTC_BINDLESS_CACHE_VERIFY=1 compares every cached key used per draw with the rule. The key used stays the
+// cached one; mismatches are counted and printed by ReportBindlessCache.
+static bool BindlessCacheVerifyEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_BINDLESS_CACHE_VERIFY");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+static std::atomic<u64> g_bindless_checks{};
+static std::atomic<u64> g_bindless_mismatches{};
+static std::atomic<u64> g_bindless_unstable{};
+
+u32 BindlessImageKeyAt(const Info& info, u32 index) noexcept {
+    if (info.bindless.ready && index < info.images.size()) {
+        const u32 key = info.bindless.image_key[index];
+        if (BindlessCacheVerifyEnabled()) {
+            g_bindless_checks.fetch_add(1, std::memory_order_relaxed);
+            if (key != BindlessImageKeyOf(info, info.images[index])) {
+                g_bindless_mismatches.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return key;
+    }
+    return BindlessImageKeyOf(info, info.images[index]);
+}
+
 u32 BindlessImageSlotOf(const Info& info, u32 index) noexcept {
+    // sotc: the cached slot of a complete Info (FillBindlessCache); the rule below is its source.
+    if (info.bindless.ready && index < info.images.size()) {
+        return info.bindless.image_slot[index];
+    }
     // sotc: SOTC_HEAP: a plain stage of a heap pipeline keeps the descriptors of its images.
     if (!BindlessImagesEnabled() || info.variant == StageVariantPlain) {
         return NO_BINDLESS_IMAGE_SLOT;
@@ -139,6 +177,9 @@ u32 BindlessImageSlotOf(const Info& info, u32 index) noexcept {
 }
 
 bool UsesBindlessImages(const Info& info) noexcept {
+    if (info.bindless.ready) {
+        return info.bindless.bindless_images;
+    }
     for (u32 i = 0; i < info.images.size(); ++i) {
         if (BindlessImageSlotOf(info, i) != NO_BINDLESS_IMAGE_SLOT) {
             return true;
@@ -151,6 +192,9 @@ bool UsesBindlessImages(const Info& info) noexcept {
 constexpr u32 MaxHeapStageImages = 16;
 
 bool HeapStaticRefusal(const Info& info) noexcept {
+    if (info.bindless.ready) {
+        return info.bindless.heap_refused;
+    }
     if (!info.fmasks.empty() || info.images.size() > MaxHeapStageImages ||
         info.samplers.size() > NUM_SAMPLERS || (info.images.empty() && info.samplers.empty())) {
         return true;
@@ -166,6 +210,106 @@ bool HeapStaticRefusal(const Info& info) noexcept {
     }
     // The samplers come from the sampler heap, through the index table.
     return !info.samplers.empty() && !UsesBindlessSamplers(info);
+}
+
+bool HeapStageRule(const Info& info) noexcept {
+    // sotc: SOTC_HEAP. Only whole stages switch: a stage with an image or sampler outside the heap
+    // keeps its push slots, and the table is then never read.
+    // Only the heap variant of a stage (chosen by the pipeline cache, which also applies the
+    // host rules) is a heap stage, and a stage with a static refusal never is.
+    if (info.variant != StageVariantHeap || HeapStaticRefusal(info)) {
+        return false;
+    }
+    if (info.images.empty() && info.samplers.empty()) {
+        return false;
+    }
+    for (u32 i = 0; i < info.images.size(); ++i) {
+        // Storage images stay on their descriptors: the index table carries sampled images only.
+        if (info.images[i].is_written || BindlessImageSlotOf(info, i) == NO_BINDLESS_IMAGE_SLOT) {
+            return false;
+        }
+    }
+    return info.samplers.empty() || UsesBindlessSamplers(info);
+}
+
+static bool SameBindlessAnswers(const Info::BindlessCache& a, const Info::BindlessCache& b) {
+    return a.num_images == b.num_images && a.num_buffers == b.num_buffers &&
+           a.bindless_samplers == b.bindless_samplers && a.bindless_images == b.bindless_images &&
+           a.heap_refused == b.heap_refused && a.heap_stage == b.heap_stage &&
+           a.shader_addr_buffers == b.shader_addr_buffers && a.image_key == b.image_key &&
+           a.image_slot == b.image_slot;
+}
+
+void CombineBindlessCache(Info::BindlessCache& stored, const Info::BindlessCache& fresh) {
+    const auto mark_unstable = [&stored] {
+        stored = {};
+        stored.unstable = true;
+        g_bindless_unstable.fetch_add(1, std::memory_order_relaxed);
+        LOG_INFO(Render_Recompiler, "SOTC bindless cache: permutations of a program disagree on image "
+                                    "keys or slots; its shaders use the per-draw rules from now on");
+    };
+    if (stored.unstable) {
+        stored.ready = false;
+        return;
+    }
+    if (!fresh.filled || fresh.unstable) {
+        mark_unstable();
+        return;
+    }
+    if (!stored.filled) {
+        stored = fresh;
+        stored.ready = true;
+        return;
+    }
+    if (!SameBindlessAnswers(stored, fresh)) {
+        mark_unstable();
+        return;
+    }
+    stored.ready = true;
+}
+
+void Info::FillBindlessCache() {
+    // The rules above read the cache when it is ready, so it is off while the answers are computed.
+    bindless.ready = false;
+    BindlessCache fresh{};
+    fresh.num_images = images.size();
+    fresh.num_buffers = buffers.size();
+    for (u32 i = 0; i < images.size(); ++i) {
+        fresh.image_key[i] = BindlessImageKeyOf(*this, images[i]);
+        fresh.image_slot[i] = BindlessImageSlotOf(*this, i);
+    }
+    fresh.bindless_samplers = UsesBindlessSamplers(*this);
+    fresh.bindless_images = UsesBindlessImages(*this);
+    fresh.heap_refused = HeapStaticRefusal(*this);
+    fresh.heap_stage = HeapStageRule(*this);
+    for (u32 i = 0; i < buffers.size(); ++i) {
+        if (ShaderAddrCandidate(*this, buffers[i])) {
+            fresh.shader_addr_buffers |= u64{1} << i;
+        }
+    }
+    fresh.filled = true;
+    fresh.ready = true;
+    CombineBindlessCache(bindless, fresh);
+}
+
+// sotc: the SOTC_BINDLESS_CACHE_VERIFY line of the 5 s report: checks and mismatches since the previous call.
+void ReportBindlessCache(std::string& out, double seconds) {
+    if (!BindlessCacheVerifyEnabled()) {
+        return;
+    }
+    static u64 prev_checks{};
+    static u64 prev_mismatches{};
+    const u64 checks = g_bindless_checks.load(std::memory_order_relaxed);
+    const u64 mismatches = g_bindless_mismatches.load(std::memory_order_relaxed);
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "SOTC BINDLESS CACHE verify: %.1f s, checks %llu, mismatches %llu, unstable programs %llu\n",
+                  seconds, static_cast<unsigned long long>(checks - prev_checks),
+                  static_cast<unsigned long long>(mismatches - prev_mismatches),
+                  static_cast<unsigned long long>(g_bindless_unstable.load(std::memory_order_relaxed)));
+    out += line;
+    prev_checks = checks;
+    prev_mismatches = mismatches;
 }
 
 bool LodFeedbackEnabled() {

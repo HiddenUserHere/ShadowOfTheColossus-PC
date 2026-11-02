@@ -165,6 +165,31 @@ struct Info : InfoPersistent {
     /// the heap decision, so the layout, the emitter and the host all see the same stage.
     u8 variant{StageVariantDefault};
 
+    /// sotc: the answers of the bindless predicates above for this Info, filled by FillBindlessCache from the rules
+    /// themselves. The fill runs once the Info is complete (after the translation, and after Deserialize), before
+    /// anything else reads it. The cache holds the flat buffer's state of that moment: the T# of an image fixes its
+    /// key, as the emitted SPIR-V does. While `ready` is false the accessors evaluate the rules instead.
+    static_assert(NUM_BUFFERS <= 64, "ShaderAddrBuffer bits");
+    struct BindlessCache {
+        bool ready{};    // the answers below are used (accessors); false while a translation runs
+        bool filled{};   // the answers of a fill are held (kept across translations of this Info)
+        bool unstable{}; // sticky: permutations disagreed, so the rules are used for good
+        u32 num_images{};
+        u32 num_buffers{};
+        bool bindless_samplers{};                  // UsesBindlessSamplers
+        bool bindless_images{};                    // UsesBindlessImages
+        bool heap_refused{};                       // HeapStaticRefusal
+        bool heap_stage{};                         // HeapStageRule
+        u64 shader_addr_buffers{};                 // bit i: buffers[i] passes the Info part of ShaderAddrBuffer
+        std::array<u32, NUM_IMAGES> image_key{};   // BindlessImageKeyOf per image
+        std::array<u32, NUM_IMAGES> image_slot{};  // BindlessImageSlotOf per image
+    };
+    BindlessCache bindless{};
+
+    /// sotc: computes the answers from the rules and merges them into `bindless` (CombineBindlessCache). Call once
+    /// the Info is complete.
+    void FillBindlessCache();
+
     std::array<Interpolation, IR::NumParams> fs_interpolation{};
 
     Info() = default;
@@ -285,6 +310,12 @@ struct Info : InfoPersistent {
 };
 DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
 
+/// sotc: merges the answers of a permutation (`fresh`, filled from its own Info) into those of its program (`stored`).
+/// The first answers are kept. Equal answers keep the cache ready. Different ones (or a permutation without
+/// answers) make `stored` unstable for good: the accessors then use the rules, as a permutation chosen per draw can
+/// have other keys.
+void CombineBindlessCache(Info::BindlessCache& stored, const Info::BindlessCache& fresh);
+
 /// Per-game dynamic_tsharp_array_size, clamped to 64 elements (0 = off)
 u32 DynamicTsharpArraySize();
 
@@ -308,6 +339,10 @@ bool UsesBindlessSamplers(const Info& info);
 /// The emitter types the heap array with this key, the host writes the view into it.
 u32 BindlessImageKeyOf(const Info& info, const ImageResource& image) noexcept;
 
+/// sotc: BindlessImageKeyOf of info.images[index]: the cached key once the Info is complete (FillBindlessCache),
+/// the rule otherwise. Per draw callers use this one.
+u32 BindlessImageKeyAt(const Info& info, u32 index) noexcept;
+
 /// sotc: true when any image of the stage is in the bindless heap (BindlessImageSlotOf).
 bool UsesBindlessImages(const Info& info) noexcept;
 
@@ -316,5 +351,9 @@ bool UsesBindlessImages(const Info& info) noexcept;
 /// images, mip fallbacks, images without a heap key, samplers that are not in the sampler heap). A heap stage that
 /// passes these answers every T#/S# through the index table (SotcArch::TableMemo), null slots included.
 bool HeapStaticRefusal(const Info& info) noexcept;
+
+/// sotc: the heap stage rule without the profile's switches (Backend::SPIRV::UsesHeapImages applies those): the variant,
+/// the images and samplers the heap takes, and the static refusal. The answer is cached in Info::bindless.
+bool HeapStageRule(const Info& info) noexcept;
 
 } // namespace Shader
