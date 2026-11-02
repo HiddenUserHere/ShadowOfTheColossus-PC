@@ -76,11 +76,19 @@ void OnUnmap(VAddr addr, u64 size);
 void ReadyForSubmit(Vulkan::Scheduler& scheduler);
 /// The window holding [addr, addr+size) with every page resident, or nullptr.
 const Window* Find(VAddr addr, u64 size);
+/// Draw thread, at bind time: makes every page of [addr, addr+size) resident for this submit. A page that is not
+/// yet bound is bound now and filled from guest memory (through the backing view) before this submit's
+/// commands. False when a page cannot be made resident (outside the window, not GPU-mapped, over budget).
+bool Touch(Vulkan::Scheduler& scheduler, VAddr addr, u64 size);
 /// Device address of guest address addr (0 when not resident). For verify paths and CPU-side replicas.
 vk::DeviceAddress Translate(VAddr addr);
 std::span<const Window> Windows();
-/// Draw thread: records a copy of guest bytes [addr, addr+size) into the mirror (the announce drain).
-void Upload(Vulkan::Scheduler& scheduler, VAddr addr, u64 size);
+/// Draw thread: records a copy of guest bytes [addr, addr+size) into the RESIDENT pages of the mirror (the
+/// announce drain keeps resident pages coherent). Never binds: a non-resident page is skipped (counted) and is
+/// filled by Touch when a shader first asks for it. When sample is not empty (at most 64 KiB, at most size), it
+/// receives the first sample.size() bytes of addr, taken from the same bytes the copy stages for the GPU. True when
+/// the sample was taken (the range starts resident); a sampled range is therefore resident.
+bool Upload(Vulkan::Scheduler& scheduler, VAddr addr, u64 size, std::span<u8> sample = {});
 void Report(char* out, u32 size, double seconds);
 } // namespace Mirror
 

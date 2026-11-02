@@ -613,6 +613,12 @@ void PipelineCache::WarmUp() {
             bda_buffers = bda_buffers == 1 ? 1 : 0;
             auto& bindless_images = profile_data[offsetof(Shader::Profile, bindless_images)];
             bindless_images = bindless_images == 1 ? 1 : 0;
+            // sotc: SOTC_HEAP and SOTC_SHADER_ADDR (the last two bytes, 66 and 67; measured with clang:
+            // sizeof(Shader::Profile) is 68). Anything but 1 is off, as for the flags above.
+            auto& heap_images = profile_data[offsetof(Shader::Profile, heap_images)];
+            heap_images = heap_images == 1 ? 1 : 0;
+            auto& shader_addr = profile_data[offsetof(Shader::Profile, shader_addr)];
+            shader_addr = shader_addr == 1 ? 1 : 0;
             std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
         }
         compatible = profile_data.size() == sizeof(Shader::Profile) && cached_profile == profile;

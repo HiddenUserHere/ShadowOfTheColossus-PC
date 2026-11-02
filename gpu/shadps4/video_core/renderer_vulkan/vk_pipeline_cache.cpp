@@ -34,6 +34,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA profile flag
+#include "video_core/sotc_arch/sotc_arch.h"           // sotc: SOTC_HEAP, SOTC_SHADER_ADDR profile flags
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -559,6 +560,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .bda_buffers = BdaTableMode(instance) != 0, // sotc: SOTC_BDA (block table, vk_bda_table.h)
         // sotc: SOTC_N5_BINDLESS, and SOTC_BINDLESS_SAMP: both heaps change the emitted SPIR-V.
         .bindless_images = Shader::BindlessImagesEnabled() || Shader::BindlessSamplersEnabled(),
+        // sotc: SOTC_HEAP (the index table per draw, heap_images) and SOTC_SHADER_ADDR (buffer addresses
+        // from the V# words). Both off: the profile is the one of today.
+        .heap_images = SotcArch::Heap::On(),
+        .shader_addr = SotcArch::ShaderAddr::On(),
     };
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
     // the loading screen on meanwhile.

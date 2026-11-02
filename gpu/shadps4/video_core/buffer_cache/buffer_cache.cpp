@@ -7904,6 +7904,8 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
     mirrored.clear();
     mirror_merged.clear();
     const auto handle = [&](const SotcNative::PendingUpload& u) {
+        // sotc: SOTC_MIRROR: served ranges are uploaded too. The packet's arena window is 0 (the ring-8 arena is
+        // many imported runs, not one window), so every shader-addressed range is read through the mirror.
         if (mirror_on) {
             mirrored.push_back(u);
         }
@@ -7978,8 +7980,21 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
             }
             mirror_merged.push_back(e);
         }
-        for (const auto& m : mirror_merged) {
-            SotcArch::Mirror::Upload(scheduler, m.addr, m.size);
+        // sotc: =2 samples one merged range per drain (rotated). The sample is the first 64 KiB of that range as the
+        // upload stages them for the GPU (Upload's probe), not a second guest read taken after the other uploads,
+        // so the readback below is compared with exactly the bytes the copy moved.
+        const bool sampling = mirror_verify == 2 && !mirror_merged.empty() && mirror_checks.size() < 8;
+        const size_t sample_index = sampling ? size_t(mirror_drains % mirror_merged.size()) : 0;
+        std::vector<u8> sample;
+        bool sample_taken = false;
+        for (size_t i = 0; i < mirror_merged.size(); ++i) {
+            const auto& m = mirror_merged[i];
+            if (sampling && i == sample_index) {
+                sample.resize(std::min<u64>(m.size, u64{64} << 10));
+                sample_taken = SotcArch::Mirror::Upload(scheduler, m.addr, m.size, sample);
+            } else {
+                SotcArch::Mirror::Upload(scheduler, m.addr, m.size);
+            }
             ++mirror_uploads;
             mirror_bytes += m.size;
         }
@@ -8004,18 +8019,18 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
                 staging_pool.FreeDeferred(c.staging);
                 mirror_checks.pop_front();
             }
-            // One range per drain (rotated over the merged ranges, at most 8 checks in flight): its first 64 KiB
-            // is copied from the mirror into a download buffer, and the guest bytes now are kept to compare with.
-            if (!mirror_merged.empty() && mirror_checks.size() < 8) {
-                const auto& m = mirror_merged[mirror_drains % mirror_merged.size()];
-                const u64 n = std::min<u64>(m.size, u64{64} << 10);
+            // One range per drain (rotated over the merged ranges, at most 8 checks in flight): its first 64 KiB is
+            // copied from the mirror into a download buffer, and compared with the sample taken by the upload above.
+            // Only a sample that was taken (the range is resident) is read back.
+            if (sampling && sample_taken) {
+                const auto& m = mirror_merged[sample_index];
+                const u64 n = sample.size();
                 if (const SotcArch::Mirror::Window* w = SotcArch::Mirror::Find(m.addr, n)) {
                     MirrorCheck c{};
                     c.addr = m.addr;
                     c.size = n;
                     c.drain = mirror_drains;
-                    c.snapshot.resize(n);
-                    memory->CopySparseMemory(m.addr, c.snapshot.data(), n);
+                    c.snapshot = std::move(sample);
                     c.staging = staging_pool.Request(n, VideoCore::MemoryType::HostCached, 0, true);
                     const vk::BufferCopy copy{m.addr - w->guest_base, c.staging.offset, n};
                     scheduler.RecordDeferred([src = w->buffer, dst = c.staging.buffer->Handle(),
@@ -8049,6 +8064,8 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
                 } else {
                     ++mirror_not_resident;
                 }
+            } else if (sampling) {
+                ++mirror_not_resident; // the sampled range is not resident (Upload skipped part of it)
             }
         }
         // Report every 5 s on the draw thread (the counters are per thread, cumulative since start).

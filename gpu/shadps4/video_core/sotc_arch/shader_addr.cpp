@@ -8,7 +8,6 @@
 #include <mutex>
 
 #include "video_core/buffer_cache/buffer.h"
-#include "video_core/renderer_vulkan/sotc_guest_memory.h"
 #include "video_core/sotc_arch/shader_addr.h"
 #include "video_core/sotc_arch/sotc_arch.h"
 
@@ -68,17 +67,8 @@ vk::DeviceAddress Expected(VAddr base, u64 size) {
     if (size == 0 || end < base) {
         return 0;
     }
-    // Arena window: the ring-8 imported run holding base (SotcGuestMemory::LookupGuestView). Its buffer byte 0 is
-    // cpu_base at device_address, so the window is [cpu_base, cpu_base + buffer_size) at device_address.
-    Vulkan::SotcGuestMemory::GuestView view{};
-    if (Vulkan::SotcGuestMemory::LookupGuestView(base, 1, &view) && view.device_address != 0 &&
-        view.buffer_size != 0) {
-        const u64 arena_guest = view.cpu_base;
-        const u64 arena_end = arena_guest + view.buffer_size;
-        if (base >= arena_guest && end <= arena_end) {
-            return view.device_address + (base - arena_guest);
-        }
-    }
+    // No arena window: the packet's arena_size is 0 (the ring-8 arena is many imported runs, not one window),
+    // so the shader takes the arena step never and every range goes through the mirror.
     // Mirror window 0 (the packet carries one mirror window).
     const auto windows = Mirror::Windows();
     if (!windows.empty()) {

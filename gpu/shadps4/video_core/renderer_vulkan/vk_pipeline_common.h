@@ -155,6 +155,11 @@ public:
 
     /// sotc: true when the layout has the packet push range (PacketPushBytes): the shaders read the
     /// DrawPacket, so BindResources needs `packet` (see below).
+    /// sotc: the profile this pipeline was built with (the rasterizer asks for the heap stage and the shader
+    /// address flags of the pipeline it binds).
+    const Shader::Profile& GetProfile() const noexcept {
+        return profile;
+    }
     bool HasPacketRange() const noexcept {
         return packet_range;
     }

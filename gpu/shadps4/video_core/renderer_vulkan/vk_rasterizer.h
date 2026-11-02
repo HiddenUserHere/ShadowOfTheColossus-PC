@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_ASYNC_COMPUTE (AsyncBeforeOp)
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_PACKET (DrawPacket), SOTC_HEAP, SOTC_MIRROR
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/amdgpu/draw_prep.h"
 #include "video_core/amdgpu/regs.h"
@@ -687,6 +688,12 @@ private:
     static constexpr u32 BufferMemoEntries = 2048;
     std::vector<BufferMemo> buffer_memo;
     bool bind_memo_ok{}; ///< this bind is a read-only graphics bind (BindResources)
+    /// sotc: SOTC_PACKET (ARCH-DRAW section 12). The push packet of the op being bound: BindResources fills the
+    /// window words and the index table, BindBuffers the flat buffer addresses; the pipelines push it.
+    SotcArch::DrawPacket draw_packet{};
+    /// sotc: SOTC_SHADER_ADDR. This op binds a shader-addressed buffer (no bound_buffers entry), so it touches
+    /// memory: Passes::Decide must see it (BindResources resets it).
+    bool shader_addr_touch{};
     /// Whether the entry still depends on nothing that changed since it last checked (the
     /// stamps), updating its checkpoints; `reason` names what moved when not.
     bool BindCacheEntryFresh(BindCacheEntry& entry, u32& reason);

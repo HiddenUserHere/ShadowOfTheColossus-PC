@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 sotc-pc port
 // SPDX-License-Identifier: GPL-2.0-or-later
-// sotc: A2 GPU memory mirror (SOTC_MIRROR, ARCH-DRAW.md part 1; contract in sotc_arch.h). One sparse
-// VkBuffer covers the PS4 user range from USER_MIN: its offset o holds guest address base + o. Device memory
-// is bound lazily: a 64 KiB page is bound when it is touched (Upload, or Find from a shader-side use) and
-// mapped by the guest. Unmapped pages are unbound after the frame fence. Map and unmap events arrive from any
-// thread and are only queued; the draw thread processes them at submit start (ReadyForSubmit) and in Upload.
+// sotc: A2 GPU memory mirror (SOTC_MIRROR, ARCH-DRAW.md part 1; contract in sotc_arch.h). One sparse VkBuffer covers
+// the PS4 user range from USER_MIN: its offset o holds guest address base + o. Residency follows GPU demand: a 64 KiB
+// page gets device memory and its guest bytes only when Touch (or a shader-side Find, through the touched flags) asks
+// for it. Upload never binds: it copies announced bytes into the pages that are already resident and skips the rest.
+// Map and unmap events arrive from any thread and are only queued; the draw thread processes them at submit start
+// (ReadyForSubmit) and in Upload / Touch.
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <vector>
 
 #include "common/assert.h"
@@ -26,7 +28,7 @@ namespace SotcArch::Mirror {
 namespace {
 
 // USER_MIN of src/runtime_memory.c. The user range is reserved at the same host address, so guest addresses
-// are host pointers: an upload reads the guest bytes at their own address. If USER_MIN changes, change this.
+// are host pointers: a copy reads the guest bytes at their own address. If USER_MIN changes, change this.
 constexpr VAddr kUserMin = 0x1000000000ULL;
 // Guest mappings are made in PAGE (16 KiB) units (src/runtime_memory.c).
 constexpr u64 kSubPage = 16ULL * 1024;
@@ -36,6 +38,7 @@ constexpr u32 kPagesPerChunk = u32(kChunkSize / PageSize);
 constexpr u64 kVramMargin = 3ULL << 29; // 1.5 GiB kept free below the device-local heap size
 constexpr u64 kStreamSize = 64ULL << 20;
 constexpr u64 kUploadChunk = 8ULL << 20;
+constexpr u64 kProbeSize = 64ULL << 10; // the first bytes of the first resident run: sample and =2 readback
 constexpr u32 kVerifySlots = 8;
 constexpr u64 kVerifyLag = 3;  // ticks to wait before the =2 readback compare
 constexpr u32 kNoSlot = ~u32{0};
@@ -62,10 +65,13 @@ struct Verify {
 
 struct Counters {
     std::atomic<u64> bind_calls{};
-    std::atomic<u64> pages_bound{};
-    std::atomic<u64> pages_unbound{};
+    std::atomic<u64> pages_bound{};   // pages, not bind records
+    std::atomic<u64> pages_unbound{}; // pages, not unbind records
+    std::atomic<u64> pages_filled{};  // pages whose 64 KiB were copied from guest memory (Touch)
     std::atomic<u64> upload_bytes{};
     std::atomic<u64> upload_ranges{};
+    std::atomic<u64> touches{};
+    std::atomic<u64> touch_failed{};
     std::atomic<u64> refused_window{};
     std::atomic<u64> refused_vram{};
     std::atomic<u64> refused_alloc{};
@@ -84,7 +90,7 @@ struct State {
     u64 window_size{};
     u64 pages{};
     std::vector<Window> windows;
-    // Per page: resident = bound and usable; touched = a shader-side Find asked for it.
+    // Per page: resident = bound, filled and usable; touched = a shader-side Find asked for it.
     std::unique_ptr<std::atomic<u8>[]> resident;
     std::unique_ptr<std::atomic<u8>[]> touched;
     // Per 16 KiB sub-page: guest-mapped. A page is mappable when all its sub-pages are mapped.
@@ -94,7 +100,7 @@ struct State {
     std::vector<u32> retire_list;   // unmapped pages whose binding waits for the frame fence
     u64 retire_max{};               // newest tick any unmap of retire_list happened at
     std::vector<vk::UniqueDeviceMemory> chunks;
-    std::vector<u32> free_slots;
+    std::vector<u32> free_slots;    // slots that no page is bound to (unique: see EnsureBound)
     u64 budget{};
     u32 memory_type{};
     vk::UniqueSemaphore timeline;
@@ -112,12 +118,23 @@ std::atomic<bool> enabled{false};
 std::atomic<bool> failed{false};
 std::atomic<bool> touched_pending{false};
 std::atomic<u64> reserved_bytes{};
-std::atomic<u64> bound_pages{};
+std::atomic<u64> bound_pages{}; // pages with a slot: incremented per page in EnsureBound, decremented per page in RetirePages
 std::mutex pending_mutex;
 std::vector<Op> pending;
-// Draw thread work (ReadyForSubmit, Upload). Recursive: an Upload may flush, which calls ReadyForSubmit.
+// Draw thread work (ReadyForSubmit, Upload, Touch). Recursive: an Upload may flush, which calls ReadyForSubmit.
 std::recursive_mutex process_mutex;
 Counters counters;
+
+// Set while the draw thread is inside Upload or Touch. A flush there (stream wait) calls ReadyForSubmit, which must
+// not run the pending work: it would re-enter the copy loops and change residency under them. The work runs at the
+// next submit instead.
+thread_local bool t_busy = false;
+struct BusyScope {
+    BusyScope() { t_busy = true; }
+    ~BusyScope() { t_busy = false; }
+    BusyScope(const BusyScope&) = delete;
+    BusyScope& operator=(const BusyScope&) = delete;
+};
 
 u32 DeviceLocalType(const vk::PhysicalDeviceMemoryProperties& props, u32 bits) {
     for (u32 i = 0; i < props.memoryTypeCount; ++i) {
@@ -167,7 +184,16 @@ bool PageMappable(const State& s, u64 page) {
     return true;
 }
 
-// Adds the sparse binds of one bind submit. Contiguous pages of one chunk are merged.
+// Pages covered by a list of bind or unbind records. Records merge contiguous pages, so records are not pages.
+u64 PagesIn(const std::vector<vk::SparseMemoryBind>& binds) {
+    u64 pages = 0;
+    for (const vk::SparseMemoryBind& bind : binds) {
+        pages += bind.size / PageSize;
+    }
+    return pages;
+}
+
+// Adds the sparse bind of one page. Contiguous pages of one chunk are merged into one record.
 void AddBind(State& s, std::vector<vk::SparseMemoryBind>& binds, u64 page, u32 slot) {
     const vk::DeviceMemory memory = *s.chunks[slot / kPagesPerChunk];
     const u64 memory_offset = u64(slot % kPagesPerChunk) * PageSize;
@@ -231,17 +257,11 @@ void SubmitSparse(State& s, const std::vector<vk::SparseMemoryBind>& binds, u64 
     ASSERT_MSG(result == vk::Result::eSuccess, "Mirror bind failed: {}", vk::to_string(result));
 }
 
-// Binds the page if it is mappable and not resident. Returns true when the page is resident afterwards.
-bool BindPage(State& s, u64 page, std::vector<vk::SparseMemoryBind>& binds) {
-    if (s.resident[page].load(std::memory_order_acquire) != 0) {
-        return true;
-    }
-    if (!PageMappable(s, page)) {
-        return false;
-    }
+// Gives a page a physical slot and adds its bind to binds. A page that is still bound keeps its slot (its unbind
+// waits for the frame fence), so it needs no bind. False when no slot can be had (budget or allocation refused).
+// Slots are unique: a slot is in free_slots or bound to exactly one page, never both; bound_pages counts pages.
+bool EnsureBound(State& s, u64 page, std::vector<vk::SparseMemoryBind>& binds) {
     if (s.bound[page] != kNoSlot) {
-        // Still bound, its unbind waits for the frame fence: the old binding simply stays.
-        s.resident[page].store(1, std::memory_order_release);
         return true;
     }
     if (s.free_slots.empty()) {
@@ -270,20 +290,21 @@ bool BindPage(State& s, u64 page, std::vector<vk::SparseMemoryBind>& binds) {
     s.bound[page] = slot;
     bound_pages.fetch_add(1, std::memory_order_relaxed);
     AddBind(s, binds, page, slot);
-    s.resident[page].store(1, std::memory_order_release);
     return true;
 }
 
-// Submits the binds collected by BindPage and registers the wait for the next graphics submit.
-void SubmitBinds(State& s, Vulkan::Scheduler& scheduler, const std::vector<vk::SparseMemoryBind>& binds) {
+// Submits the binds collected by EnsureBound and registers the wait for the next graphics submit. Returns the
+// timeline value of the bind (0 when there was nothing to bind).
+u64 SubmitBinds(State& s, Vulkan::Scheduler& scheduler, const std::vector<vk::SparseMemoryBind>& binds) {
     if (binds.empty()) {
-        return;
+        return 0;
     }
     const u64 value = ++s.bind_tick;
     SubmitSparse(s, binds, value);
     counters.bind_calls.fetch_add(1, std::memory_order_relaxed);
-    counters.pages_bound.fetch_add(binds.size(), std::memory_order_relaxed);
+    counters.pages_bound.fetch_add(PagesIn(binds), std::memory_order_relaxed);
     scheduler.RequireExternalWait(*s.timeline, value, vk::PipelineStageFlagBits::eAllCommands);
+    return value;
 }
 
 // Unbinds the pages whose frame fence is reached: the newest unmap tick must be done on the GPU.
@@ -304,9 +325,10 @@ void RetirePages(State& s, Vulkan::Scheduler& scheduler) {
     s.retire_list.clear();
     s.retire_max = 0;
     if (!unbinds.empty()) {
+        const u64 pages = PagesIn(unbinds);
         SubmitSparse(s, unbinds, 0);
-        counters.pages_unbound.fetch_add(unbinds.size(), std::memory_order_relaxed);
-        bound_pages.fetch_sub(unbinds.size(), std::memory_order_relaxed);
+        counters.pages_unbound.fetch_add(pages, std::memory_order_relaxed);
+        bound_pages.fetch_sub(pages, std::memory_order_relaxed);
     }
 }
 
@@ -331,7 +353,7 @@ void ApplyOps(State& s, Vulkan::Scheduler& scheduler, const std::vector<Op>& ops
             s.mapped_sub[i].store(op.map ? 1 : 0, std::memory_order_release);
         }
         if (op.map) {
-            continue; // mapping alone binds nothing: pages are bound when touched
+            continue; // mapping alone binds nothing: pages are bound when they are touched
         }
         // Unmapped pages stop being resident now; their binding is released after the frame fence.
         const u64 page_first = (lo - s.base) / PageSize;
@@ -356,7 +378,73 @@ void ApplyOps(State& s, Vulkan::Scheduler& scheduler, const std::vector<Op>& ops
     }
 }
 
-// The =2 compare: a readback of the first 64 KiB of an upload, taken kVerifyLag ticks later.
+// Makes the listed pages resident. A page that is not bound gets a slot; all the binds of the call go out as one
+// sparse submit. Every page that is not resident is then filled with its 64 KiB of guest memory, and the copies are
+// recorded in the upload command buffer, which runs in the submit that waits for the binds. Pages that are not
+// mappable (some 16 KiB sub-page is unmapped) are left alone. Returns how many listed pages are not resident after.
+u64 MakeResident(State& s, Vulkan::Scheduler& scheduler, const std::vector<u64>& pages) {
+    std::vector<vk::SparseMemoryBind> binds;
+    std::vector<u64> fill;
+    u64 missing = 0;
+    for (const u64 page : pages) {
+        if (s.resident[page].load(std::memory_order_acquire) != 0) {
+            continue;
+        }
+        if (!PageMappable(s, page) || !EnsureBound(s, page, binds)) {
+            ++missing;
+            continue;
+        }
+        fill.push_back(page); // bound now, or bound earlier and not filled since its unmap (stale bytes)
+    }
+    if (fill.empty()) {
+        return missing;
+    }
+    const u64 value = SubmitBinds(s, scheduler, binds);
+    // The copies below run after the bind wait of this submit. A stream wait can flush the open command buffer, and
+    // then the wait went with that submit: it is registered again for the submit that carries the copies after it.
+    u64 seen_tick = scheduler.CurrentTick();
+    bool recorded = false;
+    for (const u64 page : fill) {
+        auto [dst, src_offset] = s.stream->Map(PageSize);
+        if (dst == nullptr) {
+            counters.refused_alloc.fetch_add(1, std::memory_order_relaxed);
+            ++missing;
+            continue;
+        }
+        if (value != 0 && scheduler.CurrentTick() != seen_tick) {
+            scheduler.RequireExternalWait(*s.timeline, value, vk::PipelineStageFlagBits::eAllCommands);
+            seen_tick = scheduler.CurrentTick();
+        }
+        // Through the backing view: a guest view may be mid-split (placeholder) on another thread (runtime_memory.c).
+        Core::Memory::Instance()->CopySparseMemory(s.base + page * PageSize, static_cast<u8*>(dst), PageSize);
+        s.stream->Commit();
+        const vk::BufferCopy copy = {
+            .srcOffset = src_offset,
+            .dstOffset = page * PageSize,
+            .size = PageSize,
+        };
+        scheduler.UploadCommandBuffer().copyBuffer(s.stream->Handle(), *s.buffer, copy);
+        s.resident[page].store(1, std::memory_order_release);
+        counters.pages_filled.fetch_add(1, std::memory_order_relaxed);
+        recorded = true;
+    }
+    if (recorded) {
+        // Copies -> shader reads (the same barrier Upload records after its copies).
+        const vk::MemoryBarrier2 written = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        };
+        scheduler.UploadCommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &written,
+        });
+    }
+    return missing;
+}
+
+// The =2 compare: a readback of the probe bytes of an upload, taken kVerifyLag ticks later.
 void VerifyPending(State& s, Vulkan::Scheduler& scheduler) {
     if (s.verify.empty()) {
         return;
@@ -380,7 +468,7 @@ void VerifyPending(State& s, Vulkan::Scheduler& scheduler) {
     }
 }
 
-// Draw thread: retire, apply the queued map events, bind the pages a shader asked for.
+// Draw thread: retire, apply the queued map events, make resident the pages a shader asked for.
 void ProcessPending(State& s, Vulkan::Scheduler& scheduler) {
     RetirePages(s, scheduler);
     std::vector<Op> ops;
@@ -389,15 +477,17 @@ void ProcessPending(State& s, Vulkan::Scheduler& scheduler) {
         ops.swap(pending);
     }
     ApplyOps(s, scheduler, ops);
-    std::vector<vk::SparseMemoryBind> binds;
     if (touched_pending.exchange(false, std::memory_order_acq_rel)) {
+        std::vector<u64> pages;
         for (u64 page = 0; page < s.pages; ++page) {
             if (s.touched[page].exchange(0, std::memory_order_acq_rel) != 0) {
-                BindPage(s, page, binds);
+                pages.push_back(page);
             }
         }
+        if (!pages.empty()) {
+            MakeResident(s, scheduler, pages);
+        }
     }
-    SubmitBinds(s, scheduler, binds);
 }
 
 } // namespace
@@ -526,7 +616,7 @@ void OnUnmap(VAddr addr, u64 size) {
 }
 
 void ReadyForSubmit(Vulkan::Scheduler& scheduler) {
-    if (!enabled.load(std::memory_order_acquire)) {
+    if (!enabled.load(std::memory_order_acquire) || t_busy) {
         return;
     }
     // Called from every submit, possibly from the presenter thread: never wait for the draw thread here.
@@ -555,7 +645,7 @@ const Window* Find(VAddr addr, u64 size) {
         }
         all = false;
         if (PageMappable(s, page)) {
-            // Asked for by a shader: bound at the next submit start (ReadyForSubmit).
+            // Asked for by a shader: made resident at the next submit start (ReadyForSubmit).
             s.touched[page].store(1, std::memory_order_release);
             touched_pending.store(true, std::memory_order_release);
         }
@@ -577,33 +667,57 @@ std::span<const Window> Windows() {
     return state->windows;
 }
 
-void Upload(Vulkan::Scheduler& scheduler, VAddr addr, u64 size) {
+bool Touch(Vulkan::Scheduler& scheduler, VAddr addr, u64 size) {
     if (!enabled.load(std::memory_order_acquire) || size == 0) {
-        return;
+        return false;
     }
     std::scoped_lock lk{process_mutex};
+    BusyScope busy;
+    State& s = *state;
+    counters.touches.fetch_add(1, std::memory_order_relaxed);
+    ProcessPending(s, scheduler); // map and unmap events first: mappability is decided by them
+    u64 lo{};
+    u64 hi{};
+    if (!Clip(s, addr, size, lo, hi)) {
+        counters.touch_failed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    std::vector<u64> pages;
+    for (u64 page = (lo - s.base) / PageSize; page <= (hi - s.base - 1) / PageSize; ++page) {
+        pages.push_back(page);
+    }
+    const u64 missing = MakeResident(s, scheduler, pages);
+    bool whole = lo == addr && hi == addr + size && missing == 0;
+    for (size_t i = 0; whole && i < pages.size(); ++i) {
+        whole = s.resident[pages[i]].load(std::memory_order_acquire) != 0;
+    }
+    if (!whole) {
+        counters.touch_failed.fetch_add(1, std::memory_order_relaxed);
+    }
+    return whole;
+}
+
+bool Upload(Vulkan::Scheduler& scheduler, VAddr addr, u64 size, std::span<u8> sample) {
+    if (!enabled.load(std::memory_order_acquire) || size == 0) {
+        return false;
+    }
+    std::scoped_lock lk{process_mutex};
+    BusyScope busy;
     State& s = *state;
     u64 lo{};
     u64 hi{};
     if (!Clip(s, addr, size, lo, hi)) {
         counters.refused_window.fetch_add(1, std::memory_order_relaxed);
-        return; // counted no-op: the range is outside every window
+        return false; // counted no-op: the range is outside every window
     }
     if (lo != addr || hi != addr + size) {
         counters.refused_window.fetch_add(1, std::memory_order_relaxed);
     }
     ProcessPending(s, scheduler);
 
-    // Trigger: bind the pages of this range that are mapped (lazy residency), then copy what is resident.
-    std::vector<vk::SparseMemoryBind> binds;
+    // Runs of resident bytes of [lo, hi). Upload never binds: a byte of a page that is not resident is skipped.
     const u64 page_first = (lo - s.base) / PageSize;
     const u64 page_last = (hi - s.base - 1) / PageSize;
-    for (u64 page = page_first; page <= page_last; ++page) {
-        BindPage(s, page, binds);
-    }
-    SubmitBinds(s, scheduler, binds);
-
-    // Runs of resident bytes of [lo, hi).
     std::vector<std::pair<VAddr, u64>> runs;
     for (u64 page = page_first; page <= page_last; ++page) {
         const VAddr page_begin = s.base + page * PageSize;
@@ -620,12 +734,27 @@ void Upload(Vulkan::Scheduler& scheduler, VAddr addr, u64 size) {
         }
     }
     if (runs.empty()) {
-        return;
+        return false;
     }
 
-    // The guest bytes are read now, synchronously; the copies go into the scheduler's upload command
-    // buffer, which is submitted before the commands of this submit. The command buffer is fetched
-    // per copy: a flush inside Map ends the one recorded so far.
+    // The probe is the first 64 KiB of the first resident run, as the copy reads it (the bytes staged for the GPU,
+    // not a second guest read). It serves the caller's sample and the =2 readback compare. The sample is only
+    // taken when it starts at addr and the run covers it, so a sampled range is resident.
+    const VAddr probe_addr = runs.front().first;
+    const u64 probe_size = std::min<u64>(runs.front().second, kProbeSize);
+    const bool sample_ok = !sample.empty() && sample.size() <= kProbeSize && sample.size() <= size &&
+                           probe_addr == addr && runs.front().second >= sample.size();
+    const bool verify_wanted = Mode() == 2 && s.readback && !s.verify_free.empty();
+    const bool need_probe = sample_ok || verify_wanted;
+    std::vector<u8> probe;
+    if (need_probe) {
+        probe.resize(probe_size);
+    }
+    bool probed = false;
+
+    // The guest bytes are read now, synchronously; the copies go into the scheduler's upload command buffer, which
+    // is submitted before the commands of this submit. The command buffer is fetched per copy: a flush inside Map
+    // ends the one recorded so far. No bind is submitted here, so no bind wait can be separated from these copies.
     u64 copied = 0;
     for (const auto& [run_addr, run_size] : runs) {
         for (u64 off = 0; off < run_size;) {
@@ -635,9 +764,11 @@ void Upload(Vulkan::Scheduler& scheduler, VAddr addr, u64 size) {
                 counters.refused_alloc.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
-            // Through the backing view: a guest view may be mid-split (placeholder) on another thread, and the draw
-            // thread is not stopped by a split (runtime_memory.c carve_host).
             Core::Memory::Instance()->CopySparseMemory(run_addr + off, static_cast<u8*>(dst), n);
+            if (need_probe && !probed && run_addr + off == probe_addr) {
+                std::memcpy(probe.data(), dst, probe_size); // n >= probe_size: the chunk starts the probe run
+                probed = true;
+            }
             s.stream->Commit();
             const vk::BufferCopy copy = {
                 .srcOffset = src_offset,
@@ -652,7 +783,7 @@ void Upload(Vulkan::Scheduler& scheduler, VAddr addr, u64 size) {
     counters.upload_bytes.fetch_add(copied, std::memory_order_relaxed);
     counters.upload_ranges.fetch_add(runs.size(), std::memory_order_relaxed);
     if (copied == 0) {
-        return;
+        return false;
     }
 
     // Copies -> shader reads and, for =2, the readback copy.
@@ -667,32 +798,36 @@ void Upload(Vulkan::Scheduler& scheduler, VAddr addr, u64 size) {
         .pMemoryBarriers = &written,
     });
 
-    if (Mode() == 2 && s.readback && !s.verify_free.empty()) {
-        const auto& [first_addr, first_size] = runs.front();
-        const u64 n = std::min<u64>(first_size, PageSize);
-        Verify v{first_addr, n, s.verify_free.back(), scheduler.CurrentTick(), std::vector<u8>(n)};
-        Core::Memory::Instance()->CopySparseMemory(first_addr, v.expect.data(), n);
-        s.verify_free.pop_back();
-        const vk::BufferCopy back = {
-            .srcOffset = first_addr - s.base,
-            .dstOffset = u64{v.slot} * PageSize,
-            .size = n,
-        };
-        scheduler.UploadCommandBuffer().copyBuffer(*s.buffer, s.readback->Handle(), back);
-        const vk::MemoryBarrier2 to_host = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
-            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
-        };
-        scheduler.UploadCommandBuffer().pipelineBarrier2(vk::DependencyInfo{
-            .memoryBarrierCount = 1,
-            .pMemoryBarriers = &to_host,
-        });
-        s.verify.push_back(std::move(v));
-    } else if (Mode() == 2) {
-        counters.verify_skipped.fetch_add(1, std::memory_order_relaxed);
+    const bool sampled = sample_ok && probed;
+    if (sampled) {
+        std::memcpy(sample.data(), probe.data(), sample.size());
     }
+    if (Mode() == 2) {
+        if (verify_wanted && probed) {
+            const u32 slot = s.verify_free.back();
+            s.verify_free.pop_back();
+            const vk::BufferCopy back = {
+                .srcOffset = probe_addr - s.base,
+                .dstOffset = u64{slot} * PageSize,
+                .size = probe_size,
+            };
+            scheduler.UploadCommandBuffer().copyBuffer(*s.buffer, s.readback->Handle(), back);
+            const vk::MemoryBarrier2 to_host = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+            };
+            scheduler.UploadCommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &to_host,
+            });
+            s.verify.push_back(Verify{probe_addr, probe_size, slot, scheduler.CurrentTick(), std::move(probe)});
+        } else {
+            counters.verify_skipped.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return sampled;
 }
 
 void Report(char* out, u32 size, double seconds) {
@@ -705,8 +840,11 @@ void Report(char* out, u32 size, double seconds) {
     const u64 bound = counters.pages_bound.exchange(0, std::memory_order_relaxed);
     const u64 unbound = counters.pages_unbound.exchange(0, std::memory_order_relaxed);
     const u64 binds = counters.bind_calls.exchange(0, std::memory_order_relaxed);
+    const u64 filled = counters.pages_filled.exchange(0, std::memory_order_relaxed);
     const u64 up_bytes = counters.upload_bytes.exchange(0, std::memory_order_relaxed);
     const u64 up_ranges = counters.upload_ranges.exchange(0, std::memory_order_relaxed);
+    const u64 touches = counters.touches.exchange(0, std::memory_order_relaxed);
+    const u64 touch_failed = counters.touch_failed.exchange(0, std::memory_order_relaxed);
     const u64 refused_win = counters.refused_window.exchange(0, std::memory_order_relaxed);
     const u64 refused_vram = counters.refused_vram.exchange(0, std::memory_order_relaxed);
     const u64 refused_alloc = counters.refused_alloc.exchange(0, std::memory_order_relaxed);
@@ -715,23 +853,31 @@ void Report(char* out, u32 size, double seconds) {
     const u64 mismatch = counters.verify_mismatch.exchange(0, std::memory_order_relaxed);
     const u64 skipped = counters.verify_skipped.exchange(0, std::memory_order_relaxed);
     const u64 bound_now = bound_pages.load(std::memory_order_relaxed);
+    const u64 reserved = reserved_bytes.load(std::memory_order_relaxed);
+    const u64 budget_left = state->budget > reserved ? state->budget - reserved : 0;
+    // Slots are unique, so bound pages can never exceed the reserved slots. If they do, the counter is wrong.
+    const bool over = bound_now * PageSize > reserved;
     std::snprintf(
         out, size,
-        "SOTC MIRROR: window %llu MiB at %#llx, reserved %.1f MiB, bound %.1f MiB (%llu pages), "
+        "SOTC MIRROR: window %llu MiB at %#llx, reserved %.1f MiB, bound %.1f MiB (%llu pages)%s, "
         "binds/s %.1f (%llu pages bound, %llu unbound), uploads %.2f MiB/s (%llu ranges), "
-        "refusals: window %llu, vram %llu, alloc %llu, nonresident %.2f MiB, "
-        "verify %llu checked, %llu mismatches, %llu skipped",
+        "touches %llu (%llu failed), pages filled %llu, "
+        "refusals: window %llu, vram %llu, alloc %llu, skipped non-resident %.2f MiB, "
+        "verify %llu checked, %llu mismatches, %llu skipped, budget left %.1f MiB",
         static_cast<unsigned long long>(state->window_size >> 20),
         static_cast<unsigned long long>(state->base),
-        reserved_bytes.load(std::memory_order_relaxed) / mib,
+        reserved / mib,
         static_cast<double>(bound_now) * PageSize / mib,
-        static_cast<unsigned long long>(bound_now),
+        static_cast<unsigned long long>(bound_now), over ? " (BUG: exceeds reserved)" : "",
         static_cast<double>(binds) / sec, static_cast<unsigned long long>(bound),
         static_cast<unsigned long long>(unbound), up_bytes / mib / sec,
-        static_cast<unsigned long long>(up_ranges), static_cast<unsigned long long>(refused_win),
-        static_cast<unsigned long long>(refused_vram), static_cast<unsigned long long>(refused_alloc),
-        nonres / mib, static_cast<unsigned long long>(checked),
-        static_cast<unsigned long long>(mismatch), static_cast<unsigned long long>(skipped));
+        static_cast<unsigned long long>(up_ranges),
+        static_cast<unsigned long long>(touches), static_cast<unsigned long long>(touch_failed),
+        static_cast<unsigned long long>(filled),
+        static_cast<unsigned long long>(refused_win), static_cast<unsigned long long>(refused_vram),
+        static_cast<unsigned long long>(refused_alloc), nonres / mib, static_cast<unsigned long long>(checked),
+        static_cast<unsigned long long>(mismatch), static_cast<unsigned long long>(skipped),
+        budget_left / mib);
 }
 
 } // namespace SotcArch::Mirror
