@@ -1072,9 +1072,80 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
 int runtime_memory_carve_retry(uintptr_t address, int write); /* sotc: runtime_memory.c */
 int runtime_memory_lazy_fault(uintptr_t address, int write);  /* sotc: runtime_memory.c, SOTC_COMMIT_CHUNKS=2 */
 int runtime_memory_backing_fault(uintptr_t address, int write); /* sotc: runtime_memory.c, SOTC_COMMIT_CHUNKS=2 */
+/* sotc: SOTC_BPE_FIX=2 (B1, BPE heap crash). Diagnostics only: the handling of the fault does not
+ * change. The game's BPE allocator reads [block+8] of its rover block (eboot+0x49047, see
+ * docs/re-stutters/native/BPE-CRASH.md); the page is then committed read-write when queried after the
+ * fault. For each read fault in game code this records the page state at the fault (captured on the
+ * handler's first line), waits up to BPE_WAIT_MS for the page to become accessible, and prints the
+ * block's two words when it is. The fault then goes on to the usual handlers, so a crash still ends
+ * the process. Unset or any other value: nothing is queried. */
+#define BPE_WAIT_MS 50.0
+static int bpe_observe_on(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_BPE_FIX"); v=e && e[0]=='2'; }
+    return v;
+}
+static _Thread_local MEMORY_BASIC_INFORMATION bpe_before;
+static _Thread_local int bpe_before_valid;
+static _Thread_local uint64_t bpe_fault_ns;
+/* runtime_memory.c: SOTC_MAP_LOG mapping history (the dump is empty when the switch is off). */
+uint64_t runtime_memory_map_log_now_ns(void);
+void runtime_memory_map_log_dump(uintptr_t page, uint64_t fault_ns, int block_scan);
+int runtime_memory_thread_name(DWORD tid, char *out, size_t size);
+static volatile LONG bpe_faults, bpe_accessible_after_wait, bpe_still_inaccessible;
+static int bpe_page_accessible(const MEMORY_BASIC_INFORMATION *m) {
+    return m->State==MEM_COMMIT && !(m->Protect & PAGE_GUARD) && (m->Protect & 0xff)!=PAGE_NOACCESS;
+}
+static void bpe_observe_fault(const EXCEPTION_POINTERS *info) {
+    const uintptr_t addr=(uintptr_t)info->ExceptionRecord->ExceptionInformation[1];
+    const LONG n=InterlockedIncrement(&bpe_faults);
+    MEMORY_BASIC_INFORMATION now=bpe_before;
+    LARGE_INTEGER freq, t0, t1;
+    int accessible=0;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        if (VirtualQuery((void *)addr,&now,sizeof(now)) && bpe_page_accessible(&now)) { accessible=1; break; }
+        QueryPerformanceCounter(&t1);
+        if ((double)(t1.QuadPart-t0.QuadPart)*1000.0/(double)freq.QuadPart>=BPE_WAIT_MS) break;
+        Sleep(0);
+    }
+    QueryPerformanceCounter(&t1);
+    const double waited_ms=(double)(t1.QuadPart-t0.QuadPart)*1000.0/(double)freq.QuadPart;
+    uint64_t words[2]={0,0};
+    if (accessible) {
+        SIZE_T got=0;
+        ReadProcessMemory(GetCurrentProcess(),(void *)(addr-8),words,sizeof(words),&got);
+    }
+    InterlockedIncrement(accessible ? &bpe_accessible_after_wait : &bpe_still_inaccessible);
+    if (n<=64 || n%100==0) {
+        fprintf(stderr,"SOTC BPE read fault %ld: addr %p; state at the fault: state 0x%lx protect 0x%lx "
+                "allocation base %p region 0x%zx type 0x%lx; %s after %.3f ms, state now 0x%lx protect 0x%lx; "
+                "[addr-8] %016llx [addr] %016llx; rdi %016llx r8 %016llx\n",
+                (long)n,(void *)addr,(unsigned long)bpe_before.State,(unsigned long)bpe_before.Protect,
+                bpe_before.AllocationBase,(size_t)bpe_before.RegionSize,(unsigned long)bpe_before.Type,
+                accessible ? "accessible" : "still inaccessible",waited_ms,(unsigned long)now.State,
+                (unsigned long)now.Protect,(unsigned long long)words[0],(unsigned long long)words[1],
+                (unsigned long long)info->ContextRecord->Rdi,(unsigned long long)info->ContextRecord->R8);
+        /* SOTC_MAP_LOG=1: the faulting thread and the mapping history of its page (runtime_memory.c). */
+        char self[64];
+        runtime_memory_thread_name(GetCurrentThreadId(),self,sizeof(self));
+        fprintf(stderr,"SOTC BPE read fault %ld: faulting thread %lu (%s), fault at %llu ns (QPC)\n",(long)n,
+                (unsigned long)GetCurrentThreadId(),self[0] ? self : "unnamed",(unsigned long long)bpe_fault_ns);
+        const int reserved=bpe_before.State==MEM_RESERVE || (bpe_before.Protect & 0xff)==PAGE_NOACCESS;
+        runtime_memory_map_log_dump(addr,bpe_fault_ns,reserved);
+    }
+}
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
+    bpe_before_valid=0;
+    if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && record->ExceptionInformation[0]==0 &&
+        image && (uintptr_t)info->ContextRecord->Rip-(uintptr_t)image<0x20000000 && bpe_observe_on() &&
+        runtime_thread_is_guest()) {
+        bpe_fault_ns=runtime_memory_map_log_now_ns();
+        bpe_before_valid=VirtualQuery((void *)record->ExceptionInformation[1],&bpe_before,sizeof(bpe_before))!=0;
+    }
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && heap_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && bb_copy_guard_buf &&
@@ -1132,6 +1203,8 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
+    /* sotc: SOTC_BPE_FIX=2 (see bpe_observe_fault): the read faults that reach the fatal path are recorded. */
+    if (bpe_before_valid && code==EXCEPTION_ACCESS_VIOLATION) bpe_observe_fault(info);
     /* sotc: an SSE4a site the load-time patchers could not rewrite is interpreted. */
     if (code==EXCEPTION_ILLEGAL_INSTRUCTION && image && sotc_handle_illegal(info)) { fault_path=6; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_ILLEGAL_INSTRUCTION || code==EXCEPTION_PRIV_INSTRUCTION ||

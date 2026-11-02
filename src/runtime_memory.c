@@ -473,7 +473,114 @@ void runtime_memory_reserve(void) {
 static int commit_chunks_on(void); /* sotc: SOTC_COMMIT_CHUNKS, defined with the commit switches */
 /* A view covers one piece of one physical chunk (host_map and carve_host cut them so). With chunks
  * the view takes a reference on its chunk (chunks_view_map). */
+/* sotc: SOTC_MAP_LOG=1 (B1, BPE heap crash). The mapping history of the guest range: every map, unmap,
+ * protection change and placeholder change of a range that overlaps [MAP_LOG_LO,MAP_LOG_HI) (the
+ * game's heap mapping) is recorded in a ring of MAP_LOG_SIZE entries. Nothing is printed on the hot
+ * path. probe.c calls runtime_memory_map_log_dump when a guest read fault reaches the fatal path: the
+ * entries that overlap the fault page, newest first, and the last entries of its 1 MiB block.
+ * Lock-free: a writer sets seq to 0 while it fills an entry and to its index + 1 when done; a reader
+ * copies an entry only when seq is the same before and after. The caller is the address the host
+ * function returns to (the runtime function that called the map, unmap or protect). */
+#define MAP_LOG_SIZE 4096u
+#define MAP_LOG_LO UINT64_C(0x10dc000000)
+#define MAP_LOG_HI UINT64_C(0x110d000000)
+enum { MAP_LOG_MAP=1, MAP_LOG_UNMAP, MAP_LOG_PROTECT, MAP_LOG_PLACEHOLDER };
+typedef struct {
+    LONG seq;
+    uint32_t op, tid, prot;
+    uint64_t start, end, ns;
+    uintptr_t caller;
+} MapLogEntry;
+static MapLogEntry map_log[MAP_LOG_SIZE];
+static volatile LONG map_log_next;
+static int map_log_on(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_MAP_LOG"); v=e && e[0]=='1'; }
+    return v;
+}
+static uint64_t map_log_ns(void) {
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)((double)now.QuadPart*1e9/(double)freq.QuadPart);
+}
+static void map_log_note(uint32_t op, uintptr_t start, uintptr_t end, DWORD prot, uintptr_t caller) {
+    if ((uint64_t)end<=MAP_LOG_LO || (uint64_t)start>=MAP_LOG_HI) return;
+    const LONG i=InterlockedIncrement(&map_log_next)-1;
+    MapLogEntry *e=&map_log[(uint32_t)i & (MAP_LOG_SIZE-1)];
+    InterlockedExchange(&e->seq,0);
+    e->op=op; e->tid=GetCurrentThreadId(); e->prot=prot;
+    e->start=start; e->end=end; e->ns=map_log_ns(); e->caller=caller;
+    InterlockedExchange(&e->seq,i+1);
+}
+/* MAP_LOG(op, start, end, prot): records a change made by the function that expands it. */
+#define MAP_LOG(op,s,e,p) do { if (map_log_on()) map_log_note((op),(uintptr_t)(s),(uintptr_t)(e),(DWORD)(p),(uintptr_t)__builtin_return_address(0)); } while (0)
+uint64_t runtime_memory_map_log_now_ns(void) { return map_log_ns(); }
+/* Name of a host thread for the dump: GetThreadDescription (the guest thread names are set with it). */
+int runtime_memory_thread_name(DWORD tid, char *out, size_t size) {
+    typedef HRESULT (WINAPI *GetDescFn)(HANDLE, PWSTR *);
+    GetDescFn get_description=(GetDescFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
+    int ok=0, own=tid==GetCurrentThreadId();
+    if (size) out[0]=0;
+    if (!get_description || !size) return 0;
+    HANDLE h=own ? GetCurrentThread() : OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,tid);
+    if (!h) return 0;
+    PWSTR wide=NULL;
+    if (SUCCEEDED(get_description(h,&wide)) && wide) {
+        ok=WideCharToMultiByte(CP_UTF8,0,wide,-1,out,(int)size,NULL,NULL)>0;
+        LocalFree(wide);
+    }
+    if (!own) CloseHandle(h);
+    return ok;
+}
+/* Copies entry k of the ring when it is complete and still that entry; 0 otherwise. */
+static int map_log_copy(LONG k, MapLogEntry *out) {
+    MapLogEntry *e=&map_log[(uint32_t)k & (MAP_LOG_SIZE-1)];
+    if (InterlockedCompareExchange(&e->seq,0,0)!=k+1) return 0;
+    out->op=e->op; out->tid=e->tid; out->prot=e->prot; out->start=e->start; out->end=e->end; out->ns=e->ns; out->caller=e->caller;
+    return InterlockedCompareExchange(&e->seq,0,0)==k+1;
+}
+static const char *map_log_op_name(uint32_t op) {
+    switch (op) {
+    case MAP_LOG_MAP: return "map";
+    case MAP_LOG_UNMAP: return "unmap";
+    case MAP_LOG_PROTECT: return "protect";
+    case MAP_LOG_PLACEHOLDER: return "placeholder";
+    }
+    return "?";
+}
+/* Prints the entries overlapping [page,page+4096), newest first (at most 32), then, when block_scan is
+ * set, the last 16 entries overlapping the 1 MiB block of the page. Ages are relative to fault_ns (the
+ * fault time from runtime_memory_map_log_now_ns); a positive age is before the fault. */
+void runtime_memory_map_log_dump(uintptr_t page, uint64_t fault_ns, int block_scan) {
+    if (!map_log_on()) return;
+    const LONG last=map_log_next;
+    const uintptr_t block=page & ~(uintptr_t)((UINT64_C(1)<<20)-1);
+    const struct { const char *title; uintptr_t lo, hi; int max; } scans[2]={
+        {"overlapping the fault page",page,page+4096,32},
+        {"last entries of the 1 MiB block of the fault page",block,block+((uintptr_t)1<<20),16}};
+    for (int s=0; s<(block_scan ? 2 : 1); ++s) {
+        int printed=0;
+        fprintf(stderr,"SOTC MAP LOG (%s), newest first:\n",scans[s].title);
+        for (LONG k=last-1; k>=0 && last-k<=(LONG)MAP_LOG_SIZE && printed<scans[s].max; --k) {
+            MapLogEntry e;
+            if (!map_log_copy(k,&e)) continue;
+            if ((uint64_t)e.end<=scans[s].lo || (uint64_t)e.start>=scans[s].hi) continue;
+            char name[64];
+            runtime_memory_thread_name((DWORD)e.tid,name,sizeof(name));
+            const double age_us=((double)fault_ns-(double)e.ns)/1000.0;
+            fprintf(stderr,"  age %+.1f us op %s tid %lu (%s) range [%#llx,%#llx) prot 0x%lx caller %p\n",
+                    age_us,map_log_op_name(e.op),(unsigned long)e.tid,name[0] ? name : "unnamed",
+                    (unsigned long long)e.start,(unsigned long long)e.end,(unsigned long)e.prot,(void *)e.caller);
+            ++printed;
+        }
+        if (!printed) fprintf(stderr,"  (none)\n");
+    }
+    fflush(stderr);
+}
 static void view_map(const HostRegion *r, DWORD protect) {
+    MAP_LOG(MAP_LOG_MAP,r->start,r->end,protect);
     if (commit_chunks_on()) {
         if (chunks_view_map((void *)r->start,r->phys,r->end-r->start,protect))
             win_fail("mapping a guest chunk view",r->start,r->end-r->start);
@@ -482,12 +589,16 @@ static void view_map(const HostRegion *r, DWORD protect) {
     DWORD initial=protect==PAGE_NOACCESS ? PAGE_READWRITE : protect, old;
     if (!MapViewOfFile3(section,GetCurrentProcess(),(void *)r->start,r->phys,r->end-r->start,MEM_REPLACE_PLACEHOLDER,initial,NULL,0))
         win_fail("MapViewOfFile3",r->start,r->end-r->start);
-    if (initial!=protect && !VirtualProtect((void *)r->start,r->end-r->start,protect,&old))
-        win_fail("VirtualProtect",r->start,r->end-r->start);
+    if (initial!=protect) {
+        MAP_LOG(MAP_LOG_PROTECT,r->start,r->end,protect);
+        if (!VirtualProtect((void *)r->start,r->end-r->start,protect,&old))
+            win_fail("VirtualProtect",r->start,r->end-r->start);
+    }
 }
 /* Unmaps a view made by view_map: its range becomes a placeholder again. With chunks the chunk's
  * reference goes too (the chunk closes after the table lock is dropped, if nothing else holds it). */
 static void view_unmap(const HostRegion *r) {
+    MAP_LOG(MAP_LOG_UNMAP,r->start,r->end,0);
     if (commit_chunks_on()) {
         if (chunks_view_unmap((void *)r->start,r->phys,r->end-r->start))
             win_fail("unmapping a guest chunk view",r->start,r->end-r->start);
@@ -593,6 +704,7 @@ static size_t map_fine(size_t at, uint64_t phys) {
         uintptr_t y=(x/FINE_VIEW+1)*FINE_VIEW;
         if (y>end) y=end;
         if (y<end) {
+            MAP_LOG(MAP_LOG_PLACEHOLDER,x,y,0);
             if (!VirtualFree((void *)x,y-x,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",x,y-x);
             regions[at].end=y;
             region_insert(at+1,(HostRegion){y,end,0,0});
@@ -610,6 +722,7 @@ static void protect_views(uintptr_t start, uintptr_t end, DWORD protect) {
     for (size_t i=region_index(start); i<region_count && regions[i].start<end; ++i) {
         if (!regions[i].mapped || lazy_region(&regions[i])) continue;
         uintptr_t a=regions[i].start>start ? regions[i].start : start, b=regions[i].end<end ? regions[i].end : end;
+        MAP_LOG(MAP_LOG_PROTECT,a,b,protect);
         if (!VirtualProtect((void *)a,b-a,protect,&old)) win_fail("restoring page protection",a,b-a);
     }
 }
@@ -778,12 +891,14 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     }
     for (size_t i=first;i<last;++i) if (regions[i].mapped && !lazy_region(&regions[i])) view_unmap(&regions[i]);
     if (lazy_mode) chunks_lazy_cut(a,b); /* [a,b) has no lazy range now; the kept parts stay lazy */
+    if (last-first>1) MAP_LOG(MAP_LOG_PLACEHOLDER,lo,hi,0);
     if (last-first>1 && !VirtualFree((void *)lo,hi-lo,MEM_RELEASE|MEM_COALESCE_PLACEHOLDERS))
         win_fail("coalescing placeholders",lo,hi-lo);
     region_erase(first,last-first);
     region_insert(first,(HostRegion){lo,hi,0,0});
     size_t at=first;
     if (lo<a) {
+        MAP_LOG(MAP_LOG_PLACEHOLDER,lo,a,0);
         if (!VirtualFree((void *)lo,a-lo,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",lo,a-lo);
         regions[at].end=a;
         region_insert(at+1,(HostRegion){a,hi,0,0});
@@ -798,6 +913,7 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
         ++at;
     }
     if (b<hi) {
+        MAP_LOG(MAP_LOG_PLACEHOLDER,a,b,0);
         if (!VirtualFree((void *)a,b-a,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",a,b-a);
         regions[at].end=b;
         region_insert(at+1,(HostRegion){b,hi,0,0});
@@ -818,8 +934,11 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
             /* sotc: SOTC_CARVE_NOSTOP: left writable, reported as CPU-written after the lock. */
             if (pr==PAGE_EXECUTE_READ) {
                 if (fine) protect_views(runs[i].start,runs[i].end,PAGE_EXECUTE_READWRITE);
-                else if (!VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,PAGE_EXECUTE_READWRITE,&old))
-                    win_fail("restoring page protection",runs[i].start,runs[i].end-runs[i].start);
+                else {
+                    MAP_LOG(MAP_LOG_PROTECT,runs[i].start,runs[i].end,PAGE_EXECUTE_READWRITE);
+                    if (!VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,PAGE_EXECUTE_READWRITE,&old))
+                        win_fail("restoring page protection",runs[i].start,runs[i].end-runs[i].start);
+                }
             }
             if (carve_dirty_count && carve_dirty[carve_dirty_count-1].end==runs[i].start)
                 carve_dirty[carve_dirty_count-1].end=runs[i].end;
@@ -828,8 +947,11 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
             continue;
         }
         if (fine) protect_views(runs[i].start,runs[i].end,runs[i].protect); /* may span views now */
-        else if (!VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,runs[i].protect,&old))
-            win_fail("restoring page protection",runs[i].start,runs[i].end-runs[i].start);
+        else {
+            MAP_LOG(MAP_LOG_PROTECT,runs[i].start,runs[i].end,runs[i].protect);
+            if (!VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,runs[i].protect,&old))
+                win_fail("restoring page protection",runs[i].start,runs[i].end-runs[i].start);
+        }
     }
     if (carve_stopping) { carve_stopping=0; runtime_thread_resume(carve_stopped,carve_nstopped); }
     if (nostop) __atomic_add_fetch(&carve_gen,1,__ATOMIC_ACQ_REL); /* even: done, retries go on */
@@ -867,6 +989,7 @@ static uintptr_t piece_end(uintptr_t address, uintptr_t a, uintptr_t end, uint64
     return b;
 }
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
+    MAP_LOG(MAP_LOG_MAP,address,address+size,win_prot(prot));
     carve_reason="map";
     size_t i=carve_host(address,address+size);
     if (reserved) return 0;
@@ -893,6 +1016,7 @@ static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, ui
     for (uintptr_t a=address; a<end; ++k) {
         const uintptr_t b=piece_end(address,a,end,phys,chunk,by_chunks);
         /* [a,end) is one placeholder here: cut [a,b) off its start. */
+        if (b<end) MAP_LOG(MAP_LOG_PLACEHOLDER,a,b,0);
         if (b<end && !VirtualFree((void *)a,b-a,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER))
             win_fail("splitting a placeholder",a,b-a);
         regions[k]=(HostRegion){a,b,phys+(a-address),1};
@@ -902,10 +1026,14 @@ static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, ui
     }
     return 0;
 }
-static int host_unmap(uintptr_t address, uint64_t size) { carve_reason="unmap"; carve_host(address,address+size); return 0; }
+static int host_unmap(uintptr_t address, uint64_t size) {
+    MAP_LOG(MAP_LOG_UNMAP,address,address+size,0);
+    carve_reason="unmap"; carve_host(address,address+size); return 0;
+}
 static int host_protect(uintptr_t address, uint64_t size, int prot) {
     DWORD protect=win_prot(prot), old;
     uintptr_t end=address+size;
+    MAP_LOG(MAP_LOG_PROTECT,address,end,protect);
     const int lazy=commit_chunks_lazy();
     int result=0;
     if (lazy) chunks_lock(); /* a lazy range keeps the protection it gets when viewed: the list is updated */

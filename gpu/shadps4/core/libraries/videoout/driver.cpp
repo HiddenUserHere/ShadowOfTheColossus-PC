@@ -2089,7 +2089,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 }
             }
             if (VideoCore::TsharpSlotCache::Mode() != 0) { // sotc: SOTC_TSLOT
-                char tslot_line[512];
+                char tslot_line[1024];
                 if (VideoCore::TsharpSlotCache::Report(tslot_line, sizeof tslot_line, seconds) != 0) {
                     report += tslot_line;
                     report += '\n';
@@ -2262,7 +2262,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 // sotc: SOTC_BDA: block-table draws, slots, nulls, missing addresses (vk_bda_table.h).
                 if (const char* bda = std::getenv("SOTC_BDA");
                     (bda && bda[0] && bda[0] != '0') || std::getenv("SOTC_N5_BDA") || std::getenv("SOTC_N5_BDA_BUFFERS")) { // sotc: SOTC_N5_BDA too
-                    char bda_line[320];
+                    char bda_line[768];
                     Vulkan::BdaTableReport(bda_line, sizeof bda_line);
                     std::fprintf(stderr, "%s", bda_line);
                 }

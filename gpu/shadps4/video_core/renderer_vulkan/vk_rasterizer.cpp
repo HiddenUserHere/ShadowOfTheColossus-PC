@@ -18,6 +18,8 @@
 #include <filesystem>
 #include <xxhash.h>
 #include "common/path_util.h"
+#include "../../../sotc/pc_ring.h" // sotc: SOTC_BPE_FIX (HostServed)
+#include "video_core/buffer_cache/bpe_heap_guard.h" // sotc: SOTC_BPE_FIX
 #include "video_core/renderdoc.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -5558,6 +5560,77 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     // sotc: SOTC_N5_BDA_BUFFERS (vk_bda_table.h): 1 writes no descriptor for the slots the table
     // serves, 2 writes them and counts what 1 would drop. 0 when the device lacks bufferDeviceAddress.
     const u32 n5_buffers = BdaN5BuffersActive(instance);
+    // sotc: SOTC_BDA_DIRECT (vk_bda_table.h). A block-table slot whose range lies in an imported ring-8 run is
+    // bound by arithmetic: the run's device address plus the offset, with the run's buffer (the one
+    // BufferCache::PcHostServe returns for it, kept from its first ObtainBuffer answer), and ObtainBuffer is
+    // skipped. Needs SOTC_N5_BDA_BUFFERS (the table is what reads the address), SOTC_PC_RING=8 and the draw
+    // thread. Written slots too: ObtainBuffer's served path returns before its written-bind work.
+    const u32 bda_direct = n5_buffers != 0 ? BdaDirectMode() : 0;
+    const bool direct_ring = bda_direct != 0 && SotcStats::t_draw_thread && SotcPcRing::Mode() == 8;
+    // sotc: SOTC_BDA_DIRECT: the switches whose work ObtainBuffer does before the ring path, and PcHostBind's
+    // Ring8Verify record. With one of them on, every slot takes the ObtainBuffer path (counted as gate).
+    const bool direct_gate = direct_ring &&
+                             (SotcN1Verify::On() || SotcMemClasses::On() || SotcPcPlaceGlue::On() ||
+                              SotcLoadWarm::Enabled() || SotcLoadWarm::StreamEnabled() ||
+                              SotcPcRing::Ring8Verify());
+    // The ring maintenance (PcHostBind -> HostMaintain) runs at the first ObtainBuffer of a submit epoch and
+    // block-set version. A direct bind is taken only when the last such call saw the current epoch and version
+    // (direct_state), so no bind that could depend on the maintenance skips it.
+    struct DirectState {
+        bool maintained{};
+        u32 epoch{};
+        u64 version{};
+    };
+    static thread_local DirectState direct_state{};
+    // The buffer ObtainBuffer returned for each run (by its guest base), with the run's buffer handle.
+    static thread_local std::unordered_map<VAddr, std::pair<vk::Buffer, const VideoCore::Buffer*>>
+        direct_buffers;
+    // The arithmetic answer for a block-table slot [vbase, vbase + size) of a ring-8 run: true, with the run's
+    // view and buffer, when every condition holds; false otherwise, the reason counted.
+    const auto direct_answer = [&](VAddr vbase, u64 size, SotcGuestMemory::GuestView& view,
+                                   const VideoCore::Buffer*& run_buffer) -> bool {
+        const int relation = SotcPcRing::ArenaRelation(vbase, size);
+        if (relation != 1) {
+            BdaNoteDirect(relation == 0 ? BdaDirect::FbArena : BdaDirect::FbStraddle);
+            return false;
+        }
+        if (direct_gate) {
+            BdaNoteDirect(BdaDirect::FbGate);
+            return false;
+        }
+        if (!direct_state.maintained || direct_state.epoch != SotcPcRing::SubmitEpoch() ||
+            direct_state.version != SotcPcRing::BlockVersion()) {
+            BdaNoteDirect(BdaDirect::FbMaintain);
+            return false;
+        }
+        if (!SotcGuestMemory::LookupGuestView(vbase, size, &view)) {
+            BdaNoteDirect(BdaDirect::FbNotServed);
+            return false;
+        }
+        if (view.device_address == 0) {
+            BdaNoteDirect(BdaDirect::FbNoAddress);
+            return false;
+        }
+        const auto known = direct_buffers.find(view.cpu_base);
+        if (known == direct_buffers.end() || known->second.first != view.buffer) {
+            BdaNoteDirect(BdaDirect::FbNoBuffer);
+            return false;
+        }
+        run_buffer = known->second.second;
+        return true;
+    };
+    // The buffer ObtainBuffer answered for a served range is the run's buffer: remembered for direct binds.
+    const auto direct_learn = [&](VAddr vbase, u64 size,
+                                  const std::pair<const VideoCore::Buffer*, u64>& got) {
+        SotcGuestMemory::GuestView view{};
+        if (!got.first || !SotcGuestMemory::LookupGuestView(vbase, size, &view) ||
+            view.device_address == 0 || got.second != view.offset ||
+            got.first->Handle() != view.buffer || !got.first->HasBufferDeviceAddress() ||
+            got.first->BufferDeviceAddress() != view.device_address) {
+            return;
+        }
+        direct_buffers[view.cpu_base] = {view.buffer, got.first};
+    };
     // sotc: W1 diagnostic. The BDA table build is logged on the first frame only (flip 0), at most
     // kBdaLogLines lines per process.
     const bool bda_log = bda_stage && SotcStats::flip_count.load(std::memory_order_relaxed) == 0;
@@ -5717,6 +5790,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                        (!desc.is_written || memory->IsMappedAddress(vbase))) {
                 size = memory->ClampRangeSize(vbase, vsize);
             }
+            // sotc: SOTC_BPE_FIX: in-place written bindings are checked against the BPE heap
+            // metadata (=2 counts, =1 clamps the binding before the first metadata byte).
+            if (desc.is_written && size != 0) {
+                size = VideoCore::BpeNative::Check(vbase, size, VideoCore::BpeNative::Kind::Bind,
+                                                   stage.pgm_hash, SotcPcRing::HostServed(vbase, size),
+                                                   true);
+            }
             // sotc: SOTC_BIND_CACHE_XTICK (BindCacheRepair)
             const u64 mapped_size = pb ? pb->mapped : size;
             if (size == 0) {
@@ -5797,7 +5877,23 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 BufferMemo* memo = nullptr;
                 std::pair<const VideoCore::Buffer*, u64> obtained{};
                 bool obtain_called = false; // sotc: SOTC_BIND_MARK_ONCE: ObtainBuffer ran here
-                if (memo_on) {
+                // sotc: SOTC_BDA_DIRECT. A slot of a ring-8 run: mode 1 takes the arithmetic answer (no memo, no
+                // ObtainBuffer); mode 2 keeps the old path and compares its answer with this one after it.
+                // direct_arena and maint_*: set when ObtainBuffer runs for a ring-8 slot (the maintenance state it sees).
+                bool direct_arena = false;
+                u32 maint_epoch = 0;
+                u64 maint_version = 0;
+                SotcGuestMemory::GuestView direct_view{};
+                const VideoCore::Buffer* direct_run = nullptr;
+                const bool direct_answered =
+                    direct_ring && bda_slot && direct_answer(vbase, size, direct_view, direct_run);
+                if (direct_answered && bda_direct == 1) {
+                    obtained = {direct_run, direct_view.offset};
+                    BdaNoteDirect(BdaDirect::Bind);
+                    SotcPcRing::NoteHostBind(size, desc.is_written); // the counts PcHostServe makes
+                    SotcLabels::NoteSharedTouch();                   // and the note it makes
+                }
+                if (memo_on && !obtained.first) {
                     if (buffer_memo.empty()) {
                         buffer_memo.resize(BufferMemoEntries);
                     }
@@ -5842,6 +5938,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                           : SotcVerify::BindKind::Constant};
                     // sotc: SOTC_TRACE (a = bytes uploaded, b = protect calls)
                     const SotcTrace::BindScope trace_obtain{"obtain buffer"};
+                    // sotc: SOTC_BDA_DIRECT: the maintenance state read just before this call (direct_state).
+                    direct_arena = direct_ring && bda_slot && SotcPcRing::ArenaRelation(vbase, size) == 1;
+                    if (direct_arena) {
+                        maint_epoch = SotcPcRing::SubmitEpoch();
+                        maint_version = SotcPcRing::BlockVersion();
+                    }
                     obtained = buffer_cache.ObtainBuffer(vbase, size, desc.is_written,
                                                          desc.is_formatted, mark_offset, mark_size);
                     if (memo) {
@@ -5862,6 +5964,22 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             SotcStats::bf_memo_misses.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
+                }
+                // sotc: SOTC_BDA_DIRECT. ObtainBuffer ran for a ring-8 slot: its maintenance state is the one this
+                // call saw (direct_state), and the run's buffer is remembered for the next direct binds.
+                if (direct_arena) {
+                    direct_state = {true, maint_epoch, maint_version};
+                    direct_learn(vbase, size, obtained);
+                }
+                // sotc: SOTC_BDA_DIRECT=2: the arithmetic answer must name the buffer and the address the
+                // ObtainBuffer answer (used above) gave, with the block inside the buffer.
+                if (direct_answered && bda_direct == 2) {
+                    const bool same =
+                        obtained.first == direct_run && obtained.first->HasBufferDeviceAddress() &&
+                        obtained.first->BufferDeviceAddress() + obtained.second ==
+                            direct_view.device_address + direct_view.offset &&
+                        obtained.second + size <= obtained.first->SizeBytes();
+                    BdaNoteDirect(same ? BdaDirect::Verified : BdaDirect::Mismatch);
                 }
                 const auto [buffer, offset] = obtained;
                 if (SotcStats::kWriteMarks && desc.is_written) { // sotc: kWriteMarks (SOTC_FPS_LEAN)
@@ -6527,6 +6645,19 @@ struct LazyBind {
     VideoCore::ImageViewInfo view_info;
 };
 
+// sotc: SOTC_TSLOT: whether ImageDesc::InitMipTail makes a mip-tail candidate of a plain sampled T#
+// (texture_cache.cpp), from the T# and the resource's is_depth; `plain` excludes the other inputs
+// (is_written, mip fallback). A candidate is never memoized (FindTextureIdentity bypasses it), so its
+// identity probe cannot hit and mode 1 does not probe it. Mode 2 checks this against the built ImageDesc.
+static bool TailCandidateOf(const AmdGpu::Image& image, bool is_depth) {
+    const auto image_type = image.GetType();
+    return !(is_depth || image_type == AmdGpu::ImageType::Color3D ||
+             image_type == AmdGpu::ImageType::Color2DMsaa ||
+             image_type == AmdGpu::ImageType::Color2DMsaaArray || image.base_level == 0 ||
+             image.base_level > image.last_level ||
+             (VideoCore::MipTailMode() == 1 && !image.lod_hw_cnt_en));
+}
+
 void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                                   u32 set, const PreparedResources* pr, const PrStage* pr_stage,
                                   const TexBlockKey* tex_key, TexBlockMemo* rec) {
@@ -6732,9 +6863,27 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
             const bool plain = num_bindings == 1 && !image_desc.is_written &&
                                mip_fallback_mode == Shader::MipStorageFallbackMode::None && !rec &&
                                !bind_cache_recording;
+            // sotc: SOTC_TSLOT: a mip-tail candidate is never probed in mode 1 (TailCandidateOf); mode 2
+            // probes it, to check that it never hits. A bind that is not plain is not probed; counted.
+            const bool tail_candidate = plain && TailCandidateOf(tsharp, image_desc.is_depth);
             VideoCore::TextureCache::TexSkip skip{};
-            const bool skipped = tslot_mode != 0 && plain &&
-                                 texture_cache.ProbeTextureIdentity(tkey, tslot_mode == 2, skip);
+            bool skipped = false;
+            if (tslot_mode != 0) {
+                using NotPlain = VideoCore::TsharpSlotCache::TexNotPlain;
+                if (!plain) {
+                    VideoCore::TsharpSlotCache::NoteTexNotPlain(
+                        num_bindings != 1                     ? NotPlain::Multi
+                        : image_desc.is_written               ? NotPlain::Written
+                        : mip_fallback_mode != Shader::MipStorageFallbackMode::None
+                            ? NotPlain::MipFallback
+                            : NotPlain::Recording);
+                } else if (tail_candidate) {
+                    VideoCore::TsharpSlotCache::NoteTexNotPlain(NotPlain::Tail);
+                }
+                if (plain && (!tail_candidate || tslot_mode == 2)) {
+                    skipped = texture_cache.ProbeTextureIdentity(tkey, tslot_mode == 2, skip);
+                }
+            }
             auto& [image_id, desc] = image_bindings.emplace_back();
             if (skipped && tslot_mode == 1) {
                 image_id = skip.image_id;
@@ -6743,6 +6892,10 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
                                               &image_desc, skip.view_info});
             } else {
                 desc = VideoCore::TextureCache::ImageDesc(tsharp, image_desc);
+                if (tslot_mode == 2 && plain) { // sotc: SOTC_TSLOT=2: the tail predicate, and no tail hit
+                    VideoCore::TsharpSlotCache::NoteTexTail(
+                        tail_candidate == (desc.rebase_mip != 0) && !(tail_candidate && skipped));
+                }
                 if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                     ASSERT(num_bindings == 1);
                     desc.view_info.range.base.level += image_desc.constant_mip_index;
@@ -6847,7 +7000,10 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
             }
 
             auto& image = texture_cache.GetImage(image_id);
-            auto& image_view = texture_cache.FindTexture(image_id, desc);
+            // sotc: SOTC_TSLOT: a texture's second pass may skip UpdateImage where it is a no-op.
+            const bool second_update = !(tslot_mode != 0 &&
+                                         desc.type == VideoCore::TextureCache::BindingType::Texture);
+            auto& image_view = texture_cache.FindTexture(image_id, desc, second_update);
             const auto binding = image.binding;
 
             // The image is either bound as storage in a separate descriptor or bound as render

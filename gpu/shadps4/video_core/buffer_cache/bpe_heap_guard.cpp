@@ -8,12 +8,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <optional>
 
 #include "core/memory.h"
 #include "video_core/buffer_cache/bpe_heap_guard.h"
 #include "video_core/sotc_stats.h"
 
 extern "C" uint64_t runtime_memory_generation(void);
+extern "C" uintptr_t runtime_sotc_heap(void);       // probe.c: the heap the readback guard uses
+extern "C" uintptr_t runtime_sotc_heap_table(void); // probe.c: the engine's heap table
 
 namespace VideoCore {
 
@@ -313,6 +317,21 @@ std::vector<BpeHeapGuard::Span> BpeHeapGuard::CollectSpans(VAddr addr, VAddr end
     return spans;
 }
 
+void BpeHeapGuard::Hits(VAddr addr, VAddr end, std::vector<MetaHit>& hits) {
+    for (const auto& [lo, hi] : CollectSpans(addr, end)) {
+        // Every span starts at its block's header (the free-list spans at the block too)
+        u64 size_flags = 0;
+        const bool known = Read(lo + 8, &size_flags, sizeof(size_flags));
+        const bool in_use = known && (size_flags & InUse);
+        // The tree links of a block in use are user data: only its header is metadata
+        const VAddr span_hi = in_use && hi - lo > HeaderSize ? lo + HeaderSize : hi;
+        if (span_hi <= addr || lo >= end) {
+            continue;
+        }
+        hits.push_back(MetaHit{lo, span_hi, lo, known && !in_use});
+    }
+}
+
 u64 BpeHeapGuard::Write(VAddr addr, const u8* data, u64 size) {
     const VAddr end = addr + size;
     const std::vector<Span> spans = CollectSpans(addr, end);
@@ -490,5 +509,264 @@ void BpeUsedBlocks::Add(VAddr block, VAddr next) {
         blocks.insert(it, {block, next});
     }
 }
+
+namespace BpeNative {
+namespace {
+
+constexpr size_t MaxHeaps = 8;
+constexpr size_t RingSize = 64;
+constexpr size_t KindCount = static_cast<size_t>(Kind::Count);
+constexpr u64 NearBytes = 1ULL << 20;
+constexpr const char* KindNames[KindCount] = {"bind",  "gpu-fill", "gpu-copy", "cpu-fill", "cpu-copy",
+                                              "hle-copy", "hle-table", "image", "cp"};
+const auto RefreshEvery = std::chrono::milliseconds(250); // guard rebuild age; the free list is read live
+const auto ReportEvery = std::chrono::seconds(5);
+
+struct Overlap {
+    VAddr addr = 0;
+    u64 size = 0;
+    VAddr block = 0; // the first metadata block the write reached
+    bool freed = false;
+    Kind kind = Kind::Bind;
+    u64 detail = 0;
+    u64 seq = 0;
+};
+
+struct HeapSlot {
+    VAddr heap = 0;
+    bool active = false; // listed by the last refresh
+    std::chrono::steady_clock::time_point built{};
+    std::optional<BpeHeapGuard> guard;
+};
+
+struct State {
+    std::mutex mutex;
+    std::array<HeapSlot, MaxHeaps> heaps{};
+    std::chrono::steady_clock::time_point listed{};
+    std::array<Overlap, RingSize> ring{}; // the last overlaps, for the fault report
+    u64 seq = 0;                          // overlaps since start
+    // Counters of the current 5 s window
+    std::chrono::steady_clock::time_point window{};
+    u64 checks = 0;
+    u64 check_bytes = 0;
+    u64 overlaps = 0;
+    u64 freed_overlaps = 0;
+    u64 overlap_bytes = 0;
+    u64 clamps = 0;
+    u64 clamp_bytes = 0;
+    u64 builds = 0;
+    u64 build_ns = 0;
+    std::array<u64, KindCount> kind_checks{};
+    std::array<u64, KindCount> kind_overlaps{};
+    bool announced = false;
+};
+
+State& GetState() {
+    static State state;
+    return state;
+}
+
+// Heaps to check: the heap the readback guard uses, and the heaps of its class from the engine's table
+// (ApplyDownloads lists the same ones). A guard is rebuilt at most every RefreshEvery.
+void RefreshHeaps(State& s) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s.listed < RefreshEvery) {
+        return;
+    }
+    s.listed = now;
+    std::array<VAddr, MaxHeaps> wanted{};
+    size_t count = 0;
+    if (const VAddr chosen = runtime_sotc_heap(); chosen != 0) {
+        wanted[count++] = chosen;
+        const u64 heap_class = *std::bit_cast<const u64*>(chosen);
+        if (const VAddr table = runtime_sotc_heap_table(); table != 0) {
+            for (u32 id = 1; id < 48 && count < wanted.size(); ++id) {
+                const VAddr other = std::bit_cast<const VAddr*>(table)[id];
+                if (other == 0 || other == chosen || !(other >= 0x10000 && other < 0x10000000000ULL)) {
+                    continue;
+                }
+                const bool in_image = other - table < 0x20000000;
+                if (!in_image && !Core::Memory::Instance()->GetBackingPointer(other)) {
+                    continue;
+                }
+                if (*std::bit_cast<const u64*>(other) == heap_class) {
+                    wanted[count++] = other;
+                }
+            }
+        }
+    }
+    for (auto& slot : s.heaps) {
+        slot.active = false;
+    }
+    for (size_t w = 0; w < count; ++w) {
+        // The heap keeps its slot (and guard) while listed; otherwise a free slot, or one of a heap not listed
+        auto found = std::find_if(s.heaps.begin(), s.heaps.end(),
+                                  [&](const HeapSlot& c) { return c.heap == wanted[w]; });
+        if (found == s.heaps.end()) {
+            found = std::find_if(s.heaps.begin(), s.heaps.end(),
+                                 [](const HeapSlot& c) { return c.heap == 0 || !c.active; });
+        }
+        if (found == s.heaps.end()) {
+            continue;
+        }
+        HeapSlot* slot = &*found;
+        slot->active = true;
+        if (slot->heap != wanted[w]) {
+            slot->heap = wanted[w];
+            slot->guard.reset();
+        }
+        if (!slot->guard || now - slot->built >= RefreshEvery) {
+            const auto start = std::chrono::steady_clock::now();
+            slot->guard.emplace(Core::Memory::Instance(), slot->heap);
+            slot->built = start;
+            s.builds++;
+            s.build_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - start)
+                                               .count());
+        }
+    }
+}
+
+void ReportWindow(State& s, std::chrono::steady_clock::time_point now) {
+    const double secs = std::chrono::duration<double>(now - s.window).count();
+    std::fprintf(stderr,
+                 "SOTC BPE NATIVE (%.1f s): mode %d, in-place writes checked %llu (%.2f MiB), metadata "
+                 "overlaps %llu (free blocks %llu, %.1f KiB), clamped %llu (%.1f KiB dropped), heaps %zu, "
+                 "guard builds %llu (%.2f ms)\n",
+                 secs, Mode(), static_cast<unsigned long long>(s.checks),
+                 static_cast<double>(s.check_bytes) / (1 << 20),
+                 static_cast<unsigned long long>(s.overlaps),
+                 static_cast<unsigned long long>(s.freed_overlaps),
+                 static_cast<double>(s.overlap_bytes) / 1024.0,
+                 static_cast<unsigned long long>(s.clamps),
+                 static_cast<double>(s.clamp_bytes) / 1024.0,
+                 static_cast<size_t>(std::count_if(s.heaps.begin(), s.heaps.end(),
+                                                   [](const HeapSlot& h) { return h.active; })),
+                 static_cast<unsigned long long>(s.builds), static_cast<double>(s.build_ns) / 1e6);
+    std::fprintf(stderr, "SOTC BPE NATIVE by kind (overlapping / checked writes):");
+    for (size_t k = 0; k < KindCount; ++k) {
+        std::fprintf(stderr, " %s %llu/%llu", KindNames[k],
+                     static_cast<unsigned long long>(s.kind_overlaps[k]),
+                     static_cast<unsigned long long>(s.kind_checks[k]));
+    }
+    std::fprintf(stderr, "\n");
+    s.checks = s.check_bytes = s.overlaps = s.freed_overlaps = s.overlap_bytes = 0;
+    s.clamps = s.clamp_bytes = s.builds = s.build_ns = 0;
+    s.kind_checks.fill(0);
+    s.kind_overlaps.fill(0);
+    s.window = now;
+}
+
+} // namespace
+
+int Mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_BPE_FIX");
+        return v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+u64 Check(VAddr addr, u64 size, Kind kind, u64 detail, bool in_place, bool clamp) {
+    const int mode = Mode();
+    if (mode == 0 || size == 0 || !in_place) {
+        return size;
+    }
+    State& s = GetState();
+    std::scoped_lock lock{s.mutex};
+    const auto now = std::chrono::steady_clock::now();
+    if (!s.announced) {
+        s.announced = true;
+        s.window = now;
+        std::fprintf(stderr, "SOTC BPE NATIVE: SOTC_BPE_FIX=%d: in-place GPU writes are checked against the BPE heap "
+                             "metadata%s\n", mode, mode == 1 ? " and written bindings are clamped at it" : " (count only)");
+    }
+    RefreshHeaps(s);
+    thread_local std::vector<BpeHeapGuard::MetaHit> hits;
+    VAddr first_hit = 0;   // the first metadata block the write reaches
+    VAddr first_freed = 0; // ... and the first one that is free now
+    bool any = false;
+    bool freed_any = false;
+    u64 keep = size; // the clean prefix of the write
+    u64 bytes = 0;   // metadata bytes the write covers
+    const VAddr end = addr + size;
+    for (auto& slot : s.heaps) {
+        if (!slot.active || !slot.guard || !slot.guard->IsValid()) {
+            continue;
+        }
+        hits.clear();
+        slot.guard->Hits(addr, end, hits);
+        for (const auto& hit : hits) {
+            if (!any) {
+                first_hit = hit.block;
+            }
+            if (hit.freed && !freed_any) {
+                first_freed = hit.block;
+            }
+            any = true;
+            freed_any |= hit.freed;
+            keep = std::min<u64>(keep, hit.lo > addr ? hit.lo - addr : 0);
+            bytes += std::min<VAddr>(hit.hi, end) - std::max<VAddr>(hit.lo, addr);
+        }
+    }
+    s.checks++;
+    s.check_bytes += size;
+    s.kind_checks[static_cast<size_t>(kind)]++;
+    if (any) {
+        s.overlaps++;
+        s.freed_overlaps += freed_any ? 1 : 0;
+        s.overlap_bytes += bytes;
+        s.kind_overlaps[static_cast<size_t>(kind)]++;
+        Overlap& o = s.ring[s.seq % RingSize];
+        o = Overlap{addr, size, freed_any ? first_freed : first_hit, freed_any, kind, detail, s.seq + 1};
+        s.seq++;
+    }
+    const bool clamping = clamp && mode == 1;
+    if (clamping && keep < size) {
+        s.clamps++;
+        s.clamp_bytes += size - keep;
+    }
+    if (now - s.window >= ReportEvery) {
+        ReportWindow(s, now);
+    }
+    return clamping ? keep : size;
+}
+
+void ReportNearFault(VAddr fault_addr) {
+    if (Mode() == 0) {
+        return;
+    }
+    State& s = GetState();
+    std::unique_lock lock{s.mutex, std::try_to_lock}; // the fault may come from a thread inside Check
+    if (!lock.owns_lock()) {
+        std::fprintf(stderr, "SOTC BPE NATIVE near fault: the overlap state is busy\n");
+        return;
+    }
+    int printed = 0;
+    for (u64 i = 0; i < std::min<u64>(s.seq, RingSize) && printed < 3; ++i) {
+        const Overlap& o = s.ring[(s.seq - 1 - i) % RingSize];
+        const bool near_write = fault_addr + NearBytes >= o.addr && fault_addr < o.addr + o.size + NearBytes;
+        const bool near_block = fault_addr + NearBytes >= o.block && fault_addr < o.block + NearBytes;
+        if (!near_write && !near_block) {
+            continue;
+        }
+        const long long from_block = static_cast<long long>(fault_addr) - static_cast<long long>(o.block);
+        std::fprintf(stderr,
+                     "SOTC BPE NATIVE overlap near the fault: #%llu %s detail 0x%llx wrote [0x%llx, +0x%llx) "
+                     "over the metadata of block 0x%llx (%s); the fault is %+lld bytes from that block\n",
+                     static_cast<unsigned long long>(o.seq), KindNames[static_cast<size_t>(o.kind)],
+                     static_cast<unsigned long long>(o.detail), static_cast<unsigned long long>(o.addr),
+                     static_cast<unsigned long long>(o.size), static_cast<unsigned long long>(o.block),
+                     o.freed ? "freed" : "in use", from_block);
+        printed++;
+    }
+    if (printed == 0) {
+        std::fprintf(stderr,
+                     "SOTC BPE NATIVE no metadata overlap within 1 MiB of the fault (%llu overlaps since start)\n",
+                     static_cast<unsigned long long>(s.seq));
+    }
+}
+
+} // namespace BpeNative
 
 } // namespace VideoCore

@@ -8,6 +8,7 @@
 #include "../pc_ring.h" // sotc: 1a, HostServed (ring 8 imported runs)
 #include "verify.h" // sotc: coverage oracle (SOTC_VERIFY)
 #include "n1verify.h" // sotc: SOTC_VERIFY=n1
+#include "video_core/buffer_cache/bpe_heap_guard.h" // sotc: B2, the last in-place writes over the BPE heap metadata
 
 #include <algorithm>
 #include <atomic>
@@ -382,6 +383,8 @@ void NoteStrayFault(uint64_t addr, bool is_write, uint64_t rip) {
     VerifyCount(is_write ? "stray write fault (no tracker protection)"
                          : "stray read fault (no tracker protection)",
                 addr, 0, rip, is_write ? g_c.stray_write_faults : g_c.stray_read_faults);
+    // sotc (B2): the in-place GPU writes that reached the BPE heap metadata just before this fault
+    VideoCore::BpeNative::ReportNearFault(addr);
 }
 
 void VerifyUnannouncedWrite(uint64_t addr, uint64_t size, uint64_t rip) {

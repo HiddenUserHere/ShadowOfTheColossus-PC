@@ -15,9 +15,12 @@
 
 namespace VideoCore {
 
-/// sotc: SOTC_TSLOT: T#-content caches of the texture binds. Two parts share the switch:
+/// sotc: SOTC_TSLOT: T#-content caches of the texture binds. Three parts share the switch:
 ///  - the texture identity skip (classic and bindless): a plain sampled T# whose SOTC_GEN_TEX memo
 ///    entry holds skips its ImageDesc in BindTexturesFull (TextureCache::ProbeTextureIdentity);
+///    mip-tail candidates are not probed (they are never memoized);
+///  - the second pass of a texture bind (TextureCache::FindTexture, update=false): UpdateImage is
+///    skipped where it is a no-op;
 ///  - the bindless T# slot cache (needs SOTC_N5_BINDLESS): a bindless bind whose T# resolved to the
 ///    same live image, view info and heap slot takes that slot (Find / Store).
 /// Read once. 0 off (the default), 1 on, 2 verify: the old path runs as well, its answer is used,
@@ -61,14 +64,35 @@ public:
     /// Counts a verify-mode comparison of a bindless hit with the old resolution.
     void NoteVerify(bool same);
 
-    /// Counts a texture identity skip probe (hit or not), and a verify-mode comparison of one.
-    static void NoteTexSkip(bool hit);
+    /// Why ProbeTextureIdentity did not answer (one counter each; the epoch one also counts whether
+    /// the entry's T# address generation still held, i.e. the answer an address-scoped epoch gives).
+    enum class TexMiss : u8 { Entry, Key, Exact, Epoch, Image, Sum, Count };
+    /// Why a bind is not a plain sampled bind (no probe): a mip-tail candidate (never memoized), a
+    /// multi-binding array, a written image, a mip fallback, or a texture block / bind cache recording.
+    enum class TexNotPlain : u8 { Tail, Multi, Written, MipFallback, Recording, Count };
+
+    /// Texture identity probe counters. A hit or a miss per probe, and the not-plain binds.
+    static void NoteTexHit();
+    static void NoteTexMiss(TexMiss why, bool epoch_addr_same = false);
+    static void NoteTexNotPlain(TexNotPlain why);
+    /// Mode 2: the mip-tail predicate against the built ImageDesc (`same`), and the epoch-invalidated
+    /// entry compared with the full answer (`same`: the address-scoped epoch would have answered right).
+    static void NoteTexTail(bool same);
+    static void NoteTexHypEpoch(bool same);
+    /// Second pass of a bind (FindTexture with update false): UpdateImage skippable or not, and in
+    /// mode 2 the verify of a skip (the state is the same after the old update, same view).
+    static void NoteTexSecond(bool skippable);
+    static void NoteTexSecondVerify(bool same);
+    /// Counts a verify-mode comparison of a texture identity probe hit with the full path.
     static void NoteTexVerify(bool same);
 
-    /// One line for the 5 s report (counters are reset on read):
-    /// "SOTC TSLOT tex lookups N hits N verify N mismatch N slot lookups N hits N miss none N image N
-    /// view N slot N stores N evict N verify N mismatch N ns/s N". The ns/s value is estimated from
-    /// the sampled calls. Returns the length written, 0 when Mode() is 0. Reads atomics only.
+    /// One line for the 5 s report (counters are reset on read). Tex part: "SOTC TSLOT tex lookups N
+    /// hits N verify N mismatch N | miss entry N key N exact N epoch N (addr N) image N sum N | not
+    /// plain tail N multi N written N mip N rec N | tail N/N | hyp N/N | second skip N full N
+    /// verify N/N", N/N = checks/mismatches. The slot part (bindless) follows when SOTC_N5_BINDLESS is
+    /// on: " | slot lookups N hits N miss none N image N view N slot N stores N evict N verify N
+    /// mismatch N ns/s N". The ns/s value is estimated from the sampled calls. Returns the length
+    /// written, 0 when Mode() is 0. Reads atomics only.
     [[nodiscard]] static u32 Report(char* out, u32 size, double seconds);
 
 private:

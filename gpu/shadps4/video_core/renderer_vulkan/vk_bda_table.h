@@ -48,6 +48,28 @@ u32 BdaN5BuffersActive(const Instance& instance);
 /// (dropped = true, mode 1) or would have been dropped (dropped = false, mode 2).
 void BdaNoteDescriptorSkip(bool dropped);
 
+/// sotc: SOTC_BDA_DIRECT, read once: 0 = off (default), 1 = a block-table slot whose guest range lies in an
+/// imported ring-8 run gets its device address by arithmetic (run address + offset) and BindBuffers skips
+/// BufferCache::ObtainBuffer for it, 2 = both answers are computed and compared (BdaDirect::Mismatch), and the
+/// ObtainBuffer answer is used. Only meaningful with SOTC_N5_BDA_BUFFERS and SOTC_PC_RING=8 (BindBuffers).
+u32 BdaDirectMode();
+
+/// sotc: SOTC_BDA_DIRECT events, one per block-table slot of a stage that BindBuffers decided on.
+enum class BdaDirect : u8 {
+    Bind,        ///< mode 1: bound by arithmetic
+    Verified,    ///< mode 2: the arithmetic answer was compared with ObtainBuffer's
+    Mismatch,    ///< mode 2: the two answers differ (the ObtainBuffer answer is used)
+    FbArena,     ///< fallback: the range is in no arena block (normal path)
+    FbStraddle,  ///< fallback: the range crosses an arena block edge
+    FbNotServed, ///< fallback: no imported run holds the range
+    FbNoAddress, ///< fallback: the run was imported without a device address
+    FbMaintain,  ///< fallback: the ring maintenance has not run in this submit epoch yet
+    FbNoBuffer,  ///< fallback: the run's buffer is not known yet (its first bind goes through ObtainBuffer)
+    FbGate,      ///< fallback: a switch with side effects in ObtainBuffer's prelude is on
+    Count
+};
+void BdaNoteDirect(BdaDirect event);
+
 class BdaTable {
 public:
     /// Starts the table of one stage with `num_slots` slots. Every slot is a null block (size 0)
@@ -67,10 +89,10 @@ public:
     /// the descriptor's buffer plus the block offset). Null slots are not compared.
     void CheckSlot(u32 slot, u64 expected_address);
 
-    /// Dirty check. Lookup: true when the words equal the ones last stored under `key` and that
-    /// copy was made in the same stream-buffer generation (so its bytes are still in place); then
-    /// `offset` is the copy's offset and the upload can be skipped. Store: remembers the words
-    /// just uploaded at `offset`.
+    /// Dirty check. Lookup: true when the words equal those of one of the last copies stored under `key`
+    /// (kCopiesPerStage per key with SOTC_BDA_DIRECT, one without: see the .cpp) and that copy was made in
+    /// the same stream-buffer generation (so its bytes are still in place); then `offset` is the copy's
+    /// offset and the upload can be skipped. Store: remembers the words just uploaded at `offset`.
     bool Lookup(u64 key, u64 generation, u64* offset);
     void Store(u64 key, u64 generation, u64 offset);
 
@@ -93,10 +115,15 @@ private:
         u64 generation{};
         u64 offset{};
     };
+    /// The copies kept for one stage key: a ring of kCopiesPerStage entries, `next` the one to replace.
+    struct StageCopies {
+        std::vector<Uploaded> entries;
+        size_t next{};
+    };
 
     std::vector<u32> words;
     u64 null_address{};
-    std::unordered_map<u64, Uploaded> uploaded; ///< by stage key (pipeline hash)
+    std::unordered_map<u64, StageCopies> uploaded; ///< by stage key (pipeline hash)
 };
 
 /// Counters since the last call (they reset). One line for a periodic report, for example:
@@ -108,6 +135,11 @@ private:
 /// the descriptor buffer's address plus the offset, `reuse` uploads skipped by the dirty check,
 /// `desc_skip` (SOTC_N5_BDA_BUFFERS=1) descriptor writes dropped, `desc_verify` (=2) writes that
 /// mode 1 would have dropped. Per frame: divide by the frame count of the same report window.
+/// With SOTC_BDA_DIRECT on, two more lines follow (each ends with a newline): "SOTC BDA DIRECT bind ..
+/// verified .. mismatch .. fb arena .. straddle .. notserved .. noaddr .. maintain .. nobuf .. gate .."
+/// (BdaDirect) and "SOTC BDA TABLE copies .. copied .. B changed .. miss key .. gen .. words ..". `copied`
+/// is the bytes the table uploads, `changed` the slots that differ from the stage's last copy on each
+/// copied table. out must hold 768 bytes (three lines); without the switch it is the one line above.
 void BdaTableReport(char* out, u32 out_size);
 
 } // namespace Vulkan

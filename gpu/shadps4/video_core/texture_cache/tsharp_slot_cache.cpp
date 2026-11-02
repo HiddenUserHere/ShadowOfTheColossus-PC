@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -23,11 +25,25 @@ static_assert((TsharpSlotCache::kSampleEvery & (TsharpSlotCache::kSampleEvery - 
 static std::unique_ptr<TsharpSlotCache> g_owner;
 static std::atomic<TsharpSlotCache*> g_cache{nullptr};
 
-// sotc: texture identity skip counters (TextureCache::ProbeTextureIdentity), reset by Report.
+// sotc: texture identity counters (TextureCache::ProbeTextureIdentity and the bind paths of
+// BindTexturesFull), reset by Report.
 static std::atomic<u64> tex_lookups{};
 static std::atomic<u64> tex_hits{};
 static std::atomic<u64> tex_verifies{};
 static std::atomic<u64> tex_mismatches{};
+constexpr size_t kTexMissCount = static_cast<size_t>(TsharpSlotCache::TexMiss::Count);
+constexpr size_t kTexNotPlainCount = static_cast<size_t>(TsharpSlotCache::TexNotPlain::Count);
+static std::array<std::atomic<u64>, kTexMissCount> tex_miss{};
+static std::atomic<u64> tex_epoch_addr_same{};
+static std::array<std::atomic<u64>, kTexNotPlainCount> tex_not_plain{};
+static std::atomic<u64> tex_tail_checks{};
+static std::atomic<u64> tex_tail_mismatch{};
+static std::atomic<u64> tex_hyp_checks{};
+static std::atomic<u64> tex_hyp_mismatch{};
+static std::atomic<u64> tex_second_skip{};
+static std::atomic<u64> tex_second_full{};
+static std::atomic<u64> tex_second_verify{};
+static std::atomic<u64> tex_second_mismatch{};
 
 int TsharpSlotCache::Mode() {
     static const int mode = [] {
@@ -195,10 +211,45 @@ void TsharpSlotCache::NoteVerify(bool same) {
     }
 }
 
-void TsharpSlotCache::NoteTexSkip(bool hit) {
+void TsharpSlotCache::NoteTexHit() {
     tex_lookups.fetch_add(1, std::memory_order_relaxed);
-    if (hit) {
-        tex_hits.fetch_add(1, std::memory_order_relaxed);
+    tex_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TsharpSlotCache::NoteTexMiss(TexMiss why, bool epoch_addr_same) {
+    tex_lookups.fetch_add(1, std::memory_order_relaxed);
+    tex_miss[static_cast<size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+    if (why == TexMiss::Epoch && epoch_addr_same) {
+        tex_epoch_addr_same.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void TsharpSlotCache::NoteTexNotPlain(TexNotPlain why) {
+    tex_not_plain[static_cast<size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void TsharpSlotCache::NoteTexTail(bool same) {
+    tex_tail_checks.fetch_add(1, std::memory_order_relaxed);
+    if (!same) {
+        tex_tail_mismatch.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void TsharpSlotCache::NoteTexHypEpoch(bool same) {
+    tex_hyp_checks.fetch_add(1, std::memory_order_relaxed);
+    if (!same) {
+        tex_hyp_mismatch.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void TsharpSlotCache::NoteTexSecond(bool skippable) {
+    (skippable ? tex_second_skip : tex_second_full).fetch_add(1, std::memory_order_relaxed);
+}
+
+void TsharpSlotCache::NoteTexSecondVerify(bool same) {
+    tex_second_verify.fetch_add(1, std::memory_order_relaxed);
+    if (!same) {
+        tex_second_mismatch.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -220,6 +271,23 @@ u32 TsharpSlotCache::Report(char* out, u32 size, double seconds) {
     const u64 th = take(tex_hits);
     const u64 tv = take(tex_verifies);
     const u64 tm = take(tex_mismatches);
+    std::array<u64, kTexMissCount> miss_n{};
+    for (size_t i = 0; i < kTexMissCount; ++i) {
+        miss_n[i] = take(tex_miss[i]);
+    }
+    const u64 epoch_addr_n = take(tex_epoch_addr_same);
+    std::array<u64, kTexNotPlainCount> np_n{};
+    for (size_t i = 0; i < kTexNotPlainCount; ++i) {
+        np_n[i] = take(tex_not_plain[i]);
+    }
+    const u64 tail_n = take(tex_tail_checks);
+    const u64 tail_bad = take(tex_tail_mismatch);
+    const u64 hyp_n = take(tex_hyp_checks);
+    const u64 hyp_bad = take(tex_hyp_mismatch);
+    const u64 second_skip_n = take(tex_second_skip);
+    const u64 second_full_n = take(tex_second_full);
+    const u64 second_verify_n = take(tex_second_verify);
+    const u64 second_bad = take(tex_second_mismatch);
     TsharpSlotCache* cache = g_cache.load(std::memory_order_acquire);
     u64 lookups_n = 0, hits_n = 0, none_n = 0, image_n = 0, view_n = 0, slot_n = 0, stores_n = 0;
     u64 evict_n = 0, verify_n = 0, mismatch_n = 0, ns_sampled = 0;
@@ -239,20 +307,34 @@ u32 TsharpSlotCache::Report(char* out, u32 size, double seconds) {
     // One call in kSampleEvery is timed: the sum is scaled up to every call.
     const double ns_per_s = seconds > 0.0 ? static_cast<double>(ns_sampled) * kSampleEvery / seconds
                                           : 0.0;
+    const auto ull = [](u64 v) { return static_cast<unsigned long long>(v); };
     const int n = std::snprintf(
         out, size,
-        "SOTC TSLOT tex lookups %llu hits %llu verify %llu mismatch %llu slot lookups %llu hits %llu "
-        "miss none %llu image %llu view %llu slot %llu stores %llu evict %llu verify %llu mismatch "
-        "%llu ns/s %.0f",
-        static_cast<unsigned long long>(tl), static_cast<unsigned long long>(th),
-        static_cast<unsigned long long>(tv), static_cast<unsigned long long>(tm),
-        static_cast<unsigned long long>(lookups_n), static_cast<unsigned long long>(hits_n),
-        static_cast<unsigned long long>(none_n), static_cast<unsigned long long>(image_n),
-        static_cast<unsigned long long>(view_n), static_cast<unsigned long long>(slot_n),
-        static_cast<unsigned long long>(stores_n), static_cast<unsigned long long>(evict_n),
-        static_cast<unsigned long long>(verify_n), static_cast<unsigned long long>(mismatch_n),
-        ns_per_s);
-    return n < 0 ? 0 : static_cast<u32>(n);
+        "SOTC TSLOT tex lookups %llu hits %llu verify %llu mismatch %llu | miss entry %llu key %llu "
+        "exact %llu epoch %llu (addr %llu) image %llu sum %llu | not plain tail %llu multi %llu "
+        "written %llu mip %llu rec %llu | tail %llu/%llu | hyp %llu/%llu | second skip %llu full "
+        "%llu verify %llu/%llu",
+        ull(tl), ull(th), ull(tv), ull(tm), ull(miss_n[0]), ull(miss_n[1]), ull(miss_n[2]),
+        ull(miss_n[3]), ull(epoch_addr_n), ull(miss_n[4]), ull(miss_n[5]), ull(np_n[0]),
+        ull(np_n[1]), ull(np_n[2]), ull(np_n[3]), ull(np_n[4]), ull(tail_n), ull(tail_bad),
+        ull(hyp_n), ull(hyp_bad), ull(second_skip_n), ull(second_full_n), ull(second_verify_n),
+        ull(second_bad));
+    if (n < 0) {
+        return 0;
+    }
+    u32 len = std::min(static_cast<u32>(n), size - 1);
+    if (BindlessImagesMode() != 0) {
+        const int m = std::snprintf(
+            out + len, size - len,
+            " | slot lookups %llu hits %llu miss none %llu image %llu view %llu slot %llu stores %llu "
+            "evict %llu verify %llu mismatch %llu ns/s %.0f",
+            ull(lookups_n), ull(hits_n), ull(none_n), ull(image_n), ull(view_n), ull(slot_n),
+            ull(stores_n), ull(evict_n), ull(verify_n), ull(mismatch_n), ns_per_s);
+        if (m > 0) {
+            len = std::min(len + static_cast<u32>(m), size - 1);
+        }
+    }
+    return len;
 }
 
 } // namespace VideoCore

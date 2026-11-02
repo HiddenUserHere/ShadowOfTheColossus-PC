@@ -56,6 +56,19 @@ public:
         return !CollectSpans(addr, end).empty();
     }
 
+    /// sotc (B2): one piece of allocator metadata overlapping a write: [lo, hi) is the header of `block`,
+    /// and for a free block also its tree links. `freed` says whether the block is free now (live header).
+    struct MetaHit {
+        VAddr lo;
+        VAddr hi;
+        VAddr block;
+        bool freed;
+    };
+
+    /// sotc (B2): the metadata overlapping [addr, end), sorted by lo. Tree links of a block in use are user
+    /// data, so only its header is reported for it. Headers and the free list are read live.
+    void Hits(VAddr addr, VAddr end, std::vector<MetaHit>& hits);
+
     /// The in-use block whose user area holds `addr` (its header address and the next block's), found by
     /// following the physical chain from the closest free block below it
     bool FindUsedBlock(VAddr addr, VAddr& block, VAddr& next, int* why = nullptr) const;
@@ -125,5 +138,43 @@ private:
     std::vector<std::pair<VAddr, VAddr>> blocks; // sorted [header, next header)
     VAddr fence = 0;
 };
+
+/**
+ * sotc (B2): GPU writes into guest memory in native mode (SOTC_NATIVE=1, ring 8). Such writes land in
+ * the guest's own bytes, with no readback and no tracker, so BpeHeapGuard (which runs on readbacks only)
+ * never sees them. This module checks every in-place write against the allocator metadata of the BPE
+ * heaps and counts the overlaps (per 5 s line and the last ones, for the fault handler). SOTC_BPE_FIX:
+ *   0 (default): nothing; 2: count only; 1: count, and clamp the written bindings (Check with clamp) at
+ *   their first metadata byte, so a stale descriptor cannot write the heap's headers and free links.
+ */
+namespace BpeNative {
+
+/// What wrote the range (the counters and the fault report name it)
+enum class Kind : u8 {
+    Bind,          // a written V# bound in place (Rasterizer::BindBuffers)
+    GpuFill,       // Rasterizer::FillBuffer, the range in the imported arena (vkCmdFillBuffer)
+    GpuCopy,       // Rasterizer::CopyBuffer, destination in the imported arena
+    CpuFill,       // Rasterizer::FillBuffer, host std::fill into guest memory
+    CpuCopy,       // Rasterizer::CopyBuffer, host memcpy into guest memory
+    HleCopy,       // ExecuteShaderHLE copy shader: destination pieces
+    HleTable,      // ExecuteShaderHLE replicate fill: host writes of the table
+    ImageDownload, // TextureCache::WriteBackSkippingStacks: a GPU-written image
+    CpWrite,       // Liverpool: fence values and end-of-pipe labels
+    Count
+};
+
+/// SOTC_BPE_FIX as read once: 0, 1 or 2 (any other value is 0)
+int Mode();
+
+/// Checks the in-place write [addr, addr + size) of kind `kind` (detail: e.g. the shader hash) against the
+/// allocator metadata of the BPE heaps. Returns the size to use: with clamp and SOTC_BPE_FIX=1, the part
+/// before the first metadata byte (0 when it starts in metadata); otherwise size. `in_place` is false for
+/// writes that land in the device arena and reach guest memory later through a readback (guarded there).
+u64 Check(VAddr addr, u64 size, Kind kind, u64 detail, bool in_place, bool clamp = false);
+
+/// Called by the native stray-fault path: prints the most recent metadata overlap within 1 MiB of the fault
+void ReportNearFault(VAddr fault_addr);
+
+} // namespace BpeNative
 
 } // namespace VideoCore

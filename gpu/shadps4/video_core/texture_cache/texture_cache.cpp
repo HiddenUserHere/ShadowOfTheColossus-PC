@@ -1584,12 +1584,18 @@ TextureCache::TexBind TextureCache::FindTextureIdentity(const TexIdentityKey& ke
 
     TexIdMemo memo{};
     int code = 1;
+    TexIdMemo hyp_memo{}; // sotc: SOTC_TSLOT=2 measurement, see the store below
+    bool hyp_candidate = false;
     {
         std::unique_lock lock{mutex, std::defer_lock};
         LockCounted(lock);
         code = check(slot);
         if (code == 0) {
             memo = slot; // a copy: the full path below may store over this entry
+        } else if (code == 2 && TsharpSlotCache::Mode() == 2 &&
+                   slot.addr_gen == MemoGeneration(desc.info.guest_address)) {
+            hyp_memo = slot; // sotc: the epoch moved, the T# address generation did not
+            hyp_candidate = true;
         }
     }
     if (code == 0 && mode == 1) {
@@ -1634,6 +1640,14 @@ TextureCache::TexBind TextureCache::FindTextureIdentity(const TexIdentityKey& ke
         const Image& image = slot_images[image_id];
         const VAddr begin = image.info.guest_address;
         const u64 size = image.info.guest_size;
+        // sotc: SOTC_TSLOT=2, measured only: the entry the epoch invalidated for this bind (hyp_memo,
+        // taken at the check, before this bind's own registrations) against this bind's answer. Same
+        // answer = an address-scoped epoch would have served the bind.
+        if (hyp_candidate) {
+            TsharpSlotCache::NoteTexHypEpoch(hyp_memo.image_id == image_id &&
+                                             hyp_memo.image_uid == image.image_uid &&
+                                             hyp_memo.view_info == desc.view_info);
+        }
         if (False(image.flags & ImageFlagBits::Registered) ||
             True(image.flags & ImageFlagBits::Dirty) || image.sotc_warm_pending ||
             image.info.sotc_first_mip || image.track_addr != begin ||
@@ -1649,6 +1663,7 @@ TextureCache::TexBind TextureCache::FindTextureIdentity(const TexIdentityKey& ke
             slot.view_info = desc.view_info;
             slot.epoch = tex_epoch;
             slot.sum = GenSumImage(image);
+            slot.addr_gen = MemoGeneration(desc.info.guest_address);
             tid_stores.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -1664,12 +1679,25 @@ bool TextureCache::ProbeTextureIdentity(const TexIdentityKey& key, bool want_vie
     std::unique_lock lock{mutex, std::defer_lock};
     LockCounted(lock);
     // The checks of FindTextureIdentity's check(), with exact_fmt false and no pre view info.
-    if (!memo.valid || !(memo.key == key) || memo.exact_fmt) {
-        TsharpSlotCache::NoteTexSkip(false);
+    if (!memo.valid) {
+        TsharpSlotCache::NoteTexMiss(TsharpSlotCache::TexMiss::Entry);
+        return false;
+    }
+    if (!(memo.key == key)) { // another T# hashed to this entry (direct-mapped)
+        TsharpSlotCache::NoteTexMiss(TsharpSlotCache::TexMiss::Key);
+        return false;
+    }
+    if (memo.exact_fmt) {
+        TsharpSlotCache::NoteTexMiss(TsharpSlotCache::TexMiss::Exact);
         return false;
     }
     if (memo.epoch != tex_epoch) {
-        TsharpSlotCache::NoteTexSkip(false);
+        // sotc: counted only: whether the entry's T# address generation still holds (what an
+        // address-scoped epoch would check). The answer is not used from it.
+        AmdGpu::Image sharp{};
+        std::memcpy(&sharp, key.words.data(), sizeof sharp);
+        TsharpSlotCache::NoteTexMiss(TsharpSlotCache::TexMiss::Epoch,
+                                     memo.addr_gen == MemoGeneration(sharp.Address()));
         return false;
     }
     const Image& state = slot_images[memo.image_id];
@@ -1678,8 +1706,12 @@ bool TextureCache::ProbeTextureIdentity(const TexIdentityKey& key, bool want_vie
     if (state.image_uid != memo.image_uid || False(state.flags & ImageFlagBits::Registered) ||
         True(state.flags & ImageFlagBits::Dirty) || state.sotc_warm_pending ||
         state.info.sotc_first_mip || state.track_addr != begin ||
-        state.track_addr_end != begin + size || GenSumImage(state) != memo.sum) {
-        TsharpSlotCache::NoteTexSkip(false);
+        state.track_addr_end != begin + size) {
+        TsharpSlotCache::NoteTexMiss(TsharpSlotCache::TexMiss::Image);
+        return false;
+    }
+    if (GenSumImage(state) != memo.sum) {
+        TsharpSlotCache::NoteTexMiss(TsharpSlotCache::TexMiss::Sum);
         return false;
     }
     // The memo hit's side effects, as apply() in FindTextureIdentity does them.
@@ -1700,7 +1732,7 @@ bool TextureCache::ProbeTextureIdentity(const TexIdentityKey& key, bool want_vie
     if (want_view) {
         out.view = *image.FindView(out.view_info).image_view;
     }
-    TsharpSlotCache::NoteTexSkip(true);
+    TsharpSlotCache::NoteTexHit();
     return true;
 }
 
@@ -1945,7 +1977,22 @@ void TextureCache::PrefetchTexture(const AmdGpu::Image& tsharp,
     }
 }
 
-ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+// sotc: SOTC_TSLOT second pass. UpdateImage does nothing to an image that is not Dirty and whose guest
+// range is tracked as it is: TrackImage returns at once (unregistered, or the track range equal) and
+// RefreshImage returns after its batch flush. What is left (the LRU touch and the bind evidence) the
+// second pass makes itself, in UpdateImage's order.
+static bool TexUpdateIsNoOp(const Image& image) {
+    if (True(image.flags & ImageFlagBits::Dirty)) {
+        return false;
+    }
+    if (False(image.flags & ImageFlagBits::Registered)) {
+        return true;
+    }
+    const VAddr begin = image.info.guest_address;
+    return image.track_addr == begin && image.track_addr_end == begin + image.info.guest_size;
+}
+
+ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, bool update) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         MarkWritten(image);
@@ -1955,7 +2002,36 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
             download_images.emplace(image_id);
         }
     }
-    UpdateImage(image_id);
+    if (update) {
+        UpdateImage(image_id);
+    } else {
+        // sotc: the second pass of a texture bind (SOTC_TSLOT). Mode 1 skips UpdateImage where it is a
+        // no-op. Mode 2 runs it and checks that the skip's assumptions held: same state and track
+        // range, same view. The old answer is used either way.
+        const int mode = TsharpSlotCache::Mode();
+        if (mode == 0 || !TexUpdateIsNoOp(image)) {
+            TsharpSlotCache::NoteTexSecond(false);
+            UpdateImage(image_id);
+        } else if (mode == 1) {
+            TsharpSlotCache::NoteTexSecond(true);
+            std::unique_lock lk{mutex, std::defer_lock};
+            LockCounted(lk);
+            TouchImage(image);
+            FlushTexProtect(); // as RefreshImage does first
+            NoteBoundImage(image);
+        } else {
+            TsharpSlotCache::NoteTexSecond(true);
+            const ImageFlagBits flags_before = image.flags;
+            const VAddr track_before = image.track_addr;
+            const VAddr track_end_before = image.track_addr_end;
+            const ImageView* view_before = &image.FindView(desc.view_info);
+            UpdateImage(image_id);
+            const bool same = image.flags == flags_before && image.track_addr == track_before &&
+                              image.track_addr_end == track_end_before &&
+                              &image.FindView(desc.view_info) == view_before;
+            TsharpSlotCache::NoteTexSecondVerify(same);
+        }
+    }
     return image.FindView(desc.view_info);
 }
 

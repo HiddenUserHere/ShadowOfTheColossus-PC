@@ -14,6 +14,8 @@
 #include <vector>
 #include "core/memory.h"
 #include "shader_recompiler/info.h"
+#include "../../../sotc/pc_ring.h" // sotc: SOTC_BPE_FIX (HostServed)
+#include "video_core/buffer_cache/bpe_heap_guard.h" // sotc: SOTC_BPE_FIX
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_shadow_cull.h" // sotc: SOTC_HLE_SHADOW_CULL
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -302,6 +304,11 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         // Execute buffer copies.
         LOG_TRACE(Render_Vulkan, "HLE buffer copy: src_size = {}, dst_size = {}",
                   src_offset_max - src_offset_min, dst_offset_max - dst_offset_min);
+        for (u32 i = batch_start; i < batch_end; ++i) { // sotc: SOTC_BPE_FIX
+            const VAddr piece = dst_buf_sharp.base_address + copies[i].dstOffset;
+            VideoCore::BpeNative::Check(piece, copies[i].size, VideoCore::BpeNative::Kind::HleCopy, 0,
+                                        SotcPcRing::HostServed(piece, copies[i].size));
+        }
         runtime.CopyBuffer(src_buf, dst_buf, vk_copies);
         batch_start = batch_end;
     }

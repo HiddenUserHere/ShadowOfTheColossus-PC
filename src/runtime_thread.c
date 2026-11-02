@@ -175,6 +175,16 @@ void runtime_thread_attach_host(const char *name) {
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
+#ifdef _WIN32
+    /* sotc: the main thread runs the game's main loop and its heap allocator (eboot+0x49030), so a
+     * live view split must stop it too: without an OS handle runtime_thread_suspend_others skipped
+     * it, and its heap reads faulted on the placeholder of a view a job thread was splitting
+     * (docs/re-stutters/native/BPE-CRASH.md). */
+    pthread_mutex_lock(&lock);
+    t->os_handle=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,
+                            GetCurrentThreadId());
+    pthread_mutex_unlock(&lock);
+#endif
 }
 static GuestThread *find_thread(void *handle) {
     GuestThread *found=NULL;

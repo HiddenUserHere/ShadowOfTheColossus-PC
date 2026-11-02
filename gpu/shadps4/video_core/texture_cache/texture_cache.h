@@ -563,7 +563,9 @@ public:
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
     /// Retrieves an image view with the properties of the specified image id.
-    [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
+    /// sotc: update=false (the second pass of a texture bind, SOTC_TSLOT) skips UpdateImage when it
+    /// cannot change the image (TexUpdateIsNoOp); the touch and the bind evidence still run.
+    [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc, bool update = true);
 
     /// Retrieves the render target with specified properties
     /// sotc: update=false (BeginRendering, SOTC_RT_FAST) skips the second UpdateImage when the
@@ -624,6 +626,12 @@ public:
         TrackImage(image_id);
         TouchImage(image);
         RefreshImage(image);
+        NoteBoundImage(image);
+    }
+
+    /// sotc: the bind evidence UpdateImage records for a bound image (the diagnostics and the memory
+    /// class / placement notes). Caller holds `mutex`.
+    void NoteBoundImage(const Image& image) {
         if (SotcN1Verify::On() && SotcStats::t_draw_thread) { // sotc: SOTC_VERIFY=n1: the GPU binds this image
             SotcN1Verify::NoteBind(image.info.guest_address, image.info.guest_size, true);
         }
@@ -1039,6 +1047,8 @@ private:
         ImageViewInfo view_info{};     ///< desc.view_info after FindImage: the view it resolves to
         u64 epoch{};               ///< tex_epoch when stored
         u64 sum{};                 ///< SotcGen::Sum of the image's guest range when stored
+        u64 addr_gen{};            ///< MemoGeneration of the T#'s address when stored (SOTC_TSLOT=2
+                                   ///< measures an address-scoped epoch with it; no effect on answers)
     };
     static constexpr size_t NumTexIdMemos = 4096;
     std::unique_ptr<std::array<TexIdMemo, NumTexIdMemos>> tex_id_memos;
