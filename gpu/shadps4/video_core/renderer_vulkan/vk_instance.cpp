@@ -545,6 +545,44 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         }
     }
 
+    // sotc: SOTC_N5_DESCBUF=1|2 (vk_descriptor_buffer.h) probes the same extension on its own flag,
+    // so SOTC_DESC_BUFFER keeps its meaning. Mode 2 uses the encoder only (vkGetDescriptorEXT).
+    if (DescriptorBufferN5Mode() != 0) {
+        const bool listed =
+            std::find(available_extensions.begin(), available_extensions.end(),
+                      std::string{VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME}) !=
+            available_extensions.end();
+        const auto db_chain =
+            physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                         vk::PhysicalDeviceDescriptorBufferFeaturesEXT>();
+        const bool buffer_device_address =
+            feature_chain.get<vk::PhysicalDeviceVulkan12Features>().bufferDeviceAddress;
+        if (listed && db_chain.get<vk::PhysicalDeviceDescriptorBufferFeaturesEXT>().descriptorBuffer &&
+            buffer_device_address) {
+            const auto props_chain = physical_device.getProperties2<
+                vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDescriptorBufferPropertiesEXT>();
+            descriptor_buffer_props =
+                props_chain.get<vk::PhysicalDeviceDescriptorBufferPropertiesEXT>();
+            // Same limits as the legacy path: the ring is one buffer of DescriptorBufferBytes.
+            const bool fits =
+                descriptor_buffer_props.maxResourceDescriptorBufferRange >= DescriptorBufferBytes &&
+                descriptor_buffer_props.maxSamplerDescriptorBufferRange >= DescriptorBufferBytes &&
+                descriptor_buffer_props.allowSamplerImageViewPostSubmitCreation;
+            descriptor_buffer_n5 = fits && add_extension(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+        }
+        if (descriptor_buffer_n5) {
+            LOG_INFO(Render_Vulkan,
+                     "Descriptor buffers probed for SOTC_N5_DESCBUF={}: offset alignment {}, "
+                     "storage buffer descriptor {} bytes",
+                     DescriptorBufferN5Mode(),
+                     descriptor_buffer_props.descriptorBufferOffsetAlignment,
+                     descriptor_buffer_props.storageBufferDescriptorSize);
+        } else {
+            LOG_WARNING(Render_Vulkan, "SOTC_N5_DESCBUF set but VK_EXT_descriptor_buffer is not "
+                                       "usable here, keeping descriptor sets");
+        }
+    }
+
     // sotc: VK_EXT_host_image_copy behind SOTC_HOST_IMAGE_COPY=1 (texture_cache.cpp RefreshImage,
     // vk_runtime.cpp TryHostImageCopy). It needs the feature bit, and GENERAL must be a layout
     // the host can transition to and copy into; otherwise the staging uploads stay in use.
@@ -1079,7 +1117,7 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
-    if (!descriptor_buffer) {
+    if (!descriptor_buffer && !descriptor_buffer_n5) {
         device_chain.unlink<vk::PhysicalDeviceDescriptorBufferFeaturesEXT>();
     }
     if (!host_image_copy) {

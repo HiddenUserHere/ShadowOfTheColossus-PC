@@ -50,6 +50,21 @@ struct StateKey {
     bool operator==(const StateKey& other) const noexcept = default;
 };
 
+/// sotc: SOTC_FUTEX_WAIT counters of the recorder waits (vk_recorder.cpp: consumer idle wait, Sync,
+/// PassSecondary::WaitJob). A wait counts once in "waits"; it ends in the spin ("spins") or in
+/// WaitOnAddress ("sleeps"). "safety_met": timed-out sleeps whose condition already held. Read and
+/// reset by the 5 s report (driver.cpp).
+struct SotcFutexRecCounters {
+    std::atomic<u64> waits{};
+    std::atomic<u64> spins{};
+    std::atomic<u64> sleeps{};
+    std::atomic<u64> sleep_ns{};
+    std::atomic<u64> sleep_max_ns{};
+    std::atomic<u64> wakes{};
+    std::atomic<u64> safety_met{};
+};
+inline SotcFutexRecCounters g_futex_rec;
+
 /// With cp_record_thread, record Vulkan commands and submit them on a separate thread from the
 /// command processor
 /// The scheduler gives the producer fake command buffer handles, and dispatcher handlers copy their

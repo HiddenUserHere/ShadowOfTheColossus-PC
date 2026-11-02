@@ -174,7 +174,8 @@ Pipeline::~Pipeline() = default;
 
 void Pipeline::QueryDescriptorBufferLayout(
     std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-    if (!instance.IsDescriptorBufferEnabled()) {
+    if (!instance.IsDescriptorBufferEnabled() &&
+        !DescriptorBufferN5Layout(instance, desc_heap, stage_sets, uses_bindless_samplers)) {
         return;
     }
     const vk::Device device = instance.GetDevice();
@@ -291,6 +292,146 @@ void Pipeline::BindDescriptorBuffer(const DescriptorWrites& set_writes,
                                          &alloc.offset);
 }
 
+namespace {
+
+/// sotc: the most layout slots the N5 memo keeps. Past it the memo starts over (the ring keeps
+/// the bytes of the regions in use until their ticks complete).
+constexpr size_t MaxN5Slots = 8192;
+
+/// sotc: the source key of a set: everything its bytes are encoded from. It holds the layout handle,
+/// the layout size and binding offsets, and per write its header and the handles of every element's
+/// info. Equal keys in one session give equal bytes.
+void BuildSourceKey(const std::vector<vk::WriteDescriptorSet>& writes, vk::PipelineLayout layout,
+                    vk::DeviceSize size, std::span<const vk::DeviceSize> offsets,
+                    std::vector<u64>& key) {
+    key.clear();
+    key.push_back(std::bit_cast<u64>(layout));
+    key.push_back(size);
+    key.push_back(offsets.size());
+    key.insert(key.end(), offsets.begin(), offsets.end());
+    for (const auto& write : writes) {
+        key.push_back(u64{write.dstBinding} | (u64{write.dstArrayElement} << 32));
+        key.push_back(u64{write.descriptorCount} |
+                      (static_cast<u64>(write.descriptorType) << 32));
+        for (u32 i = 0; i < write.descriptorCount; ++i) {
+            if (write.descriptorType == vk::DescriptorType::eStorageBuffer) {
+                const auto& info = write.pBufferInfo[i];
+                key.push_back(std::bit_cast<u64>(info.buffer));
+                key.push_back(info.offset);
+                key.push_back(info.range);
+            } else {
+                const auto& info = write.pImageInfo[i];
+                key.push_back(std::bit_cast<u64>(info.sampler));
+                key.push_back(std::bit_cast<u64>(info.imageView));
+                key.push_back(static_cast<u64>(info.imageLayout));
+            }
+        }
+    }
+}
+
+/// sotc: SOTC_N5_DESCBUF=1. Writes the set into the ring at its binding offsets and binds it, or
+/// reuses the bytes written earlier in this session for the same layout and sources.
+void BindN5Set(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
+               const std::vector<vk::WriteDescriptorSet>& set_writes,
+               vk::PipelineLayout pipeline_layout, vk::DeviceSize layout_size,
+               std::span<const vk::DeviceSize> binding_offsets, vk::PipelineBindPoint bind_point) {
+    DescriptorBufferRing& ring = *desc_heap.GetDescriptorBuffer();
+    const auto& props = instance.GetDescriptorBufferProperties();
+    const vk::Device device = instance.GetDevice();
+    const u64 session = scheduler.SessionSerial();
+    static thread_local std::vector<u64> key;
+    BuildSourceKey(set_writes, pipeline_layout, layout_size, binding_offsets, key);
+
+    // A region is reused only inside its session: its tick is still open, so the ring keeps it.
+    auto& slots = ring.Slots();
+    if (slots.size() >= MaxN5Slots) {
+        slots.clear();
+    }
+    auto [it, is_new] = slots.try_emplace(std::bit_cast<u64>(pipeline_layout));
+    DescriptorBufferRing::SetSlot& slot = it.value();
+    vk::DeviceSize offset{};
+    if (!is_new && slot.session == session && slot.key == key) {
+        DescBufN5::sets_skipped.fetch_add(1, std::memory_order_relaxed);
+        offset = slot.offset;
+    } else {
+        const auto alloc = ring.Allocate(layout_size, props.descriptorBufferOffsetAlignment);
+        for (const auto& write : set_writes) {
+            ASSERT_MSG(write.dstBinding < binding_offsets.size(),
+                       "Descriptor binding {} is not in the set layout", write.dstBinding);
+            const size_t size = DescriptorBufferSize(props, write.descriptorType);
+            u8* base = alloc.mapped + binding_offsets[write.dstBinding] +
+                       write.dstArrayElement * size;
+            for (u32 i = 0; i < write.descriptorCount; ++i) {
+                WriteDescriptorElement(device, write, i, base + i * size, size);
+            }
+        }
+        ring.Flush(alloc.offset, layout_size);
+        slot.key = key;
+        slot.session = session;
+        slot.offset = alloc.offset;
+        offset = alloc.offset;
+        DescBufN5::bytes_written.fetch_add(layout_size, std::memory_order_relaxed);
+    }
+    DescBufN5::Report();
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+    // The buffer is bound once per command buffer, before its offset is set.
+    if (ring.NeedsBinding(session)) {
+        const vk::DescriptorBufferBindingInfoEXT binding_info = {
+            .address = ring.Address(),
+            .usage = vk::BufferUsageFlagBits::eResourceDescriptorBufferEXT |
+                     vk::BufferUsageFlagBits::eSamplerDescriptorBufferEXT,
+        };
+        cmdbuf.bindDescriptorBuffersEXT(1, &binding_info);
+    }
+    const u32 buffer_index = 0;
+    cmdbuf.setDescriptorBufferOffsetsEXT(bind_point, pipeline_layout, 0, 1, &buffer_index,
+                                         &offset);
+}
+
+/// sotc: SOTC_N5_DESCBUF=2. Encodes the classic writes of a set, and in one session compares the
+/// bytes of every set whose source key was seen before. The classic bind still runs; this only
+/// counts. A reference for the bytes cannot be made without a descriptor buffer layout, so the
+/// check is that equal sources encode to equal bytes.
+void VerifyN5Set(const Instance& instance, DescriptorHeap& desc_heap,
+                 const std::vector<vk::WriteDescriptorSet>& set_writes,
+                 vk::PipelineLayout pipeline_layout, u64 session) {
+    static thread_local std::vector<u64> key;
+    static thread_local std::vector<u8> encoded;
+    const auto& props = instance.GetDescriptorBufferProperties();
+    const vk::Device device = instance.GetDevice();
+    BuildSourceKey(set_writes, pipeline_layout, 0, {}, key);
+    encoded.clear();
+    for (const auto& write : set_writes) {
+        const size_t size = DescriptorBufferSize(props, write.descriptorType);
+        for (u32 i = 0; i < write.descriptorCount; ++i) {
+            const size_t at = encoded.size();
+            encoded.resize(at + size);
+            WriteDescriptorElement(device, write, i, encoded.data() + at, size);
+        }
+    }
+
+    auto& slots = desc_heap.GetDescriptorBuffer()->Slots();
+    if (slots.size() >= MaxN5Slots) {
+        slots.clear();
+    }
+    auto [it, is_new] = slots.try_emplace(std::bit_cast<u64>(pipeline_layout));
+    DescriptorBufferRing::SetSlot& slot = it.value();
+    if (!is_new && slot.session == session && slot.key == key) {
+        DescBufN5::verify_checks.fetch_add(1, std::memory_order_relaxed);
+        if (slot.encoded != encoded) {
+            DescBufN5::verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        slot.key = key;
+        slot.session = session;
+        slot.encoded = encoded;
+    }
+    DescBufN5::Report();
+}
+
+} // namespace
+
 void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> write_sets,
                              const Shader::PushData& push_data,
                              const Shader::BindlessSamplerSlots& bindless_slots) const {
@@ -340,6 +481,18 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
     if (stage_sets) {
         BindStageSets(set_writes, write_sets, bind_point);
         return;
+    }
+
+    // sotc: SOTC_N5_DESCBUF=1: the set is written into the descriptor buffer ring (or reused from
+    // this session) and bound at its offset. The layout is a descriptor buffer layout by construction.
+    if (DescriptorBufferN5Layout(instance, desc_heap, stage_sets, uses_bindless_samplers)) {
+        BindN5Set(instance, scheduler, desc_heap, set_writes, pipeline_layout, desc_layout_size,
+                  desc_binding_offsets, bind_point);
+        return;
+    }
+    // sotc: SOTC_N5_DESCBUF=2: the classic bind below runs, its sources are checked here first.
+    if (DescriptorBufferN5Mode() == 2 && DescriptorBufferN5Active(instance, desc_heap)) {
+        VerifyN5Set(instance, desc_heap, set_writes, pipeline_layout, scheduler.SessionSerial());
     }
 
     if (uses_push_descriptors) {

@@ -108,7 +108,9 @@ public:
 
     /// One line for the 5 s report (counters are reset on read):
     /// "SOTC N5 BINDLESS acquire N writes N releases N reclaims N evict N full N verify N mismatch N
-    /// pending N". Returns the length written.
+    /// pending N served N". `writes` are the descriptor writes the heap made; `served` counts the
+    /// heap binds (fresh or replayed), each one a descriptor write the classic path would have made.
+    /// Returns the length written.
     u32 Report(char* out, u32 size);
 
 private:
@@ -157,6 +159,7 @@ private:
     u64 full{};
     u64 verifies{};
     u64 mismatches{};
+    u64 served{};
 };
 
 } // namespace VideoCore

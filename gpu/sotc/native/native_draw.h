@@ -15,7 +15,10 @@ struct PendingUpload {
     uint64_t addr;
     uint64_t size;
     Kind kind;
-    uint64_t seq = 0; ///< SotcNative::AnnounceSeq() of the newest announce merged into this entry (0: unknown)
+    uint64_t seq = 0;      ///< SotcNative::AnnounceSeq() of the newest announce merged into this entry (0: unknown)
+    /// sotc: the range lies in a run ring 8 imports and serves in place (SotcPcRing::HostServed when announced):
+    /// the drain invalidates images only, no page mark and no upload (the binds read the guest bytes).
+    bool served = false;
 };
 
 /// Draw thread. Pops the oldest pending upload. False when none is queued.
@@ -44,6 +47,10 @@ void NoteDrainEntry(uint64_t seq, uint64_t pickup_seq, uint64_t size);
 /// End of a drain: warm_deferred_bytes = Persistent uploads postponed by the budget in this drain (already
 /// marked CPU-modified, so a bind uploads them anyway), warm_backlog_bytes = bytes still waiting for a drain.
 void NoteDrainDone(uint64_t warm_deferred_bytes, uint64_t warm_backlog_bytes);
+/// Cost of one NativeDrain (draw thread): wall time ns, 4 KiB pages given a CPU mark, texture invalidation calls,
+/// queued entries that were served in place (no mark), and merged ranges the drain processed.
+void NoteDrainWork(uint64_t ns, uint64_t pages_marked, uint64_t invalidations, uint64_t served_entries,
+                   uint64_t ranges);
 
 /// Ring depths of the engine's per-frame heaps (heaps.md section 7): the flip (FUN_0001d230) advances the
 /// frame index mod depth and reuses a block after depth flips without waiting on the GPU, so the port fences.

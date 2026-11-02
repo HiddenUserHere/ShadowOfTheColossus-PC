@@ -62,6 +62,18 @@ void NoteWorkerJob(u64 ops, u64 ns) noexcept;
 /// Owner: time spent waiting for a worker at EndRendering.
 void NoteOwnerWait(u64 ns) noexcept;
 
+/// SOTC_N5_PARALLEL_TRANSLATE=1: the producer emission census is on (read once). Mode 2 (verify of
+/// a worker translation) is not implemented: no op is translated off the draw thread yet.
+bool TranslateCensus();
+
+/// Monotonic clock in ns for the census timers (producer side only).
+u64 NowNs() noexcept;
+
+/// Producer (draw thread), CommandRecorder::Allocate: one block of the given category (a
+/// BlockCategory index), its total bytes including header, and the ns spent writing it. Only the
+/// header write is timed, not the wait for a free chunk (NextChunk).
+void NoteEmit(u8 category, u32 bytes, u64 ns) noexcept;
+
 /// Appends one 5 s report line (the caller's window) and resets the window counters. Prints
 /// nothing when Enabled() is false.
 void Report(std::string& out, double seconds);

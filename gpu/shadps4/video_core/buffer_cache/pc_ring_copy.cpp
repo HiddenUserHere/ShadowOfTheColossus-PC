@@ -636,6 +636,7 @@ void HostMaintain(BufferCache& cache) {
         applied = imported;
         RegionManager::ring_enabled.store(true, std::memory_order_release);
         cache.PcHostApply(imported);
+        SotcPcRing::SetHostServed(imported); // sotc: 1a, SotcNative::Announce reads it (HostServed)
     }
 }
 

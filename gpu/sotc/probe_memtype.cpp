@@ -24,6 +24,11 @@
 // stack (committed, never GPU-tracked) and to the image's heap-id globals.
 
 #include "pc_ring.h"
+// sotc: SOTC_PC_RING_HEAPSTAT (pc_ring.cpp). Declared here; pc_ring.h should carry these two declarations.
+namespace SotcPcRing {
+bool HeapStatOn();
+void NoteHeapAlloc(uint32_t slot, uint64_t addr, uint64_t size);
+} // namespace SotcPcRing
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -489,6 +494,8 @@ void AllocPost(GuestRegs& regs, void*) {
     if (SotcNative::On() && static_cast<int64_t>(call.slot) == kRenderSingleFrameCpuSlot && regs.rax != 0) {
         SotcNativeHooks::NoteFrameBlock(regs.rax, call.size);
     }
+    // sotc: SOTC_PC_RING_HEAPSTAT: where the allocation landed relative to the served ranges, per slot.
+    SotcPcRing::NoteHeapAlloc(call.slot, regs.rax, call.size);
 }
 
 // Granule summary of the classes mode. The counts are totals (granules are never freed), so the line
@@ -565,7 +572,7 @@ void RegisterMemtype() {
     g_post_granules = g_classes_on || SotcPcPlaceGlue::On();
     // sotc: SOTC_NATIVE needs the post phase too (NoteFrameBlock runs there); the post phase then runs without the
     // granule claims unless the classes mode or the glue asks for them (g_post_granules).
-    g_post_on = g_post_granules || SotcNative::On();
+    g_post_on = g_post_granules || SotcNative::On() || SotcPcRing::HeapStatOn();
 
     SotcHooks::Handler alloc;
     alloc.pre = &AllocPre;

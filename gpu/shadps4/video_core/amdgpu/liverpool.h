@@ -68,6 +68,21 @@ extern std::atomic<u64> g_rbx_addr_deferred, g_rbx_mode_switches, g_rbx_probes,
     g_rbx_labels_early_hot, g_rbx_waits_charged, g_rbx_waits_unattributed, g_rbx_ewma_a_ns,
     g_rbx_ewma_b_ns;
 
+// sotc: SOTC_FUTEX_WAIT counters of the command processor and draw thread waits (liverpool.cpp).
+// A wait counts once in "waits"; it ends either in the spin ("spins") or in WaitOnAddress
+// ("sleeps"). "safety_met" counts timed-out sleeps whose condition already held: wakes that would
+// have been lost without the timeout. Read and reset by the 5 s report (driver.cpp).
+struct SotcFutexCpCounters {
+    std::atomic<u64> waits{};
+    std::atomic<u64> spins{};
+    std::atomic<u64> sleeps{};
+    std::atomic<u64> sleep_ns{};
+    std::atomic<u64> sleep_max_ns{};
+    std::atomic<u64> wakes{};
+    std::atomic<u64> safety_met{};
+};
+inline SotcFutexCpCounters g_futex_cp;
+
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
     static constexpr u32 NumGfxRings = 1u;     // actually 2, but HP is reserved by system software
@@ -799,6 +814,13 @@ private:
     /// EopService on the draw thread once the oldest label has waited too long.
     void EopWaitGuard();
     void WakeBack() {
+        if (back_threaded && futex_wait) {
+            // sotc: SOTC_FUTEX_WAIT: BackLoop blocks on back_wake (WaitOnAddress); bump it when asleep.
+            if (back_sleeping.load(std::memory_order_seq_cst)) {
+                WakeBackFutex();
+            }
+            return;
+        }
         if (back_threaded && back_nospin) {
             // sotc: SOTC_WAIT_NOSPIN: BackLoop blocks on back_wake; bump it only when it sleeps.
             if (back_sleeping.load(std::memory_order_seq_cst)) {
@@ -816,11 +838,18 @@ private:
         back_wake.fetch_add(1, std::memory_order_seq_cst);
         back_wake.notify_one();
     }
+    /// sotc: SOTC_FUTEX_WAIT: bumps back_wake and wakes the one BackLoop waiter (liverpool.cpp,
+    /// Windows; a no-op elsewhere, the switch is Windows-only).
+    void WakeBackFutex();
 
     bool back_threaded{};
     bool back_strict{};
     /// sotc: SOTC_WAIT_NOSPIN=1: BackLoop spins ~20 us, then blocks on back_wake (not back_cv).
     bool back_nospin{};
+    /// sotc: SOTC_FUTEX_WAIT=1 (Windows only, off by default): the command processor waits on
+    /// back_tail and the draw thread blocks on back_wake with WaitOnAddress (liverpool.cpp).
+    /// Overrides back_nospin for the draw thread idle wait; the rest of the switches are unchanged.
+    bool futex_wait{};
     // sotc: switches read in the constructor (liverpool.cpp), all OFF by default:
     // SOTC_BACK_HEAD_CACHE (draw thread caches back_head), SOTC_BACK_PF (prefetch of the next
     // op's register chunks), SOTC_REG_SAME (register writes that change nothing are not marked,
@@ -850,6 +879,124 @@ private:
     std::condition_variable back_cv;
     std::condition_variable drain_cv;
     u64 back_write_seq{0};
+    // sotc: SOTC_CP_PRECISE_WAIT (liverpool.cpp; 0 off, 1 precise, 2 precise and verified). Before a
+    // pipeline lookup the command processor waits only for the queued ops whose guest writes overlap
+    // the ranges the lookup read (CpCollectReads, read after the lookup; a lookup is retried after
+    // the wait when it overlapped a pending write). Every publish that writes memory records its
+    // range in cp_wr_ring: the range given by NoteBackWriteRange, else unknown (the old wait).
+    static constexpr u32 CpWriteRingSize = 256;
+    static constexpr u32 CpMaxReadRanges = 48;
+    static constexpr u32 CpMaxAttempts = 3;
+    /// Bound of the fetch shader code a lookup reads (its scan runs to S_SETPC; see the report).
+    static constexpr u64 CpFetchShaderBytes = 4096;
+    struct CpWriteRange {
+        u64 seq{};
+        VAddr addr{};
+        u64 size{};
+        bool unknown{};
+    };
+    struct CpReadSet {
+        std::array<std::pair<VAddr, u64>, CpMaxReadRanges> ranges{};
+        u32 count{};
+    };
+public:
+    /// sotc: SOTC_CP_PRECISE_WAIT counters, read and reset by the 5 s report (driver.cpp).
+    struct CpPreciseStats {
+        static inline std::atomic<u64> avoided{}; ///< lookups that ran while writes were pending
+        static inline std::atomic<u64> taken_overlap{}; ///< waits for an overlapping known range
+        static inline std::atomic<u64> taken_unknown{}; ///< waits for an unknown range or reads
+        static inline std::atomic<u64> retries{};       ///< lookups repeated after a wait
+        static inline std::atomic<u64> fallback{};      ///< lookups that gave up, old wait
+        static inline std::atomic<u64> verified{};      ///< =2: lookups compared with the old wait
+        static inline std::atomic<u64> violations{};    ///< =2: results that differed
+        static inline std::atomic<u64> ns_blocked{};    ///< time blocked in the precise waits
+    };
+
+private:
+    u8 cp_precise{};
+    std::array<CpWriteRange, CpWriteRingSize> cp_wr_ring{};
+    u64 cp_wr_count{};
+    u64 cp_wr_dropped_seq{}; ///< newest pending range overwritten in the ring (0: none)
+    VAddr cp_note_addr{};
+    u64 cp_note_size{};
+    u64 cp_note_seq{}; ///< back_head + 1 at NoteBackWriteRange: the publish it describes
+    /// Command processor, before the op that publishes the writes: the guest range they write
+    /// (size 0 or no call: unknown). Only the next publish uses it.
+    void NoteBackWriteRange(VAddr addr, u64 size) {
+        if (!cp_precise) {
+            return;
+        }
+        cp_note_addr = addr;
+        cp_note_size = size;
+        cp_note_seq = back_head.load(std::memory_order_relaxed) + 1;
+    }
+    /// Command processor, before a publish with writes_memory set that writes no guest memory
+    /// (the op only touches host state): it adds no range to cp_wr_ring.
+    void NoteBackNoGuestWrite() {
+        if (!cp_precise) {
+            return;
+        }
+        cp_note_addr = 0;
+        cp_note_size = CpNoGuestWrite;
+        cp_note_seq = back_head.load(std::memory_order_relaxed) + 1;
+    }
+    static constexpr u64 CpNoGuestWrite = ~u64{0};
+    void RecordBackWrite(u64 head, bool writes_memory);
+    void PushWriteRange(u64 seq, VAddr addr, u64 size, bool unknown);
+    /// False when the lookup's reads are not all bounded (or there is no pipeline to read them).
+    bool CpCollectReads(const Vulkan::Pipeline* pipeline, CpReadSet& reads) const;
+    /// The back_tail to wait for before the lookup's result may be used: 0 when no queued write
+    /// newer than snap overlaps what the lookup read.
+    u64 CpWaitTarget(const Vulkan::Pipeline* pipeline, u64 snap, bool& unknown);
+    void CpWaitFor(u64 target, bool unknown);
+    void CpDigest(const Vulkan::Pipeline* pipeline, std::vector<u64>& out) const;
+    /// The pipeline lookup of a draw or dispatch, after the waits its guest reads need.
+    /// looks_up false: no lookup runs (filtered draw), nothing is read.
+    template <typename F>
+    const Vulkan::Pipeline* LookupAfterWrites(bool looks_up, F&& lookup) {
+        if (!cp_precise) {
+            WaitBackWrites();
+            return looks_up ? lookup() : nullptr;
+        }
+        if (!looks_up) {
+            return nullptr;
+        }
+        for (u32 attempt = 0; attempt < CpMaxAttempts; ++attempt) {
+            const u64 snap = back_tail.load(std::memory_order_acquire);
+            if (snap >= back_write_seq) { // nothing pending: the old wait returns at once too
+                return lookup();
+            }
+            if (attempt != 0) {
+                CpPreciseStats::retries.fetch_add(1, std::memory_order_relaxed);
+            }
+            const Vulkan::Pipeline* pipeline = lookup();
+            bool unknown = false;
+            const u64 target = CpWaitTarget(pipeline, snap, unknown);
+            if (target == 0) {
+                CpPreciseStats::avoided.fetch_add(1, std::memory_order_relaxed);
+                if (cp_precise != 2) {
+                    return pipeline;
+                }
+                // =2: the old wait and the lookup again; the result and the state the draw
+                // captures from it must be the same. The old result is the one used.
+                std::vector<u64> first;
+                std::vector<u64> second;
+                CpDigest(pipeline, first);
+                WaitBackWrites();
+                const Vulkan::Pipeline* old_pipeline = lookup();
+                CpDigest(old_pipeline, second);
+                CpPreciseStats::verified.fetch_add(1, std::memory_order_relaxed);
+                if (old_pipeline != pipeline || first != second) {
+                    CpPreciseStats::violations.fetch_add(1, std::memory_order_relaxed);
+                }
+                return old_pipeline;
+            }
+            CpWaitFor(target, unknown); // the lookup may have read a write still pending
+        }
+        CpPreciseStats::fallback.fetch_add(1, std::memory_order_relaxed);
+        WaitBackWrites();
+        return lookup();
+    }
     /// sotc: SOTC_CP_LABEL_SKIP. back_head of the newest publish that may write guest memory on
     /// the GPU or the CPU (every writes_memory publish, every pipeline that may write, and every
     /// non-recorded label). Recorded labels do not count: a skipped wait is for one of them.

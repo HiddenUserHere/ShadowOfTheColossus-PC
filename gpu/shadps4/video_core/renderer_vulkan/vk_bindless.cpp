@@ -146,6 +146,7 @@ void BindlessImages::Use(u32 key, u32 slot) {
     Slot& s = slots[key][slot];
     if (s.state == SlotState::Live) {
         s.last_use = scheduler.CurrentTick();
+        ++served;
     }
 }
 
@@ -209,13 +210,13 @@ u32 BindlessImages::Report(char* out, u32 size) {
     const int n = std::snprintf(
         out, size,
         "SOTC N5 BINDLESS acquire %llu writes %llu releases %llu reclaims %llu evict %llu full %llu "
-        "verify %llu mismatch %llu pending %zu",
+        "verify %llu mismatch %llu pending %zu served %llu",
         static_cast<unsigned long long>(acquires), static_cast<unsigned long long>(writes),
         static_cast<unsigned long long>(releases), static_cast<unsigned long long>(reclaims),
         static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(full),
         static_cast<unsigned long long>(verifies), static_cast<unsigned long long>(mismatches),
-        pending.size());
-    acquires = writes = releases = reclaims = evictions = full = verifies = mismatches = 0;
+        pending.size(), static_cast<unsigned long long>(served));
+    acquires = writes = releases = reclaims = evictions = full = verifies = mismatches = served = 0;
     return n < 0 ? 0 : static_cast<u32>(n);
 }
 

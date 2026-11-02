@@ -42,6 +42,7 @@
 #include "video_core/renderer_vulkan/vk_parallel_record.h" // sotc: SOTC_N5_PARALLEL counters
 #include "video_core/renderer_vulkan/vk_bindless.h" // sotc: SOTC_N5_BINDLESS report
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_recorder.h" // sotc: SOTC_FUTEX_WAIT report
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND report
 #include "video_core/sotc_adaptive.h"
@@ -102,6 +103,8 @@ void SotcTinyAsyncReport(std::string& out, double seconds);
 void ReportN5Pso(std::string& out, double seconds); // sotc: N5 (SOTC_N5_PSO=1)
 void ReportPipeMemo(std::string& out, double seconds); // sotc: SOTC_PIPE_MEMO
 void ReportPipeDirty(std::string& out, double seconds); // sotc: SOTC_PIPE_DIRTY
+void ReportPipeFast(std::string& out, double seconds); // sotc: SOTC_PIPE_FAST
+void ReportSpecMemo(std::string& out, double seconds); // sotc: SOTC_SPEC_MEMO
 void ReportPipeGpl(std::string& out, double seconds); // sotc: SOTC_PIPE_GPL
 } // namespace Vulkan
 // sotc: src/runtime_kernel.c, SOTC USLEEP line (usleep histogram, SOTC_USLEEP_YIELD).
@@ -2005,6 +2008,43 @@ void VideoOutDriver::Flip(const Request& req) {
                 ReportPrintf(report, "SOTC CP back-write waits: %.0f/s, %.2f ms/s, max %.2f ms\n",
                              bw_n / seconds, bw_ns / 1e6 / seconds, bw_max / 1e6);
             }
+            {
+                // sotc: SOTC_CP_PRECISE_WAIT counters, per 5 s window.
+                using P = AmdGpu::Liverpool::CpPreciseStats;
+                const uint64_t pw_avoided = P::avoided.exchange(0), pw_ov = P::taken_overlap.exchange(0);
+                const uint64_t pw_unk = P::taken_unknown.exchange(0), pw_retry = P::retries.exchange(0);
+                const uint64_t pw_fb = P::fallback.exchange(0), pw_ver = P::verified.exchange(0);
+                const uint64_t pw_bad = P::violations.exchange(0), pw_ns = P::ns_blocked.exchange(0);
+                if (pw_avoided || pw_ov || pw_unk || pw_retry || pw_fb || pw_ver || pw_bad || pw_ns) {
+                    ReportPrintf(report,
+                                 "SOTC CP precise waits: avoided %.0f/s, taken overlap %.0f/s, unknown %.0f/s, "
+                                 "retries %.0f/s, fallback %.0f/s, verified %.0f/s, violations %llu, blocked %.2f ms/s\n",
+                                 pw_avoided / seconds, pw_ov / seconds, pw_unk / seconds, pw_retry / seconds,
+                                 pw_fb / seconds, pw_ver / seconds, static_cast<unsigned long long>(pw_bad),
+                                 pw_ns / 1e6 / seconds);
+                }
+            }
+            // sotc: SOTC_FUTEX_WAIT counters, per 5 s window (liverpool.h, vk_recorder.h).
+            const auto futex_line = [&](const char* who, auto& c) {
+                const uint64_t n = c.waits.exchange(0);
+                const uint64_t spins = c.spins.exchange(0);
+                const uint64_t sleeps = c.sleeps.exchange(0);
+                const uint64_t sleep_ns = c.sleep_ns.exchange(0);
+                const uint64_t sleep_max = c.sleep_max_ns.exchange(0);
+                const uint64_t wakes = c.wakes.exchange(0);
+                const uint64_t safety = c.safety_met.exchange(0);
+                if (n || wakes) {
+                    ReportPrintf(report,
+                                 "SOTC FUTEX %s: waits %llu, spin %llu, sleeps %llu, avg sleep %.1f us, max %.1f us, "
+                                 "wakes %llu, safety-met %llu\n",
+                                 who, static_cast<unsigned long long>(n), static_cast<unsigned long long>(spins),
+                                 static_cast<unsigned long long>(sleeps), sleeps ? sleep_ns / 1e3 / sleeps : 0.0,
+                                 sleep_max / 1e3, static_cast<unsigned long long>(wakes),
+                                 static_cast<unsigned long long>(safety));
+                }
+            };
+            futex_line("cp", AmdGpu::g_futex_cp);
+            futex_line("rec", Vulkan::g_futex_rec);
             // sotc: stutter-architecture counters (engine hooks, declared writes, tiny pipelines,
             // short sleeps); each prints only when its switch or SOTC_FPS gave it activity.
             SotcHookStats::Report(report, seconds);
@@ -2072,6 +2112,8 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcAreaPrewarm::ReportAreaPrewarm(report, seconds); // SOTC_AREA_PREWARM >= 2
             Vulkan::ReportPipeMemo(report, seconds);              // SOTC_PIPE_MEMO
             Vulkan::ReportPipeDirty(report, seconds); // SOTC_PIPE_DIRTY
+            Vulkan::ReportPipeFast(report, seconds); // SOTC_PIPE_FAST
+            Vulkan::ReportSpecMemo(report, seconds); // SOTC_SPEC_MEMO
             Vulkan::ReportPipeGpl(report, seconds); // SOTC_PIPE_GPL
             AmdGpu::ReportCpLabelSkip(report, seconds);           // SOTC_CP_LABEL_SKIP
             SotcLabels::ReportLabels(report, seconds);            // SOTC_LABELS_HONEST
@@ -2205,8 +2247,8 @@ void VideoOutDriver::Flip(const Request& req) {
                 }
                 // sotc: SOTC_BDA: block-table draws, slots, nulls, missing addresses (vk_bda_table.h).
                 if (const char* bda = std::getenv("SOTC_BDA");
-                    (bda && bda[0] && bda[0] != '0') || std::getenv("SOTC_N5_BDA")) { // sotc: SOTC_N5_BDA too
-                    char bda_line[256];
+                    (bda && bda[0] && bda[0] != '0') || std::getenv("SOTC_N5_BDA") || std::getenv("SOTC_N5_BDA_BUFFERS")) { // sotc: SOTC_N5_BDA too
+                    char bda_line[320];
                     Vulkan::BdaTableReport(bda_line, sizeof bda_line);
                     std::fprintf(stderr, "%s", bda_line);
                 }

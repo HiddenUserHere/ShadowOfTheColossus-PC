@@ -96,6 +96,7 @@ void Visit(Info& info, const IR::Inst& inst) {
         info.uses_fp64 = true;
         break;
     case IR::Opcode::ImageWrite:
+    case IR::Opcode::ImageRead: // sotc: a read-only storage image needs StorageImageReadWithoutFormat too
         info.has_storage_images = true;
         break;
     case IR::Opcode::QuadBroadcast:

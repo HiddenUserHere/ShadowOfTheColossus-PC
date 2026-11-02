@@ -11,6 +11,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -482,8 +483,10 @@ GraphicsPipeline::GraphicsPipeline(
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
     // sotc: pipelines whose layouts are descriptor buffer layouts carry this flag.
+    const bool n5_layout =
+        DescriptorBufferN5Layout(instance, desc_heap, stage_sets, uses_bindless_samplers);
     const vk::PipelineCreateFlags pipeline_flags =
-        instance.IsDescriptorBufferEnabled()
+        instance.IsDescriptorBufferEnabled() || n5_layout
             ? vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eDescriptorBufferEXT)
             : vk::PipelineCreateFlags{};
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
@@ -865,7 +868,10 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
     }
     // sotc: descriptor buffers replace push descriptors (the two layout flags are exclusive).
     // Neither is used with a set per stage: their sets are bound by BindStageSets.
-    const bool descriptor_buffer = !stage_sets && instance.IsDescriptorBufferEnabled();
+    // sotc: SOTC_N5_DESCBUF=1 adds its pipelines (DescriptorBufferN5Layout) to the same layout kind.
+    const bool descriptor_buffer =
+        !stage_sets && (instance.IsDescriptorBufferEnabled() ||
+                        DescriptorBufferN5Layout(instance, desc_heap, stage_sets, uses_bindless_samplers));
     uses_push_descriptors =
         !stage_sets && !descriptor_buffer && binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors

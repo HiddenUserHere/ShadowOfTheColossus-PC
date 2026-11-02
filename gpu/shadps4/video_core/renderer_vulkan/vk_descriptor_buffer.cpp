@@ -3,11 +3,17 @@
 // sotc: VK_EXT_descriptor_buffer ring, see vk_descriptor_buffer.h.
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_queues.h"
+#include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 #include <vk_mem_alloc.h>
@@ -125,5 +131,86 @@ void DescriptorBufferRing::Flush(vk::DeviceSize offset, vk::DeviceSize size) con
         vmaFlushAllocation(memory->allocator, memory->allocation, offset, size);
     }
 }
+
+int DescriptorBufferN5Mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_N5_DESCBUF");
+        const int wanted = (v && v[0] == '1') ? 1 : (v && v[0] == '2') ? 2 : 0;
+        const char* legacy = std::getenv("SOTC_DESC_BUFFER");
+        if (wanted != 0 && legacy && legacy[0] == '1') {
+            LOG_WARNING(Render_Vulkan, "SOTC_N5_DESCBUF ignored: SOTC_DESC_BUFFER=1 is set");
+            return 0;
+        }
+        return wanted;
+    }();
+    return mode;
+}
+
+bool DescriptorBufferN5Active(const Instance& instance, const DescriptorHeap& heap) {
+    if (DescriptorBufferN5Mode() == 0 || !instance.IsDescriptorBufferN5Enabled()) {
+        return false;
+    }
+    if (heap.GetDescriptorBuffer() == nullptr) {
+        static std::atomic<bool> logged{};
+        if (!logged.exchange(true)) {
+            LOG_WARNING(Render_Vulkan, "SOTC_N5_DESCBUF={} not complete: the resource pool made no "
+                                       "descriptor buffer ring, classic descriptors",
+                        DescriptorBufferN5Mode());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool DescriptorBufferN5Layout(const Instance& instance, const DescriptorHeap& heap, bool stage_sets,
+                              bool bindless) {
+    if (DescriptorBufferN5Mode() != 1 || stage_sets || bindless) {
+        return false;
+    }
+    // The async compute redirect records binds on its own timeline value, which the ring's tick
+    // marks do not cover: the two are not combined (mode 2 keeps no region, so it is not affected).
+    if (SotcQueues::AsyncMoveOn()) {
+        static std::atomic<bool> logged{};
+        if (!logged.exchange(true)) {
+            LOG_WARNING(Render_Vulkan, "SOTC_N5_DESCBUF=1 not combined with SOTC_N5_ASYNC_COMPUTE=1, "
+                                       "classic descriptors");
+        }
+        return false;
+    }
+    return DescriptorBufferN5Active(instance, heap);
+}
+
+namespace DescBufN5 {
+
+void Report() {
+    // Checked every 256 calls: the clock read stays off the draw path.
+    static std::atomic<u64> last_report_ns{};
+    const u64 n = calls.fetch_add(1, std::memory_order_relaxed);
+    if ((n & 255) != 0) {
+        return;
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    constexpr u64 period_ns = 5'000'000'000;
+    u64 due = last_report_ns.load(std::memory_order_relaxed);
+    if (due != 0 && static_cast<u64>(now) < due) {
+        return;
+    }
+    if (!last_report_ns.compare_exchange_strong(due, static_cast<u64>(now) + period_ns,
+                                                std::memory_order_relaxed)) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "SOTC N5 DESCBUF: mode %d, calls %llu, sets skipped %llu, bytes written %llu, "
+                 "verify checks %llu, verify mismatches %llu\n",
+                 DescriptorBufferN5Mode(), static_cast<unsigned long long>(calls.load()),
+                 static_cast<unsigned long long>(sets_skipped.load()),
+                 static_cast<unsigned long long>(bytes_written.load()),
+                 static_cast<unsigned long long>(verify_checks.load()),
+                 static_cast<unsigned long long>(verify_mismatches.load()));
+}
+
+} // namespace DescBufN5
 
 } // namespace Vulkan

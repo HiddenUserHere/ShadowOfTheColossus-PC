@@ -223,6 +223,14 @@ void NoteRingLeave(uint64_t pages);
 /// Mode 8. Relation of [addr, addr + size) to the live arena blocks: 0 outside all of them, 1 inside
 /// one, 2 crossing a block edge. Other modes: 0. Lock-free.
 int ArenaRelation(uint64_t addr, uint64_t size);
+/// Mode 8. Lock-free. True when [addr, addr + size) lies entirely inside one run of the imported set that
+/// SetHostServed last published: its binds are served in place (BufferCache::PcHostBind), so the guest bytes
+/// are the ones the GPU reads and a CPU write there needs no upload mark. False otherwise (no published set,
+/// other modes, a range that crosses two runs).
+bool HostServed(uint64_t addr, uint64_t size);
+/// Mode 8. Draw thread only, after the imported set changed (pc_ring_copy.cpp HostMaintain, after PcHostApply):
+/// publishes the runs for HostServed. An empty or over-full set publishes nothing served.
+void SetHostServed(const std::vector<RingExtent>& runs);
 /// Mode 8. Lock-free counters of the block set and of the submit epoch (OnSubmit), read by the
 /// draw thread to decide when the host imports must be refreshed.
 uint64_t BlockVersion();

@@ -6,6 +6,7 @@
 
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
@@ -78,7 +79,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     };
 
     // sotc: descriptor buffers replace push descriptors (the two layout flags are exclusive).
-    const bool descriptor_buffer = instance.IsDescriptorBufferEnabled();
+    // sotc: SOTC_N5_DESCBUF=1 adds its pipelines (DescriptorBufferN5Layout) to the same layout kind.
+    const bool descriptor_buffer =
+        instance.IsDescriptorBufferEnabled() ||
+        DescriptorBufferN5Layout(instance, desc_heap, false, uses_bindless_samplers);
     uses_push_descriptors = !descriptor_buffer && binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
@@ -139,8 +143,9 @@ void ComputePipeline::CreatePipeline() {
         .pName = "main",
     };
     // sotc: pipelines whose layouts are descriptor buffer layouts carry this flag.
+    const bool n5_layout = DescriptorBufferN5Layout(instance, desc_heap, false, uses_bindless_samplers);
     const vk::PipelineCreateFlags pipeline_flags =
-        instance.IsDescriptorBufferEnabled()
+        instance.IsDescriptorBufferEnabled() || n5_layout
             ? vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eDescriptorBufferEXT)
             : vk::PipelineCreateFlags{};
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {

@@ -26,6 +26,7 @@
 #include "video_core/page_manager.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -74,6 +75,19 @@ std::mutex g_block_mutex;             // writers only
 // one) and are few: a new one only when the run set changes.
 std::atomic<const std::vector<RingExtent>*> g_extras{nullptr};
 std::vector<std::unique_ptr<const std::vector<RingExtent>>> g_extras_kept; // under g_block_mutex
+
+// sotc: HostServed (1a). The imported runs as the draw thread last published them. Seqlock over atomic fields
+// (no data race): the writer (SetHostServed, under g_served_mutex) makes g_served_seq odd, stores the runs,
+// makes it even; a reader (HostServed, any thread) retries while the sequence is odd or changed.
+constexpr size_t kServedMax = 4096;
+struct ServedRun {
+    std::atomic<uint64_t> addr{0};
+    std::atomic<uint64_t> end{0};
+};
+ServedRun g_served[kServedMax];
+std::atomic<uint64_t> g_served_seq{0};
+std::atomic<size_t> g_served_count{0};
+std::mutex g_served_mutex; // writers only
 
 std::atomic<uint32_t> g_epoch{1}; // frame epoch; starts at 1 so 0 means "never"
 
@@ -1582,6 +1596,59 @@ int ArenaRelation(uint64_t addr, uint64_t size) {
     return relation;
 }
 
+void SetHostServed(const std::vector<RingExtent>& runs) {
+    std::vector<RingExtent> sorted = runs;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const RingExtent& a, const RingExtent& b) { return a.addr < b.addr; });
+    // Runs are disjoint and not merged when adjacent: a bind across two adjacent runs is not served
+    // (PcHostBind, group off), so it must not be reported as served here either.
+    const bool fits = sorted.size() <= kServedMax;
+    std::lock_guard<std::mutex> lock(g_served_mutex);
+    const uint64_t seq = g_served_seq.load(std::memory_order_relaxed);
+    g_served_seq.store(seq + 1, std::memory_order_relaxed); // odd: writing
+    std::atomic_thread_fence(std::memory_order_release);
+    const size_t n = fits ? sorted.size() : 0;
+    for (size_t i = 0; i < n; ++i) {
+        g_served[i].addr.store(sorted[i].addr, std::memory_order_relaxed);
+        g_served[i].end.store(sorted[i].addr + sorted[i].size, std::memory_order_relaxed);
+    }
+    g_served_count.store(n, std::memory_order_relaxed);
+    g_served_seq.store(seq + 2, std::memory_order_release); // even: done
+}
+
+bool HostServed(uint64_t addr, uint64_t size) {
+    const uint64_t end = addr + size;
+    if (!size || end < addr) {
+        return false;
+    }
+    for (;;) {
+        const uint64_t s1 = g_served_seq.load(std::memory_order_acquire);
+        if (s1 & 1) {
+            continue; // a publish is writing the runs
+        }
+        const size_t n = g_served_count.load(std::memory_order_relaxed);
+        // The run holding addr is the last one starting at or below it (runs are sorted and disjoint).
+        size_t lo = 0;
+        size_t hi = n;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (g_served[mid].addr.load(std::memory_order_relaxed) <= addr) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        bool served = false;
+        if (lo > 0) {
+            served = end <= g_served[lo - 1].end.load(std::memory_order_relaxed);
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (g_served_seq.load(std::memory_order_relaxed) == s1) {
+            return served;
+        }
+    }
+}
+
 uint64_t BlockVersion() {
     return g_block_version.load(std::memory_order_relaxed);
 }
@@ -1720,6 +1787,49 @@ void NoteHostVerify(bool written, uint64_t bytes, bool changed) {
     }
 }
 
+// sotc: SOTC_PC_RING_HEAPSTAT=1 (off by default). Per memtype slot of the post phase of MEMTYPE_ALLOC
+// (probe_memtype.cpp): the allocations of the window, and how many of them lie inside a served range
+// (ArenaRelation 1: an imported arena block or heap run), straddle one (2) or lie outside all of them
+// (0). The share per slot is the measured answer to which heaps the GPU already reads in place. Only
+// mode 8 has served ranges, so the other modes count everything as outside. Printed in the host window.
+constexpr size_t kStatSlots = 64; // = the memtype probe's kSlots (probe_memtype.cpp)
+struct HeapStat {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> inside{0};
+    std::atomic<uint64_t> inside_bytes{0};
+    std::atomic<uint64_t> straddle{0};
+    std::atomic<uint64_t> outside{0};
+};
+std::array<HeapStat, kStatSlots> g_heap_stat{};
+
+bool HeapStatOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_PC_RING_HEAPSTAT");
+        return v && v[0] && std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+// Post phase of MEMTYPE_ALLOC (any game thread, lock-free): one allocation of a memtype slot at addr.
+void NoteHeapAlloc(uint32_t slot, uint64_t addr, uint64_t size) {
+    if (slot >= kStatSlots || addr == 0 || size == 0 || !HeapStatOn()) {
+        return;
+    }
+    HeapStat& s = g_heap_stat[slot];
+    s.calls.fetch_add(1, std::memory_order_relaxed);
+    s.bytes.fetch_add(size, std::memory_order_relaxed);
+    const int relation = ArenaRelation(addr, size);
+    if (relation == 1) {
+        s.inside.fetch_add(1, std::memory_order_relaxed);
+        s.inside_bytes.fetch_add(size, std::memory_order_relaxed);
+    } else if (relation == 2) {
+        s.straddle.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        s.outside.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 // Mode 8 report lines (Report prints nothing else in this mode). The read traffic is the unique
 // bytes per submit, summed over the submits of the window, per frame (the GPU reads host memory
 // per submit; overlapping binds of one submit are read once).
@@ -1829,6 +1939,29 @@ void ReportHost(std::string& out, double seconds) {
                       static_cast<unsigned long long>(wr), static_cast<double>(wrb) / mib,
                       static_cast<unsigned long long>(wrc));
         out += line;
+    }
+    if (HeapStatOn()) { // one line per memtype slot that allocated in the window
+        for (size_t slot = 0; slot < kStatSlots; ++slot) {
+            HeapStat& s = g_heap_stat[slot];
+            const uint64_t calls = s.calls.exchange(0, std::memory_order_relaxed);
+            const uint64_t heap_bytes = s.bytes.exchange(0, std::memory_order_relaxed);
+            const uint64_t inside = s.inside.exchange(0, std::memory_order_relaxed);
+            const uint64_t inside_bytes = s.inside_bytes.exchange(0, std::memory_order_relaxed);
+            const uint64_t straddle = s.straddle.exchange(0, std::memory_order_relaxed);
+            const uint64_t outside = s.outside.exchange(0, std::memory_order_relaxed);
+            if (calls == 0) {
+                continue;
+            }
+            std::snprintf(line, sizeof line,
+                          "SOTC PC RING host heap slot %zu: allocs %llu (%.2f MiB), inside a served "
+                          "range %llu (%.2f MiB), straddling %llu, outside %llu\n",
+                          slot, static_cast<unsigned long long>(calls),
+                          static_cast<double>(heap_bytes) / mib, static_cast<unsigned long long>(inside),
+                          static_cast<double>(inside_bytes) / mib,
+                          static_cast<unsigned long long>(straddle),
+                          static_cast<unsigned long long>(outside));
+            out += line;
+        }
     }
 }
 

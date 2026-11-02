@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
@@ -105,6 +106,50 @@ struct PipeKeyRegs {
     std::array<AmdGpu::BlendControl, AmdGpu::NUM_COLOR_BUFFERS> blend_control;
 };
 
+/// sotc: SOTC_PIPE_FAST. Every register a graphics lookup reads besides the key part: the key part
+/// (PipeKeyRegs) and the stage selection (GS mode and stream-out config, see RefreshGraphicsStages).
+struct PipeFastRegs {
+    PipeKeyRegs key;
+    AmdGpu::GsMode vgt_gs_mode;
+    AmdGpu::StreamOutConfig vgt_strmout_config;
+};
+
+/// sotc: SOTC_PIPE_FAST: why a draw could not take the recorded lookup (counted per reason).
+enum class PipeFastMiss : u8 { None, Record, Async, Regs, Params, Sharp, Runtime };
+
+/// sotc: SOTC_SPEC_MEMO. One stored answer of GetProgram: the permutation a stage resolved to, keyed
+/// by the program, the stage pair, the shader hash, the bindings the stage started from, the runtime
+/// info, the tessellation constant buffer (tessellation stages), the parsed fetch shader and the key
+/// words of the specialization (PackSpecObject layout). Linked in an LRU list by index.
+struct SpecMemoEntry {
+    static constexpr u32 None = ~u32{0};
+    const Program* program{};
+    Shader::HwStage hw_stage{};
+    Shader::SwStage sw_stage{};
+    u64 hash{};
+    u32 perm{};
+    u64 key_hash{};              ///< the hash the index maps to this entry
+    u32 prev{None};              ///< LRU neighbours (towards the most recently used)
+    u32 next{None};
+    Shader::Backend::Bindings start{};
+    Shader::RuntimeInfo runtime_info{};
+    bool has_tess{};
+    Shader::TessellationDataConstantBuffer tess{};
+    Shader::Gcn::FetchShaderData fetch{};
+    std::vector<u32> words;
+};
+
+/// sotc: SOTC_SPEC_MEMO state: a fixed number of entries (kCap), an index from key hash to entry
+/// (several entries may share a hash; each lookup compares the full key), and the LRU ends.
+struct SpecMemoState {
+    static constexpr size_t kCap = 4096;
+    std::vector<SpecMemoEntry> entries; ///< allocated on the first lookup
+    std::unordered_multimap<u64, u32> index;
+    u32 used{};                         ///< entries filled so far (below kCap, no eviction yet)
+    u32 head{SpecMemoEntry::None};      ///< most recently used
+    u32 tail{SpecMemoEntry::None};      ///< least recently used: the eviction victim
+};
+
 class PipelineCache {
 public:
     /// sotc: SOTC_RAM_REPORT: counts of the programs and pipelines kept in host memory, and the size
@@ -182,6 +227,9 @@ private:
     /// sotc: N5. The lookups; GetGraphicsPipeline and GetComputePipeline count the draws that bind.
     const GraphicsPipeline* GetGraphicsPipelineLookup(const DrawIndirectParams params);
     const ComputePipeline* GetComputePipelineLookup();
+    /// sotc: SOTC_PIPE_FAST. The full lookups the wrappers above run when no recorded lookup applies.
+    const GraphicsPipeline* GetGraphicsPipelineLookupSlow(const DrawIndirectParams params);
+    const ComputePipeline* GetComputePipelineLookupSlow();
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
@@ -229,6 +277,8 @@ private:
     static constexpr size_t kStageMemoWays = 2;
     std::vector<StageMemo> stage_memo;
     u64 stage_memo_tick{};
+    /// sotc: SOTC_SPEC_MEMO (GetProgram): the specialization memo. Command processor thread only.
+    SpecMemoState spec_memo_state;
     /// sotc: the first thread that called GetProgram in a memo mode. Other threads take the slow
     /// path (counted as foreign).
     std::atomic<std::thread::id> pipe_memo_owner{};
@@ -254,6 +304,71 @@ private:
     ComputePipelineKey last_compute_key{};
     size_t last_compute_size{}; ///< compute_pipelines.size() when stored
     size_t last_graphics_size{}; ///< graphics_pipelines.size() when last_graphics_pipeline was stored
+
+    /// sotc: SOTC_PIPE_FAST. One stage of a resolved lookup: the inputs GetProgram and the
+    /// specialization read for it, so the next draw can check them without the full lookup.
+    struct PipeFastStage {
+        Shader::HwStage hw_stage{};
+        Shader::SwStage sw_stage{};
+        bool absent{};                   ///< the stage is not bound (no program): nothing to check
+        Shader::Info* info{};            ///< the program's info (programs are never erased)
+        vk::ShaderModule module{};
+        u64 hash{};                      ///< params.hash
+        u64 pgm_base{};                  ///< params.Base(): the code address
+        std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+        std::vector<u32> flat;           ///< info->FlatBuf() after the lookup's refresh
+        Shader::RuntimeInfo runtime_info{}; ///< BuildRuntimeInfo's result for the stage
+        bool has_tess{};
+        Shader::TessellationDataConstantBuffer tess{}; ///< read from guest memory at the lookup
+        bool has_fetch{};
+        std::vector<u32> fetch_code;     ///< the vertex fetch shader's words, read at the lookup
+    };
+    /// sotc: SOTC_PIPE_FAST. The last successful graphics lookup: its pipeline, the registers it
+    /// read and its stages in bind order. Invalidated at the start of every full lookup.
+    struct PipeFastGraphics {
+        bool valid{};
+        const GraphicsPipeline* pipeline{};
+        size_t pipelines_size{};   ///< graphics_pipelines.size() when recorded
+        PipeFastRegs regs{};
+        Shader::Gcn::FetchShaderData* fetch{}; ///< fetch_shader as the lookup left it
+        std::vector<PipeFastStage> stages;
+    };
+    /// sotc: SOTC_PIPE_FAST. The last successful compute lookup.
+    struct PipeFastCompute {
+        bool valid{};
+        const ComputePipeline* pipeline{};
+        size_t pipelines_size{};   ///< compute_pipelines.size() when recorded
+        ComputePipelineKey key{};
+        PipeFastStage stage{};
+    };
+    /// sotc: SOTC_PIPE_FAST. The state a lookup leaves behind, which a fast hit reproduces.
+    struct PipeFastState {
+        const GraphicsPipeline* pipeline{};
+        const ComputePipeline* compute{};
+        std::array<const Shader::Info*, MaxShaderStages> infos{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        Shader::Gcn::FetchShaderData* fetch{};
+    };
+    PipeFastGraphics pipe_fast_gfx;
+    PipeFastCompute pipe_fast_cs;
+    /// sotc: SOTC_PIPE_FAST. Each returns true when the draw matches the record (and then fills
+    /// out with the state the full lookup would leave); misses are counted by reason.
+    bool GraphicsFastCheck(PipeFastState& out);
+    bool ComputeFastCheck(PipeFastState& out);
+    /// sotc: SOTC_PIPE_FAST. Checks one recorded stage against the draw's params: reads the guest
+    /// memory the stage reads (flat buffer, tessellation constants, fetch shader) and sets its
+    /// info and module in slot, as GetProgram does.
+    PipeFastMiss FastVerifyStage(const PipeFastStage& st, const Shader::ShaderParams& params,
+                                 size_t slot);
+    /// sotc: SOTC_PIPE_FAST. Fills the record of one stage the full lookup bound. Returns false when
+    /// the stage cannot be checked later.
+    bool FillFastStage(PipeFastStage& st, Shader::Info& info, Shader::HwStage hw,
+                       Shader::SwStage sw, const Shader::ShaderParams& params,
+                       vk::ShaderModule module, Shader::Gcn::FetchShaderData* fetch);
+    /// sotc: SOTC_PIPE_FAST. Records the state of a lookup that returned pipeline (after the full
+    /// lookup, on the same thread). A stage that cannot be recorded leaves the record invalid.
+    void RecordGraphicsFast(const GraphicsPipeline* pipeline);
+    void RecordComputeFast(const ComputePipeline* pipeline);
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
@@ -424,9 +539,17 @@ private:
 /// when the switch is on and the window had lookups. Call from one thread only.
 void ReportPipeMemo(std::string& out, double seconds);
 
+/// sotc: SOTC_SPEC_MEMO=1/2 counters (vk_pipeline_cache.cpp): appends one "SOTC spec memo" line for
+/// the 5 s report when the switch is on and the window had lookups. Call from one thread only.
+void ReportSpecMemo(std::string& out, double seconds);
+
 /// sotc: SOTC_PIPE_DIRTY=1/2 counters (vk_pipeline_cache.cpp): appends one line for the 5 s report
 /// when the switch is on and the window had graphics key or flat buffer work. Call from one thread.
 void ReportPipeDirty(std::string& out, double seconds);
+
+/// sotc: SOTC_PIPE_FAST counters (vk_pipeline_cache.cpp): appends one line for the 5 s report when
+/// the switch is on and the window had lookups. Call from one thread only.
+void ReportPipeFast(std::string& out, double seconds);
 
 /// sotc: SOTC_PIPE_GPL counters (vk_pipeline_cache.cpp): appends one line for the 5 s report when the
 /// switch is on and the window had cold misses or libraries. Call from one thread.

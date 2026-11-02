@@ -5554,6 +5554,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     // sotc: SOTC_N5_BDA (vk_bda_table.h): 1 drops the descriptors of the slots the table serves,
     // 2 keeps them and checks each table slot against its descriptor's buffer.
     static const u32 n5_bda = BdaN5Mode();
+    // sotc: SOTC_N5_BDA_BUFFERS (vk_bda_table.h): 1 writes no descriptor for the slots the table
+    // serves, 2 writes them and counts what 1 would drop. 0 when the device lacks bufferDeviceAddress.
+    const u32 n5_buffers = BdaN5BuffersActive(instance);
     if (bda_stage) {
         bda_table.Begin(static_cast<u32>(stage.buffers.size()),
                         buffer_cache.GetStreamBuffer().BufferDeviceAddress());
@@ -5645,6 +5648,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             // sotc: SOTC_PR_RESOLVE: the values the prep thread computed for this descriptor;
             // otherwise the V# is read here.
             const u32 buf_index = static_cast<u32>(&desc - stage.buffers.data());
+            // sotc: SOTC_BDA: a slot the table serves is a guest buffer that is neither texel nor
+            // coherent (DefineBuffers emits no descriptor for it, so the shader never reads one).
+            const bool bda_slot =
+                bda_stage && !desc.is_formatted && desc.GetSharp(stage).mtype != 3;
+            // sotc: SOTC_N5_BDA_BUFFERS. DefineBuffers declares no variable for a table slot, so the
+            // shader never reads its descriptor: mode 1 writes none (drop_desc: no buffer info, no
+            // set write, also for a size-0 bind), mode 2 writes it and counts the drop.
+            const bool drop_desc = n5_buffers == 1 && bda_slot;
+            if (n5_buffers != 0 && bda_slot) {
+                BdaNoteDescriptorSkip(drop_desc);
+            }
             const PrBuffer* pb =
                 pr && pr_stage && pr->buffers[pr_stage->buf_first + buf_index].computed
                     ? &pr->buffers[pr_stage->buf_first + buf_index]
@@ -5680,7 +5694,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             // sotc: SOTC_BIND_CACHE_XTICK (BindCacheRepair)
             const u64 mapped_size = pb ? pb->mapped : size;
             if (size == 0) {
-                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                if (!drop_desc) {
+                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                }
                 if (bind_cache_recording && SotcStats::kBindCacheXtick &&
                     vbase != 0 && vsize != 0) {
                     bind_cache_map_dep_rec = true; // sotc: SOTC_BIND_CACHE_FRAME: a map can fill it
@@ -5836,15 +5852,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 stage.pgm_hash);
                 }
                 push_data.AddOffset(binding.buffer, adjust);
-                // sotc: SOTC_BDA: a slot the table serves is a guest buffer that is neither texel nor
-                // coherent (DefineBuffers emits no descriptor for it, so the shader never reads one).
-                const bool bda_slot =
-                    bda_stage && !desc.is_formatted && desc.GetSharp(stage).mtype != 3;
                 if (bda_stage) { // sotc: SOTC_BDA: exact offset and size, not the aligned ones
                     const bool has_address = buffer->HasBufferDeviceAddress();
                     bda_table.SetBlock(buf_index, has_address ? buffer->BufferDeviceAddress() : 0,
                                        buffer->SizeBytes(), offset, size);
-                    if (n5_bda == 2 && bda_slot && has_address) {
+                    if ((n5_bda == 2 || n5_buffers == 2) && bda_slot && has_address) {
                         // Verify: the address the table gives must be the descriptor buffer's device
                         // address plus the offset the descriptor would have started at.
                         const vk::DeviceAddress descriptor_base = instance.GetDevice().getBufferAddress(
@@ -5852,12 +5864,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         bda_table.CheckSlot(buf_index, descriptor_base + offset);
                     }
                 }
-                if (n5_bda == 1 && bda_slot) {
+                if (!drop_desc && n5_bda == 1 && bda_slot) {
                     // sotc: SOTC_N5_BDA=1: the block table serves this slot, so its descriptor is a
                     // null placeholder. The write stays (the layout is unchanged) and the buffer
                     // stays in bound_buffers, so barriers and write marks still cover it.
                     buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
-                } else {
+                } else if (!drop_desc) {
                     buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 }
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
@@ -5916,6 +5928,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
                 SotcOpPhases::ChargeBinding(desc.is_written, ph_upload0, ph_t0); // sotc: SOTC_OP_PHASES
+            }
+            if (drop_desc) {
+                // sotc: SOTC_N5_BDA_BUFFERS=1: no set write for this slot. The layout slots still
+                // advance, as the write would have advanced them.
+                ++binding.unified;
+                ++binding.buffer;
+                continue;
             }
         }
 

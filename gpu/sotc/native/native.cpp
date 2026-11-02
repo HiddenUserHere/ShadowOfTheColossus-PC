@@ -5,6 +5,7 @@
 // ticket is a backend supplied by BufferCache.
 #include "native.h"
 #include "native_draw.h"
+#include "../pc_ring.h" // sotc: 1a, HostServed (ring 8 imported runs)
 #include "verify.h" // sotc: coverage oracle (SOTC_VERIFY)
 #include "n1verify.h" // sotc: SOTC_VERIFY=n1
 
@@ -65,6 +66,14 @@ struct Counters {
     std::atomic<uint64_t> warm_backlog_max{};   // bytes waiting for a later drain, max
     std::atomic<uint64_t> late_writes{}, late_bytes{};    // announced before the writer finished, same frame
     std::atomic<uint64_t> late_next{}, late_next_bytes{}; // ... changed after a SubmitDone (also a legal rewrite)
+    // sotc: 1a. Announce fast path and the cost of the drain.
+    std::atomic<uint64_t> announce_served{};       // announces inside a run ring 8 serves in place (queued, served)
+    std::atomic<uint64_t> announce_merged{};       // announce pieces merged into a queued entry
+    std::atomic<uint64_t> drain_ns{};              // NativeDrain wall time
+    std::atomic<uint64_t> drain_pages{};           // 4 KiB pages given a CPU mark by the drain
+    std::atomic<uint64_t> drain_invalidations{};   // TextureCache::InvalidateMemory calls
+    std::atomic<uint64_t> drain_served{};          // queued entries served in place (no mark, no upload)
+    std::atomic<uint64_t> drain_ranges{};          // merged ranges the drain processed
 };
 Counters g_c;
 std::atomic<uint64_t> g_submitted_local{}; // frame counter when no backend is set
@@ -183,21 +192,31 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
         g_c.announce_per_frame.fetch_add(1, std::memory_order_relaxed);
     }
     // PerFrame is queued like Persistent; the draw thread marks it CPU-modified instead of uploading it.
+    // sotc: 1a. A range ring 8 serves in place is queued as served, not dropped: the drain then skips its page
+    // mark and upload (the binds read the guest bytes), but still invalidates the images over it (ringed pages
+    // never fault, so the texture cache would not hear of a write there).
+    const bool served = SotcPcRing::HostServed(addr, size);
     std::scoped_lock lock{g_mutex};
+    uint64_t merged = 0;
     for (uint64_t at = addr; at < addr + size;) {
         const uint64_t piece = std::min<uint64_t>(kMaxUploadChunk, addr + size - at);
-        // sotc: a piece that touches the newest queued range of its kind extends it. The union holds
-        // announced bytes only (adjacent or overlapping), so the drain copies exactly what was written.
-        // Sequential small writes (memcpy runs) fill one entry instead of overflowing the queue, and an
-        // overflow drops the write: mode 1 never sees it again.
-        if (!g_pending.empty() && g_pending.back().kind == kind) {
+        // sotc: a piece that touches the newest queued range of its kind extends it, on either side. The union
+        // holds announced bytes only (adjacent or overlapping), so the drain copies exactly what was written.
+        // Sequential small writes (memcpy runs) fill one entry instead of overflowing the queue. Served and
+        // not-served ranges are never merged (the drain treats them differently). One entry stays <= 64 MiB.
+        if (!g_pending.empty()) {
             PendingUpload& back = g_pending.back();
-            const uint64_t back_end = back.addr + back.size;
-            if (at >= back.addr && at <= back_end && at + piece - back.addr <= kMaxUploadChunk) {
-                back.size = std::max<uint64_t>(back_end, at + piece) - back.addr;
-                back.seq = seq;
-                at += piece;
-                continue;
+            if (back.kind == kind && back.served == served) {
+                const uint64_t lo = std::min<uint64_t>(back.addr, at);
+                const uint64_t hi = std::max<uint64_t>(back.addr + back.size, at + piece);
+                if (at <= back.addr + back.size && back.addr <= at + piece && hi - lo <= kMaxUploadChunk) {
+                    back.addr = lo;
+                    back.size = hi - lo;
+                    back.seq = seq;
+                    ++merged;
+                    at += piece;
+                    continue;
+                }
             }
         }
         if (g_pending.size() >= kMaxPending) {
@@ -209,9 +228,15 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
                              kMaxPending);
             }
         } else {
-            g_pending.push_back(PendingUpload{at, piece, kind, seq});
+            g_pending.push_back(PendingUpload{at, piece, kind, seq, served});
         }
         at += piece;
+    }
+    if (served) {
+        g_c.announce_served.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (merged) {
+        g_c.announce_merged.fetch_add(merged, std::memory_order_relaxed);
     }
     g_pending_count.store(PendingTotal(), std::memory_order_release);
 }
@@ -233,10 +258,10 @@ void Release(uint64_t addr, uint64_t size) {
         g_c.announce_released.fetch_add(1, std::memory_order_relaxed);
         const uint64_t end = p.addr + p.size;
         if (p.addr < addr) {
-            kept.push_back(PendingUpload{p.addr, addr - p.addr, p.kind, p.seq});
+            kept.push_back(PendingUpload{p.addr, addr - p.addr, p.kind, p.seq, p.served});
         }
         if (end > addr + size) {
-            kept.push_back(PendingUpload{addr + size, end - (addr + size), p.kind, p.seq});
+            kept.push_back(PendingUpload{addr + size, end - (addr + size), p.kind, p.seq, p.served});
         }
     }
     g_pending.swap(kept);
@@ -391,7 +416,7 @@ void Report(std::string& out, double seconds) {
         desc_noted = g_desc_noted;
         desc_replaced = g_desc_replaced;
     }
-    char line[512];
+    char line[1024];
     std::snprintf(line, sizeof(line),
                   "SOTC NATIVE mode %d (%.1f s): announce persistent %llu per-frame %llu gpu-written %llu "
                   "dropped %llu released %llu rejected %llu (session)\n",
@@ -414,21 +439,40 @@ void Report(std::string& out, double seconds) {
         // visible to that submit's binds), Persistent uploads the budget postponed, writes found after their
         // announce (re-announced by native_hooks.cpp).
         const auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+        const uint64_t drains_n = take(g_c.drains);
         std::snprintf(line, sizeof(line),
                       "SOTC NATIVE TIMING drains %llu entries %llu %llu KiB, after-pickup %llu %llu KiB (lag max "
                       "%llu), warm deferred %llu (backlog max %llu KiB), late writes same-frame %llu %llu B "
                       "next-frame %llu %llu B\n",
-                      ull(take(g_c.drains)), ull(take(g_c.drain_entries)), ull(take(g_c.drain_bytes) >> 10),
+                      ull(drains_n), ull(take(g_c.drain_entries)), ull(take(g_c.drain_bytes) >> 10),
                       ull(take(g_c.drain_after_pickup)), ull(take(g_c.drain_after_bytes) >> 10),
                       ull(take(g_c.drain_lag_max)), ull(take(g_c.warm_deferred)),
                       ull(take(g_c.warm_backlog_max) >> 10), ull(take(g_c.late_writes)),
                       ull(take(g_c.late_bytes)), ull(take(g_c.late_next)), ull(take(g_c.late_next_bytes)));
         out += line;
+        // sotc: 1a. What NativeDrain costs on the draw thread, per frame (SubmitDone count in the window) and
+        // what the announce fast path did (served in place, merged into a queued entry).
+        const uint64_t drain_ns = take(g_c.drain_ns);
+        const uint64_t frames_now = FrameSubmitted();
+        static uint64_t frames_prev = 0;
+        const uint64_t frames = frames_now >= frames_prev ? frames_now - frames_prev : 0;
+        frames_prev = frames_now;
+        const double ms = drain_ns / 1e6;
+        std::snprintf(line, sizeof(line),
+                      "SOTC NATIVE TIMING drain %.2f ms (%.3f ms per frame over %llu frames, %.1f drains per frame), "
+                      "ranges %llu, pages marked %llu, texture invalidations %llu, served entries %llu; announces "
+                      "served %llu, merged %llu\n",
+                      ms, frames ? ms / static_cast<double>(frames) : 0.0, ull(frames),
+                      frames ? static_cast<double>(drains_n) / static_cast<double>(frames) : 0.0,
+                      ull(take(g_c.drain_ranges)), ull(take(g_c.drain_pages)), ull(take(g_c.drain_invalidations)),
+                      ull(take(g_c.drain_served)), ull(take(g_c.announce_served)), ull(take(g_c.announce_merged)));
+        out += line;
     }
     if (g_mode == 1) {
         std::snprintf(line, sizeof(line),
                       "SOTC NATIVE tracking off (%.1f s): readbacks skipped %llu, stray faults write %llu "
-                      "read %llu, exact uploads %llu %llu KiB, images reused %llu\n",
+                      "read %llu, exact uploads %llu %llu KiB, images reused %llu, command processor writes %llu "
+                      "%llu KiB\n",
                       seconds, static_cast<unsigned long long>(take(g_c.readbacks_skipped)),
                       static_cast<unsigned long long>(take(g_c.stray_write_faults)),
                       static_cast<unsigned long long>(take(g_c.stray_read_faults)),
@@ -534,6 +578,15 @@ void NoteDrainDone(uint64_t warm_deferred_bytes, uint64_t warm_backlog_bytes) {
 
 void NoteDroppedUpload() {
     g_c.announce_dropped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteDrainWork(uint64_t ns, uint64_t pages_marked, uint64_t invalidations, uint64_t served_entries,
+                   uint64_t ranges) {
+    g_c.drain_ns.fetch_add(ns, std::memory_order_relaxed);
+    g_c.drain_pages.fetch_add(pages_marked, std::memory_order_relaxed);
+    g_c.drain_invalidations.fetch_add(invalidations, std::memory_order_relaxed);
+    g_c.drain_served.fetch_add(served_entries, std::memory_order_relaxed);
+    g_c.drain_ranges.fetch_add(ranges, std::memory_order_relaxed);
 }
 
 void FlipReuseFence(uint64_t frame_now, RingDepth depth) {

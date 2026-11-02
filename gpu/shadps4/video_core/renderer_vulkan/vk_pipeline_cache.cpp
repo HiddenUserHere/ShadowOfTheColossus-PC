@@ -557,7 +557,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .stage_bindings = Shader::StageBindingsEnabled() &&
                           instance.GetMaxBoundDescriptorSets() >= Shader::MaxStageDescriptorSets,
         .bda_buffers = BdaTableMode(instance) != 0, // sotc: SOTC_BDA (block table, vk_bda_table.h)
-        .bindless_images = Shader::BindlessImagesEnabled(), // sotc: SOTC_N5_BINDLESS
+        // sotc: SOTC_N5_BINDLESS, and SOTC_BINDLESS_SAMP: both heaps change the emitted SPIR-V.
+        .bindless_images = Shader::BindlessImagesEnabled() || Shader::BindlessSamplersEnabled(),
     };
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
     // the loading screen on meanwhile.
@@ -1615,7 +1616,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return pipeline;
 }
 
-const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookup(const DrawIndirectParams params) {
+// sotc: SOTC_PIPE_FAST: the full lookup; GetGraphicsPipelineLookup runs it unless a record applies.
+const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawIndirectParams params) {
     draw_indirect_params = params;
     // sotc: SOTC_DEPTH_SYNC_PIPE=1 builds depth-only (shadow) pipelines on this thread so their
     // draws are never skipped. Off by default since 2026-10-27: each build took ~36 ms and an
@@ -1860,7 +1862,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return pipeline;
 }
 
-const ComputePipeline* PipelineCache::GetComputePipelineLookup() {
+// sotc: SOTC_PIPE_FAST: the full lookup; GetComputePipelineLookup runs it unless a record applies.
+const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -2044,6 +2047,441 @@ void ReportPipeDirty(std::string& out, double seconds) {
         static_cast<unsigned long long>(d[4]), pct(d[4], d[3]),
         d[3] ? static_cast<double>(d[5]) / static_cast<double>(d[3]) : 0.0,
         seconds > 0.0 ? static_cast<double>(d[3]) / seconds : 0.0);
+    out += line;
+}
+
+// sotc: SOTC_PIPE_FAST. Unset or 0: the lookups run in full, as before. 1: a draw whose recorded
+// inputs are unchanged takes the recorded pipeline and stage state. 2: the check runs, the full
+// lookup runs too, and a difference is counted (the full lookup's result is used).
+static int PipeFastMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_PIPE_FAST");
+        return v && v[0] == '1' ? 1 : v && v[0] == '2' ? 2 : 0;
+    }();
+    return mode;
+}
+
+namespace {
+// sotc: counters of SOTC_PIPE_FAST, printed by ReportPipeFast. The fields are in the order of
+// the array there.
+struct PipeFastStats {
+    std::atomic<u64> gfx_hits{};
+    std::atomic<u64> gfx_miss_record{};
+    std::atomic<u64> gfx_miss_async{};
+    std::atomic<u64> gfx_miss_regs{};
+    std::atomic<u64> gfx_miss_params{};
+    std::atomic<u64> gfx_miss_sharp{};
+    std::atomic<u64> gfx_miss_runtime{};
+    std::atomic<u64> cs_hits{};
+    std::atomic<u64> cs_miss_record{};
+    std::atomic<u64> cs_miss_params{};
+    std::atomic<u64> cs_miss_sharp{};
+    std::atomic<u64> cs_miss_runtime{};
+    std::atomic<u64> mismatch_gfx{};
+    std::atomic<u64> mismatch_cs{};
+    std::atomic<u64> check_ns{}; ///< time spent in the checks (hits and misses)
+};
+PipeFastStats g_pipe_fast;
+
+// sotc: counts one miss of a check, by its reason.
+void CountFastMiss(bool graphics, PipeFastMiss miss) {
+    auto& s = g_pipe_fast;
+    if (graphics) {
+        switch (miss) {
+        case PipeFastMiss::Record: s.gfx_miss_record.fetch_add(1, std::memory_order_relaxed); break;
+        case PipeFastMiss::Async: s.gfx_miss_async.fetch_add(1, std::memory_order_relaxed); break;
+        case PipeFastMiss::Regs: s.gfx_miss_regs.fetch_add(1, std::memory_order_relaxed); break;
+        case PipeFastMiss::Params: s.gfx_miss_params.fetch_add(1, std::memory_order_relaxed); break;
+        case PipeFastMiss::Sharp: s.gfx_miss_sharp.fetch_add(1, std::memory_order_relaxed); break;
+        case PipeFastMiss::Runtime: s.gfx_miss_runtime.fetch_add(1, std::memory_order_relaxed); break;
+        case PipeFastMiss::None: break;
+        }
+    } else {
+        switch (miss) {
+        case PipeFastMiss::Record: s.cs_miss_record.fetch_add(1, std::memory_order_relaxed); break;
+        case PipeFastMiss::Params: s.cs_miss_params.fetch_add(1, std::memory_order_relaxed); break;
+        case PipeFastMiss::Sharp: s.cs_miss_sharp.fetch_add(1, std::memory_order_relaxed); break;
+        case PipeFastMiss::Runtime: s.cs_miss_runtime.fetch_add(1, std::memory_order_relaxed); break;
+        default: break;
+        }
+    }
+}
+} // namespace
+
+// sotc: SOTC_PIPE_FAST. The stages RefreshGraphicsStages binds for the stage selection in regs, in
+// its order (the fragment stage first). Keep in step with the switch of that function.
+static size_t PipeFastStageList(const AmdGpu::Regs& regs,
+                                std::array<std::pair<Shader::HwStage, Shader::SwStage>, 5>& out) {
+    using Hw = Shader::HwStage;
+    using Sw = Shader::SwStage;
+    size_t n = 0;
+    out[n++] = {Hw::Fragment, Sw::Fragment};
+    switch (regs.stage_enable.raw) {
+    case AmdGpu::ShaderStageEnable::VgtStages::Vs:
+        out[n++] = {Hw::Vertex, Sw::Vertex};
+        break;
+    case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
+        out[n++] = {Hw::Export, Sw::Vertex};
+        out[n++] = {Hw::Geometry, Sw::Geometry};
+        break;
+    case AmdGpu::ShaderStageEnable::VgtStages::LsHs:
+        out[n++] = {Hw::Hull, Sw::TessellationControl};
+        out[n++] = {Hw::Vertex, Sw::TessellationEval};
+        out[n++] = {Hw::Local, Sw::Vertex};
+        break;
+    case AmdGpu::ShaderStageEnable::VgtStages::LsHsEsGs:
+        out[n++] = {Hw::Hull, Sw::TessellationControl};
+        out[n++] = {Hw::Export, Sw::TessellationEval};
+        out[n++] = {Hw::Local, Sw::Vertex};
+        out[n++] = {Hw::Geometry, Sw::Geometry};
+        break;
+    default:
+        break;
+    }
+    return n;
+}
+
+// sotc: SOTC_PIPE_FAST. Fills the record of one stage the full lookup bound, from its program. Reads
+// the guest memory the stage reads now, after the lookup. False when the stage cannot be checked
+// later (its fetch shader is unknown): the record is not kept.
+bool PipelineCache::FillFastStage(PipeFastStage& st, Shader::Info& info, Shader::HwStage hw,
+                                  Shader::SwStage sw, const Shader::ShaderParams& params,
+                                  vk::ShaderModule module, Shader::Gcn::FetchShaderData* fetch) {
+    st.absent = false;
+    st.hw_stage = hw;
+    st.sw_stage = sw;
+    st.info = &info;
+    st.module = module;
+    st.hash = params.hash;
+    st.pgm_base = params.Base();
+    std::memcpy(st.user_data.data(), params.user_data.data(), sizeof(st.user_data));
+    st.flat.assign(info.FlatBuf().begin(), info.FlatBuf().end());
+    st.runtime_info = runtime_infos[static_cast<u32>(sw)];
+    // The same tests as the specialization and GetProgram make.
+    st.has_tess = info.sw_stage == Shader::SwStage::TessellationControl ||
+                  info.sw_stage == Shader::SwStage::TessellationEval;
+    if (st.has_tess) {
+        info.ReadTessConstantBuffer(st.tess);
+    }
+    st.has_fetch = info.sw_stage == Shader::SwStage::Vertex && info.has_fetch_shader;
+    st.fetch_code.clear();
+    if (st.has_fetch) {
+        if (!fetch) {
+            return false;
+        }
+        const u8* backing = Core::Memory::Instance()->GetBackingPointer(reinterpret_cast<VAddr>(
+            Shader::Gcn::GetFetchShaderCode(info, info.fetch_shader_sgpr_base)));
+        const size_t words = fetch->size / sizeof(u32);
+        if (!backing || words == 0) {
+            return false;
+        }
+        st.fetch_code.resize(words);
+        std::memcpy(st.fetch_code.data(), backing, words * sizeof(u32));
+    }
+    return true;
+}
+
+// sotc: SOTC_PIPE_FAST. Checks one recorded stage against the draw. Makes the same updates to the
+// program's info that GetProgram makes (PgmBase, UserData, the flat buffer), so the guest memory
+// is read as the full lookup reads it. On a match the stage's info and module are set in slot, as
+// the full lookup leaves them.
+PipeFastMiss PipelineCache::FastVerifyStage(const PipeFastStage& st,
+                                            const Shader::ShaderParams& params, size_t slot) {
+    if (params.hash != st.hash || params.Base() != st.pgm_base ||
+        std::memcmp(params.user_data.data(), st.user_data.data(), sizeof(st.user_data)) != 0) {
+        return PipeFastMiss::Params;
+    }
+    Shader::Info& info = *st.info;
+    info.PgmBase() = params.Base();
+    info.UserData() = params.user_data;
+    info.RefreshFlatBuf();
+    if (!std::ranges::equal(info.FlatBuf(), st.flat)) {
+        return PipeFastMiss::Sharp;
+    }
+    if (st.has_tess) {
+        Shader::TessellationDataConstantBuffer tess{};
+        info.ReadTessConstantBuffer(tess);
+        if (std::memcmp(&tess, &st.tess, sizeof(tess)) != 0) {
+            return PipeFastMiss::Sharp;
+        }
+    }
+    if (st.has_fetch) {
+        const u8* backing = Core::Memory::Instance()->GetBackingPointer(reinterpret_cast<VAddr>(
+            Shader::Gcn::GetFetchShaderCode(info, info.fetch_shader_sgpr_base)));
+        if (!backing || std::memcmp(backing, st.fetch_code.data(),
+                                    st.fetch_code.size() * sizeof(u32)) != 0) {
+            return PipeFastMiss::Sharp;
+        }
+    }
+    infos[slot] = &info;
+    modules[slot] = st.module;
+    // BuildRuntimeInfo reads the registers, the draw's indirect params and (for the local stage)
+    // the hull stage's constants: compared as the specialization receives it.
+    const auto& rt = BuildRuntimeInfo(st.hw_stage, st.sw_stage);
+    return rt == st.runtime_info ? PipeFastMiss::None : PipeFastMiss::Runtime;
+}
+
+// sotc: SOTC_PIPE_FAST. The check of a graphics draw against the record. Each stage of the record
+// is verified in bind order (the hull stage before the local one, which reads its constants).
+bool PipelineCache::GraphicsFastCheck(PipeFastState& out) {
+    const auto& rec = pipe_fast_gfx;
+    if (!rec.valid || !last_graphics_pipeline || last_graphics_pipeline != rec.pipeline ||
+        last_graphics_size != graphics_pipelines.size()) {
+        CountFastMiss(true, PipeFastMiss::Record);
+        return false;
+    }
+    // The full lookup finishes the translations that are done first.
+    if (async_done_count.load(std::memory_order_acquire) != 0) {
+        CountFastMiss(true, PipeFastMiss::Async);
+        return false;
+    }
+    const auto& regs = liverpool->regs;
+    if (!PipeKeyRegsMatch(regs, rec.regs.key) ||
+        !SameBytes(regs.vgt_gs_mode, rec.regs.vgt_gs_mode) ||
+        !SameBytes(regs.vgt_strmout_config, rec.regs.vgt_strmout_config)) {
+        CountFastMiss(true, PipeFastMiss::Regs);
+        return false;
+    }
+    // The same start as RefreshGraphicsStages.
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    for (const auto& st : rec.stages) {
+        const auto* pgm = regs.ProgramForStage(static_cast<u32>(st.hw_stage));
+        const bool has_pgm = pgm && pgm->Address<u32*>();
+        PipeFastMiss miss = PipeFastMiss::None;
+        if (st.absent) {
+            if (has_pgm) { // a program where the record had none: the full lookup binds it
+                miss = PipeFastMiss::Params;
+            }
+        } else if (!has_pgm) {
+            miss = PipeFastMiss::Params;
+        } else {
+            miss = FastVerifyStage(st, AmdGpu::GetParams(*pgm), static_cast<size_t>(st.sw_stage));
+        }
+        if (miss != PipeFastMiss::None) {
+            CountFastMiss(true, miss);
+            return false;
+        }
+    }
+    out.pipeline = rec.pipeline;
+    out.infos = infos;
+    out.modules = modules;
+    out.fetch = rec.fetch;
+    return true;
+}
+
+// sotc: SOTC_PIPE_FAST. The check of a compute dispatch against the record.
+bool PipelineCache::ComputeFastCheck(PipeFastState& out) {
+    const auto& rec = pipe_fast_cs;
+    if (!rec.valid || !rec.pipeline || rec.pipelines_size != compute_pipelines.size()) {
+        CountFastMiss(false, PipeFastMiss::Record);
+        return false;
+    }
+    const auto params = AmdGpu::GetParams(liverpool->GetCsRegs());
+    // A shader still on a worker is waited for by the full lookup.
+    if (compute_prefetch && pending_programs.contains(params.hash)) {
+        CountFastMiss(false, PipeFastMiss::Record);
+        return false;
+    }
+    const PipeFastMiss miss = FastVerifyStage(rec.stage, params, 0);
+    if (miss != PipeFastMiss::None) {
+        CountFastMiss(false, miss);
+        return false;
+    }
+    out.compute = rec.pipeline;
+    out.infos[0] = infos[0];
+    out.modules[0] = modules[0];
+    return true;
+}
+
+// sotc: SOTC_PIPE_FAST. Records the state a full graphics lookup left, when it returned pipeline.
+// Only the stages it bound are recorded (the stage selection is in the record's registers).
+void PipelineCache::RecordGraphicsFast(const GraphicsPipeline* pipeline) {
+    auto& rec = pipe_fast_gfx;
+    rec.valid = false;
+    const auto& regs = liverpool->regs;
+    std::array<std::pair<Shader::HwStage, Shader::SwStage>, 5> list{};
+    const size_t count = PipeFastStageList(regs, list);
+    rec.stages.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+        const auto [hw, sw] = list[i];
+        const auto slot = static_cast<size_t>(static_cast<u32>(sw));
+        PipeFastStage& st = rec.stages[i];
+        const auto* pgm = regs.ProgramForStage(static_cast<u32>(hw));
+        if (!pgm || !pgm->Address<u32*>()) {
+            if (infos[slot]) { // bound without a program: not a state this record can check
+                return;
+            }
+            st.absent = true;
+            st.hw_stage = hw;
+            st.sw_stage = sw;
+            continue;
+        }
+        const auto params = AmdGpu::GetParams(*pgm);
+        const auto it = program_cache.find(params.hash);
+        if (it == program_cache.end() || infos[slot] != &it.value()->info) {
+            return;
+        }
+        if (!FillFastStage(st, it.value()->info, hw, sw, params, modules[slot], fetch_shader)) {
+            return;
+        }
+    }
+    PipeKeyRegsCapture(regs, rec.regs.key);
+    std::memcpy(&rec.regs.vgt_gs_mode, &regs.vgt_gs_mode, sizeof(rec.regs.vgt_gs_mode));
+    std::memcpy(&rec.regs.vgt_strmout_config, &regs.vgt_strmout_config,
+                sizeof(rec.regs.vgt_strmout_config));
+    rec.fetch = fetch_shader;
+    rec.pipeline = pipeline;
+    rec.pipelines_size = graphics_pipelines.size();
+    rec.valid = true;
+}
+
+// sotc: SOTC_PIPE_FAST. Records the state a full compute lookup left, when it returned pipeline.
+void PipelineCache::RecordComputeFast(const ComputePipeline* pipeline) {
+    auto& rec = pipe_fast_cs;
+    rec.valid = false;
+    const auto params = AmdGpu::GetParams(liverpool->GetCsRegs());
+    const auto it = program_cache.find(params.hash);
+    if (it == program_cache.end() || infos[0] != &it.value()->info) {
+        return;
+    }
+    if (!FillFastStage(rec.stage, it.value()->info, Shader::HwStage::Compute,
+                       Shader::SwStage::Compute, params, modules[0], nullptr)) {
+        return;
+    }
+    rec.key = compute_key;
+    rec.pipeline = pipeline;
+    rec.pipelines_size = compute_pipelines.size();
+    rec.valid = true;
+}
+
+// sotc: SOTC_PIPE_FAST. The graphics lookup: the check first; a hit returns the recorded pipeline
+// (mode 1). Otherwise the full lookup runs, and a hit is compared with its result (mode 2).
+const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookup(const DrawIndirectParams params) {
+    const int fast_mode = PipeFastMode();
+    if (fast_mode == 0) {
+        return GetGraphicsPipelineLookupSlow(params);
+    }
+    // The full lookup sets these too; the check needs them first (BuildRuntimeInfo reads them).
+    draw_indirect_params = params;
+    translation_pending = false;
+    PipeFastState cand{};
+    const auto check_start = std::chrono::steady_clock::now();
+    const bool hit = GraphicsFastCheck(cand);
+    g_pipe_fast.check_ns.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - check_start)
+                             .count()),
+        std::memory_order_relaxed);
+    if (hit && fast_mode == 1) {
+        fetch_shader = cand.fetch;
+        std::memcpy(&graphics_key, &last_graphics_key, sizeof(graphics_key));
+        g_pipe_fast.gfx_hits.fetch_add(1, std::memory_order_relaxed);
+        if (cand.pipeline->IsLinked()) {
+            g_gpl_counters.linked_served.fetch_add(1, std::memory_order_relaxed);
+        }
+        return cand.pipeline;
+    }
+    pipe_fast_gfx.valid = false;
+    const GraphicsPipeline* result = GetGraphicsPipelineLookupSlow(params);
+    if (hit) { // =2: the check's state against the full lookup's; the full result is used
+        g_pipe_fast.gfx_hits.fetch_add(1, std::memory_order_relaxed);
+        if (result != cand.pipeline || cand.fetch != fetch_shader || cand.infos != infos ||
+            cand.modules != modules) {
+            g_pipe_fast.mismatch_gfx.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (result) {
+        RecordGraphicsFast(result);
+    }
+    return result;
+}
+
+// sotc: SOTC_PIPE_FAST. The compute lookup: the check first, then as GetGraphicsPipelineLookup.
+const ComputePipeline* PipelineCache::GetComputePipelineLookup() {
+    const int fast_mode = PipeFastMode();
+    if (fast_mode == 0) {
+        return GetComputePipelineLookupSlow();
+    }
+    PipeFastState cand{};
+    const auto check_start = std::chrono::steady_clock::now();
+    const bool hit = ComputeFastCheck(cand);
+    g_pipe_fast.check_ns.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - check_start)
+                             .count()),
+        std::memory_order_relaxed);
+    if (hit && fast_mode == 1) {
+        compute_key = pipe_fast_cs.key;
+        g_pipe_fast.cs_hits.fetch_add(1, std::memory_order_relaxed);
+        return cand.compute;
+    }
+    pipe_fast_cs.valid = false;
+    const ComputePipeline* result = GetComputePipelineLookupSlow();
+    if (hit) { // =2: as for graphics
+        g_pipe_fast.cs_hits.fetch_add(1, std::memory_order_relaxed);
+        if (result != cand.compute || cand.infos[0] != infos[0] || cand.modules[0] != modules[0]) {
+            g_pipe_fast.mismatch_cs.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (result) {
+        RecordComputeFast(result);
+    }
+    return result;
+}
+
+// sotc: writes a report line for the 5 s report: counts since the previous call, for SOTC_PIPE_FAST.
+// Prints nothing while the switch is off or the window had no lookups. One thread only.
+void ReportPipeFast(std::string& out, double seconds) {
+    const int mode = PipeFastMode();
+    if (mode == 0) {
+        return;
+    }
+    // Same order as the fields of PipeFastStats.
+    const std::array<const std::atomic<u64>*, 15> counters{
+        &g_pipe_fast.gfx_hits,        &g_pipe_fast.gfx_miss_record, &g_pipe_fast.gfx_miss_async,
+        &g_pipe_fast.gfx_miss_regs,   &g_pipe_fast.gfx_miss_params, &g_pipe_fast.gfx_miss_sharp,
+        &g_pipe_fast.gfx_miss_runtime, &g_pipe_fast.cs_hits,        &g_pipe_fast.cs_miss_record,
+        &g_pipe_fast.cs_miss_params,  &g_pipe_fast.cs_miss_sharp,   &g_pipe_fast.cs_miss_runtime,
+        &g_pipe_fast.mismatch_gfx,    &g_pipe_fast.mismatch_cs,     &g_pipe_fast.check_ns,
+    };
+    static std::array<u64, counters.size()> prev{};
+    std::array<u64, counters.size()> d{};
+    for (std::size_t i = 0; i < d.size(); ++i) {
+        const u64 now = counters[i]->load(std::memory_order_relaxed);
+        d[i] = now - prev[i];
+        prev[i] = now;
+    }
+    // Indices as in the array above.
+    constexpr std::size_t kGfxHits = 0, kGfxRecord = 1, kGfxAsync = 2, kGfxRegs = 3,
+                          kGfxParams = 4, kGfxSharp = 5, kGfxRuntime = 6, kCsHits = 7,
+                          kCsRecord = 8, kCsParams = 9, kCsSharp = 10, kCsRuntime = 11,
+                          kMismatchGfx = 12, kMismatchCs = 13, kCheckNs = 14;
+    const u64 gfx_miss = d[kGfxRecord] + d[kGfxAsync] + d[kGfxRegs] + d[kGfxParams] +
+                         d[kGfxSharp] + d[kGfxRuntime];
+    const u64 cs_miss = d[kCsRecord] + d[kCsParams] + d[kCsSharp] + d[kCsRuntime];
+    const u64 gfx_total = d[kGfxHits] + gfx_miss;
+    const u64 cs_total = d[kCsHits] + cs_miss;
+    if (gfx_total == 0 && cs_total == 0) {
+        return;
+    }
+    const auto pct = [](u64 part, u64 whole) {
+        return whole ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+    };
+    const auto U = [](u64 v) { return static_cast<unsigned long long>(v); };
+    char line[640];
+    std::snprintf(
+        line, sizeof(line),
+        "SOTC pipe fast: mode %d, graphics %llu/%llu hits (%.0f%%), misses: record %llu, async "
+        "%llu, regs %llu, params %llu, sharp %llu, runtime %llu; compute %llu/%llu hits (%.0f%%), "
+        "misses: record %llu, params %llu, sharp %llu, runtime %llu; mismatches %llu (graphics "
+        "%llu, compute %llu); checks %.2f ms/s\n",
+        mode, U(d[kGfxHits]), U(gfx_total), pct(d[kGfxHits], gfx_total), U(d[kGfxRecord]),
+        U(d[kGfxAsync]), U(d[kGfxRegs]), U(d[kGfxParams]), U(d[kGfxSharp]), U(d[kGfxRuntime]),
+        U(d[kCsHits]), U(cs_total), pct(d[kCsHits], cs_total), U(d[kCsRecord]), U(d[kCsParams]),
+        U(d[kCsSharp]), U(d[kCsRuntime]), U(d[kMismatchGfx] + d[kMismatchCs]),
+        U(d[kMismatchGfx]), U(d[kMismatchCs]),
+        seconds > 0.0 ? static_cast<double>(d[kCheckNs]) / 1e6 / seconds : 0.0);
     out += line;
 }
 
@@ -2392,6 +2830,196 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+// sotc: SOTC_SPEC_MEMO. Unset or 0: off. 1: the specialization memo answers GetProgram (the stage
+// memo of SOTC_PIPE_MEMO is not used with it). 2: the memo and the slow path both run; the slow
+// answer is returned and every difference is counted.
+static int SpecMemoMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_SPEC_MEMO");
+        return v && v[0] == '1' ? 1 : v && v[0] == '2' ? 2 : 0;
+    }();
+    return mode;
+}
+
+namespace {
+// sotc: counters of SOTC_SPEC_MEMO, printed by ReportSpecMemo (the order of its counter array).
+struct SpecMemoStats {
+    std::atomic<u64> lookups{};          ///< GetProgram calls probed (owner thread, mode 1/2)
+    std::atomic<u64> hits{};             ///< of those, answered by an entry with an equal key
+    std::atomic<u64> stores{};           ///< entries stored from a miss
+    std::atomic<u64> store_skipped{};    ///< misses not stored: the constructed spec packed differently
+    std::atomic<u64> evictions{};        ///< stores that replaced the least recently used entry
+    std::atomic<u64> entries{};          ///< entries filled (a gauge, read in the report)
+    std::atomic<u64> probe_ns{};         ///< time of the key pass and the lookup
+    std::atomic<u64> mismatch_perm{};    ///< =2: memo permutation index differed from the slow path
+    std::atomic<u64> mismatch_module{};  ///< =2: same permutation, other shader module
+    std::atomic<u64> mismatch_fetch{};   ///< =2: fetch shader data differed
+    std::atomic<u64> mismatch_bindings{}; ///< =2: bindings after the stage differed
+};
+SpecMemoStats g_spec_memo;
+
+// Scratch of the probe of one GetProgram call: the key words and the parsed fetch shader. The
+// store after a miss (same call) reads them.
+thread_local std::vector<u32> t_spec_words;
+thread_local Shader::Gcn::FetchShaderData t_spec_fetch;
+thread_local std::vector<u32> t_spec_check;
+
+constexpr u32 kSpecNone = SpecMemoEntry::None;
+
+u64 SpecKeyHash(const std::vector<u32>& words, const Program* program, u64 hash,
+                Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                const Shader::Backend::Bindings& start) {
+    constexpr u64 kPrime = 0x100000001b3ull;
+    u64 h = 0xcbf29ce484222325ull ^ static_cast<u64>(reinterpret_cast<uintptr_t>(program));
+    h = (h ^ hash) * kPrime;
+    h = (h ^ ((u64(static_cast<u32>(hw_stage)) << 8) | u64(static_cast<u32>(sw_stage)))) * kPrime;
+    h = (h ^ start.unified) * kPrime;
+    h = (h ^ start.buffer) * kPrime;
+    for (const u32 w : words) {
+        h = (h ^ w) * kPrime;
+    }
+    return h ^ (h >> 29);
+}
+
+// The entry whose key equals the probe, or kSpecNone. Every part of the key is compared; the hash
+// only selects the candidates.
+u32 SpecMemoFind(const SpecMemoState& memo, u64 key_hash, const Program& program,
+                 Shader::HwStage hw_stage, Shader::SwStage sw_stage, u64 hash,
+                 const Shader::Backend::Bindings& start, const Shader::RuntimeInfo& rt,
+                 bool has_tess, const Shader::TessellationDataConstantBuffer& tess,
+                 const Shader::Gcn::FetchShaderData& fetch, const std::vector<u32>& words) {
+    const auto [first, last] = memo.index.equal_range(key_hash);
+    for (auto it = first; it != last; ++it) {
+        const SpecMemoEntry& e = memo.entries[it->second];
+        if (e.program != &program || e.hw_stage != hw_stage || e.sw_stage != sw_stage ||
+            e.hash != hash || !(e.start == start) || e.has_tess != has_tess ||
+            (has_tess && std::memcmp(&e.tess, &tess, sizeof(tess)) != 0) || !(e.runtime_info == rt) ||
+            !(e.fetch == fetch) || e.words != words || e.perm >= program.modules.size()) {
+            continue;
+        }
+        return it->second;
+    }
+    return kSpecNone;
+}
+
+void SpecMemoUnlink(SpecMemoState& memo, u32 i) {
+    SpecMemoEntry& e = memo.entries[i];
+    if (e.prev != kSpecNone) {
+        memo.entries[e.prev].next = e.next;
+    } else {
+        memo.head = e.next;
+    }
+    if (e.next != kSpecNone) {
+        memo.entries[e.next].prev = e.prev;
+    } else {
+        memo.tail = e.prev;
+    }
+    e.prev = kSpecNone;
+    e.next = kSpecNone;
+}
+
+void SpecMemoPushHead(SpecMemoState& memo, u32 i) {
+    SpecMemoEntry& e = memo.entries[i];
+    e.prev = kSpecNone;
+    e.next = memo.head;
+    if (memo.head != kSpecNone) {
+        memo.entries[memo.head].prev = i;
+    } else {
+        memo.tail = i;
+    }
+    memo.head = i;
+}
+} // namespace
+
+// sotc: SOTC_SPEC_MEMO. Stores the answer of a miss. The least recently used entry is replaced once
+// the memo is full. Entries are never updated in place: a key that is stored again is a new entry.
+static void SpecMemoStore(SpecMemoState& memo, u64 key_hash, const Program& program,
+                          Shader::HwStage hw_stage, Shader::SwStage sw_stage, u64 hash,
+                          const Shader::Backend::Bindings& start, const Shader::RuntimeInfo& rt,
+                          bool has_tess, const Shader::TessellationDataConstantBuffer& tess,
+                          const Shader::Gcn::FetchShaderData& fetch, const std::vector<u32>& words,
+                          u32 perm) {
+    if (memo.entries.empty()) {
+        memo.entries.resize(SpecMemoState::kCap);
+    }
+    u32 i{};
+    if (memo.used < SpecMemoState::kCap) {
+        i = memo.used++;
+        g_spec_memo.entries.store(memo.used, std::memory_order_relaxed);
+    } else {
+        i = memo.tail;
+        SpecMemoUnlink(memo, i);
+        const auto [first, last] = memo.index.equal_range(memo.entries[i].key_hash);
+        for (auto it = first; it != last; ++it) {
+            if (it->second == i) {
+                memo.index.erase(it);
+                break;
+            }
+        }
+        g_spec_memo.evictions.fetch_add(1, std::memory_order_relaxed);
+    }
+    SpecMemoEntry& e = memo.entries[i];
+    e.program = &program;
+    e.hw_stage = hw_stage;
+    e.sw_stage = sw_stage;
+    e.hash = hash;
+    e.perm = perm;
+    e.key_hash = key_hash;
+    e.start = start;
+    e.runtime_info = rt;
+    e.has_tess = has_tess;
+    e.tess = tess;
+    e.fetch = fetch;
+    e.words = words;
+    memo.index.emplace(key_hash, i);
+    SpecMemoPushHead(memo, i);
+}
+
+// sotc: writes the SOTC_SPEC_MEMO line for the 5 s report: counts since the previous call. Prints
+// nothing while the switch is unset or the window had no lookups. Call from one thread only.
+void ReportSpecMemo(std::string& out, double seconds) {
+    if (SpecMemoMode() == 0) {
+        return;
+    }
+    // Same order as the fields of SpecMemoStats.
+    const std::array<const std::atomic<u64>*, 10> counters{
+        &g_spec_memo.lookups,         &g_spec_memo.hits,
+        &g_spec_memo.stores,          &g_spec_memo.store_skipped,
+        &g_spec_memo.evictions,       &g_spec_memo.probe_ns,
+        &g_spec_memo.mismatch_perm,   &g_spec_memo.mismatch_module,
+        &g_spec_memo.mismatch_fetch,  &g_spec_memo.mismatch_bindings,
+    };
+    static std::array<u64, counters.size()> prev{};
+    std::array<u64, counters.size()> d{};
+    for (std::size_t i = 0; i < d.size(); ++i) {
+        const u64 now = counters[i]->load(std::memory_order_relaxed);
+        d[i] = now - prev[i];
+        prev[i] = now;
+    }
+    if (d[0] == 0) {
+        return;
+    }
+    const u64 mismatches = d[6] + d[7] + d[8] + d[9];
+    char line[512];
+    std::snprintf(
+        line, sizeof(line),
+        "SOTC spec memo: mode %d, lookups %llu, hits %llu (%.1f%%), stores %llu (skipped %llu), "
+        "evictions %llu, entries %llu/%zu, probe %.0f ns/s, mismatches %llu (perm %llu, module "
+        "%llu, fetch %llu, bindings %llu)\n",
+        SpecMemoMode(), static_cast<unsigned long long>(d[0]),
+        static_cast<unsigned long long>(d[1]),
+        100.0 * static_cast<double>(d[1]) / static_cast<double>(d[0]),
+        static_cast<unsigned long long>(d[2]), static_cast<unsigned long long>(d[3]),
+        static_cast<unsigned long long>(d[4]),
+        static_cast<unsigned long long>(g_spec_memo.entries.load(std::memory_order_relaxed)),
+        SpecMemoState::kCap,
+        seconds > 0.0 ? static_cast<double>(d[5]) / seconds : 0.0,
+        static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(d[6]),
+        static_cast<unsigned long long>(d[7]), static_cast<unsigned long long>(d[8]),
+        static_cast<unsigned long long>(d[9]));
+    out += line;
+}
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding,
@@ -2458,9 +3086,56 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     // shader and the returned values are set the same way. Entries are only stored from this path
     // (an existing program), never for a translation still pending. Unset: none of the code below
     // runs; the locals only start empty.
-    int memo_mode = PipeMemoStageMode();
+    // sotc: SOTC_SPEC_MEMO (set) replaces the stage memo: the two are not combined.
+    const int spec_mode = SpecMemoMode();
+    int memo_mode = spec_mode != 0 ? 0 : PipeMemoStageMode();
     if (memo_mode != 0 && !PipeMemoOwnerThread()) {
         memo_mode = 0; // sotc: a call from another thread takes the slow path (counted)
+    }
+    // sotc: SOTC_SPEC_MEMO. The key of this stage is built in one pass over its sharps (the reads
+    // the specialization makes, BuildSpecKey) and compared with the entries of the memo. Unset:
+    // none of the code below runs; the locals only start empty.
+    const bool spec_probed = spec_mode != 0 && PipeMemoOwnerThread();
+    const Shader::Backend::Bindings spec_start = binding; // the specialization starts from this
+    u32 spec_hit = kSpecNone;                             // the entry that answered the probe
+    u64 spec_key_hash{};
+    bool spec_has_tess = false;
+    Shader::TessellationDataConstantBuffer spec_tess{};
+    if (spec_probed) {
+        const auto probe_start = std::chrono::steady_clock::now();
+        spec_has_tess = info.sw_stage == SwStage::TessellationControl ||
+                        info.sw_stage == SwStage::TessellationEval;
+        if (spec_has_tess) {
+            info.ReadTessConstantBuffer(spec_tess);
+        }
+        Shader::BuildSpecKey(t_spec_words, info, rt, t_spec_fetch);
+        spec_key_hash = SpecKeyHash(t_spec_words, program.get(), params.hash, hw_stage, sw_stage,
+                                    binding);
+        spec_hit = SpecMemoFind(spec_memo_state, spec_key_hash, *program, hw_stage, sw_stage,
+                                params.hash, binding, rt, spec_has_tess, spec_tess, t_spec_fetch,
+                                t_spec_words);
+        if (spec_hit != kSpecNone) {
+            SpecMemoUnlink(spec_memo_state, spec_hit);
+            SpecMemoPushHead(spec_memo_state, spec_hit);
+            g_spec_memo.hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_spec_memo.lookups.fetch_add(1, std::memory_order_relaxed);
+        g_spec_memo.probe_ns.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - probe_start)
+                                 .count()),
+            std::memory_order_relaxed);
+        if (spec_hit != kSpecNone && spec_mode == 1) {
+            // The answer of the slow path for an equal key: the same steps as its found branch.
+            const SpecMemoEntry& entry = spec_memo_state.entries[spec_hit];
+            info.AddBindings(binding, Shader::UsesBindlessSamplers(info));
+            auto& found = program->modules[entry.perm];
+            if (auto& fetch = found.spec.fetch_shader_data; !fetch.Empty()) {
+                fetch_shader = &fetch;
+            }
+            return std::make_tuple(&program->info, found.module,
+                                   HashCombine(params.hash, static_cast<size_t>(entry.perm)));
+        }
     }
     Shader::Backend::Bindings memo_start{}; // the specialization starts from this
     Shader::TessellationDataConstantBuffer memo_tess{};
@@ -2507,6 +3182,22 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     }
 
     auto spec = Shader::StageSpecialization(info, rt, profile, binding);
+    // sotc: SOTC_SPEC_MEMO. A miss is stored only when the specialization just built packs to the
+    // key words of the probe (a guest sharp that changed between the two reads fails this check).
+    bool spec_store = false;
+    if (spec_probed && spec_hit == kSpecNone) {
+        Shader::PackSpecObject(t_spec_check, spec);
+        spec_store = t_spec_check == t_spec_words && spec.fetch_shader_data == t_spec_fetch;
+        if (spec_store && spec_has_tess) {
+            // The constructor read the tessellation constants again: they must be the probe's.
+            Shader::TessellationDataConstantBuffer tess_now{};
+            info.ReadTessConstantBuffer(tess_now);
+            spec_store = std::memcmp(&tess_now, &spec_tess, sizeof(tess_now)) == 0;
+        }
+        if (!spec_store) {
+            g_spec_memo.store_skipped.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
@@ -2565,6 +3256,34 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                          : *StageMemoVictim(memo_ways, *program, hw_stage, sw_stage, params.hash);
             StageMemoStore(target, *program, hw_stage, sw_stage, params, rt, memo_start, memo_tess,
                            has_tess, memo_gen, perm_idx, binding);
+        }
+    }
+    if (spec_probed) {
+        if (spec_hit != kSpecNone && spec_mode == 2) {
+            // sotc: =2 only. The memo answer, as mode 1 would return it, against the slow result
+            // (which is the one returned). Each kind is counted on its own.
+            const SpecMemoEntry& entry = spec_memo_state.entries[spec_hit];
+            const auto& memo_module = program->modules[entry.perm];
+            if (entry.perm != perm_idx) {
+                g_spec_memo.mismatch_perm.fetch_add(1, std::memory_order_relaxed);
+            } else if (memo_module.module != module) {
+                g_spec_memo.mismatch_module.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (!(memo_module.spec.fetch_shader_data ==
+                  program->modules[perm_idx].spec.fetch_shader_data)) {
+                g_spec_memo.mismatch_fetch.fetch_add(1, std::memory_order_relaxed);
+            }
+            Shader::Backend::Bindings memo_after = spec_start;
+            info.AddBindings(memo_after, Shader::UsesBindlessSamplers(info));
+            if (!(memo_after == binding)) {
+                g_spec_memo.mismatch_bindings.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (spec_store) {
+            SpecMemoStore(spec_memo_state, spec_key_hash, *program, hw_stage, sw_stage,
+                          params.hash, spec_start, rt, spec_has_tess, spec_tess, t_spec_fetch,
+                          t_spec_words, static_cast<u32>(perm_idx));
+            g_spec_memo.stores.fetch_add(1, std::memory_order_relaxed);
         }
     }
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {

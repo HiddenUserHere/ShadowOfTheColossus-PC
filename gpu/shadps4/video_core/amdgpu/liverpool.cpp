@@ -28,6 +28,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/frontend/fetch_shader.h" // sotc: SOTC_CP_PRECISE_WAIT (fetch code range)
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -112,6 +113,19 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     }
 
     return span.subspan(offset);
+}
+
+// sotc: SOTC_CP_PRECISE_WAIT=1 (precise waits) or 2 (precise, verified against the old wait);
+// off by default. Read once, before any thread starts.
+static u8 CpPreciseMode() {
+    static const u8 mode = [] {
+        const char* v = std::getenv("SOTC_CP_PRECISE_WAIT");
+        if (v && v[0] == '1') {
+            return u8{1};
+        }
+        return (v && v[0] == '2') ? u8{2} : u8{0};
+    }();
+    return mode;
 }
 
 // sotc: SOTC_CP_LABEL_SKIP=1 (skip) or 2 (decide and count, still wait); off by default.
@@ -257,8 +271,17 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     back_pf = back_threaded && sotc_switch("SOTC_BACK_PF");
     reg_same = back_threaded && sotc_switch("SOTC_REG_SAME");
     opstat = back_threaded && sotc_switch("SOTC_OPSTAT");
+    // sotc: SOTC_FUTEX_WAIT=1 (Windows only, off by default; see futex_wait in liverpool.h).
+#ifdef _WIN32
+    futex_wait = back_threaded && sotc_switch("SOTC_FUTEX_WAIT");
+    if (futex_wait) {
+        LOG_INFO(Render, "SOTC_FUTEX_WAIT: on (WaitOnAddress for the command processor and draw "
+                         "thread waits)");
+    }
+#endif
     // sotc: SOTC_CP_LABEL_SKIP (needs the draw thread; see LabelWaitSkip).
     label_skip = back_threaded ? CpLabelSkipMode() : u8{0};
+    cp_precise = back_threaded ? CpPreciseMode() : u8{0}; // sotc: SOTC_CP_PRECISE_WAIT
     // sotc: SOTC_WD_FUSE=1 (off by default; needs the draw thread): small WRITE_DATA packets ride
     // along with the next indirect draw instead of being queued as functions. SOTC_INLINE_FUNC=1
     // (also set by SOTC_WD_FUSE) keeps small closures of the op ring out of the heap.
@@ -439,6 +462,9 @@ Liverpool::~Liverpool() {
             // sotc: BackLoop blocks on back_wake, which only changes when something bumps it
             WakeBackAtomic();
         }
+        if (futex_wait) { // sotc: SOTC_FUTEX_WAIT: the stop request is set before the wake
+            WakeBackFutex();
+        }
         back_thread.join();
     }
     for (auto& thread : prep_threads) { // sotc: SOTC_PARALLEL_RECORD
@@ -459,6 +485,61 @@ Liverpool::~Liverpool() {
 static inline void CpuRelax() {
 #if defined(__x86_64__) || defined(_M_X64)
     __builtin_ia32_pause();
+#endif
+}
+
+namespace {
+// sotc: SOTC_FUTEX_WAIT (Windows). A waiter sleeps only while the word it waits on still holds the
+// value it read, and the publisher changes that word before it wakes: WaitOnAddress then returns at
+// once when the publish came first, so no wake is lost. The timeout is a safety net only, and the
+// timed-out sleeps whose condition already held are counted (safety_met).
+constexpr u32 kFutexSpin = 128;
+constexpr u32 kFutexTimeoutMs = 16;
+
+// Sleeps while word == observed, at most kFutexTimeoutMs. Returns false on timeout.
+template <typename T>
+bool FutexSleep(std::atomic<T>& word, T observed) {
+    static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8);
+    SotcFutexCpCounters& c = g_futex_cp;
+    const auto t0 = std::chrono::steady_clock::now();
+#ifdef _WIN32
+    const bool woken = WaitOnAddress(&word, &observed, sizeof(T), kFutexTimeoutMs) != FALSE;
+#else
+    const bool woken = true; // not reached: SOTC_FUTEX_WAIT is Windows-only
+#endif
+    const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - t0)
+                                        .count());
+    c.sleeps.fetch_add(1, std::memory_order_relaxed);
+    c.sleep_ns.fetch_add(ns, std::memory_order_relaxed);
+    u64 seen = c.sleep_max_ns.load(std::memory_order_relaxed);
+    while (ns > seen &&
+           !c.sleep_max_ns.compare_exchange_weak(seen, ns, std::memory_order_relaxed)) {
+    }
+    return woken;
+}
+
+// Wakes one (or every) thread sleeping in FutexSleep on word.
+template <typename T>
+void FutexWake(std::atomic<T>& word, bool all) {
+    g_futex_cp.wakes.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    if (all) {
+        WakeByAddressAll(&word);
+    } else {
+        WakeByAddressSingle(&word);
+    }
+#else
+    (void)word;
+    (void)all;
+#endif
+}
+} // namespace
+
+void Liverpool::WakeBackFutex() {
+#ifdef _WIN32
+    back_wake.fetch_add(1, std::memory_order_seq_cst);
+    FutexWake(back_wake, false);
 #endif
 }
 
@@ -710,6 +791,39 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                     SotcTrace::Span("draw idle", start, now); // sotc: SOTC_TRACE
                 }
             } idle_time{idle_start, idle_timed};
+            if (futex_wait) {
+                // sotc: SOTC_FUTEX_WAIT: a short spin, then WaitOnAddress on back_wake. The doorbell
+                // is read before the checks, and every producer bumps it after changing the checked
+                // state (BackPublish, WakeBack), so a publish after the checks changes back_wake.
+                SotcFutexCpCounters& c = g_futex_cp;
+                c.waits.fetch_add(1, std::memory_order_relaxed);
+                bool found = false;
+                for (u32 spin = 0; spin < kFutexSpin; ++spin) {
+                    if (back_head.load(std::memory_order_acquire) != tail ||
+                        num_commands.load(std::memory_order_acquire)) {
+                        found = true;
+                        break;
+                    }
+                    CpuRelax();
+                }
+                if (found) {
+                    c.spins.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    back_sleeping.store(true, std::memory_order_seq_cst);
+                    const u32 seen = back_wake.load(std::memory_order_seq_cst);
+                    if (back_head.load(std::memory_order_seq_cst) == tail &&
+                        !num_commands.load(std::memory_order_seq_cst) &&
+                        !stoken.stop_requested()) {
+                        if (!FutexSleep(back_wake, seen) &&
+                            (back_head.load(std::memory_order_acquire) != tail ||
+                             num_commands.load(std::memory_order_acquire))) {
+                            c.safety_met.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    back_sleeping.store(false, std::memory_order_relaxed);
+                }
+                continue;
+            }
             if (back_nospin) {
                 // sotc: spin ~20 us, then block until back_wake changes. The snapshot is taken
                 // before the checks, and every producer changes the checked state before bumping.
@@ -837,8 +951,13 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             NotifyCpWait();
         }
         if (drain_waiting.load(std::memory_order_seq_cst)) {
-            std::scoped_lock lk{back_mutex};
-            drain_cv.notify_all();
+            if (futex_wait) { // sotc: SOTC_FUTEX_WAIT: WaitBackTail and the ring-full wait sleep on back_tail
+                FutexWake(back_tail, true);
+            }
+            if (!futex_wait || prep_workers) { // the condition variable waiters (prep ring-full wait)
+                std::scoped_lock lk{back_mutex};
+                drain_cv.notify_all();
+            }
         }
     }
 }
@@ -859,6 +978,29 @@ void Liverpool::WaitBackTail(u64 head) {
     // sotc: SOTC_FPS: command processor time blocked on the draw thread.
     const SotcStats::RoleTimer blocked{SotcStats::RoleCp, SotcStats::cp_blocked_ns,
                                          "cp blocked on draw"};
+    if (futex_wait) { // sotc: SOTC_FUTEX_WAIT: WaitOnAddress on back_tail, woken by BackLoop
+        SotcFutexCpCounters& c = g_futex_cp;
+        c.waits.fetch_add(1, std::memory_order_relaxed);
+        u64 seen = back_tail.load(std::memory_order_acquire);
+        for (u32 spin = 0; seen < head && spin < kFutexSpin; ++spin) {
+            CpuRelax();
+            seen = back_tail.load(std::memory_order_acquire);
+        }
+        if (seen >= head) {
+            c.spins.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // The flag is set before the re-read: BackLoop stores back_tail, then reads the flag.
+        drain_waiting.store(true, std::memory_order_seq_cst);
+        while ((seen = back_tail.load(std::memory_order_seq_cst)) < head) {
+            if (!FutexSleep(back_tail, seen) &&
+                back_tail.load(std::memory_order_seq_cst) >= head) {
+                c.safety_met.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        drain_waiting.store(false, std::memory_order_relaxed);
+        return;
+    }
     for (u32 spin = 0; back_tail.load(std::memory_order_acquire) < head; ++spin) {
         if (spin < 4096) {
             CpuRelax();
@@ -893,18 +1035,43 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
         const bool prep_throttle = prep_workers && SotcStats::kFpsTimers && // sotc: SOTC_FPS_LEAN
                                    head - back_tail.load(std::memory_order_acquire) < BackRingSize;
         const u64 throttle_start = prep_throttle ? SotcStats::NowNs() : 0;
-        for (u32 spin = 0; head - MinRingTail(std::memory_order_acquire) >= BackRingSize;
-             ++spin) {
-            if (spin < 4096) {
+        if (futex_wait && !prep_workers) {
+            // sotc: SOTC_FUTEX_WAIT: without the prep threads MinRingTail is back_tail, so the wait
+            // sleeps on back_tail (the prep tails have no wake; with SOTC_PARALLEL_RECORD the
+            // condition variable wait below stays).
+            SotcFutexCpCounters& c = g_futex_cp;
+            c.waits.fetch_add(1, std::memory_order_relaxed);
+            u64 seen = back_tail.load(std::memory_order_acquire);
+            for (u32 spin = 0; head - seen >= BackRingSize && spin < kFutexSpin; ++spin) {
                 CpuRelax();
-                continue;
+                seen = back_tail.load(std::memory_order_acquire);
             }
-            std::unique_lock lk{back_mutex};
-            drain_waiting.store(true, std::memory_order_seq_cst);
-            drain_cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
-                return head - MinRingTail(std::memory_order_seq_cst) < BackRingSize;
-            });
-            drain_waiting.store(false, std::memory_order_relaxed);
+            if (head - seen < BackRingSize) {
+                c.spins.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                drain_waiting.store(true, std::memory_order_seq_cst);
+                while (head - (seen = back_tail.load(std::memory_order_seq_cst)) >= BackRingSize) {
+                    if (!FutexSleep(back_tail, seen) &&
+                        head - back_tail.load(std::memory_order_seq_cst) < BackRingSize) {
+                        c.safety_met.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                drain_waiting.store(false, std::memory_order_relaxed);
+            }
+        } else {
+            for (u32 spin = 0; head - MinRingTail(std::memory_order_acquire) >= BackRingSize;
+                 ++spin) {
+                if (spin < 4096) {
+                    CpuRelax();
+                    continue;
+                }
+                std::unique_lock lk{back_mutex};
+                drain_waiting.store(true, std::memory_order_seq_cst);
+                drain_cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
+                    return head - MinRingTail(std::memory_order_seq_cst) < BackRingSize;
+                });
+                drain_waiting.store(false, std::memory_order_relaxed);
+            }
         }
         if (prep_throttle) {
             SotcStats::pr_throttle_ns.fetch_add(SotcStats::NowNs() - throttle_start,
@@ -949,6 +1116,9 @@ void Liverpool::BackPublish(bool writes_memory, bool gpu_write) {
     if (writes_memory) {
         back_write_seq = head;
     }
+    if (cp_precise) { // sotc: SOTC_CP_PRECISE_WAIT: the range this publish writes
+        RecordBackWrite(head, writes_memory);
+    }
     if (writes_memory || gpu_write) { // sotc: SOTC_CP_LABEL_SKIP (see back_gpu_write_seq)
         back_gpu_write_seq = head;
     }
@@ -962,7 +1132,9 @@ void Liverpool::BackPublish(bool writes_memory, bool gpu_write) {
         prep_wake.notify_all();
     }
     if (back_sleeping.load(std::memory_order_seq_cst)) {
-        if (back_nospin) {
+        if (futex_wait) { // sotc: SOTC_FUTEX_WAIT
+            WakeBackFutex();
+        } else if (back_nospin) {
             WakeBackAtomic();
         } else {
             std::scoped_lock lk{back_mutex};
@@ -1019,6 +1191,176 @@ void Liverpool::WaitBackWritesSlow() {
     SotcStats::cp_bw_rep_waits.fetch_add(1, std::memory_order_relaxed);
     SotcStats::cp_bw_rep_ns.fetch_add(waited, std::memory_order_relaxed);
     SotcStats::GateStoreMax(SotcStats::cp_bw_rep_max_ns, waited);
+}
+
+// sotc: SOTC_CP_PRECISE_WAIT. Called by BackPublish when the switch is on, with the publish's head
+// (the op is back_ring[head - 1]). Records the guest range the op writes, or unknown.
+void Liverpool::RecordBackWrite(u64 head, bool writes_memory) {
+    const BackOp& pub = back_ring[(head - 1) % BackRingSize];
+    const bool noted = cp_note_seq == head;
+    bool keep_note = false;
+    if (pub.wd.num_segs != 0) {
+        if (writes_memory && pub.kind != BackOp::Kind::Func) {
+            // A draw or dispatch that carries held-back WRITE_DATA and may write anything itself.
+            PushWriteRange(head, 0, 0, true);
+        } else {
+            // The held-back WRITE_DATA of the op: exactly the box of its segments (a flushed batch
+            // is a Func op with no closure: the NoteBackWriteRange of the closure comes next).
+            VAddr lo = ~VAddr{0};
+            VAddr hi = 0;
+            for (u32 i = 0; i < pub.wd.num_segs; ++i) {
+                const BackWd::Seg& seg = pub.wd.segs[i];
+                lo = std::min<VAddr>(lo, seg.address);
+                hi = std::max<VAddr>(hi, seg.address + seg.length);
+            }
+            PushWriteRange(head, lo, hi - lo, false);
+            keep_note = noted && pub.kind == BackOp::Kind::Func;
+        }
+    } else if (writes_memory) {
+        if (noted && cp_note_size == CpNoGuestWrite) {
+            // NoteBackNoGuestWrite: nothing for the waits to see.
+        } else if (noted && cp_note_size != 0) {
+            PushWriteRange(head, cp_note_addr, cp_note_size, false);
+        } else {
+            PushWriteRange(head, 0, 0, true);
+        }
+    }
+    if (keep_note) {
+        cp_note_seq = head + 1;
+    } else if (noted) {
+        cp_note_seq = 0;
+        cp_note_size = 0;
+    }
+}
+
+void Liverpool::PushWriteRange(u64 seq, VAddr addr, u64 size, bool unknown) {
+    const u64 slot = cp_wr_count % CpWriteRingSize;
+    if (cp_wr_count >= CpWriteRingSize) {
+        // The entry this overwrites may still be pending: the waits must cover it (see
+        // CpWaitTarget, which then waits for everything).
+        const u64 old_seq = cp_wr_ring[slot].seq;
+        if (old_seq > back_tail.load(std::memory_order_acquire)) {
+            cp_wr_dropped_seq = std::max(cp_wr_dropped_seq, old_seq);
+        }
+    }
+    cp_wr_ring[slot] = CpWriteRange{seq, addr, size, unknown};
+    ++cp_wr_count;
+}
+
+bool Liverpool::CpCollectReads(const Vulkan::Pipeline* pipeline, CpReadSet& reads) const {
+    reads.count = 0;
+    if (!pipeline) {
+        return false; // a stage is still translating: its reads are not known here
+    }
+    const auto add = [&reads](VAddr addr, u64 size) {
+        if (size == 0) {
+            return true;
+        }
+        if (reads.count == CpMaxReadRanges) {
+            return false;
+        }
+        reads.ranges[reads.count++] = {addr, size};
+        return true;
+    };
+    for (const Shader::Info* info : pipeline->GetStages()) {
+        if (!info) {
+            continue;
+        }
+        const Shader::InfoRuntime& rt = info->runtime[0];
+        // The SRT walker and the tessellation constants read guest memory at unbounded or
+        // not-recorded places: such a lookup waits the old way.
+        if (info->srt_info.walker_func || info->tess_consts_dword_offset >= 0) {
+            return false;
+        }
+        // The binary info of the code (what GetParams hashes): its recorded length.
+        const auto& bin = AmdGpu::SearchBinaryInfoCached(
+            reinterpret_cast<const u32*>(static_cast<uintptr_t>(rt.pgm_base)));
+        if (!add(rt.pgm_base, bin.length)) {
+            return false;
+        }
+        if (info->has_fetch_shader) {
+            const auto* fetch = Shader::Gcn::GetFetchShaderCode(*info, info->fetch_shader_sgpr_base);
+            if (!add(reinterpret_cast<VAddr>(fetch), CpFetchShaderBytes)) {
+                return false;
+            }
+        }
+        // The sharp tables: the same address RefreshSharpTables reads (Info::RefreshSharpTables).
+        for (const auto& table : info->sharp_tables) {
+            const VAddr ptr = (VAddr{rt.flattened_ud_buf[table.ptr_lo]} |
+                               VAddr{rt.flattened_ud_buf[table.ptr_hi]} << 32) &
+                              0xFFFFFFFFFFFFULL;
+            if (ptr == 0) {
+                continue; // null table: memset, no read
+            }
+            if (!add(ptr + u64{table.offset_dw} * sizeof(u32),
+                     u64{table.NumDwords()} * sizeof(u32))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+u64 Liverpool::CpWaitTarget(const Vulkan::Pipeline* pipeline, u64 snap, bool& unknown) {
+    unknown = false;
+    CpReadSet reads{};
+    if (!CpCollectReads(pipeline, reads)) {
+        unknown = true;
+        return back_write_seq;
+    }
+    if (cp_wr_dropped_seq != 0 && back_tail.load(std::memory_order_acquire) >= cp_wr_dropped_seq) {
+        cp_wr_dropped_seq = 0;
+    }
+    if (cp_wr_dropped_seq > snap) {
+        unknown = true;
+        return back_write_seq;
+    }
+    // The ring is in publish order: newest first, the first hit is the newest overlapping write.
+    const u64 count = std::min<u64>(cp_wr_count, CpWriteRingSize);
+    for (u64 i = 0; i < count; ++i) {
+        const CpWriteRange& w = cp_wr_ring[(cp_wr_count - 1 - i) % CpWriteRingSize];
+        if (w.seq <= snap) {
+            break; // done before the lookup started
+        }
+        bool hit = w.unknown;
+        for (u32 r = 0; !hit && r < reads.count; ++r) {
+            const auto [addr, size] = reads.ranges[r];
+            hit = w.addr < addr + size && addr < w.addr + w.size;
+        }
+        if (hit) {
+            unknown = w.unknown;
+            return w.seq;
+        }
+    }
+    return 0;
+}
+
+void Liverpool::CpWaitFor(u64 target, bool unknown) {
+    const u64 start = SotcStats::NowNs();
+    WaitBackTail(target);
+    CpPreciseStats::ns_blocked.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
+    (unknown ? CpPreciseStats::taken_unknown : CpPreciseStats::taken_overlap)
+        .fetch_add(1, std::memory_order_relaxed);
+}
+
+void Liverpool::CpDigest(const Vulkan::Pipeline* pipeline, std::vector<u64>& out) const {
+    out.clear();
+    out.push_back(reinterpret_cast<uintptr_t>(pipeline));
+    if (!pipeline) {
+        return;
+    }
+    for (const Shader::Info* info : pipeline->GetStages()) {
+        if (!info) {
+            out.push_back(0);
+            continue;
+        }
+        const Shader::InfoRuntime& rt = info->runtime[0];
+        out.push_back(rt.pgm_base);
+        out.push_back(rt.user_data.size());
+        out.insert(out.end(), rt.user_data.begin(), rt.user_data.end());
+        out.push_back(rt.flattened_ud_buf.size());
+        out.insert(out.end(), rt.flattened_ud_buf.begin(), rt.flattened_ud_buf.end());
+    }
 }
 
 bool Liverpool::FuseWriteData(VAddr address, const u32* data, u32 data_size) {
@@ -1451,10 +1793,10 @@ void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
         rasterizer->Draw(is_indexed, index_offset);
         return;
     }
-    WaitBackWrites();
     // sotc: no pipeline for a draw FilterDraw drops on the draw thread (review of #99).
-    const auto* pipeline =
-        rasterizer->IsDrawFilteredOut() ? nullptr : rasterizer->LookupGraphicsPipeline(0, 0);
+    const bool looks_up = !rasterizer->IsDrawFilteredOut();
+    const auto* pipeline = LookupAfterWrites(
+        looks_up, [&] { return rasterizer->LookupGraphicsPipeline(0, 0); });
     if (!prep_workers) { // sotc: SOTC_PARALLEL_RECORD: the prep threads do it (PrepLoop)
         rasterizer->PrefetchImages(pipeline); // sotc: SOTC_ASYNC_IMAGE_CREATE
     }
@@ -1478,11 +1820,10 @@ void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u
     // sotc: SOTC_WD_FUSE: WRITE_DATA packets held back for this draw's arguments (or queued).
     NotePairs();
     PrepareWdForIndirect(address + offset, u64{stride} * max_count, count_address == 0);
-    WaitBackWrites();
-    const auto* pipeline = rasterizer->IsDrawFilteredOut()
-                               ? nullptr
-                               : rasterizer->LookupGraphicsPipeline(vertex_sgpr_offset,
-                                                                    instance_sgpr_offset);
+    const bool looks_up = !rasterizer->IsDrawFilteredOut();
+    const auto* pipeline = LookupAfterWrites(looks_up, [&] {
+        return rasterizer->LookupGraphicsPipeline(vertex_sgpr_offset, instance_sgpr_offset);
+    });
     if (!prep_workers) { // sotc: SOTC_PARALLEL_RECORD: the prep threads do it (PrepLoop)
         rasterizer->PrefetchImages(pipeline); // sotc: SOTC_ASYNC_IMAGE_CREATE
     }
@@ -1585,8 +1926,8 @@ void Liverpool::SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 siz
     } else {
         FlushWd();
     }
-    WaitBackWrites();
-    const auto* pipeline = rasterizer->LookupComputePipeline();
+    const auto* pipeline =
+        LookupAfterWrites(true, [&] { return rasterizer->LookupComputePipeline(); });
     // sotc: SOTC_ASYNC_IMAGE_CREATE; with SOTC_PARALLEL_RECORD the prep threads prefetch too, so
     // the dispatches take their lock (PrefetchImagesShared).
     if (prep_workers) {
@@ -3539,6 +3880,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             Core::MemoryManager::NoteHostWrite(dump_const->Address<VAddr>(), dump_const->Size(), 5);
             // sotc: SOTC_NATIVE=1: the dump lands in memory the draws read; queued behind the draws before it.
             if (!SotcNative::TracksGuestPages()) {
+                NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (the dump ran on the CP above)
                 BackOrRun([this, address = dump_const->Address<VAddr>(), size = u64{dump_const->Size()}] {
                     NoteHostWrite(reinterpret_cast<void*>(address), size);
                 });
@@ -3608,6 +3950,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // sotc: mode 8 always runs it (PcHostSubmitStart counts the draw-side submits: the dedupe key).
     // sotc: SOTC_NATIVE timing audit: the announce count at the pickup of this submit rides along (native.h).
     if (pc_ring_top && rasterizer && (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8)) {
+        NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (host ring copy)
         BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); });
     }
 
@@ -4124,6 +4467,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     (g_ring8_wait_unknown ||
                      g_ring8_submit_waits.contains(reinterpret_cast<VAddr>(eos.Address()) &
                                                    ~VAddr{7}));
+                NoteBackWriteRange(reinterpret_cast<VAddr>(eos.Address()), 8); // sotc: SOTC_CP_PRECISE_WAIT
                 BackOrRun([this, eos, eos_waited] {
                     if (rasterizer) {
                         rasterizer->OnFence();
@@ -4229,6 +4573,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                      g_ring8_submit_waits.contains(reinterpret_cast<VAddr>(
                                                        eop_packet.Address<void>()) &
                                                    ~VAddr{7}));
+                if (eop_packet.data_sel.Value() == DataSelect::None) { // sotc: SOTC_CP_PRECISE_WAIT
+                    NoteBackNoGuestWrite();
+                } else {
+                    NoteBackWriteRange(reinterpret_cast<VAddr>(eop_packet.Address<void>()), 8);
+                }
                 BackOrRun([this, eop_packet, t_cp, ring8_waited] {
                 const auto* event_eop = &eop_packet;
                 if (rasterizer) {
@@ -4427,12 +4776,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ASSERT(dma_data->command.das == 0);
                 const PM4DmaData dma = *dma_data;
                 if (dma.src_sel == DmaDataSrc::Data && dma.dst_sel == DmaDataDst::Gds) {
+                    NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (GDS)
                     BackOrRun([this, dma] {
                         rasterizer->FillBuffer(dma.dst_addr_lo, dma.NumBytes(), dma.data, true);
                     });
                 } else if ((dma.src_sel == DmaDataSrc::Memory ||
                             dma.src_sel == DmaDataSrc::MemoryUsingL2) &&
                            dma.dst_sel == DmaDataDst::Gds) {
+                    NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (GDS)
                     BackOrRun([this, dma] {
                         rasterizer->CopyBuffer(dma.dst_addr_lo, dma.SrcAddress<VAddr>(),
                                                dma.NumBytes(), true, false);
@@ -4441,6 +4792,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                            (dma.dst_sel == DmaDataDst::Memory ||
                             dma.dst_sel == DmaDataDst::MemoryUsingL2)) {
                     XpSetHint(XpDma, dma.DstAddress<VAddr>(), dma.NumBytes());
+                    NoteBackWriteRange(dma.DstAddress<VAddr>(), dma.NumBytes()); // sotc: SOTC_CP_PRECISE_WAIT
                     BackOrRun([this, dma] {
                         rasterizer->FillBuffer(dma.DstAddress<VAddr>(), dma.NumBytes(), dma.data,
                                                false);
@@ -4448,6 +4800,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (dma.src_sel == DmaDataSrc::Gds &&
                            (dma.dst_sel == DmaDataDst::Memory ||
                             dma.dst_sel == DmaDataDst::MemoryUsingL2)) {
+                    NoteBackWriteRange(dma.DstAddress<VAddr>(), dma.NumBytes()); // sotc: SOTC_CP_PRECISE_WAIT
                     BackOrRun([this, dma] {
                         rasterizer->CopyBuffer(dma.DstAddress<VAddr>(), dma.src_addr_lo,
                                                dma.NumBytes(), false, true);
@@ -4458,6 +4811,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             dma.dst_sel == DmaDataDst::MemoryUsingL2)) {
                     XpSetHint(XpDma, dma.DstAddress<VAddr>(), dma.NumBytes(),
                               dma.SrcAddress<VAddr>(), dma.NumBytes());
+                    NoteBackWriteRange(dma.DstAddress<VAddr>(), dma.NumBytes()); // sotc: SOTC_CP_PRECISE_WAIT
                     BackOrRun([this, dma] {
                         rasterizer->CopyBuffer(dma.DstAddress<VAddr>(), dma.SrcAddress<VAddr>(),
                                                dma.NumBytes(), false, false);
@@ -4481,6 +4835,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     std::vector<u32> data(write_data->data, write_data->data + data_size / 4);
                     XpSetHint(XpWriteData, std::bit_cast<VAddr>(address), data_size);
+                    NoteBackWriteRange(std::bit_cast<VAddr>(address), data_size); // sotc: SOTC_CP_PRECISE_WAIT
                     BackOrRun([this, address, data = std::move(data), data_size] {
                         if (rasterizer) {
                             rasterizer->OnFence();
@@ -4740,6 +5095,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         ~PcRingAscDepth() { --pc_ring_asc_depth; }
     } const pc_ring_asc;
     if (pc_ring_asc.top && rasterizer && (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8)) {
+        NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (host ring copy)
         BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); });
     }
 
@@ -4848,12 +5204,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(dma_data->command.das == 0);
             const PM4DmaData dma = *dma_data;
             if (dma.src_sel == DmaDataSrc::Data && dma.dst_sel == DmaDataDst::Gds) {
+                NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (GDS)
                 BackOrRun([this, dma] {
                     rasterizer->FillBuffer(dma.dst_addr_lo, dma.NumBytes(), dma.data, true);
                 });
             } else if ((dma.src_sel == DmaDataSrc::Memory ||
                         dma.src_sel == DmaDataSrc::MemoryUsingL2) &&
                        dma.dst_sel == DmaDataDst::Gds) {
+                NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (GDS)
                 BackOrRun([this, dma] {
                     rasterizer->CopyBuffer(dma.dst_addr_lo, dma.SrcAddress<VAddr>(),
                                            dma.NumBytes(), true, false);
@@ -4861,6 +5219,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else if (dma.src_sel == DmaDataSrc::Data &&
                        (dma.dst_sel == DmaDataDst::Memory ||
                         dma.dst_sel == DmaDataDst::MemoryUsingL2)) {
+                NoteBackWriteRange(dma.DstAddress<VAddr>(), dma.NumBytes()); // sotc: SOTC_CP_PRECISE_WAIT
                 BackOrRun([this, dma] {
                     rasterizer->FillBuffer(dma.DstAddress<VAddr>(), dma.NumBytes(), dma.data,
                                            false);
@@ -4868,6 +5227,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else if (dma.src_sel == DmaDataSrc::Gds &&
                        (dma.dst_sel == DmaDataDst::Memory ||
                         dma.dst_sel == DmaDataDst::MemoryUsingL2)) {
+                NoteBackWriteRange(dma.DstAddress<VAddr>(), dma.NumBytes()); // sotc: SOTC_CP_PRECISE_WAIT
                 BackOrRun([this, dma] {
                     rasterizer->CopyBuffer(dma.DstAddress<VAddr>(), dma.src_addr_lo,
                                            dma.NumBytes(), false, true);
@@ -4886,6 +5246,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     header->type == 3 && header->type3.opcode == PM4ItOpcode::DispatchDirect) {
                     indirect_patches.emplace_back(header, src_addr);
                 } else {
+                    NoteBackWriteRange(dst_addr, num_bytes); // sotc: SOTC_CP_PRECISE_WAIT
                     BackOrRun([this, dst_addr, src_addr, num_bytes] {
                         rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
                     });
@@ -4988,6 +5349,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!write_data->wr_one_addr.Value()) {
                 void* address = write_data->Address<void*>();
                 std::vector<u32> data(write_data->data, write_data->data + data_size / 4);
+                NoteBackWriteRange(reinterpret_cast<VAddr>(address), data_size); // sotc: SOTC_CP_PRECISE_WAIT
                 BackOrRun([this, address, data = std::move(data), data_size] {
                     if (rasterizer) {
                         rasterizer->OnFence();
@@ -5080,6 +5442,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const bool rm_waited =
                 label_machinery && (g_ring8_wait_unknown ||
                                     g_ring8_submit_waits.contains(release.Address<VAddr>() & ~VAddr{7}));
+            if (release.data_sel.Value() == DataSelect::GdsMemStore) { // sotc: SOTC_CP_PRECISE_WAIT
+                NoteBackNoGuestWrite();
+            } else {
+                NoteBackWriteRange(release.Address<VAddr>(), 8);
+            }
             BackOrRun([this, release, pipe_id = queue.pipe_id, rm_waited] {
                 if (rasterizer) {
                     rasterizer->OnFence();

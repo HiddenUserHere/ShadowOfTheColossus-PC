@@ -4,6 +4,7 @@
 #pragma once
 
 #include <bitset>
+#include <vector>
 
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -70,6 +71,112 @@ struct SamplerSpecialization {
     bool operator==(const SamplerSpecialization&) const = default;
 };
 
+// sotc: SOTC_SPEC_MEMO. The element fills below are shared by the StageSpecialization constructor
+// and by BuildSpecKey, so both write the same values for the same sharp. An element is filled only
+// when its sharp is present; otherwise it keeps the zero value (the constructor's emplace_back).
+
+inline void FillVsAttrib(VsAttribSpecialization& spec, const Gcn::VertexAttribute& desc,
+                         AmdGpu::Buffer sharp, const RuntimeInfo& runtime_info) {
+    using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+    if (const auto step_rate = desc.GetStepRate(); step_rate != InstanceIdType::None) {
+        spec.divisor = step_rate == InstanceIdType::OverStepRate0
+                           ? runtime_info.sw.vs.step_rate_0
+                           : (step_rate == InstanceIdType::OverStepRate1
+                                  ? runtime_info.sw.vs.step_rate_1
+                                  : 1);
+    }
+    spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
+    spec.dst_select = sharp.DstSelect();
+}
+
+inline void FillBuffer(BufferSpecialization& spec, const BufferResource& desc,
+                       AmdGpu::Buffer sharp) {
+    spec.stride = sharp.GetStride();
+    spec.is_formatted = desc.is_formatted;
+    spec.swizzle_enable = sharp.swizzle_enable;
+    if (spec.is_formatted) {
+        spec.data_format = static_cast<u32>(sharp.GetDataFmt());
+        spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
+        spec.dst_select = sharp.DstSelect();
+        spec.num_conversion = sharp.GetNumberConversion();
+    }
+    if (spec.swizzle_enable) {
+        spec.index_stride = sharp.index_stride;
+        spec.element_size = sharp.element_size;
+    }
+}
+
+inline void FillImage(ImageSpecialization& spec, const ImageResource& desc, AmdGpu::Image sharp,
+                      const Info& info) {
+    spec.type = sharp.GetViewType(desc.is_array);
+    spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
+    spec.is_storage = desc.is_written;
+    if (spec.is_storage) {
+        spec.dst_select = sharp.DstSelect();
+    } else {
+        spec.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
+    }
+    spec.num_conversion = sharp.GetNumberConversion();
+    spec.num_bindings = desc.NumBindings(info);
+}
+
+inline void FillFMask(FMaskSpecialization& spec, AmdGpu::Image sharp) {
+    spec.width = sharp.width;
+    spec.height = sharp.height;
+}
+
+inline void FillSampler(SamplerSpecialization& spec, AmdGpu::Sampler sharp) {
+    spec.force_unnormalized = sharp.force_unnormalized;
+    spec.force_degamma = sharp.force_degamma;
+}
+
+// sotc: SOTC_SPEC_MEMO. Key words: every field of an element, in a fixed order and width. The
+// words are written field by field, so struct padding never reaches a key.
+inline void PackMapping(std::vector<u32>& out, const AmdGpu::CompMapping& m) {
+    out.push_back(static_cast<u32>(m.array[0]) | (static_cast<u32>(m.array[1]) << 8) |
+                  (static_cast<u32>(m.array[2]) << 16) | (static_cast<u32>(m.array[3]) << 24));
+}
+
+inline void PackVsAttrib(std::vector<u32>& out, const VsAttribSpecialization& s) {
+    out.push_back(s.divisor);
+    out.push_back(static_cast<u32>(s.num_class));
+    PackMapping(out, s.dst_select);
+}
+
+inline void PackBuffer(std::vector<u32>& out, const BufferSpecialization& s) {
+    out.push_back(s.stride);
+    out.push_back(s.is_formatted);
+    out.push_back(s.swizzle_enable);
+    out.push_back(s.data_format);
+    out.push_back(s.num_format);
+    out.push_back(s.index_stride);
+    out.push_back(s.element_size);
+    PackMapping(out, s.dst_select);
+    out.push_back(static_cast<u32>(s.num_conversion));
+}
+
+inline void PackImage(std::vector<u32>& out, const ImageSpecialization& s) {
+    const auto type = static_cast<u64>(s.type);
+    out.push_back(static_cast<u32>(type));
+    out.push_back(static_cast<u32>(type >> 32));
+    out.push_back(u32{s.is_integer});
+    out.push_back(u32{s.is_storage});
+    out.push_back(u32{s.is_srgb});
+    PackMapping(out, s.dst_select);
+    out.push_back(static_cast<u32>(s.num_conversion));
+    out.push_back(s.num_bindings);
+}
+
+inline void PackFMask(std::vector<u32>& out, const FMaskSpecialization& s) {
+    out.push_back(s.width);
+    out.push_back(s.height);
+}
+
+inline void PackSampler(std::vector<u32>& out, const SamplerSpecialization& s) {
+    out.push_back(u32{s.force_unnormalized});
+    out.push_back(u32{s.force_degamma});
+}
+
 /**
  * Alongside runtime information, this structure also checks bound resources
  * for compatibility. Can be used as a key for storing shader permutations.
@@ -99,58 +206,25 @@ struct StageSpecialization {
             // Specialize shader on VS input number types to follow spec.
             ForEachSharp(vs_attribs, fetch_shader_data.attributes,
                          [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
-                             using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-                             if (const auto step_rate = desc.GetStepRate();
-                                 step_rate != InstanceIdType::None) {
-                                 spec.divisor = step_rate == InstanceIdType::OverStepRate0
-                                                    ? runtime_info.sw.vs.step_rate_0
-                                                    : (step_rate == InstanceIdType::OverStepRate1
-                                                           ? runtime_info.sw.vs.step_rate_1
-                                                           : 1);
-                             }
-                             spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
-                             spec.dst_select = sharp.DstSelect();
+                             FillVsAttrib(spec, desc, sharp, runtime_info);
                          });
         }
         u32 binding{};
         ForEachSharp(binding, buffers, info->buffers,
                      [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
-                         spec.stride = sharp.GetStride();
-                         spec.is_formatted = desc.is_formatted;
-                         spec.swizzle_enable = sharp.swizzle_enable;
-                         if (spec.is_formatted) {
-                             spec.data_format = static_cast<u32>(sharp.GetDataFmt());
-                             spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
-                             spec.dst_select = sharp.DstSelect();
-                             spec.num_conversion = sharp.GetNumberConversion();
-                         }
-                         if (spec.swizzle_enable) {
-                             spec.index_stride = sharp.index_stride;
-                             spec.element_size = sharp.element_size;
-                         }
+                         FillBuffer(spec, desc, sharp);
                      });
         ForEachSharp(binding, images, info->images,
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                         spec.type = sharp.GetViewType(desc.is_array);
-                         spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
-                         spec.is_storage = desc.is_written;
-                         if (spec.is_storage) {
-                             spec.dst_select = sharp.DstSelect();
-                         } else {
-                             spec.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
-                         }
-                         spec.num_conversion = sharp.GetNumberConversion();
-                         spec.num_bindings = desc.NumBindings(*info);
+                         FillImage(spec, desc, sharp, *info);
                      });
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                         spec.width = sharp.width;
-                         spec.height = sharp.height;
+                         FillFMask(spec, sharp);
                      });
         ForEachSharp(samplers, info->samplers,
                      [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {
-                         spec.force_unnormalized = sharp.force_unnormalized;
-                         spec.force_degamma = sharp.force_degamma;
+                         FillSampler(spec, sharp);
                      });
 
         // Initialize runtime_info fields that rely on analysis in tessellation passes
@@ -246,5 +320,103 @@ struct StageSpecialization {
     void Serialize(Serialization::Archive& ar) const;
     bool Deserialize(Serialization::Archive& ar);
 };
+
+// sotc: SOTC_SPEC_MEMO. Packs the stored specialization of a permutation into key words, in the
+// same layout BuildSpecKey writes: the element count of each list, then per element its presence
+// bit (buffers, images, fmasks: the bitset, which the constructor sets per binding) and its fields.
+inline void PackSpecObject(std::vector<u32>& out, const StageSpecialization& spec) {
+    out.clear();
+    out.push_back(static_cast<u32>(spec.vs_attribs.size()));
+    for (size_t i = 0; i < spec.vs_attribs.size(); ++i) {
+        PackVsAttrib(out, spec.vs_attribs[i]);
+    }
+    u32 binding = 0;
+    out.push_back(static_cast<u32>(spec.buffers.size()));
+    for (size_t i = 0; i < spec.buffers.size(); ++i) {
+        out.push_back(u32{spec.bitset[binding++]});
+        PackBuffer(out, spec.buffers[i]);
+    }
+    out.push_back(static_cast<u32>(spec.images.size()));
+    for (size_t i = 0; i < spec.images.size(); ++i) {
+        out.push_back(u32{spec.bitset[binding++]});
+        PackImage(out, spec.images[i]);
+    }
+    out.push_back(static_cast<u32>(spec.fmasks.size()));
+    for (size_t i = 0; i < spec.fmasks.size(); ++i) {
+        out.push_back(u32{spec.bitset[binding++]});
+        PackFMask(out, spec.fmasks[i]);
+    }
+    out.push_back(static_cast<u32>(spec.samplers.size()));
+    for (size_t i = 0; i < spec.samplers.size(); ++i) {
+        PackSampler(out, spec.samplers[i]);
+    }
+}
+
+// sotc: SOTC_SPEC_MEMO. One pass over the sharps of a stage, through the same fills as the
+// StageSpecialization constructor, packed into the key words PackSpecObject also produces for the
+// constructed specialization. The vertex fetch shader is parsed into fetch as the constructor does
+// (the caller compares it with the stored one); runtime_info and the tessellation constants are
+// the caller's to compare. Reads guest memory only through the sharp accessors.
+inline void BuildSpecKey(std::vector<u32>& out, const Info& info,
+                         const RuntimeInfo& runtime_info, Gcn::FetchShaderData& fetch) {
+    out.clear();
+    fetch = Gcn::FetchShaderData{};
+    if (info.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info, fetch)) {
+        out.push_back(static_cast<u32>(fetch.attributes.size()));
+        for (const auto& desc : fetch.attributes) {
+            VsAttribSpecialization spec{};
+            const auto sharp = desc.GetSharp(info);
+            if (sharp) {
+                FillVsAttrib(spec, desc, sharp, runtime_info);
+            }
+            PackVsAttrib(out, spec);
+        }
+    } else {
+        out.push_back(0);
+    }
+
+    out.push_back(static_cast<u32>(info.buffers.size()));
+    for (const auto& desc : info.buffers) {
+        BufferSpecialization spec{};
+        const auto sharp = desc.GetSharp(info);
+        out.push_back(sharp ? 1u : 0u);
+        if (sharp) {
+            FillBuffer(spec, desc, sharp);
+        }
+        PackBuffer(out, spec);
+    }
+
+    out.push_back(static_cast<u32>(info.images.size()));
+    for (const auto& desc : info.images) {
+        ImageSpecialization spec{};
+        const auto sharp = desc.GetSharp(info);
+        out.push_back(sharp ? 1u : 0u);
+        if (sharp) {
+            FillImage(spec, desc, sharp, info);
+        }
+        PackImage(out, spec);
+    }
+
+    out.push_back(static_cast<u32>(info.fmasks.size()));
+    for (const auto& desc : info.fmasks) {
+        FMaskSpecialization spec{};
+        const auto sharp = desc.GetSharp(info);
+        out.push_back(sharp ? 1u : 0u);
+        if (sharp) {
+            FillFMask(spec, sharp);
+        }
+        PackFMask(out, spec);
+    }
+
+    out.push_back(static_cast<u32>(info.samplers.size()));
+    for (const auto& desc : info.samplers) {
+        SamplerSpecialization spec{};
+        const auto sharp = desc.GetSharp(info);
+        if (sharp) {
+            FillSampler(spec, sharp);
+        }
+        PackSampler(out, spec);
+    }
+}
 
 } // namespace Shader

@@ -7828,8 +7828,12 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostServe(
 
 // sotc: SOTC_NATIVE. Draw thread, once per submit: performs the queued announced uploads.
 void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
+    const auto t0 = std::chrono::steady_clock::now();
     u64 spent = 0;
     u64 warm_deferred = 0;
+    u64 pages = 0;
+    u64 invalidations = 0;
+    u64 served = 0;
     // sotc: the budget limits uploads only. A page mark costs nothing and has to reach every bind of this
     // submit: stopping at the budget (as before, with marks counted as spent) carried the announces of the
     // submit's own DCB, chunks and constants to a later drain, and the binds in between read them unmarked
@@ -7840,6 +7844,15 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
         native_warm_bytes -= warm_size;
         spent += DrainRange(warm_addr, warm_size);
     }
+    // sotc: 1a. Every queued entry is taken and counted. The images over each entry are invalidated as a guest
+    // write would invalidate them (TextureCache::InvalidateMemory answers a range with no image without its
+    // mutex). An entry the ring serves in place is done there: no page mark, no upload, the binds read the
+    // guest bytes. The others are merged per kind (overlapping or touching ranges become one), so a range that
+    // several writes announced is marked and uploaded once.
+    static thread_local std::vector<SotcNative::PendingUpload> taken;
+    static thread_local std::vector<SotcNative::PendingUpload> merged;
+    taken.clear();
+    merged.clear();
     SotcNative::PendingUpload up{};
     while (SotcNative::TakeUpload(up)) {
         SotcNative::NoteDrainEntry(up.seq, pickup_seq, up.size);
@@ -7848,36 +7861,65 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
         // untracked, re-hashed at the next use), and the buffer range is marked CPU-modified. The mark
         // is needed for Persistent too: DrainRange skips a range that is not CPU-modified.
         texture_cache.InvalidateMemory(up.addr, up.size, !SotcNative::TracksGuestPages());
+        ++invalidations;
+        if (up.served) {
+            ++served;
+            continue;
+        }
+        taken.push_back(up);
+    }
+    std::sort(taken.begin(), taken.end(), [](const SotcNative::PendingUpload& a, const SotcNative::PendingUpload& b) {
+        return a.kind != b.kind ? a.kind < b.kind : a.addr < b.addr;
+    });
+    // One DrainRange call takes at most 64 MiB (kMaxChunk), the same bound an announce entry has.
+    constexpr u64 kMaxChunk = u64{64} << 20;
+    for (const auto& e : taken) {
+        if (!merged.empty()) {
+            SotcNative::PendingUpload& r = merged.back();
+            const u64 lo = std::min<u64>(r.addr, e.addr);
+            const u64 hi = std::max<u64>(r.addr + r.size, e.addr + e.size);
+            if (r.kind == e.kind && e.addr <= r.addr + r.size && r.addr <= e.addr + e.size && hi - lo <= kMaxChunk) {
+                r.addr = lo;
+                r.size = hi - lo;
+                continue;
+            }
+        }
+        merged.push_back(e);
+    }
+    for (const auto& r : merged) {
         // sotc: without tracking, GPU-written bytes are never read back into guest memory, so a page
         // mark over them would upload stale guest bytes over the GPU's (1 Nov: garbage geometry and
         // textures after area loads). Only the announced bytes go up then.
-        if (!SotcNative::TracksGuestPages() && IsRegionGpuModified(up.addr, up.size) &&
-            NativeExactUpload(up.addr, up.size)) {
-            SotcNative::NoteExactUpload(up.size);
-            SotcN1Verify::NoteDrain(up.addr, up.size, true); // sotc: SOTC_VERIFY=n1 (announce record check)
-            spent += up.size;
+        if (!SotcNative::TracksGuestPages() && IsRegionGpuModified(r.addr, r.size) &&
+            NativeExactUpload(r.addr, r.size)) {
+            SotcNative::NoteExactUpload(r.size);
+            SotcN1Verify::NoteDrain(r.addr, r.size, true); // sotc: SOTC_VERIFY=n1 (announce record check)
+            spent += r.size;
             continue;
         }
-        SotcN1Verify::NoteDrain(up.addr, up.size, false); // sotc: SOTC_VERIFY=n1
-        memory_tracker->MarkRegionAsCpuModified(up.addr, up.size);
-        if (up.kind == SotcNative::Kind::PerFrame) {
-            SotcNative::NoteMarked(up.size);
+        SotcN1Verify::NoteDrain(r.addr, r.size, false); // sotc: SOTC_VERIFY=n1
+        memory_tracker->MarkRegionAsCpuModified(r.addr, r.size);
+        pages += ((r.addr + r.size - 1) >> 12) - (r.addr >> 12) + 1;
+        if (r.kind == SotcNative::Kind::PerFrame) {
+            SotcNative::NoteMarked(r.size);
             continue;
         }
         if (spent >= budget) {
-            native_warm.emplace_back(up.addr, up.size);
-            native_warm_bytes += up.size;
-            warm_deferred += up.size;
+            native_warm.emplace_back(r.addr, r.size);
+            native_warm_bytes += r.size;
+            warm_deferred += r.size;
             continue;
         }
         // Persistent: the same sync the early bind uses (residency, CPU-dirty bytes copied; the copy
         // threads when SOTC_LOAD_STREAM / SOTC_NATIVE is on). The next submit waits for those copies
         // (Scheduler::SubmitExecution calls AsyncUpload::WaitUpTo), so the GPU never reads them early.
-        const u64 bytes = DrainRange(up.addr, up.size);
+        const u64 bytes = DrainRange(r.addr, r.size);
         SotcNative::NoteUploaded(bytes);
         spent += bytes;
     }
     SotcNative::NoteDrainDone(warm_deferred, native_warm_bytes);
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0);
+    SotcNative::NoteDrainWork(static_cast<u64>(ns.count()), pages, invalidations, served, merged.size());
 }
 
 // sotc: SOTC_NATIVE=1. See buffer_cache.h. The page mark is what a write fault of mode 0 left behind

@@ -593,6 +593,12 @@ public:
         return descriptor_buffer;
     }
 
+    /// sotc: true when VK_EXT_descriptor_buffer was probed for SOTC_N5_DESCBUF (modes 1 and 2). Kept
+    /// apart from IsDescriptorBufferEnabled: the layouts of the two schemes differ.
+    bool IsDescriptorBufferN5Enabled() const noexcept {
+        return descriptor_buffer_n5;
+    }
+
     /// sotc: true when VK_EXT_host_image_copy is enabled (SOTC_HOST_IMAGE_COPY=1). Images created
     /// with VK_IMAGE_USAGE_HOST_TRANSFER_BIT may then be written by the host (Runtime::TryHostImageCopy).
     bool IsHostImageCopyEnabled() const noexcept {
@@ -814,6 +820,7 @@ private:
     bool device_fault{};
     bool device_fault_vendor_binary{};
     bool descriptor_buffer{}; // sotc: VK_EXT_descriptor_buffer enabled (SOTC_DESC_BUFFER=1)
+    bool descriptor_buffer_n5{}; // sotc: VK_EXT_descriptor_buffer probed for SOTC_N5_DESCBUF
     bool host_image_copy{};   // sotc: VK_EXT_host_image_copy enabled (SOTC_HOST_IMAGE_COPY=1)
     bool present_wait_enabled{}; // sotc: VK_KHR_present_wait on, see IsPresentWaitEnabled
     bool present_wait_pacing{};  // sotc: SOTC_PRESENT_WAIT, see IsPresentWaitPacingEnabled

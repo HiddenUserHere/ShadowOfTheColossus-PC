@@ -128,6 +128,84 @@ bool WaitNoSpin() {
     return value;
 }
 
+// sotc: SOTC_FUTEX_WAIT=1 (Windows only, off by default): the consumer's idle wait (on wake_seq),
+// Sync (sync_done) and PassSecondary::WaitJob (done_seq) sleep in WaitOnAddress, and the producer
+// side wakes them after it stores the word they wait on. The sleep compares the value the waiter
+// read, so a store that came first is seen at once: no wake is lost. The timeout is a safety net,
+// and timed-out sleeps whose condition already held are counted (safety_met).
+bool FutexWaitOn() {
+#ifdef _WIN32
+    static const bool value = [] {
+        const char* v = std::getenv("SOTC_FUTEX_WAIT");
+        return v && v[0] == '1';
+    }();
+    return value;
+#else
+    return false;
+#endif
+}
+
+constexpr u32 kFutexSpin = 128;
+constexpr u32 kFutexTimeoutMs = 16;
+
+// Sleeps while word == observed, at most kFutexTimeoutMs. Returns false on timeout.
+template <typename T>
+bool FutexSleepRec(std::atomic<T>& word, T observed) {
+    static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8);
+    SotcFutexRecCounters& c = g_futex_rec;
+    const auto t0 = std::chrono::steady_clock::now();
+#ifdef _WIN32
+    const bool woken = WaitOnAddress(&word, &observed, sizeof(T), kFutexTimeoutMs) != FALSE;
+#else
+    const bool woken = true; // not reached: SOTC_FUTEX_WAIT is Windows-only
+#endif
+    const u64 ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+            .count());
+    c.sleeps.fetch_add(1, std::memory_order_relaxed);
+    c.sleep_ns.fetch_add(ns, std::memory_order_relaxed);
+    u64 seen = c.sleep_max_ns.load(std::memory_order_relaxed);
+    while (ns > seen && !c.sleep_max_ns.compare_exchange_weak(seen, ns, std::memory_order_relaxed)) {
+    }
+    return woken;
+}
+
+// Wakes one (or every) thread sleeping in FutexSleepRec on word.
+template <typename T>
+void FutexWakeRec(std::atomic<T>& word, bool all) {
+    g_futex_rec.wakes.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    if (all) {
+        WakeByAddressAll(&word);
+    } else {
+        WakeByAddressSingle(&word);
+    }
+#else
+    (void)word;
+    (void)all;
+#endif
+}
+
+// Waits until word >= target: a short spin, then sleeps (the publisher stores, then wakes).
+void FutexWaitAtLeast(std::atomic<u64>& word, u64 target) {
+    SotcFutexRecCounters& c = g_futex_rec;
+    c.waits.fetch_add(1, std::memory_order_relaxed);
+    u64 seen = word.load(std::memory_order_acquire);
+    for (u32 spin = 0; seen < target && spin < kFutexSpin; ++spin) {
+        RECORDER_PAUSE();
+        seen = word.load(std::memory_order_acquire);
+    }
+    if (seen >= target) {
+        c.spins.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    while ((seen = word.load(std::memory_order_seq_cst)) < target) {
+        if (!FutexSleepRec(word, seen) && word.load(std::memory_order_seq_cst) >= target) {
+            c.safety_met.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
 u32 CurrentThreadId() {
 #ifdef _WIN32
     return static_cast<u32>(GetCurrentThreadId());
@@ -1351,6 +1429,10 @@ bool PassSecondary::TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::st
 }
 
 void PassSecondary::WaitJob(u64 job_seq_) {
+    if (FutexWaitOn()) { // sotc: SOTC_FUTEX_WAIT
+        FutexWaitAtLeast(done_seq, job_seq_);
+        return;
+    }
     u64 done = done_seq.load(std::memory_order_acquire);
     while (done < job_seq_) {
         done_seq.wait(done, std::memory_order_acquire);
@@ -1486,8 +1568,13 @@ void PassSecondary::Record(Job* job) {
         pinned->job_pins.fetch_sub(1, std::memory_order_release);
     }
     job->pinned.clear();
-    done_seq.store(job->seq, std::memory_order_release);
-    done_seq.notify_all();
+    if (FutexWaitOn()) { // sotc: SOTC_FUTEX_WAIT: WaitJob sleeps on done_seq
+        done_seq.store(job->seq, std::memory_order_seq_cst);
+        FutexWakeRec(done_seq, true);
+    } else {
+        done_seq.store(job->seq, std::memory_order_release);
+        done_seq.notify_all();
+    }
 }
 
 CommandRecorder::CommandRecorder(const Instance& instance, Semaphore* work_semaphore) {
@@ -1602,6 +1689,9 @@ void* CommandRecorder::Allocate(size_t size, BlockKind kind, BlockCategory categ
     if (write_pos + total + sizeof(BlockHeader) > Chunk::Size) {
         NextChunk();
     }
+    // sotc: SOTC_N5_PARALLEL_TRANSLATE census, the producer's header write only (not NextChunk)
+    const bool census = ParallelRecord::TranslateCensus();
+    const u64 census_t0 = census ? ParallelRecord::NowNs() : 0;
     auto* header = reinterpret_cast<BlockHeader*>(write_chunk->data + write_pos);
     header->size = static_cast<u32>(total);
     header->kind = kind;
@@ -1609,6 +1699,10 @@ void* CommandRecorder::Allocate(size_t size, BlockKind kind, BlockCategory categ
     header->aux = aux;
     header->invoke = invoke;
     write_pos += static_cast<u32>(total);
+    if (census) {
+        ParallelRecord::NoteEmit(static_cast<u8>(category), static_cast<u32>(total),
+                                 ParallelRecord::NowNs() - census_t0);
+    }
     return header + 1;
 }
 
@@ -1635,6 +1729,9 @@ void* CommandRecorder::AllocateState(size_t size, BlockCategory category, void (
     meta->key = key;
     write_pos += static_cast<u32>(meta_total);
 
+    // sotc: SOTC_N5_PARALLEL_TRANSLATE census; times the command block only (the Meta is not timed)
+    const bool census = ParallelRecord::TranslateCensus();
+    const u64 census_t0 = census ? ParallelRecord::NowNs() : 0;
     auto* header = reinterpret_cast<BlockHeader*>(write_chunk->data + write_pos);
     header->size = static_cast<u32>(total);
     header->kind = BlockKind::Command;
@@ -1642,6 +1739,10 @@ void* CommandRecorder::AllocateState(size_t size, BlockCategory category, void (
     header->aux = aux;
     header->invoke = invoke;
     write_pos += static_cast<u32>(total);
+    if (census) {
+        ParallelRecord::NoteEmit(static_cast<u8>(category), static_cast<u32>(meta_total + total),
+                                 ParallelRecord::NowNs() - census_t0);
+    }
     return header + 1;
 }
 
@@ -1691,7 +1792,7 @@ void CommandRecorder::NextChunk() {
     end->invoke = nullptr;
     write_pos += sizeof(BlockHeader);
     write_chunk->committed.store(write_pos, std::memory_order_release);
-    if (WaitNoSpin()) {
+    if (WaitNoSpin() || FutexWaitOn()) { // sotc: the futex consumer sleeps too, it needs the wake
         // sotc: the consumer may be blocked on the end of the old chunk. The fence orders the
         // committed store before the sleeping flag load, as in PublishAll and Kick (otherwise the
         // consumer can sleep on the old value until the next publish: a hitch).
@@ -1764,6 +1865,11 @@ void CommandRecorder::SweepDeferred() {
 }
 
 void CommandRecorder::WakeConsumer() {
+    if (FutexWaitOn()) { // sotc: SOTC_FUTEX_WAIT: the consumer sleeps on wake_seq only
+        wake_seq.fetch_add(1, std::memory_order_seq_cst);
+        FutexWakeRec(wake_seq, false);
+        return;
+    }
     {
         std::scoped_lock lk{wake_mutex};
         wake_flag = true;
@@ -1796,16 +1902,25 @@ void CommandRecorder::Sync() {
         perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const u64 target = ++sync_requested;
     Run(BlockCategory::Other, [this, target] {
+        if (FutexWaitOn()) { // sotc: SOTC_FUTEX_WAIT: the producer sleeps on sync_done
+            sync_done.store(target, std::memory_order_seq_cst);
+            FutexWakeRec(sync_done, true);
+            return;
+        }
         sync_done.store(target, std::memory_order_release);
         sync_done.notify_all();
     });
     Kick();
     const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
     const SotcStats::SplitTimer recorder_split{SotcStats::SplitWaitRecorder};
-    u64 done = sync_done.load(std::memory_order_acquire);
-    while (done < target) {
-        sync_done.wait(done, std::memory_order_acquire);
-        done = sync_done.load(std::memory_order_acquire);
+    if (FutexWaitOn()) { // sotc: SOTC_FUTEX_WAIT
+        FutexWaitAtLeast(sync_done, target);
+    } else {
+        u64 done = sync_done.load(std::memory_order_acquire);
+        while (done < target) {
+            sync_done.wait(done, std::memory_order_acquire);
+            done = sync_done.load(std::memory_order_acquire);
+        }
     }
     if (perf) {
         Add(Id::RecorderDrains);
@@ -1862,6 +1977,9 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     }();
 
     const bool nospin = WaitNoSpin();
+    // sotc: SOTC_FUTEX_WAIT: the idle wait is a WaitOnAddress on wake_seq, after the same short
+    // spin as SOTC_WAIT_NOSPIN (at most ~20 us)
+    const bool futex_wait = FutexWaitOn();
     Chunk* chunk = first_chunk;
     Chunk* previous = nullptr;
     u32 pos = 0;
@@ -1872,7 +1990,7 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         if (pos == committed) {
             // When there is no work, spin briefly before sleeping until the producer kicks the
             // queue or the short timeout expires
-            if (nospin) {
+            if (nospin || futex_wait) {
                 // sotc: at most ~20 us of spinning (deadline checked every 64 iterations)
                 const auto spin_end =
                     Clock::now() + std::min(SpinTime, std::chrono::microseconds{20});
@@ -1892,13 +2010,31 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
                     RECORDER_PAUSE();
                 }
             }
+            if (futex_wait) { // sotc: SOTC_FUTEX_WAIT: one idle wait, ended by the spin or the sleep
+                g_futex_rec.waits.fetch_add(1, std::memory_order_relaxed);
+                if (committed != pos) {
+                    g_futex_rec.spins.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             if (committed == pos) {
                 if (stoken.stop_requested()) {
                     break;
                 }
                 consumer_sleeping.store(true, std::memory_order_relaxed);
                 std::atomic_thread_fence(std::memory_order_seq_cst);
-                if (nospin) {
+                if (futex_wait) {
+                    // sotc: SOTC_FUTEX_WAIT: the snapshot is taken after the fence, before the
+                    // re-check; a producer that publishes after the re-check sees consumer_sleeping
+                    // and bumps wake_seq, so the sleep returns at once (see FutexWaitAtLeast).
+                    const u32 seen = wake_seq.load(std::memory_order_acquire);
+                    if (chunk->committed.load(std::memory_order_acquire) == pos &&
+                        !stoken.stop_requested()) {
+                        if (!FutexSleepRec(wake_seq, seen) &&
+                            chunk->committed.load(std::memory_order_acquire) != pos) {
+                            g_futex_rec.safety_met.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                } else if (nospin) {
                     // sotc: the snapshot is taken before the re-check; a producer that publishes
                     // after the re-check sees consumer_sleeping and rings the doorbell (or
                     // WakeConsumer on destruction), so the wait returns at once

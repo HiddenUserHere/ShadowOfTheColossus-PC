@@ -131,7 +131,7 @@ DescriptorHeap::DescriptorHeap(const Instance& instance, Scheduler& scheduler,
       descriptor_heap_count{descriptor_heap_count_}, pool_sizes{pool_sizes_} {
     CreateDescriptorPool();
     // sotc: with descriptor buffers the sets are not pooled; the ring replaces Commit.
-    if (instance.IsDescriptorBufferEnabled()) {
+    if (instance.IsDescriptorBufferEnabled() || instance.IsDescriptorBufferN5Enabled()) { // sotc: SOTC_N5_DESCBUF
         descriptor_buffer = std::make_unique<DescriptorBufferRing>(instance, scheduler);
     }
 }

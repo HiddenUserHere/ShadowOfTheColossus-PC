@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string_view>
@@ -31,6 +32,11 @@ struct Counters {
     std::atomic<u64> would{};                               ///< mode 2: passes that would go parallel
     std::atomic<u64> would_draws{};                         ///< mode 2: draws in those passes
     std::atomic<u64> would_blocks{};                        ///< mode 2: command blocks in those passes
+    // SOTC_N5_PARALLEL_TRANSLATE census: producer (draw thread) emission into the stream
+    std::atomic<u64> emit_blocks{};
+    std::atomic<u64> emit_bytes{};
+    std::atomic<u64> emit_ns{};
+    std::array<std::atomic<u64>, kBlockCategories> emit_by_category{};
 };
 Counters cnt;
 
@@ -78,6 +84,55 @@ int SwitchOn() {
     return value;
 }
 
+/// SOTC_N5_PARALLEL_TRANSLATE=1 turns on the producer emission census (NoteEmit). Read once.
+bool TranslateOn() {
+    static const bool value = [] {
+        const char* v = std::getenv("SOTC_N5_PARALLEL_TRANSLATE");
+        const bool on = v && v[0] == '1';
+        if (on) {
+            LOG_INFO(Render, "SOTC_N5_PARALLEL_TRANSLATE=1: producer emission census on, no op is "
+                             "translated off the draw thread");
+        }
+        return on;
+    }();
+    return value;
+}
+
+/// One 5 s line for the census window: what the draw thread spends writing command blocks.
+void ReportEmit(std::string& out, double seconds) {
+    if (!TranslateOn()) {
+        return;
+    }
+    const u64 blocks = Take(cnt.emit_blocks);
+    const u64 bytes = Take(cnt.emit_bytes);
+    const u64 ns = Take(cnt.emit_ns);
+    std::array<u64, kBlockCategories> by{};
+    for (size_t i = 0; i < by.size(); ++i) {
+        by[i] = Take(cnt.emit_by_category[i]);
+    }
+    if (blocks == 0) {
+        return;
+    }
+    const double sec = seconds > 0.0 ? seconds : 1.0;
+    char line[1024];
+    int n = std::snprintf(
+        line, sizeof(line),
+        "N5 translate (SOTC_N5_PARALLEL_TRANSLATE=1): emit %.0f blocks/s, %.2f MiB/s, producer "
+        "emit %.3f ms/s (%.2f%% of the window), by category ",
+        static_cast<double>(blocks) / sec, static_cast<double>(bytes) / sec / 1048576.0,
+        static_cast<double>(ns) / 1e6 / sec, 100.0 * static_cast<double>(ns) / 1e9 / sec);
+    for (size_t i = 0; i < by.size() && n > 0 && n < int(sizeof(line)); ++i) {
+        if (by[i] != 0) {
+            n += std::snprintf(line + n, sizeof(line) - n, "%s %.0f/s ", kBlockNames[i],
+                               static_cast<double>(by[i]) / sec);
+        }
+    }
+    if (n > 0 && n < int(sizeof(line))) {
+        std::snprintf(line + n, sizeof(line) - n, "| resolution not counted, workers 0\n");
+    }
+    out += line;
+}
+
 } // namespace
 
 int Mode() {
@@ -119,7 +174,27 @@ void NoteOwnerWait(u64 ns) noexcept {
     cnt.owner_wait_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
+bool TranslateCensus() {
+    return TranslateOn();
+}
+
+u64 NowNs() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+void NoteEmit(u8 category, u32 bytes, u64 ns) noexcept {
+    cnt.emit_blocks.fetch_add(1, std::memory_order_relaxed);
+    cnt.emit_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    cnt.emit_ns.fetch_add(ns, std::memory_order_relaxed);
+    if (category < kBlockCategories) {
+        cnt.emit_by_category[category].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void Report(std::string& out, double seconds) {
+    ReportEmit(out, seconds);
     if (!Enabled()) {
         return;
     }

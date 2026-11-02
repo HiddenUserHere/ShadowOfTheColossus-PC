@@ -30,6 +30,24 @@ u32 BdaTableMode(const Instance& instance);
 /// checked against the device address of its descriptor's buffer (base_mismatch). Read once.
 u32 BdaN5Mode();
 
+/// sotc: SOTC_N5_BDA_BUFFERS (native mode only, like BdaN5Mode): 0 = off (default), 1 = a guest
+/// buffer slot the table serves gets no descriptor write at all (no set write, no buffer info: the
+/// shader declares no variable for it, see DefineBuffers), 2 = verify: the descriptors are written
+/// as before, every table slot is checked against its descriptor's buffer, and the writes that
+/// mode 1 would drop are counted (desc_verify). Read once. Also turns the table on, like the others.
+u32 BdaN5BuffersMode();
+
+/// sotc: the device exposes bufferDeviceAddress (Vulkan 1.2 feature), probed once.
+bool BdaBufferDeviceAddressSupported(const Instance& instance);
+
+/// sotc: SOTC_N5_BDA_BUFFERS as used by the rasterizer: BdaN5BuffersMode, or 0 when the device has
+/// no bufferDeviceAddress (the switch is then ignored, with one log line).
+u32 BdaN5BuffersActive(const Instance& instance);
+
+/// sotc: SOTC_N5_BDA_BUFFERS: counts one guest buffer slot whose descriptor write was dropped
+/// (dropped = true, mode 1) or would have been dropped (dropped = false, mode 2).
+void BdaNoteDescriptorSkip(bool dropped);
+
 class BdaTable {
 public:
     /// Starts the table of one stage with `num_slots` slots. Every slot is a null block (size 0)
@@ -83,11 +101,13 @@ private:
 
 /// Counters since the last call (they reset). One line for a periodic report, for example:
 /// "SOTC BDA draws 120 slots 4800 nulls 310 no_bda 0 misaligned 0 verify_fail 0 base_mismatch 0
-/// reuse 80 table 19200 B".
+/// reuse 80 table 19200 B desc_skip 0 desc_verify 0".
 /// `nulls` counts size-0 slots, `no_bda` slots whose buffer had no device address (their reads
 /// return zero: a correctness problem while the table is on), `misaligned` blocks whose address is
 /// not 4-byte aligned (dword accesses need it), `base_mismatch` (verify) slots whose address is not
-/// the descriptor buffer's address plus the offset, `reuse` uploads skipped by the dirty check.
+/// the descriptor buffer's address plus the offset, `reuse` uploads skipped by the dirty check,
+/// `desc_skip` (SOTC_N5_BDA_BUFFERS=1) descriptor writes dropped, `desc_verify` (=2) writes that
+/// mode 1 would have dropped. Per frame: divide by the frame count of the same report window.
 void BdaTableReport(char* out, u32 out_size);
 
 } // namespace Vulkan
