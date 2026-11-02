@@ -40,6 +40,7 @@
 #include "hooks.h"
 #include "pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE heap carves
 #include "mem_classes.h" // SotcMemClasses::OnGranule / OnGranuleShared (granule claims)
+#include "native/n1verify.h" // sotc: SOTC_VERIFY=n1 allocator class feed
 #include "probes.h"
 #include "native/native.h"               // sotc: SOTC_NATIVE switch (SotcNative::On)
 
@@ -375,6 +376,9 @@ void RegisterGranuleOwner(GranuleEntry& entry, uint64_t granule_base, uint32_t s
         const std::string pool = "memtype:" + label;
         entry.label.store(std::hash<std::string>{}(label), std::memory_order_release);
         SotcMemClasses::OnGranule(granule_base, kGranuleSize, pool.c_str());
+    }
+    if (SotcN1Verify::On()) { // sotc: SOTC_VERIFY=n1: the heap class of a missed bind
+        SotcN1Verify::OnGranule(granule_base, kGranuleSize, ("memtype:" + SlotLabel(slot)).c_str());
     }
     // sotc: SOTC_PC_PLACE: the claim is a carve too, whether or not SOTC_MEMTYPE_CLASSES is on.
     SotcPcPlaceGlue::Global().OnHeapCarve(granule_base, static_cast<int32_t>(slot));

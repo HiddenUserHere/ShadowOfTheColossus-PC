@@ -38,6 +38,7 @@
 #include "pc_ring.h"     // sotc: SOTC_PC_RING feed (per-frame arena blocks)
 #include "pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE / SOTC_PC_RECYCLE feed
 #include "mem_classes.h" // sotc: step 6 feed (CPU-only ranges) and the PC memory model owner feed
+#include "native/n1verify.h" // sotc: SOTC_VERIFY=n1 allocator class feed
 #include "probes.h"
 #include "video_core/sotc_trace.h" // image bounds (SotcTrace::ImageBase/ImageSize)
 
@@ -465,6 +466,7 @@ void AllocPost(GuestRegs& regs, void*) {
     SotcPcPlaceGlue::Global().OnAllocObserved(SotcPcPlace::OwnerKey{f.family, name, kind}, base, size, slot, -1);
     SotcPcRing::OnBlock(base, size, name, kind); // sotc: SOTC_PC_RING, the per-frame arena blocks
     SotcRbClass::OnBlock(base, size, name, kind); // sotc: SOTC_RB_CLASS, the XPR mask arena
+    SotcN1Verify::OnBlock(base, size, name, kind, slot); // sotc: SOTC_VERIFY=n1
 
     PoolRow& row = g_pools[pool];
     row.alloc_count += 1;
@@ -498,6 +500,7 @@ HookAction FreePre(GuestRegs& regs, void*) {
     SotcPcPlaceGlue::Global().OnFreeObserved(e.base, e.size); // sotc: SOTC_PC_PLACE
     SotcPcRing::OnFreeBlock(e.base); // sotc: SOTC_PC_RING
     SotcRbClass::OnFreeBlock(e.base); // sotc: SOTC_RB_CLASS
+    SotcN1Verify::OnFreeBlock(e.base); // sotc: SOTC_VERIFY=n1
     PoolRow& row = g_pools[e.pool];
     row.live_bytes -= static_cast<int64_t>(e.size);
     if (row.live_bytes < 0) {

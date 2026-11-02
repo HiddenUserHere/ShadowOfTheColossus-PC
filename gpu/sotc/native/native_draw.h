@@ -15,6 +15,7 @@ struct PendingUpload {
     uint64_t addr;
     uint64_t size;
     Kind kind;
+    uint64_t seq = 0; ///< SotcNative::AnnounceSeq() of the newest announce merged into this entry (0: unknown)
 };
 
 /// Draw thread. Pops the oldest pending upload. False when none is queued.
@@ -33,7 +34,16 @@ void SetFrameBackend(const FrameBackend& backend);
 /// Counters (draw thread or any thread, relaxed).
 void NoteUploaded(uint64_t bytes);     ///< a persistent range uploaded by the draw thread (0: already clean)
 void NoteMarked(uint64_t bytes);       ///< a per-frame range marked CPU-modified (fallback)
+void NoteExactUpload(uint64_t bytes);  ///< an announce over GPU-written memory copied byte-exact (mode 1)
 void NoteDroppedUpload();              ///< a queue overflow: nothing else can be done for the range
+
+/// Timing counters of one NativeDrain (draw thread). pickup_seq is SotcNative::AnnounceSeq() when the command
+/// processor picked the submit up (0: unknown). An entry whose seq is above it was announced after the submit
+/// reached the port, so that submit's binds can see a mark of CPU work newer than the submit.
+void NoteDrainEntry(uint64_t seq, uint64_t pickup_seq, uint64_t size);
+/// End of a drain: warm_deferred_bytes = Persistent uploads postponed by the budget in this drain (already
+/// marked CPU-modified, so a bind uploads them anyway), warm_backlog_bytes = bytes still waiting for a drain.
+void NoteDrainDone(uint64_t warm_deferred_bytes, uint64_t warm_backlog_bytes);
 
 /// Ring depths of the engine's per-frame heaps (heaps.md section 7): the flip (FUN_0001d230) advances the
 /// frame index mod depth and reuses a block after depth flips without waiting on the GPU, so the port fences.

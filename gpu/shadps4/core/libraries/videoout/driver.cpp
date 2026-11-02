@@ -60,6 +60,7 @@
 #include "../../../../sotc/native/native.h" // sotc: SOTC_NATIVE report
 #include "../../../../sotc/native/native_sync.h" // sotc: SOTC_NATIVE frame ticket report
 #include "../../../../sotc/native/verify.h" // sotc: SOTC_VERIFY report
+#include "../../../../sotc/native/n1verify.h" // sotc: SOTC_VERIFY=n1 report
 #include "../../../../sotc/native/native_results.h" // sotc: SOTC_NATIVE results report
 #include "../../../../sotc/native/native_particles.h" // sotc: SOTC_NATIVE_PARTICLES report
 #include "../../../../sotc/native/native_copies.h"   // sotc: PC-native GPU result copies report
@@ -2024,6 +2025,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcNativeHooks::Report(report, seconds); // sotc: SOTC_NATIVE write hooks
             SotcNativeSync::Report(report, seconds);  // sotc: SOTC_NATIVE frame ticket
             SotcVerify::Report(report, seconds);      // sotc: SOTC_VERIFY
+            SotcN1Verify::Report(report, seconds);    // sotc: SOTC_VERIFY=n1
             SotcNativeResults::Report(report, seconds); // sotc: SOTC_NATIVE GPU-result consumers
             SotcNativeParticles::Report(report, seconds); // sotc: SOTC_NATIVE_PARTICLES=prev
             SotcNativeCopies::Report(report, seconds);    // sotc: the copies behind particles and masks

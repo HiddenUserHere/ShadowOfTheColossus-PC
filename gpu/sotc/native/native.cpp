@@ -6,6 +6,7 @@
 #include "native.h"
 #include "native_draw.h"
 #include "verify.h" // sotc: coverage oracle (SOTC_VERIFY)
+#include "n1verify.h" // sotc: SOTC_VERIFY=n1
 
 #include <algorithm>
 #include <atomic>
@@ -13,8 +14,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace SotcNative {
 namespace {
@@ -37,6 +40,10 @@ struct Counters {
     std::atomic<uint64_t> uploads{};
     std::atomic<uint64_t> uploads_clean{};
     std::atomic<uint64_t> marked_bytes{};
+    std::atomic<uint64_t> exact_uploads{};
+    std::atomic<uint64_t> exact_bytes{};
+    std::atomic<uint64_t> images_reused{};
+    std::atomic<uint64_t> cp_writes{}, cp_write_bytes{}; // command processor writes told to the caches
     std::atomic<uint64_t> frame_waits{};
     std::atomic<uint64_t> frame_wait_ns{};
     std::atomic<uint64_t> frame_wait_max_ns{};
@@ -47,13 +54,49 @@ struct Counters {
     std::atomic<uint64_t> readbacks_skipped{};  // mode 1: a GPU-to-guest copy the port did not make
     std::atomic<uint64_t> stray_write_faults{}; // mode 1: a write fault no tracker protection caused
     std::atomic<uint64_t> stray_read_faults{};  // mode 1: a read fault no tracker protection caused
+    // Timing audit (JITTER-BRIEF): what each drain did relative to the submit it ran for.
+    std::atomic<uint64_t> drains{};             // NativeDrain calls
+    std::atomic<uint64_t> drain_entries{};      // announces drained
+    std::atomic<uint64_t> drain_bytes{};        // bytes of those announces
+    std::atomic<uint64_t> drain_after_pickup{}; // ... announced after the CP picked the submit up
+    std::atomic<uint64_t> drain_after_bytes{};
+    std::atomic<uint64_t> drain_lag_max{};      // max (seq at drain - seq at pickup), in announces
+    std::atomic<uint64_t> warm_deferred{};      // drains that postponed Persistent uploads (marked at once)
+    std::atomic<uint64_t> warm_backlog_max{};   // bytes waiting for a later drain, max
+    std::atomic<uint64_t> late_writes{}, late_bytes{};    // announced before the writer finished, same frame
+    std::atomic<uint64_t> late_next{}, late_next_bytes{}; // ... changed after a SubmitDone (also a legal rewrite)
 };
 Counters g_c;
 std::atomic<uint64_t> g_submitted_local{}; // frame counter when no backend is set
 std::atomic<size_t> g_pending_count{};     // size of g_pending (lock-free look)
+std::atomic<uint64_t> g_announce_seq{};    // Announce calls (stamps PendingUpload::seq)
 
 std::mutex g_mutex; // the pending queue and the descriptor map
 std::deque<PendingUpload> g_pending;
+// sotc: announces that arrive while g_pending is full (a load announces ~1M ranges before the draw thread
+// drains once). They used to be dropped, which left every GPU copy and image over them stale for good in mode 1
+// (no page fault catches the write later). Kept as merged exact intervals per kind instead: start -> end.
+std::map<uint64_t, uint64_t> g_overflow[2];
+size_t PendingTotal() {
+    return g_pending.size() + g_overflow[0].size() + g_overflow[1].size();
+}
+void OverflowAdd(Kind kind, uint64_t addr, uint64_t end) {
+    auto& m = g_overflow[kind == Kind::Persistent ? 0 : 1];
+    auto it = m.upper_bound(addr);
+    if (it != m.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second >= addr) {
+            addr = prev->first;
+            end = std::max(end, prev->second);
+            it = m.erase(prev);
+        }
+    }
+    while (it != m.end() && it->first <= end) {
+        end = std::max(end, it->second);
+        it = m.erase(it);
+    }
+    m.emplace(addr, end);
+}
 
 struct DescRecord {
     uint64_t base;
@@ -127,7 +170,9 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
         }
         return;
     }
+    const uint64_t seq = g_announce_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     SotcVerify::NoteAnnounce(addr, size); // sotc: clears the coverage oracle's pending faults
+    SotcN1Verify::NoteAnnounce(addr, size, static_cast<uint8_t>(kind), __builtin_return_address(0)); // sotc: SOTC_VERIFY=n1
     if (kind == Kind::GpuWritten) {
         g_c.announce_gpu_written.fetch_add(1, std::memory_order_relaxed);
         return; // the GPU writes it: nothing to upload
@@ -141,6 +186,20 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
     std::scoped_lock lock{g_mutex};
     for (uint64_t at = addr; at < addr + size;) {
         const uint64_t piece = std::min<uint64_t>(kMaxUploadChunk, addr + size - at);
+        // sotc: a piece that touches the newest queued range of its kind extends it. The union holds
+        // announced bytes only (adjacent or overlapping), so the drain copies exactly what was written.
+        // Sequential small writes (memcpy runs) fill one entry instead of overflowing the queue, and an
+        // overflow drops the write: mode 1 never sees it again.
+        if (!g_pending.empty() && g_pending.back().kind == kind) {
+            PendingUpload& back = g_pending.back();
+            const uint64_t back_end = back.addr + back.size;
+            if (at >= back.addr && at <= back_end && at + piece - back.addr <= kMaxUploadChunk) {
+                back.size = std::max<uint64_t>(back_end, at + piece) - back.addr;
+                back.seq = seq;
+                at += piece;
+                continue;
+            }
+        }
         if (g_pending.size() >= kMaxPending) {
             NoteDroppedUpload();
             static bool logged = false;
@@ -150,11 +209,11 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
                              kMaxPending);
             }
         } else {
-            g_pending.push_back(PendingUpload{at, piece, kind});
+            g_pending.push_back(PendingUpload{at, piece, kind, seq});
         }
         at += piece;
     }
-    g_pending_count.store(g_pending.size(), std::memory_order_release);
+    g_pending_count.store(PendingTotal(), std::memory_order_release);
 }
 
 void Release(uint64_t addr, uint64_t size) {
@@ -162,6 +221,7 @@ void Release(uint64_t addr, uint64_t size) {
         return;
     }
     SotcVerify::NoteAnnounce(addr, size); // sotc: a released range is not an unannounced write
+    SotcN1Verify::NoteRelease(addr, size); // sotc: SOTC_VERIFY=n1: its announce records go
     std::scoped_lock lock{g_mutex};
     // Drops the queued parts inside [addr, addr + size); the parts outside it stay queued.
     std::deque<PendingUpload> kept;
@@ -173,14 +233,33 @@ void Release(uint64_t addr, uint64_t size) {
         g_c.announce_released.fetch_add(1, std::memory_order_relaxed);
         const uint64_t end = p.addr + p.size;
         if (p.addr < addr) {
-            kept.push_back(PendingUpload{p.addr, addr - p.addr, p.kind});
+            kept.push_back(PendingUpload{p.addr, addr - p.addr, p.kind, p.seq});
         }
         if (end > addr + size) {
-            kept.push_back(PendingUpload{addr + size, end - (addr + size), p.kind});
+            kept.push_back(PendingUpload{addr + size, end - (addr + size), p.kind, p.seq});
         }
     }
     g_pending.swap(kept);
-    g_pending_count.store(g_pending.size(), std::memory_order_release);
+    for (auto& m : g_overflow) {
+        std::vector<std::pair<uint64_t, uint64_t>> parts;
+        for (auto it = m.begin(); it != m.end();) {
+            if (!Overlaps(it->first, it->second - it->first, addr, size)) {
+                ++it;
+                continue;
+            }
+            if (it->first < addr) {
+                parts.emplace_back(it->first, addr);
+            }
+            if (it->second > addr + size) {
+                parts.emplace_back(addr + size, it->second);
+            }
+            it = m.erase(it);
+        }
+        for (const auto& part : parts) {
+            m.emplace(part.first, part.second);
+        }
+    }
+    g_pending_count.store(PendingTotal(), std::memory_order_release);
 }
 
 uint64_t FrameSubmitted() {
@@ -228,6 +307,29 @@ void NoteDescriptor(uint64_t desc_addr, uint64_t base, uint64_t size, uint32_t f
     }
 }
 
+uint64_t AnnounceSeq() {
+    return g_announce_seq.load(std::memory_order_relaxed);
+}
+
+void NoteLateWrite(uint64_t size, bool same_frame) {
+    if (same_frame) {
+        g_c.late_writes.fetch_add(1, std::memory_order_relaxed);
+        g_c.late_bytes.fetch_add(size, std::memory_order_relaxed);
+    } else {
+        g_c.late_next.fetch_add(1, std::memory_order_relaxed);
+        g_c.late_next_bytes.fetch_add(size, std::memory_order_relaxed);
+    }
+}
+
+void NoteImageReused() {
+    g_c.images_reused.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteCpGuestWrite(uint64_t size) {
+    g_c.cp_writes.fetch_add(1, std::memory_order_relaxed);
+    g_c.cp_write_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
 void NoteSkippedReadback(uint64_t addr, uint64_t size) {
     if (g_c.readbacks_skipped.fetch_add(1, std::memory_order_relaxed) < 8) {
         std::fprintf(stderr, "SOTC NATIVE readback skipped: addr 0x%llx size 0x%llx\n",
@@ -272,6 +374,8 @@ void Report(std::string& out, double seconds) {
     const uint64_t clean = take(g_c.uploads_clean);
     const uint64_t up_bytes = take(g_c.uploaded_bytes);
     const uint64_t marked = take(g_c.marked_bytes);
+    const uint64_t exact = take(g_c.exact_uploads);
+    const uint64_t exact_bytes = take(g_c.exact_bytes);
     const uint64_t waits = take(g_c.frame_waits);
     const uint64_t wait_ns = take(g_c.frame_wait_ns);
     const uint64_t wait_max = take(g_c.frame_wait_max_ns);
@@ -305,13 +409,33 @@ void Report(std::string& out, double seconds) {
                   waits ? wait_ns / 1e6 / static_cast<double>(waits) : 0.0, wait_max / 1e6,
                   static_cast<unsigned long long>(fences));
     out += line;
+    {
+        // Timing audit: drained entries newer than the submit they were drained for (CPU work after the pickup is
+        // visible to that submit's binds), Persistent uploads the budget postponed, writes found after their
+        // announce (re-announced by native_hooks.cpp).
+        const auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+        std::snprintf(line, sizeof(line),
+                      "SOTC NATIVE TIMING drains %llu entries %llu %llu KiB, after-pickup %llu %llu KiB (lag max "
+                      "%llu), warm deferred %llu (backlog max %llu KiB), late writes same-frame %llu %llu B "
+                      "next-frame %llu %llu B\n",
+                      ull(take(g_c.drains)), ull(take(g_c.drain_entries)), ull(take(g_c.drain_bytes) >> 10),
+                      ull(take(g_c.drain_after_pickup)), ull(take(g_c.drain_after_bytes) >> 10),
+                      ull(take(g_c.drain_lag_max)), ull(take(g_c.warm_deferred)),
+                      ull(take(g_c.warm_backlog_max) >> 10), ull(take(g_c.late_writes)),
+                      ull(take(g_c.late_bytes)), ull(take(g_c.late_next)), ull(take(g_c.late_next_bytes)));
+        out += line;
+    }
     if (g_mode == 1) {
         std::snprintf(line, sizeof(line),
                       "SOTC NATIVE tracking off (%.1f s): readbacks skipped %llu, stray faults write %llu "
-                      "read %llu\n",
+                      "read %llu, exact uploads %llu %llu KiB, images reused %llu\n",
                       seconds, static_cast<unsigned long long>(take(g_c.readbacks_skipped)),
                       static_cast<unsigned long long>(take(g_c.stray_write_faults)),
-                      static_cast<unsigned long long>(take(g_c.stray_read_faults)));
+                      static_cast<unsigned long long>(take(g_c.stray_read_faults)),
+                      static_cast<unsigned long long>(exact), static_cast<unsigned long long>(exact_bytes >> 10),
+                      static_cast<unsigned long long>(take(g_c.images_reused)),
+                      static_cast<unsigned long long>(take(g_c.cp_writes)),
+                      static_cast<unsigned long long>(take(g_c.cp_write_bytes) >> 10));
         out += line;
     }
     if (g_verify) {
@@ -332,11 +456,30 @@ bool TakeUpload(PendingUpload& out) {
     }
     std::scoped_lock lock{g_mutex};
     if (g_pending.empty()) {
+        for (int k = 0; k < 2; ++k) { // sotc: the overflow after the queue (see g_overflow)
+            auto& m = g_overflow[k];
+            if (m.empty()) {
+                continue;
+            }
+            auto it = m.begin();
+            const uint64_t piece = std::min<uint64_t>(kMaxUploadChunk, it->second - it->first);
+            out = PendingUpload{it->first, piece, k == 0 ? Kind::Persistent : Kind::PerFrame};
+            if (piece == it->second - it->first) {
+                m.erase(it);
+            } else {
+                const uint64_t rest_end = it->second;
+                const uint64_t rest = it->first + piece;
+                m.erase(it);
+                m.emplace(rest, rest_end);
+            }
+            g_pending_count.store(PendingTotal(), std::memory_order_release);
+            return true;
+        }
         return false;
     }
     out = g_pending.front();
     g_pending.pop_front();
-    g_pending_count.store(g_pending.size(), std::memory_order_release);
+    g_pending_count.store(PendingTotal(), std::memory_order_release);
     return true;
 }
 
@@ -358,6 +501,35 @@ void NoteUploaded(uint64_t bytes) {
 
 void NoteMarked(uint64_t bytes) {
     g_c.marked_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void NoteExactUpload(uint64_t bytes) {
+    g_c.exact_uploads.fetch_add(1, std::memory_order_relaxed);
+    g_c.exact_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void NoteDrainEntry(uint64_t seq, uint64_t pickup_seq, uint64_t size) {
+    g_c.drain_entries.fetch_add(1, std::memory_order_relaxed);
+    g_c.drain_bytes.fetch_add(size, std::memory_order_relaxed);
+    if (pickup_seq != 0 && seq > pickup_seq) {
+        g_c.drain_after_pickup.fetch_add(1, std::memory_order_relaxed);
+        g_c.drain_after_bytes.fetch_add(size, std::memory_order_relaxed);
+        const uint64_t lag = seq - pickup_seq;
+        uint64_t prev = g_c.drain_lag_max.load(std::memory_order_relaxed);
+        while (lag > prev && !g_c.drain_lag_max.compare_exchange_weak(prev, lag, std::memory_order_relaxed)) {
+        }
+    }
+}
+
+void NoteDrainDone(uint64_t warm_deferred_bytes, uint64_t warm_backlog_bytes) {
+    g_c.drains.fetch_add(1, std::memory_order_relaxed);
+    if (warm_deferred_bytes != 0) {
+        g_c.warm_deferred.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint64_t prev = g_c.warm_backlog_max.load(std::memory_order_relaxed);
+    while (warm_backlog_bytes > prev &&
+           !g_c.warm_backlog_max.compare_exchange_weak(prev, warm_backlog_bytes, std::memory_order_relaxed)) {
+    }
 }
 
 void NoteDroppedUpload() {

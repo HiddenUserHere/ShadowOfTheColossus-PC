@@ -73,7 +73,20 @@ uint64_t runtime_file_read_ns_take(void) { return __atomic_exchange_n(&read_ns,0
  * peak study (docs/re-stutters/FIRST-FRAME-PEAK.md: which uploads come from file reads). */
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
 const unsigned char *runtime_memory_backing_view(uint64_t *size);
-static void trace_file_dest(const void *buffer, ssize_t n) {
+/* sotc: PC-native announce (SOTC_NATIVE, gpu/bbgpu.h). Streamed textures and geometry are read straight into
+ * GPU memory (the engine's texel and mip copy hooks never run for them), so every read that landed is announced
+ * PerFrame: the range is marked CPU-written and its images invalidated, and nothing is uploaded until a bind
+ * reads it, so a CPU-only buffer costs one mark. The announce takes a mutex: it runs on the host stack. */
+void bbgpu_native_announce_file_read(void *dst, uint64_t size) __attribute__((weak));
+static void announce_file_read_on_host_stack(void *arg) {
+    const struct { void *dst; uint64_t size; } *call = arg;
+    bbgpu_native_announce_file_read(call->dst, call->size);
+}
+static void trace_file_dest(void *buffer, ssize_t n) {
+    if (n>0 && bbgpu_native_announce_file_read) {
+        struct { void *dst; uint64_t size; } call = { buffer, (uint64_t)n };
+        runtime_call_on_host_stack(announce_file_read_on_host_stack, &call);
+    }
     if (n<=0 || !trace_now()) return;
     const unsigned char *base=runtime_memory_backing_view(NULL);
     const unsigned char *p=base ? runtime_memory_backing_pointer((uintptr_t)buffer) : NULL;

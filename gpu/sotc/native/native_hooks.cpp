@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -97,6 +98,12 @@ constexpr Span kChunkCallers[] = {
     {0xb50c0, 0xb5b05},   // sub_b50c0 DIRECT bind + PM4
     {0xb9710, 0xba57c},   // sub_b9710 VIA 0x93960 -> V# encoder 0x85fc10
     {0xd83b0, 0xd8653},   // sub_d83b0 DIRECT bind
+    // Foliage displacer (VirtualGeometryDisplacement::UpdateJob 0xd8330). The prep 0xd81d0 fills the cluster records
+    // (up to 64 x 0x20 bytes) with plain stores into a chunk whose pointer sits at [struct+0x50]; the job copies that
+    // pointer into its own block (0xd83b0 reads [param_1+0x50]), so the GPU reads the records through it. The second
+    // job variant 0xd8660 is the same chunk user with the cull dispatch 0x92b50 (see kCullDispatchCallers).
+    {0xd81d0, 0xd8322},   // sub_d81d0 chunk of the displacer cluster records (plain stores)
+    {0xd8660, 0xd892d},   // sub_d8660 DIRECT dispatch, chunk writer
     {0xe60c0, 0xe6342},   // sub_e60c0 SLOT(+0xb0) + PM4/bind
     {0xe69e0, 0xe738f},   // sub_e69e0 SLOT(+0xb0) + PM4/bind
     {0xe7390, 0xe7b53},   // sub_e7390 SLOT(+0xb0) + PM4/bind
@@ -183,8 +190,10 @@ struct Window {
     std::atomic<uint64_t> mip_announces{0}, mip_bytes{0};
     std::atomic<uint64_t> mip_releases{0}, mip_release_bytes{0};
     std::atomic<uint64_t> skipped{0};
-    Counter dcb, ccb, chunk, zc, mat, blk, inst, part, view, strm, cull, rec, ring;
+    Counter dcb, ccb, chunk, zc, mat, blk, inst, part, view, strm, cull, rec, ring, ubuf;
+    Counter sun, pkt, pal; // sotc: ResolveSunShadows blocks, user-data packets, cloth matrix palettes (n1verify misses)
     Counter gmem; // sotc: guest copies (runtime memcpy/memset/memmove) announced
+    Counter file; // sotc: file reads (src/runtime_file.c) announced
     std::atomic<uint64_t> desc{0};
     std::atomic<uint64_t> chunk_dropped{0};
 };
@@ -216,6 +225,124 @@ void AnnounceRange(uint64_t begin, uint64_t end, SotcNative::Kind kind, Counter&
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Write-after-announce guard (JITTER-BRIEF timing audit). A PerFrame announce is only a page mark: the bind that
+// reads the page uploads the bytes it holds at that moment and clears the mark. Mode 0 had the write fault, which
+// marked the page again for every CPU write after an upload. Mode 1 has nothing between the announce and the bind,
+// so an announce made BEFORE the writer finished (a chunk flushed at a submit that is not the one that uses it, a
+// block announced at the entry of its writer, a zero-copy backing announced at creation) lets any earlier bind of
+// the same page (the draw thread lags the CPU; chunks are far smaller than a page; some binds cover whole heaps)
+// consume the mark with the unfinished bytes, and the real bytes are never uploaded: the GPU draws the data of the
+// frame that used the block before (stale camera and palette matrices, previous-frame matrices of the motion
+// vectors one frame late). Where the exact copy of NativeDrain applies (range over GPU-written memory) the stale
+// bytes are copied at drain time and no later bind fixes them.
+//
+// The guard keeps a hash of every small announced block for a few submits and announces it again when the bytes
+// changed after the announce. A block written before its announce costs one hash per check; the announce
+// protocol itself does not change. Counters: SotcNative::NoteLateWrite (Report "late writes").
+constexpr uint32_t kTrackMaxSize = 64u << 10;   // larger blocks are not guarded
+constexpr uint64_t kTrackMaxBytes = 768u << 10; // guarded bytes at a time; the oldest entries are dropped first
+constexpr uint32_t kTrackMaxChecks = 16;        // submits an entry is checked for
+constexpr uint64_t kTrackFrames = 2;            // ... and SubmitDone counts (frames)
+
+struct Tracked {
+    uint64_t addr;
+    uint64_t hash;
+    uint64_t frame; // SotcNative::FrameSubmitted() at the first announce
+    uint32_t size;
+    uint32_t checks;
+    Counter* counter;
+    bool expected; // announced at the entry of its writer: a change is the normal case, not counted as late
+};
+std::mutex g_track_mutex;
+std::deque<Tracked> g_tracked;
+uint64_t g_tracked_bytes = 0;
+
+// Hash of the guest bytes [addr, addr + size). False when the range is not contiguous in the host view.
+bool HashGuest(uint64_t addr, uint32_t size, uint64_t* out) {
+    const unsigned char* p = runtime_memory_backing_pointer(static_cast<uintptr_t>(addr));
+    if (!p || size == 0 || runtime_memory_backing_pointer(static_cast<uintptr_t>(addr + size - 1)) != p + size - 1) {
+        return false;
+    }
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ size;
+    uint32_t i = 0;
+    for (; i + 8 <= size; i += 8) {
+        uint64_t w;
+        std::memcpy(&w, p + i, sizeof(w));
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 32;
+    }
+    for (; i < size; ++i) {
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    }
+    *out = h;
+    return true;
+}
+
+// Announces [begin, end) PerFrame and guards it against a later write (see above).
+void AnnounceTracked(uint64_t begin, uint64_t end, Counter& c, bool entry_hook = false) {
+    uint64_t hash = 0;
+    const bool track = end > begin && end - begin <= kTrackMaxSize && SotcNative::On() &&
+                       HashGuest(begin, static_cast<uint32_t>(end - begin), &hash); // before the announce
+    AnnounceRange(begin, end, SotcNative::Kind::PerFrame, c);
+    if (!track) {
+        return;
+    }
+    const uint32_t size = static_cast<uint32_t>(end - begin);
+    const uint64_t frame = SotcNative::FrameSubmitted();
+    std::lock_guard<std::mutex> lock(g_track_mutex);
+    g_tracked.push_back(Tracked{begin, hash, frame, size, 0, &c, entry_hook});
+    g_tracked_bytes += size;
+    while (g_tracked_bytes > kTrackMaxBytes && !g_tracked.empty()) {
+        g_tracked_bytes -= g_tracked.front().size;
+        g_tracked.pop_front();
+    }
+}
+
+// At every submit hook: announces again the guarded blocks whose bytes changed since their last announce, and
+// retires the ones that were checked often enough or belong to an older frame.
+void RecheckTracked() {
+    if (!SotcNative::On()) {
+        return;
+    }
+    struct Again {
+        uint64_t addr;
+        uint32_t size;
+        bool same_frame;
+        bool expected;
+        Counter* counter;
+    };
+    std::vector<Again> again;
+    const uint64_t frame = SotcNative::FrameSubmitted();
+    {
+        std::lock_guard<std::mutex> lock(g_track_mutex);
+        size_t keep = 0;
+        for (size_t i = 0; i < g_tracked.size(); ++i) {
+            Tracked& t = g_tracked[i];
+            uint64_t hash = 0;
+            if (frame > t.frame + kTrackFrames || ++t.checks > kTrackMaxChecks || !HashGuest(t.addr, t.size, &hash)) {
+                g_tracked_bytes -= t.size;
+                continue;
+            }
+            if (hash != t.hash) {
+                t.hash = hash;
+                again.push_back(Again{t.addr, t.size, frame == t.frame, t.expected, t.counter});
+            }
+            if (keep != i) {
+                g_tracked[keep] = t;
+            }
+            ++keep;
+        }
+        g_tracked.resize(keep);
+    }
+    for (const Again& a : again) {
+        if (!a.expected) {
+            SotcNative::NoteLateWrite(a.size, a.same_frame);
+        }
+        AnnounceRange(a.addr, a.addr + a.size, SotcNative::Kind::PerFrame, *a.counter);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Chunk list: blocks returned by 0x8c0d0 to the chunk writers, announced PerFrame at the next submit.
 // The submit (0x91f80 / 0x16f100) is the one point where the GPU is about to read this frame's command
 // buffers, and every chunk the writers filled before it is already complete (0xd07c0 waits on the jobs first).
@@ -237,13 +364,17 @@ void ChunkPush(uint64_t addr, uint32_t size) {
 }
 
 void FlushChunks() {
+    // sotc: blocks announced by an earlier flush (or at the entry of their writer) that changed since are
+    // announced again before this flush (write-after-announce guard above).
+    RecheckTracked();
     std::vector<ChunkBlock> batch;
     {
         std::lock_guard<std::mutex> lock(g_chunk_mutex);
         batch.swap(g_chunks);
     }
     for (const ChunkBlock& b : batch) {
-        AnnounceRange(b.addr, b.addr + b.size, SotcNative::Kind::PerFrame, g_window.chunk);
+        // A chunk allocated before this submit may still be written by a job of the next one: guarded.
+        AnnounceTracked(b.addr, b.addr + b.size, g_window.chunk);
     }
 }
 
@@ -305,7 +436,7 @@ HookAction ZeroCopyCreate(GuestRegs& regs, void*) {
     }
     const uint64_t size = static_cast<uint64_t>(static_cast<uint32_t>(regs.rdx)) *
                           static_cast<uint32_t>(regs.rcx);
-    AnnounceRange(regs.r9, regs.r9 + size, SotcNative::Kind::PerFrame, g_window.zc);
+    AnnounceTracked(regs.r9, regs.r9 + size, g_window.zc); // announced at creation: the builder fills it afterwards
     return HookAction::Continue;
 }
 
@@ -400,7 +531,7 @@ HookAction InstEntry(GuestRegs& regs, void*) {
     }
     const uint64_t block = GuestU64(regs.rdi + 0x1d8);
     if (block != 0) {
-        AnnounceRange(block, block + 0x18, SotcNative::Kind::PerFrame, g_window.inst);
+        AnnounceTracked(block, block + 0x18, g_window.inst, true); // announced before the body writes it
     }
     return HookAction::Continue;
 }
@@ -411,7 +542,7 @@ HookAction InstEntry(GuestRegs& regs, void*) {
 // are read at the next submit, after the job waits in 0xd07c0.
 HookAction RecordEntry(GuestRegs& regs, void*) {
     if (SotcNative::On() && regs.rdi != 0) {
-        AnnounceRange(regs.rdi + 0x278, regs.rdi + 0x298, SotcNative::Kind::PerFrame, g_window.rec);
+        AnnounceTracked(regs.rdi + 0x278, regs.rdi + 0x298, g_window.rec, true); // before the body writes it
     }
     return HookAction::Continue;
 }
@@ -553,7 +684,7 @@ HookAction InstClass2Entry(GuestRegs& regs, void*) {
     }
     const uint64_t block = GuestU64(regs.rdi + 0xa8);
     if (block != 0) {
-        AnnounceRange(block, block + 0x18, SotcNative::Kind::PerFrame, g_window.inst);
+        AnnounceTracked(block, block + 0x18, g_window.inst, true); // before the body writes it
     }
     return HookAction::Continue;
 }
@@ -585,7 +716,9 @@ HookAction BuildXprExit(GuestRegs& regs, void*) {
 // function that writes the block: lines 109-110 of its decompilation, right before the call) is announced. The other
 // 15 call sites (SetViewParams, sub_ab630, ...) pass object fields whose writers were not verified, so they are not
 // announced. The 0xceae0 thunk tail-jumps into 0x11dbe0 (impl-writes5's "twin" was wrong), so it needs no span.
-constexpr Span kCullDispatchCallers[] = {{0x11dbe0, 0x11e181}};
+// The foliage displacer variant 0xd8660 passes its block at [struct+0xc8] to the same dispatch (r8 dwords); the
+// block is rewritten per job, so it is announced PerFrame like the BPXPR one.
+constexpr Span kCullDispatchCallers[] = {{0x11dbe0, 0x11e181}, {0xd8660, 0xd892d}};
 HookAction CullDispatchEntry(GuestRegs& regs, void*) {
     if (!SotcNative::On() || regs.rcx == 0) {
         return HookAction::Continue;
@@ -597,6 +730,94 @@ HookAction CullDispatchEntry(GuestRegs& regs, void*) {
     }
     const uint64_t size = static_cast<uint64_t>(static_cast<uint32_t>(regs.r8)) * 4; // dword count (5 = 0x14 bytes)
     AnnounceRange(regs.rcx, regs.rcx + size, SotcNative::Kind::PerFrame, g_window.cull);
+    return HookAction::Continue;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// SOTC_VERIFY=n1 misses (flicker brief 2): buffers that the engine fills with plain stores and the GPU binds in the same
+// or the next frame, with no announce after the writes. 0x8be60 (NATIVE_ZC_CREATE) announces a zero-copy backing when
+// the resource is created, which is before these builders fill it, so mode 1 never uploaded the bytes (mode 0 saw the
+// write fault). Each hook announces exactly the buffers its builder wrote, PerFrame, when the builder is done.
+
+// sub_198bb0 Site 0x199d62: the 0x804 buffer (type 0x1b, 16-byte elements, one per entry of the list at
+// param_1 + 0x70 / + 0x78) was filled by the loop and r12 points at its end.
+HookAction UbufFill198(GuestRegs& regs, void*) {
+    if (!SotcNative::On() || regs.r13 == 0 || regs.r12 == 0) {
+        return HookAction::Continue;
+    }
+    const uint64_t begin = GuestU64(regs.r13 + 0x70), end = GuestU64(regs.r13 + 0x78);
+    if (end <= begin) {
+        return HookAction::Continue;
+    }
+    const uint64_t size = (end - begin) * 2; // (entries) * 16 bytes
+    if (regs.r12 > size) {
+        AnnounceRange(regs.r12 - size, regs.r12, SotcNative::Kind::PerFrame, g_window.ubuf);
+    }
+    return HookAction::Continue;
+}
+
+// Wrap pre of sub_1af960 / sub_1b0440: rdi = builder, [rdi + 8] = the object that receives the buffers, rsi = the
+// element vector (begin [rsi], end [rsi + 8], 8 bytes per element). The buffers do not exist yet.
+struct UbufCall {
+    uint64_t object;
+    uint64_t list_bytes; // end - begin of the element vector
+};
+thread_local UbufCall t_ubuf{};
+
+HookAction UbufPre(GuestRegs& regs, void*) {
+    t_ubuf = UbufCall{};
+    if (!SotcNative::On() || regs.rdi == 0 || regs.rsi == 0) {
+        return HookAction::Continue;
+    }
+    const uint64_t begin = GuestU64(regs.rsi), end = GuestU64(regs.rsi + 8);
+    if (end > begin) {
+        t_ubuf = UbufCall{GuestU64(regs.rdi + 8), end - begin};
+    }
+    return HookAction::Continue;
+}
+
+void UbufAnnounce(uint64_t object, uint64_t slot, uint64_t size) {
+    const uint64_t block = GuestU64(object + slot);
+    if (block != 0 && size != 0) {
+        AnnounceRange(block, block + size, SotcNative::Kind::PerFrame, g_window.ubuf);
+    }
+}
+
+// sub_1af960: obj+0x48 (0x10 * list_bytes), +0x50 (4 *), +0x58 (0x80 bytes, written by 0x123280), +0x60 (8 *, zeroed and
+// filled per element at 0x1afb46 / 0x1afb79 / 0x123180) and +0x70 (1 *, the 0xbf800000 pairs at 0x1afbfd).
+void UbufPost1AF960(GuestRegs&, void*) {
+    const UbufCall call = t_ubuf;
+    t_ubuf = UbufCall{};
+    if (call.object == 0) {
+        return;
+    }
+    UbufAnnounce(call.object, 0x48, call.list_bytes * 16);
+    UbufAnnounce(call.object, 0x50, call.list_bytes * 4);
+    UbufAnnounce(call.object, 0x58, 0x80);
+    UbufAnnounce(call.object, 0x60, call.list_bytes * 8);
+    UbufAnnounce(call.object, 0x70, call.list_bytes);
+}
+
+// sub_1b0440: obj+0x40 (5 dwords per element) and obj+0x78 (0x40 bytes per element, filled by sub_1b0080).
+void UbufPost1B0440(GuestRegs&, void*) {
+    const UbufCall call = t_ubuf;
+    t_ubuf = UbufCall{};
+    if (call.object == 0) {
+        return;
+    }
+    UbufAnnounce(call.object, 0x40, (call.list_bytes / 8) * 0x14);
+    UbufAnnounce(call.object, 0x78, call.list_bytes * 8);
+}
+
+// Foliage displacer per-frame block (sub_d83b0 0xd852b, sub_d8660 0xd87cf): an 8-byte block from the 0x12820 allocator
+// (category DAT_02ed1f54, not the 0x8c0d0 wrapper, so NATIVE_CHUNK never sees it) that holds the buffer address the job
+// binds (`*block = [struct+0xb0]`, plain store). Site after the call: rax = the block, announced PerFrame. The
+// allocator recycles blocks once the per-frame heap wraps, so a block that was never announced shows the GPU a
+// previous frame's V# (the "after a few seconds" symptom of the grass flicker).
+HookAction DisplacerBlock(GuestRegs& regs, void*) {
+    if (SotcNative::On() && regs.rax != 0) {
+        ChunkPush(regs.rax, 8);
+    }
     return HookAction::Continue;
 }
 
@@ -615,29 +836,103 @@ HookAction MatCopyStream(GuestRegs& regs, void*) {
     return HookAction::Continue;
 }
 
-// Earlier batch: resource copies and mip streaming (unchanged).
+// ---------------------------------------------------------------------------------------------------------
+// Flicker brief 2 (SOTC_VERIFY=n1 misses): plain-store writers that no earlier announce covered.
+//
+// ResolveSunShadows sub_afcc0 and its twin sub_b0100 (per frame). Besides the constants chunk of 0x8c0d0 (queued by
+// NATIVE_CHUNK, announced at the submit), they write two blocks of the 0x12820 allocator that NATIVE_CHUNK never
+// sees: the 0x10-byte backing of the 0x804 zero-copy buffer (category DAT_02ed1f50, stored at [[object+0x10]+0xf28],
+// written by the stores at 0xafe13/0xafe16/0xafe23) and the 0x18-byte bind block (category DAT_02ed1f54: three
+// pointers, bound through 0x85ecd0 / 0x862490). The zero-copy creator hook NATIVE_ZC_CREATE was refused by the
+// detour engine until NATIVE_RES_COPY left 0x8be60 ("the function has other CPU patches"), so the backing was
+// never announced and the GPU bound it in the same frame; the bind block still needs this Site. Site after the last store of the 0x18-byte block: announce
+// all three blocks (the chunk again, exactly 0x60 bytes written) PerFrame.
+void AnnounceSunShadowBlocks(uint64_t object, uint64_t bind_block) {
+    if (!SotcNative::On() || object == 0) {
+        return;
+    }
+    const uint64_t owner = GuestU64(object + 0x10);
+    const uint64_t backing = owner != 0 ? GuestU64(owner + 0xf28) : 0;
+    AnnounceRange(backing, backing + 0x10, SotcNative::Kind::PerFrame, g_window.sun);
+    AnnounceRange(bind_block, bind_block + 0x18, SotcNative::Kind::PerFrame, g_window.sun);
+    const uint64_t constants = GuestU64(object + 0xb0);
+    AnnounceRange(constants, constants + 0x60, SotcNative::Kind::PerFrame, g_window.sun);
+}
 
-// 0x8bf50, inside the resource buffer wrapper 0x8be60 after `memcpy(r15, r14, [rbx+0x20])`.
-// r15 = the new block (the copy's destination), rbx = the resource object (size u32 at +0x20),
-// rbp-0x34 = the flags word (param_5): bit 1 or flags 0x18 with bit 0 clear select GPUMemory.
-// Zero-copy (0x800) never reaches this site. Persistent: uploaded once, then read-only.
-HookAction ResCopy(GuestRegs& regs, void*) {
-    if (!SotcNative::On()) {
-        return HookAction::Continue;
-    }
-    const uint64_t dest = regs.r15;
-    const uint64_t size = GuestU32(regs.rbx + 0x20);
-    if (dest == 0 || size == 0) {
-        g_window.skipped.fetch_add(1, std::memory_order_relaxed);
-        return HookAction::Continue;
-    }
-    SotcNative::Announce(dest, size, SotcNative::Kind::Persistent);
-    Count(g_window.res_announces, g_window.res_bytes, size);
-    const uint32_t flags = GuestU32(regs.rbp - 0x34);
-    const bool gpu = (flags & 2) == 0 && ((flags & 0x18) != 0 || (flags & 1) == 0);
-    (gpu ? g_window.res_gpu_bytes : g_window.res_cpu_bytes).fetch_add(size, std::memory_order_relaxed);
+// 0xaff60 in sub_afcc0: r15 = the shadow object (param_2), r12 = the 0x18-byte bind block.
+HookAction SunShadowAfcc0(GuestRegs& regs, void*) {
+    AnnounceSunShadowBlocks(regs.r15, regs.r12);
     return HookAction::Continue;
 }
+
+// 0xb03bd in sub_b0100: r14 = the shadow object (param_2), rbx = the 0x18-byte bind block.
+HookAction SunShadowB0100(GuestRegs& regs, void*) {
+    AnnounceSunShadowBlocks(regs.r14, regs.rbx);
+    return HookAction::Continue;
+}
+
+// User-data packets. The packet writer 0x884240 (SET_SH_REG with a 2-dword marker, compute user data) cannot be
+// hooked (its jump table is an unresolved indirect branch), and the writes into the command buffer reached the GPU
+// before the submit announce of the DCB/ACE range (n1verify: rip 0x884289, binds <= 64 KiB). Its callers 0x85ecd0
+// (tail jump) and 0x85e5d0 (user-data flush) take the command buffer object from [rdi+0x90]; its cursor is at +0x10
+// (the buffers are fixed-size: the refill callback returns 0). Pre/post read the cursor and announce exactly the
+// words written in between, PerFrame, right after they are written.
+struct CursorCall {
+    uint64_t object;
+    uint64_t cursor;
+};
+thread_local CursorCall t_udata{};
+
+HookAction UdataPre(GuestRegs& regs, void*) {
+    t_udata = CursorCall{};
+    if (!SotcNative::On() || regs.rdi == 0) {
+        return HookAction::Continue;
+    }
+    const uint64_t object = GuestU64(regs.rdi + 0x90);
+    if (object != 0) {
+        t_udata = CursorCall{object, GuestU64(object + 0x10)};
+    }
+    return HookAction::Continue;
+}
+
+void UdataPost(GuestRegs&, void*) {
+    const CursorCall call = t_udata;
+    t_udata = CursorCall{};
+    if (call.object == 0 || call.cursor == 0) {
+        return;
+    }
+    const uint64_t cursor = GuestU64(call.object + 0x10);
+    if (cursor > call.cursor && cursor - call.cursor <= (1u << 16)) {
+        AnnounceRange(call.cursor, cursor, SotcNative::Kind::PerFrame, g_window.pkt);
+    }
+}
+
+// 0xa3ee50, the cloth skeleton matrix palette builder (callers sub_a3e170 and sub_a3fa30; the result is stored at
+// object+0xe0 or passed to the buffer creator). The index vector at param_1+0x90..0x98 holds 4-byte joint indices;
+// the block returned by 0x12820 is (bytes * 16) = joints * 0x40 bytes, every 0x40 bytes a 4x4 matrix written by plain
+// stores (n1verify: rip 0xa3ef1b). Complete at return: announced PerFrame there.
+thread_local uint64_t t_palette_bytes = 0;
+
+HookAction PalettePre(GuestRegs& regs, void*) {
+    t_palette_bytes = 0;
+    if (SotcNative::On() && regs.rdi != 0) {
+        const uint64_t begin = GuestU64(regs.rdi + 0x90), end = GuestU64(regs.rdi + 0x98);
+        if (end > begin && end - begin <= (1u << 20)) {
+            t_palette_bytes = (end - begin) * 16;
+        }
+    }
+    return HookAction::Continue;
+}
+
+void PalettePost(GuestRegs& regs, void*) {
+    const uint64_t bytes = t_palette_bytes;
+    t_palette_bytes = 0;
+    if (bytes != 0 && regs.rax != 0) {
+        AnnounceRange(regs.rax, regs.rax + bytes, SotcNative::Kind::PerFrame, g_window.pal);
+    }
+}
+
+// Earlier batch: resource copies and mip streaming (unchanged).
 
 // 0x96b59, in the texture build 0x96680 after the single-block texel copy: r14 = the block from
 // 0x12820 (destination), rbx = its size.
@@ -679,49 +974,17 @@ HookAction MipRelease(GuestRegs& regs, void*) {
 
 // ---------------------------------------------------------------------------------------------------------
 // impl-writes7 gap 2: guest memset/memcpy/memmove (src/runtime.c) and file reads (src/runtime_file.c) announce the
-// bytes they put into guest memory when the GPU reads them. The runtime calls these after the copy has landed, so
-// the announce is post-write, as the Site hooks are. The table holds exact return addresses (image offsets, EU 1.01)
-// of the eboot calls whose destination is GPU data:
-//   0xf6eac9  sub_f711a0 (a tail-called memset) inside 0xf6ea60: clears the 16-byte V# pool slots that 0xf6e000 and
-//             0xf6e3b0 then fill with descriptors. PerFrame (the pool is rebuilt every frame).
-//   0xf9d7d   0xf9cf0: copies a parameter block into [obj+0x4b0]+offset and sets the object's dirty bit
-//             (table 0x2edf140). PerFrame: material and constant parameters.
-//   0xfce45   RenderThread_Kick (0xfc470): copies up to 128 bytes of per-slot state into the slot object +0xd8.
-//             PerFrame; probably GPU user data, not confirmed by a bind (the gmem counter shows the volume).
-// Not in the table, on purpose:
-//   0x8bf50   resource initial data: ResCopy (Site, after the memcpy) already announces it as Persistent.
-//   0x918e7   CRenderContext zeroing: a CPU object; the GPU reads the command buffers it points to, which submit announces.
-//   0x8df2e   generic stream copy: the destination belongs to the caller, so the copy cannot say whether it is GPU data.
-//   0xca18d   resource table: the stores after the copy build it, so a copy announce would be early; needs a Site hook
-//             after the last store.
-//   0x85e558, 0x19a328, 0xb0d1db: CPU object zeroing and container moves (few pages in the write-decl counts).
-struct GuestWriteCaller {
-    uint32_t ret;
-    SotcNative::Kind kind;
-};
-constexpr GuestWriteCaller kGuestWriteCallers[] = {
-    {0xf6eac9, SotcNative::Kind::PerFrame},
-    {0xf9d7d, SotcNative::Kind::PerFrame},
-    {0xfce45, SotcNative::Kind::PerFrame},
-};
-
-// The code of the announce a guest copy from return_address needs: 0 = none, else 1 + SotcNative::Kind.
-// Lock-free and cheap: it runs on every guest memcpy/memset/memmove while SOTC_NATIVE is on.
+// bytes they put into guest memory. The runtime calls these after the copy has landed, so the announce is post-write,
+// as the Site hooks are. Every guest copy is announced PerFrame (a page mark: nothing is uploaded until a bind reads
+// the range, and a range the GPU wrote is copied byte-exact, BufferCache::NativeDrain). A table of three callers
+// whose destination was known GPU data missed the engine's other copies of GPU data: without page tracking the
+// Shrine of Worship facade was never uploaded (1 Nov). Announcing every copy costs nothing measurable on the Lab
+// route (~130k announces/s, same FPS and p99).
+// The code of the announce a guest copy needs: 0 = none, else 1 + SotcNative::Kind. Lock-free and cheap: it runs
+// on every guest memcpy/memset/memmove.
 uint32_t GuestWriteCode(uint64_t return_address) {
-    if (!SotcNative::On() || return_address == 0) {
-        return 0;
-    }
-    const uint64_t base = static_cast<uint64_t>(SotcHooks::ImageBase());
-    if (base == 0 || return_address < base) {
-        return 0;
-    }
-    const uint64_t offset = return_address - base;
-    for (const GuestWriteCaller& c : kGuestWriteCallers) {
-        if (offset == c.ret) {
-            return 1u + static_cast<uint32_t>(c.kind);
-        }
-    }
-    return 0;
+    (void)return_address;
+    return SotcNative::On() ? 1u + static_cast<uint32_t>(SotcNative::Kind::PerFrame) : 0u;
 }
 
 // Announces [dst, dst + size) for a guest copy that has landed.
@@ -772,8 +1035,13 @@ void Report(std::string& out, double seconds) {
     out += cls("strm", g_window.strm);
     out += cls("cull", g_window.cull);
     out += cls("rec", g_window.rec);
+    out += cls("ubuf", g_window.ubuf);
     out += cls("gmem", g_window.gmem);
+    out += cls("file", g_window.file);
     out += cls("ring", g_window.ring);
+    out += cls("sun", g_window.sun);
+    out += cls("pkt", g_window.pkt);
+    out += cls("pal", g_window.pal);
     std::snprintf(line, sizeof(line), " desc %llu dropped %llu\n",
                   static_cast<unsigned long long>(take(g_window.desc)),
                   static_cast<unsigned long long>(take(g_window.chunk_dropped)));
@@ -782,7 +1050,6 @@ void Report(std::string& out, double seconds) {
 
 void Register() {
     using SotcHooks::Handler;
-    SotcHooks::RegisterHandler("NATIVE_RES_COPY", Handler{ResCopy, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_TEX_COPY", Handler{TexCopy, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_TEX_TAIL_COPY", Handler{TexTailCopy, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_MIP_COPY", Handler{MipCopy, nullptr, nullptr});
@@ -808,6 +1075,16 @@ void Register() {
     SotcHooks::RegisterHandler("NATIVE_CULL_DISPATCH_BLK", Handler{CullDispatchEntry, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_MAT_COPY_STREAM", Handler{MatCopyStream, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_RECORD_18C390", Handler{RecordEntry, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_UBUF_198BB0", Handler{UbufFill198, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_UBUF_1AF960", Handler{UbufPre, UbufPost1AF960, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_UBUF_1B0440", Handler{UbufPre, UbufPost1B0440, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_DISP_BLOCK_D83B0", Handler{DisplacerBlock, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_DISP_BLOCK_D8660", Handler{DisplacerBlock, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_SUNSHADOW_AFCC0", Handler{SunShadowAfcc0, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_SUNSHADOW_B0100", Handler{SunShadowB0100, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_UDATA_85ECD0", Handler{UdataPre, UdataPost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_UDATA_85E5D0", Handler{UdataPre, UdataPost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_PALETTE_A3EE50", Handler{PalettePre, PalettePost, nullptr});
 }
 
 // The RenderSingleFrameCPU ring (memtype 17): every block of it is per-frame GPU data written by the render jobs
@@ -834,6 +1111,14 @@ extern "C" void bbgpu_native_announce_write(void* dst, uint64_t size, uint32_t c
         return;
     }
     SotcNativeHooks::AnnounceWrite(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst)), size, code);
+}
+
+extern "C" void bbgpu_native_announce_file_read(void* dst, uint64_t size) {
+    const uint64_t first = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst));
+    if (!SotcNative::On() || size == 0 || first > UINT64_MAX - size) {
+        return;
+    }
+    SotcNativeHooks::AnnounceRange(first, first + size, SotcNative::Kind::PerFrame, SotcNativeHooks::g_window.file);
 }
 
 namespace SotcNativeRing {

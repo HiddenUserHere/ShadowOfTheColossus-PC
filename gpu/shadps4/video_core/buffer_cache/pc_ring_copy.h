@@ -22,7 +22,7 @@ namespace VideoCore::PcRingCopy {
 
 /// Draw thread. Queued by ProcessGraphics (liverpool.cpp) for each top-level gfx submit, before
 /// the submit's first op. Does nothing when SOTC_PC_RING is off.
-void OnSubmitStart(Vulkan::Rasterizer& rasterizer);
+void OnSubmitStart(Vulkan::Rasterizer& rasterizer, u64 announce_seq = 0);
 
 /// sotc: SOTC_PC_RING=8, draw thread, from BufferCache::PcHostBind. Once per submit (or when the
 /// arena block set changed): imports the live arena blocks for the host binds and applies the ring

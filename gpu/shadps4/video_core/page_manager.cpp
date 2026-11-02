@@ -42,6 +42,7 @@
 #include "video_core/buffer_cache/memory_tracker.h" // sotc: SOTC_WRITE_DECL (MAX_CPU_PAGE_BITS)
 #include "../../sotc/write_decl.h" // sotc: SOTC_WRITE_DECL statistics and write fault classes
 #include "../../sotc/native/native.h" // sotc: SOTC_NATIVE=1 turns the tracking off (TracksGuestPages)
+#include "../../sotc/native/n1verify.h" // sotc: SOTC_VERIFY=n1 (mode 1 with record-only protection)
 #include "../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE write evidence
 #include "../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK write faults per pool (plan step 6)
 #include "../../sotc/pc_ring.h"     // sotc: SOTC_PC_RING shadow
@@ -239,6 +240,9 @@ std::function<void()> g_protect_batch_flush;
 std::function<void(VAddr)> g_fault_protect_flush;
 // Makes one page writable if the tracker says so and the host does not (EnsurePageWritable).
 std::function<void(VAddr)> g_fault_page_fix;
+// sotc: SOTC_VERIFY=n1. The tracker's watchers of a page as bits (1 write watched, 2 read watched), -1 when the
+// tracker has no state for it. Lock-free look, for the N1VERIFY fault handler.
+std::function<int(VAddr)> g_n1_page_state;
 
 /// sotc: SOTC_PROTECT_COALESCE: pages of a hole between two runs of one protection that a flush
 /// bridges with a single call (SOTC_PROTECT_GAP, default 8; 0 = no bridging, also when the switch
@@ -466,6 +470,13 @@ struct PageManager::Impl {
         g_protect_batch_flush = [this] { FlushProtectBatch(); };
         g_fault_protect_flush = [this](VAddr fault_page) { FlushFaultProtects(fault_page); };
         g_fault_page_fix = [this](VAddr page) { EnsurePageWritable(page >> PM_PAGE_BITS); };
+        g_n1_page_state = [this](VAddr page) -> int {
+            const PageState* state = cached_pages.find(page >> PM_PAGE_BITS);
+            if (!state) {
+                return -1;
+            }
+            return (state->num_write_watchers != 0 ? 1 : 0) | (state->num_read_watchers != 0 ? 2 : 0);
+        };
     }
     virtual ~Impl() = default;
 
@@ -1130,7 +1141,8 @@ struct SignalImpl : public PageManager::Impl {
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
-        if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, no page is ever protected
+        // sotc: SOTC_NATIVE=1, no page is ever protected (SOTC_VERIFY=n1: record-only protection)
+        if (!SotcNative::TracksGuestPages() && !SotcN1Verify::On()) {
             return;
         }
         // sotc: no RENDERER_TRACE zone here: Protect is reached from the guest fault handler, where
@@ -1322,6 +1334,82 @@ struct SignalImpl : public PageManager::Impl {
         SotcStats::desync_repairs.fetch_add(1, std::memory_order_relaxed);
     }
 
+    /// sotc: SOTC_VERIFY=n1 (gpu/sotc/native/n1verify.h). The fault handler of the sub-mode, on the faulting
+    /// thread. A page the tracker wants protected (its watcher bits say so) is recorded (RIP, page, thread
+    /// class), opened for read and write, and queued for protection at the next submit start. Nothing else
+    /// happens: no invalidation, no readback, no mark, no forward to the draw thread. It takes no lock and
+    /// allocates nothing; the calls it makes are the tracker state look (reads only), the recorder (atomics,
+    /// fixed tables) and the host page protection of the faulting page (the same call the mode-1 stray
+    /// branch makes). It cannot recurse: the page is open when it returns, and nothing it calls touches a
+    /// protected guest page. Returns false when the fault is not one of the sub-mode's; the caller then takes
+    /// the mode-1 path, exactly as without the sub-mode.
+    static bool HandleN1VerifyFault(void* context, void* fault_address) {
+        const auto addr = reinterpret_cast<VAddr>(fault_address);
+        if (addr >= (VAddr{1} << Impl::ADDRESS_BITS)) {
+            return false; // not guest memory (the tracker's tables end here): a host fault, not ours
+        }
+        const bool is_write = Common::IsWriteError(context);
+        const bool gpu_side = rasterizer->IsGpuSideThread();
+        // The generated SRT walkers read user data tables of GPU-modified pages from the backing: not a CPU read.
+        if (!is_write && gpu_side && TryCleanWalkerLoad(context)) {
+            return true;
+        }
+        const VAddr page = PageManager::GetPageAddr(addr);
+        const u64 rip = reinterpret_cast<u64>(Common::GetRip(context));
+        const int state = g_n1_page_state ? g_n1_page_state(page) : -1;
+        // A write also faults on a page that is only read watched: SignalImpl::Protect turns the write-only
+        // permission (CPU- and GPU-modified pages) into none.
+        const bool ours = state > 0 && (is_write ? (state & 3) != 0 : (state & 2) != 0);
+        if (!ours) {
+#ifdef _WIN32
+            // The tracker already opened the page (a racing unprotect): the retry succeeds.
+            MEMORY_BASIC_INFORMATION info{};
+            if (state >= 0 && VirtualQuery(reinterpret_cast<void*>(page), &info, sizeof(info)) &&
+                info.State == MEM_COMMIT) {
+                const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
+                                       PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
+                const DWORD writable = PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
+                                       PAGE_EXECUTE_WRITECOPY;
+                if ((info.Protect & (is_write ? writable : readable)) != 0) {
+                    SotcN1Verify::NoteRaced();
+                    return true;
+                }
+            }
+#endif
+            return false;
+        }
+        // The same thread faulting on the same instruction and page again and again: the host refuses an
+        // access the handler keeps granting (the game's own protection). Give up, the mode-1 path decides.
+        static thread_local u64 last_rip = 0;
+        static thread_local VAddr last_page = 0;
+        static thread_local u32 repeats = 0;
+        static thread_local u64 last_ns = 0;
+        const u64 now_ns = SotcStats::NowNs();
+        // A real loop retries within microseconds; the same write one frame later is a new record.
+        if (rip == last_rip && page == last_page && now_ns - last_ns < 200'000) {
+            if (++repeats >= 8) {
+                repeats = 0;
+                last_ns = now_ns;
+                SotcN1Verify::NoteLoopBreak();
+                return false;
+            }
+        } else {
+            last_rip = rip;
+            last_page = page;
+            repeats = 0;
+        }
+        last_ns = now_ns;
+        const SotcN1Verify::Who who = SotcN1Verify::Classify(rip, gpu_side);
+        if (is_write) {
+            SotcN1Verify::NoteWriteFault(addr, rip, who);
+        } else {
+            SotcN1Verify::NoteReadFault(addr, rip, who);
+        }
+        Core::Memory::Instance()->GetAddressSpace().Protect(page, PageManager::PM_PAGE_SIZE,
+                                                            Core::MemoryPermission::ReadWrite);
+        return true;
+    }
+
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         // sotc: a fault of the command processor while the draw thread binds the draws
         // (Liverpool::IsBackThreaded) is handled on the draw thread, after what is queued: that
@@ -1333,6 +1421,12 @@ struct SignalImpl : public PageManager::Impl {
         if (reinterpret_cast<VAddr>(fault_address) < 0x10000 && !Common::IsWriteError(context) &&
             Shader::IsSrtWalkerCode(Common::GetRip(context))) {
             return false;
+        }
+        // sotc: SOTC_VERIFY=n1: the fault is recorded and the page opened on the faulting thread, with no
+        // forward to the draw thread (no wait, no lock: the handler cannot deadlock or recurse). Faults of
+        // pages the tracker does not want protected go on to the mode-1 path below, as without the sub-mode.
+        if (SotcN1Verify::On() && HandleN1VerifyFault(context, fault_address)) {
+            return true;
         }
         // sotc: SOTC_ARENA_ATTRIB: the faulting thread is read here, on it. A fault forwarded to the
         // draw thread below is then attributed to the guest thread that wrote, not to the draw thread.
@@ -1456,6 +1550,21 @@ struct SignalImpl : public PageManager::Impl {
             SotcNative::NoteStrayFault(reinterpret_cast<VAddr>(fault_address), is_write,
                                        reinterpret_cast<uint64_t>(Common::GetRip(context)));
             if (!is_write) {
+                // sotc: the first stray reads say what the OS holds at the address (free, reserved,
+                // no access, or a view with other rights), for the mode-1 read fault study.
+                static std::atomic<u32> stray_logged{0};
+                if (stray_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (VirtualQuery(fault_address, &info, sizeof(info))) {
+                        std::fprintf(stderr,
+                                     "SOTC NATIVE stray read state: addr %p state 0x%lx protect 0x%lx "
+                                     "base %p region 0x%zx type 0x%lx\n",
+                                     fault_address, static_cast<unsigned long>(info.State),
+                                     static_cast<unsigned long>(info.Protect), info.AllocationBase,
+                                     static_cast<size_t>(info.RegionSize),
+                                     static_cast<unsigned long>(info.Type));
+                    }
+                }
                 return false;
             }
             Core::Memory::Instance()->GetAddressSpace().Protect(
@@ -1800,7 +1909,8 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
 }
 
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op, bool deferrable) const {
-    if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, no watcher state, no protection
+    // sotc: SOTC_NATIVE=1, no watcher state, no protection (SOTC_VERIFY=n1 keeps them: record-only)
+    if (!SotcNative::TracksGuestPages() && !SotcN1Verify::On()) {
         return;
     }
     impl->UpdatePageWatchers(addr, size, write_op, deferrable);
@@ -1810,7 +1920,7 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bou
                                               const RegionBits& write_mask,
                                               const RegionBits& read_mask, PageOp write_op,
                                               PageOp read_op, bool deferrable) const {
-    if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, see UpdatePageWatchers
+    if (!SotcNative::TracksGuestPages() && !SotcN1Verify::On()) { // sotc: SOTC_NATIVE=1, see UpdatePageWatchers
         return;
     }
     impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op,
@@ -1842,6 +1952,14 @@ void PageManager::ProtectBatch::Flush() {
 
 bool PageManager::ProtectBatchOpen() noexcept {
     return tl_protect_batch.depth > 0 && tl_protect_batch.suspended == 0;
+}
+
+// sotc: SOTC_VERIFY=n1. The pages the fault handler opened are protected again from the tracker's state:
+// ReapplyProtection takes the page locks and protects only pages whose watchers say so.
+void PageManager::N1VerifyRearm(VAddr addr, u64 size) {
+    if (g_reapply_protection) {
+        g_reapply_protection(addr, size);
+    }
 }
 
 void PageManager::EnsureFaultPageWritable(VAddr page) {

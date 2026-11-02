@@ -12,20 +12,27 @@
 
 namespace SotcNativeMasks {
 
-/// SOTC_NATIVE_MASKS=prev, read once.
+/// SOTC_NATIVE_MASKS=prev or =cpu, read once: the consumers are served without waiting for the GPU.
 bool Prev();
+
+/// SOTC_NATIVE_MASKS=cpu, read once: the masks of the current frame are computed on the CPU (cpu_cull.h) and served
+/// first; the last completed GPU copy is the fallback. Off by default until its cost and the LOD mirror's agreement
+/// are good enough (docs/re-stutters/native/CPUCULL-BRIEF.md).
+bool Cpu();
 
 /// Registers the producer handler (hook_handlers.cpp through SotcNativeResults::Register).
 void Register();
 
 /// A consumer of the main scene (BPXPR_ConsumeVisibilityMask, ...Indirect) or of the decals (sub_1a8a40) is about to read `count` bits at
-/// `mask`. Returns the guest pointer the consumer should read instead: a block holding the newest completed copy
-/// of the same mask (same set entry and slot, this or an earlier frame), or a zero mask (nothing of that set is
-/// drawn this frame) when no copy is complete. Verify mode (SotcNative::Verify) returns `mask` and counts the bits
-/// in which the candidate differs from the real mask (read through the backing view).
+/// `mask`. Returns the guest pointer the consumer should read instead. First choice: the CPU mask of the same frame
+/// (computed at the producer site, cpu_cull.h), when it exists for the same object and count (CPUCULL-BRIEF). Else a
+/// block holding the newest completed GPU copy of the same mask (same set entry and slot, this or an earlier frame),
+/// or a zero mask (nothing of that set is drawn this frame) when no copy is complete. Verify mode (SotcNative::Verify)
+/// returns `mask`; a served CPU mask is compared bit by bit with the real GPU mask of its frame once that copy is
+/// complete (SOTC NATIVE_MASKS verify line).
 uint64_t Serve(uint64_t mask, uint64_t count);
 
-/// "SOTC NATIVE_MASKS" 5 s line (counters reset). Nothing when off.
+/// "SOTC NATIVE_MASKS" 5 s lines (counters reset): the copy ring, the CPU mask cost and the verify. Nothing when off.
 void Report(std::string& out, double seconds);
 
 } // namespace SotcNativeMasks

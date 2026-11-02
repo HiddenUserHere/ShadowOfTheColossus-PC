@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -194,10 +195,390 @@ void FormatRip(char* buf, size_t n, uint64_t addr) {
 
 } // namespace
 
+// ---- 5. Byte oracle (SOTC VERIFY BYTES, verify.h) -------------------------------------------------
+namespace {
+
+constexpr size_t kViewBits = 4096; // one bit per byte of a 4 KiB view page
+constexpr size_t kViewWords = kViewBits / 64;
+constexpr size_t kViewPageCap = 8192; // ~6.5 KiB per view page: 52 MiB at most
+constexpr size_t kViewRipCap = 4096;
+constexpr size_t kViewTopRips = 16;
+constexpr size_t kKinds = static_cast<size_t>(BindKind::Count);
+const char* const kKindNames[kKinds] = {"vertex", "index", "constant", "storage", "texel", "image", "other"};
+
+// The bytes the GPU holds for one page, with per-byte flags (bit i = byte i of the page).
+struct ViewPage {
+    uint8_t bytes[kViewBits];                  // the GPU's copy (last refresh)
+    uint64_t held[kViewWords] = {};            // handed to the GPU at least once
+    uint64_t announced[kViewWords] = {};       // announced since its last refresh
+    uint64_t gpu_pend[kViewWords] = {};        // a shader write covers it: the next upload reads it back
+    uint64_t gpu_origin[kViewWords] = {};      // the GPU holds bytes of a shader write (mode 1 keeps them)
+    uint64_t stale[kViewWords] = {};           // the GPU holds bytes that differ from guest memory
+};
+
+inline bool Bit(const uint64_t* w, size_t i) {
+    return (w[i >> 6] >> (i & 63)) & 1;
+}
+inline void SetBit(uint64_t* w, size_t i) {
+    w[i >> 6] |= uint64_t{1} << (i & 63);
+}
+inline void ClearBit(uint64_t* w, size_t i) {
+    w[i >> 6] &= ~(uint64_t{1} << (i & 63));
+}
+
+std::mutex g_view_mutex; // views, window counters and the RIP table
+std::unordered_map<uint64_t, std::unique_ptr<ViewPage>> g_views; // page -> view
+std::atomic<size_t> g_view_count{0};                              // lock-free "no views yet" test
+
+struct ByteRip {
+    uint64_t miss_new[kKinds] = {};
+    uint64_t miss_standing[kKinds] = {};
+    uint64_t gpu_new = 0;
+    uint64_t gpu_standing = 0;
+    uint64_t last_addr = 0;
+};
+std::unordered_map<uint64_t, ByteRip> g_byte_rips; // RIP of the page's last write fault (0 = unknown)
+uint64_t g_byte_rips_dropped = 0;
+
+struct ByteWindow {
+    uint64_t uploads = 0;
+    uint64_t upload_bytes = 0;
+    uint64_t compared = 0;
+    uint64_t covered_exact = 0; // changed, announced: mode 1 uploads the new bytes
+    uint64_t covered_page = 0;  // changed, not announced, its page announced: mode 1's page upload covers it
+    uint64_t resynced = 0;      // first upload after a shader write: the read-back bytes become the view
+    uint64_t miss_new = 0;
+    uint64_t miss_standing = 0;
+    uint64_t gpu_new = 0;       // changed shader-written bytes, no exact announce (mode 1 keeps the GPU bytes)
+    uint64_t gpu_standing = 0;
+    uint64_t gpu_writes = 0;
+    uint64_t skipped_big = 0;
+    uint64_t dropped_pages = 0;
+    uint64_t kind_compared[kKinds] = {};
+    uint64_t kind_miss_new[kKinds] = {};
+    uint64_t kind_miss_standing[kKinds] = {};
+    uint64_t kind_covered_page[kKinds] = {};
+};
+ByteWindow g_bw;                        // one 5 s window (guarded by g_view_mutex)
+uint64_t g_bw_index = 0;                // reports so far
+double g_bw_elapsed = 0.0;              // seconds covered by the reports so far
+uint64_t g_bw_total_miss_new = 0;       // since the start, for comparing windows
+uint64_t g_bw_total_gpu_new = 0;
+
+thread_local BindKind t_kind = BindKind::Other;
+
+// The RIP of the last write fault on the page (the direct-mapped g_last table, key checked). 0 when unknown.
+uint64_t PageLastRip(uint64_t page) {
+    const LastWrite& lw = g_last[Slot(page, kLastWriteBits)];
+    return lw.key.load(std::memory_order_relaxed) == page + 1 ? lw.rip.load(std::memory_order_relaxed) : 0;
+}
+
+// Caller holds g_view_mutex. Null when the page is new and the cap is reached (counted).
+ViewPage* FindOrCreateView(uint64_t page) {
+    auto it = g_views.find(page);
+    if (it != g_views.end()) {
+        return it->second.get();
+    }
+    if (g_views.size() >= kViewPageCap) {
+        ++g_bw.dropped_pages;
+        return nullptr;
+    }
+    auto& slot = g_views[page];
+    slot = std::make_unique<ViewPage>();
+    g_view_count.store(g_views.size(), std::memory_order_relaxed);
+    return slot.get();
+}
+
+// True when an announce touched the page since its bytes were last refreshed (the page-granular rule).
+bool PageAnnounced(const ViewPage& v) {
+    for (uint64_t w : v.announced) {
+        if (w) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+bool BytesOn() {
+    return VerifyAll() && SotcNative::Verify();
+}
+
+BindKind CurrentBindKind() {
+    return t_kind;
+}
+
+BindKindScope::BindKindScope(BindKind kind) : prev_(t_kind) {
+    t_kind = kind;
+}
+
+BindKindScope::~BindKindScope() {
+    t_kind = prev_;
+}
+
+// Called from NoteAnnounce (any thread): marks the announced bytes of the views they cover.
+void NoteViewAnnounce(uint64_t addr, uint64_t size) {
+    if (g_view_count.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_view_mutex);
+    const uint64_t first = addr >> kPageShift;
+    const uint64_t last = (addr + size - 1) >> kPageShift;
+    const auto mark = [addr, size](uint64_t page, ViewPage& v) {
+        const uint64_t base = page << kPageShift;
+        const uint64_t lo = std::max(addr, base);
+        const uint64_t hi = std::min(addr + size, base + (uint64_t{1} << kPageShift));
+        for (uint64_t a = lo; a < hi; ++a) {
+            SetBit(v.announced, a - base);
+        }
+    };
+    if (last - first < 256) {
+        for (uint64_t page = first; page <= last; ++page) {
+            if (auto it = g_views.find(page); it != g_views.end()) {
+                mark(page, *it->second);
+            }
+        }
+        return;
+    }
+    for (auto& [page, v] : g_views) { // a large announce: one pass over the views
+        if (page >= first && page <= last) {
+            mark(page, *v);
+        }
+    }
+}
+
+void NoteUploadBytes(uint64_t addr, uint64_t size, const uint8_t* bytes, BindKind kind) {
+    if (size == 0 || !bytes || !BytesOn()) {
+        return;
+    }
+    const size_t k = static_cast<size_t>(kind);
+    std::lock_guard<std::mutex> lock(g_view_mutex);
+    ++g_bw.uploads;
+    g_bw.upload_bytes += size;
+    const uint64_t first = addr >> kPageShift;
+    const uint64_t last = (addr + size - 1) >> kPageShift;
+    for (uint64_t page = first; page <= last; ++page) {
+        ViewPage* v = FindOrCreateView(page);
+        if (!v) {
+            continue;
+        }
+        const uint64_t base = page << kPageShift;
+        const uint64_t lo = std::max(addr, base);
+        const uint64_t hi = std::min(addr + size, base + (uint64_t{1} << kPageShift));
+        // Mode 1 refreshes a page whole once an announce marked it: read this before the bytes below.
+        const bool page_marked = PageAnnounced(*v);
+        uint64_t p_new = 0, p_standing = 0, p_gpu_new = 0, p_gpu_standing = 0;
+        for (uint64_t a = lo; a < hi; ++a) {
+            const size_t off = static_cast<size_t>(a - base);
+            const uint8_t cur = bytes[a - addr];
+            if (Bit(v->gpu_pend, off)) { // a shader wrote it: the read-back bytes are what the GPU's view takes
+                v->bytes[off] = cur;
+                ClearBit(v->gpu_pend, off);
+                ClearBit(v->announced, off);
+                ClearBit(v->stale, off);
+                SetBit(v->held, off);
+                SetBit(v->gpu_origin, off);
+                ++g_bw.resynced;
+                continue;
+            }
+            if (!Bit(v->held, off)) { // first upload of the byte: the view starts here
+                v->bytes[off] = cur;
+                SetBit(v->held, off);
+                continue;
+            }
+            ++g_bw.compared;
+            ++g_bw.kind_compared[k];
+            if (Bit(v->announced, off)) { // mode 1 uploads an announced byte: the view takes the new value
+                if (v->bytes[off] != cur) {
+                    ++g_bw.covered_exact;
+                }
+                v->bytes[off] = cur;
+                ClearBit(v->announced, off);
+                ClearBit(v->stale, off);
+                ClearBit(v->gpu_origin, off);
+                continue;
+            }
+            if (v->bytes[off] == cur) { // unchanged (or rewritten to the view's value): not stale
+                ClearBit(v->stale, off);
+                continue;
+            }
+            // Changed without an announce on the byte.
+            const bool was_stale = Bit(v->stale, off);
+            if (Bit(v->gpu_origin, off)) {
+                // Mode 1 keeps the GPU's bytes (no exact copy): the view stays, the GPU holds the old value.
+                if (was_stale) {
+                    ++p_gpu_standing;
+                } else {
+                    ++p_gpu_new;
+                }
+                SetBit(v->stale, off);
+                continue;
+            }
+            if (page_marked) { // mode 1's page-granular upload takes the whole page
+                ++g_bw.covered_page;
+                ++g_bw.kind_covered_page[k];
+                v->bytes[off] = cur;
+                ClearBit(v->stale, off);
+                continue;
+            }
+            // Real miss: no announce on the page, so mode 1 keeps the old bytes.
+            if (was_stale) {
+                ++p_standing;
+                ++g_bw.kind_miss_standing[k];
+            } else {
+                ++p_new;
+                ++g_bw.kind_miss_new[k];
+            }
+            SetBit(v->stale, off);
+        }
+        g_bw.miss_new += p_new;
+        g_bw.miss_standing += p_standing;
+        g_bw.gpu_new += p_gpu_new;
+        g_bw.gpu_standing += p_gpu_standing;
+        g_bw_total_miss_new += p_new;
+        g_bw_total_gpu_new += p_gpu_new;
+        if (p_new + p_standing + p_gpu_new + p_gpu_standing != 0) {
+            const uint64_t rip = PageLastRip(page);
+            auto it = g_byte_rips.find(rip);
+            if (it == g_byte_rips.end() && g_byte_rips.size() < kViewRipCap) {
+                it = g_byte_rips.emplace(rip, ByteRip{}).first;
+            }
+            if (it == g_byte_rips.end()) {
+                ++g_byte_rips_dropped;
+            } else {
+                ByteRip& row = it->second;
+                row.miss_new[k] += p_new;
+                row.miss_standing[k] += p_standing;
+                row.gpu_new += p_gpu_new;
+                row.gpu_standing += p_gpu_standing;
+                row.last_addr = lo;
+            }
+        }
+    }
+}
+
+void NoteGpuWrite(uint64_t addr, uint64_t size) {
+    if (size == 0 || !BytesOn()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_view_mutex);
+    ++g_bw.gpu_writes;
+    const uint64_t first = addr >> kPageShift;
+    const uint64_t last = (addr + size - 1) >> kPageShift;
+    for (uint64_t page = first; page <= last; ++page) {
+        ViewPage* v = FindOrCreateView(page);
+        if (!v) {
+            continue;
+        }
+        const uint64_t base = page << kPageShift;
+        const uint64_t lo = std::max(addr, base);
+        const uint64_t hi = std::min(addr + size, base + (uint64_t{1} << kPageShift));
+        for (uint64_t a = lo; a < hi; ++a) {
+            SetBit(v->gpu_pend, a - base);
+        }
+    }
+}
+
+void NoteBytesSkipped() {
+    if (!BytesOn()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_view_mutex);
+    ++g_bw.skipped_big;
+}
+
+// The SOTC VERIFY BYTES block of one window (Report). Resets the window; the totals keep running.
+void ReportBytes(std::string& out, double seconds) {
+    if (!BytesOn()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_view_mutex);
+    ++g_bw_index;
+    g_bw_elapsed += seconds;
+    const ByteWindow& w = g_bw;
+    char buf[640];
+    std::snprintf(
+        buf, sizeof buf,
+        "SOTC VERIFY BYTES win=%llu t=%.0fs window=%.1fs uploads=%llu upload_bytes=%llu compared=%llu "
+        "covered_exact=%llu covered_page=%llu resynced=%llu miss_new=%llu miss_standing=%llu gpu_new=%llu "
+        "gpu_standing=%llu gpu_writes=%llu skipped_big=%llu dropped_pages=%llu pages=%zu total_miss_new=%llu "
+        "total_gpu_new=%llu rips_dropped=%llu\n",
+        static_cast<unsigned long long>(g_bw_index), g_bw_elapsed, seconds,
+        static_cast<unsigned long long>(w.uploads), static_cast<unsigned long long>(w.upload_bytes),
+        static_cast<unsigned long long>(w.compared), static_cast<unsigned long long>(w.covered_exact),
+        static_cast<unsigned long long>(w.covered_page), static_cast<unsigned long long>(w.resynced),
+        static_cast<unsigned long long>(w.miss_new), static_cast<unsigned long long>(w.miss_standing),
+        static_cast<unsigned long long>(w.gpu_new), static_cast<unsigned long long>(w.gpu_standing),
+        static_cast<unsigned long long>(w.gpu_writes), static_cast<unsigned long long>(w.skipped_big),
+        static_cast<unsigned long long>(w.dropped_pages), g_views.size(),
+        static_cast<unsigned long long>(g_bw_total_miss_new), static_cast<unsigned long long>(g_bw_total_gpu_new),
+        static_cast<unsigned long long>(g_byte_rips_dropped));
+    out += buf;
+    for (size_t k = 0; k < kKinds; ++k) {
+        if (w.kind_compared[k] == 0 && w.kind_miss_new[k] == 0 && w.kind_miss_standing[k] == 0) {
+            continue;
+        }
+        std::snprintf(buf, sizeof buf,
+                      "SOTC VERIFY BYTES KIND %s compared=%llu miss_new=%llu miss_standing=%llu covered_page=%llu\n",
+                      kKindNames[k], static_cast<unsigned long long>(w.kind_compared[k]),
+                      static_cast<unsigned long long>(w.kind_miss_new[k]),
+                      static_cast<unsigned long long>(w.kind_miss_standing[k]),
+                      static_cast<unsigned long long>(w.kind_covered_page[k]));
+        out += buf;
+    }
+    std::vector<std::pair<uint64_t, ByteRip>> rows(g_byte_rips.begin(), g_byte_rips.end());
+    const auto total = [](const ByteRip& r) {
+        uint64_t n = r.gpu_new + r.gpu_standing;
+        for (size_t k = 0; k < kKinds; ++k) {
+            n += r.miss_new[k] + r.miss_standing[k];
+        }
+        return n;
+    };
+    std::sort(rows.begin(), rows.end(), [&](const auto& a, const auto& b) { return total(a.second) > total(b.second); });
+    for (size_t i = 0; i < rows.size() && i < kViewTopRips; ++i) {
+        const ByteRip& r = rows[i].second;
+        if (total(r) == 0) {
+            break;
+        }
+        char where[64];
+        if (rows[i].first == 0) {
+            std::snprintf(where, sizeof where, "unknown");
+        } else {
+            FormatRip(where, sizeof where, rows[i].first);
+        }
+        uint64_t new_sum = 0, standing_sum = 0;
+        std::string kinds;
+        for (size_t k = 0; k < kKinds; ++k) {
+            new_sum += r.miss_new[k];
+            standing_sum += r.miss_standing[k];
+            if (r.miss_new[k] || r.miss_standing[k]) {
+                char part[64];
+                std::snprintf(part, sizeof part, " %s=%llu/%llu", kKindNames[k],
+                              static_cast<unsigned long long>(r.miss_new[k]),
+                              static_cast<unsigned long long>(r.miss_standing[k]));
+                kinds += part;
+            }
+        }
+        std::snprintf(buf, sizeof buf,
+                      "SOTC VERIFY BYTES RIP %zu rip=%s miss_new=%llu miss_standing=%llu gpu_new=%llu "
+                      "gpu_standing=%llu last_addr=0x%llx by_kind(new/standing):%s\n",
+                      i + 1, where, static_cast<unsigned long long>(new_sum),
+                      static_cast<unsigned long long>(standing_sum), static_cast<unsigned long long>(r.gpu_new),
+                      static_cast<unsigned long long>(r.gpu_standing), static_cast<unsigned long long>(r.last_addr),
+                      kinds.c_str());
+        out += buf;
+    }
+    g_bw = ByteWindow{};
+    g_byte_rips.clear();
+}
+
 bool VerifyAll() {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_VERIFY");
-        const bool value = v && *v && std::strcmp(v, "0") != 0;
+        // sotc: SOTC_VERIFY=n1 is the mode-1 sub-mode (n1verify.h), not "every verify mode".
+        const bool n1 = v && (v[0] == 'n' || v[0] == 'N') && v[1] == '1' && v[2] == '\0';
+        const bool value = v && *v && std::strcmp(v, "0") != 0 && !n1;
         if (value) {
             std::fprintf(stderr, "SOTC VERIFY: on (native verify, range log, frame data counters)\n");
         }
@@ -238,6 +619,7 @@ void NoteAnnounce(uint64_t addr, uint64_t size) {
     if (size == 0 || !SotcNative::Verify()) {
         return;
     }
+    NoteViewAnnounce(addr, size); // sotc: SOTC VERIFY BYTES, the announced bytes of the views
     const uint64_t first = addr >> kPageShift;
     const uint64_t last = (addr + size - 1) >> kPageShift;
     if (last - first < 256) {
@@ -535,6 +917,8 @@ void Report(std::string& out, double seconds) {
     if (!VerifyAll()) {
         return;
     }
+
+    ReportBytes(out, seconds); // sotc: SOTC VERIFY BYTES (native view of the uploads, no-op unless SOTC_VERIFY)
 
     // Range log: the window's sync-copy ranges, split by old / first-bind / class, top resources by bytes.
     {

@@ -30,6 +30,7 @@
 #include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM replay records
 #include "../../../sotc/mem_classes.h"   // sotc: SOTC_CLASS_TRACK bind signal
 #include "../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE bind evidence
+#include "../../../sotc/native/n1verify.h" // sotc: SOTC_VERIFY=n1 (NoteBind)
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -472,7 +473,11 @@ public:
     bool TryEmergencyCollect(u32 level);
 
     /// Invalidates any image in the logical page range.
-    void InvalidateMemory(VAddr addr, size_t size);
+    /// sotc: keep_gpu_written (SOTC_NATIVE=1 announces): images the GPU wrote (render targets, depth)
+    /// are left alone. Without tracking nothing reads them back to guest memory, and announces such as a
+    /// whole per-frame heap chunk cover them without the CPU writing their texels, so dirtying one
+    /// re-uploads stale guest bytes over the GPU's (1 Nov: Shrine facade missing, black rectangles).
+    void InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_written = false);
 
     /// Marks an image as dirty if it exists at the provided address.
     /// sotc: any_overlap marks every image overlapping the range (DMA copies and fills).
@@ -607,6 +612,9 @@ public:
         TrackImage(image_id);
         TouchImage(image);
         RefreshImage(image);
+        if (SotcN1Verify::On() && SotcStats::t_draw_thread) { // sotc: SOTC_VERIFY=n1: the GPU binds this image
+            SotcN1Verify::NoteBind(image.info.guest_address, image.info.guest_size, true);
+        }
         // sotc: SOTC_CLASS_TRACK: a bound image's guest range is GPU-bound (never CPU_ONLY).
         if (SotcMemClasses::On() && SotcStats::t_draw_thread) {
             SotcMemClasses::NoteGpuBind(image.info.guest_address, image.info.guest_size);

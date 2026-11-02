@@ -439,7 +439,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     UntrackImage(image_id);
 }
 
-void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
+void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_written) {
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
     // sotc: most guest write faults hit buffer pages without any image: no lock for them (they
@@ -462,6 +462,22 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     }
     std::scoped_lock lock{mutex};
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
+        if (keep_gpu_written && True(image.flags & ImageFlagBits::GpuModified)) {
+            // sotc: SOTC_NATIVE aging rule. A GPU-written image is kept while announces cover it: an
+            // announce over a per-frame chunk covers a render target the CPU never wrote. Once the
+            // image has been idle for a while and an announce covers its whole range, the game has
+            // reused its memory for new contents: the image stops being GPU-written and is refreshed
+            // from guest memory like a CPU-written one (mode 0 gets the same result through its readback).
+            constexpr u64 native_reuse_idle_ticks = 120;
+            const u64 idle = scheduler.CurrentTick() - image.tick_accessed_last;
+            const bool covers = addr <= image.info.guest_address &&
+                                addr + size >= image.info.guest_address + image.info.guest_size;
+            if (!covers || idle < native_reuse_idle_ticks) {
+                return;
+            }
+            image.flags &= ~(ImageFlagBits::GpuModified | ImageFlagBits::GpuDirty);
+            SotcNative::NoteImageReused(); // counter for the report
+        }
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
         GenBumpImage(image); // sotc: SOTC_GEN_TEX, a guest write reached this image's range
@@ -799,7 +815,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             (image_info.size.width != cache_image.info.size.width ||
              image_info.size.height != cache_image.info.size.height)) {
             SotcStats::reuse_size_frees.fetch_add(1, std::memory_order_relaxed);
-            static u32 reuse_logged = 0; // sotc: TEMP diagnostic
+            static u32 reuse_logged = 0; // sotc: diagnostic
             if (reuse_logged++ < 60) {
                 std::fprintf(stderr,
                              "SOTC REUSE %#llx: cached %ux%u %s L%u M%u flags %#x -> asked %ux%u %s L%u M%u"
@@ -2042,6 +2058,16 @@ void TextureCache::RefreshImage(Image& image) {
         SotcVerify::NoteGpuConsume(image.info.guest_address, image.info.guest_size,
                                    SotcVerify::ConsumePath::ImageUpload, image.info.guest_size,
                                    false);
+        // sotc: SOTC VERIFY BYTES: the image's guest texels against the native view (verify.h, part 5).
+        if (SotcVerify::BytesOn()) {
+            thread_local std::vector<u8> view_bytes;
+            view_bytes.resize(image.info.guest_size);
+            if (Core::Memory::Instance()->TryCopySparseMemory(image.info.guest_address, view_bytes.data(),
+                                                              image.info.guest_size)) {
+                SotcVerify::NoteUploadBytes(image.info.guest_address, image.info.guest_size, view_bytes.data(),
+                                            SotcVerify::BindKind::Image);
+            }
+        }
     }
     if (image.sotc_warm_used && !SotcLoadWarm::InWarm()) { // sotc: SOTC_LOAD_WARM: paid again
         image.sotc_warm_used = false;

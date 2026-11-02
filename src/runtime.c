@@ -204,11 +204,10 @@ static inline void declare_guest_write(void *dst, size_t size, void *caller) {
     runtime_call_on_host_stack(declare_on_host_stack, &call);
 }
 /* sotc: PC-native announces (SOTC_NATIVE; gpu/bbgpu.h, gpu/sotc/native/native_hooks.cpp). A guest copy whose
- * destination the GPU reads is announced after its bytes landed (impl-writes7 gap 2): the GPU library
- * decides by the caller's return address (code 0 = nothing to do). File reads are not announced: the
- * GPU resources they fill are announced by their creator (NATIVE_RES_COPY), and announcing every read
- * buffer would upload CPU-only data. Off costs one call and a flag test. The announce takes a mutex,
- * so it runs on the host stack. */
+ * destination the GPU may read is announced after its bytes landed (impl-writes7 gap 2): with SOTC_NATIVE
+ * every guest copy is (a page mark; the GPU library gives the code, 0 = nothing to do). File reads are
+ * announced by src/runtime_file.c. Off costs one call and a flag test. The announce takes a mutex, so it
+ * runs on the host stack. */
 uint32_t bbgpu_native_guest_write_kind(uint64_t return_address) __attribute__((weak));
 void bbgpu_native_announce_write(void *dst, uint64_t size, uint32_t code) __attribute__((weak));
 static void announce_on_host_stack(void *arg) {

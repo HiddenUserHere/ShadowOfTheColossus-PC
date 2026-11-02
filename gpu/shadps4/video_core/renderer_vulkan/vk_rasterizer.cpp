@@ -40,11 +40,13 @@
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_write_extent.h"
 #include "../../../sotc/native/native_copies.h" // sotc: PC-native GPU result copies
+#include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (TracksGuestPages)
 #include "video_core/sotc_generation.h" // sotc: SOTC_PR_GEN (per-64 KiB generation sums)
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
 #include "../../../sotc/native/verify.h" // sotc: SOTC_VERIFY (SotcVerify::VerifyAll)
+#include "../../../sotc/native/n1verify.h" // sotc: SOTC_VERIFY=n1
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH (barrier events)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -2409,6 +2411,11 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    // sotc: the LOD pre-shader variants (7b79db7c stateful, 6eb39c35 snapping) by code address: the CPU mirror
+    // (cpu_cull_lod.cpp) tells them apart with it.
+    if (cs.pgm_hash == 0x7b79db7cull || cs.pgm_hash == 0x6eb39c35ull) {
+        SotcNativeCopies::NoteProgram(cs_program.Address<uintptr_t>(), cs.pgm_hash);
+    }
     SotcStats::current_program.store(cs.pgm_hash, std::memory_order_relaxed);
     if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
         SotcStats::cmd_kinds[4].fetch_add(1, std::memory_order_relaxed);
@@ -4942,6 +4949,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
             // Start is not mapped (garbage vertex sharp): keep a small range instead of GBs.
             size = std::min<u64>(range.GetSize(), 4096);
         }
+        SotcVerify::BindKindScope verify_kind{SotcVerify::BindKind::Vertex}; // sotc: SOTC VERIFY BYTES
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
@@ -4994,6 +5002,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
+    SotcVerify::BindKindScope verify_kind{SotcVerify::BindKind::Index}; // sotc: SOTC VERIFY BYTES
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
@@ -5773,6 +5782,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 memo->stamp_epoch = epoch;
                             }
                             obtained = {memo->arena, memo->offset};
+                            if (SotcN1Verify::On() && SotcStats::t_draw_thread) { // sotc: SOTC_VERIFY=n1: a memo hit reads the range
+                                SotcN1Verify::NoteBind(memo->addr, memo->size, false, true);
+                            }
                             if (SotcStats::kFpsLog) {
                                 SotcStats::bf_memo_hits.fetch_add(1, std::memory_order_relaxed);
                             }
@@ -5781,6 +5793,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 if (!obtained.first) {
                     obtain_called = true;
+                    // sotc: SOTC VERIFY BYTES: the bind kind of this shader buffer (texel, storage or constant)
+                    SotcVerify::BindKindScope verify_kind{
+                        desc.is_formatted ? SotcVerify::BindKind::Texel
+                        : desc.is_written ? SotcVerify::BindKind::Storage
+                                          : SotcVerify::BindKind::Constant};
                     // sotc: SOTC_TRACE (a = bytes uploaded, b = protect calls)
                     const SotcTrace::BindScope trace_obtain{"obtain buffer"};
                     obtained = buffer_cache.ObtainBuffer(vbase, size, desc.is_written,
@@ -7396,6 +7413,12 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
+            // sotc: SOTC_NATIVE=1: this host write reaches no tracker (no page is protected), so the GPU
+            // copy of the range and the images over it learn it here, as the write fault did in mode 0.
+            if (!SotcNative::TracksGuestPages()) {
+                InvalidateMemory(address, num_bytes, true);
+                SotcN1Verify::NoteAnnounce(address, num_bytes, SotcN1Verify::kAnnDirect, reinterpret_cast<const void*>(1)); // sotc: SOTC_VERIFY=n1
+            }
             return;
         }
     }
@@ -7426,6 +7449,10 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
+            if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, see FillBuffer
+                InvalidateMemory(dst, num_bytes, true);
+                SotcN1Verify::NoteAnnounce(dst, num_bytes, SotcN1Verify::kAnnDirect, reinterpret_cast<const void*>(2)); // sotc: SOTC_VERIFY=n1
+            }
             SotcStats::dma_cpu_copies.fetch_add(1, std::memory_order_relaxed);
             SotcStats::dma_cpu_bytes.fetch_add(num_bytes, std::memory_order_relaxed);
             return;
@@ -7477,8 +7504,19 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
         return false;
     }
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
-    texture_cache.InvalidateMemory(addr, size);
+    // sotc: SOTC_NATIVE=1: images the GPU wrote stay (TextureCache::InvalidateMemory keep_gpu_written).
+    texture_cache.InvalidateMemory(addr, size, !SotcNative::TracksGuestPages());
     return true;
+}
+
+// sotc: SOTC_NATIVE=1, see vk_rasterizer.h. The texture cache part is the announce rule (NativeDrain):
+// images the GPU wrote are kept.
+void Rasterizer::NoteHostWrite(VAddr addr, u64 size, bool allow_exact) {
+    if (SotcNative::TracksGuestPages() || size == 0 || !IsMapped(addr, size)) {
+        return;
+    }
+    buffer_cache.NativeHostWrite(addr, size, allow_exact);
+    texture_cache.InvalidateMemory(addr, size, true);
 }
 
 // sotc: a guest (not command processor) write fault. With the repeat-fault grace on, the texture

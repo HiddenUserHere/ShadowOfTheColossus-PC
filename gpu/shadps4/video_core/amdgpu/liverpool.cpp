@@ -1119,6 +1119,7 @@ void Liverpool::ApplyBackWd(const BackWd& wd) {
         }
         std::memcpy(reinterpret_cast<void*>(seg.address), wd.data.data() + seg.offset, seg.length);
         Core::MemoryManager::NoteHostWrite(seg.address, seg.length, 4);
+        NoteHostWrite(reinterpret_cast<void*>(seg.address), seg.length); // sotc: SOTC_NATIVE=1
     }
     if (rbx && rasterizer && wd.num_segs) {
         RbxNoteWritten(rbx_snap);
@@ -3044,11 +3045,20 @@ void Liverpool::WriteFenceValue(void* address, u64 data, u32 num_bytes) {
     // mapped read-only), which the memory tracker cannot see. Invalidate first so a copy of the
     // page already uploaded to the GPU is not reused with the old value, and so GPU-written data
     // sharing the page is read back before the new value lands on top of it.
-    if (rasterizer) {
+    // sotc: SOTC_NATIVE=1: no page is tracked and a readback-less invalidation would drop the GPU bits of the
+    // whole page, so the label is announced after it landed instead (a label is never GPU-bound data).
+    if (rasterizer && SotcNative::TracksGuestPages()) {
         rasterizer->InvalidateMemory(std::bit_cast<VAddr>(address), num_bytes, true);
     }
     auto* memory = Core::Memory::Instance();
     ASSERT(memory->TryWriteBacking(address, &data, num_bytes, 2));
+    NoteHostWrite(address, num_bytes, false);
+}
+
+void Liverpool::NoteHostWrite(const void* address, u64 size, bool allow_exact) {
+    if (rasterizer) {
+        rasterizer->NoteHostWrite(std::bit_cast<VAddr>(address), size, allow_exact);
+    }
 }
 
 void Liverpool::ProcessCommands() {
@@ -3527,6 +3537,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
             Core::MemoryManager::NoteHostWrite(dump_const->Address<VAddr>(), dump_const->Size(), 5);
+            // sotc: SOTC_NATIVE=1: the dump lands in memory the draws read; queued behind the draws before it.
+            if (!SotcNative::TracksGuestPages()) {
+                BackOrRun([this, address = dump_const->Address<VAddr>(), size = u64{dump_const->Size()}] {
+                    NoteHostWrite(reinterpret_cast<void*>(address), size);
+                });
+            }
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -3590,8 +3606,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     // sotc: mode 8 also runs OnSubmitStart (import and ring at the submit start, PcHostSubmitStart).
     // sotc: mode 8 always runs it (PcHostSubmitStart counts the draw-side submits: the dedupe key).
+    // sotc: SOTC_NATIVE timing audit: the announce count at the pickup of this submit rides along (native.h).
     if (pc_ring_top && rasterizer && (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8)) {
-        BackOrRun([r = rasterizer] { VideoCore::PcRingCopy::OnSubmitStart(*r); });
+        BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); });
     }
 
     // TODO: potentially, ASCs also can depend on CE and in this case the
@@ -4120,7 +4137,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         eos.command == PM4CmdEventWriteEos::Command::SignalFence) {
                         const VAddr addr = reinterpret_cast<VAddr>(eos.Address());
                         if (LabelDecide(SotcLabels::Kind::Eos, 0, addr, eos_waited).defer) {
-                            rasterizer->InvalidateMemory(addr, 8, true);
+                            if (SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1 notes the write after it landed
+                                rasterizer->InvalidateMemory(addr, 8, true);
+                            }
                             if (rbx) {
                                 rbx_snap = rasterizer->GetBufferCache().HotWriteSeq();
                             }
@@ -4176,6 +4195,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             rasterizer->Finish();
                             const u32 value = rasterizer->ReadDataFromGds(eos.gds_index);
                             *eos.Address() = value;
+                            NoteHostWrite(eos.Address(), sizeof(value), false); // sotc: SOTC_NATIVE=1
                         }
                     }
                 }, back_strict);
@@ -4281,7 +4301,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
                     // As in the SOTC_EOP_DEFER path: the GPU copy of the label's page must not
                     // be reused with the old value. Done now, while the page is still the same.
-                    if (eop.data_sel.Value() != DataSelect::None) {
+                    if (eop.data_sel.Value() != DataSelect::None && SotcNative::TracksGuestPages()) {
                         rasterizer->InvalidateMemory(label, 8, true);
                     }
                     if (rbx_defer && rbx_hot) {
@@ -4290,11 +4310,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const auto job = QueueDeferredLabel(
                         0, label, eop.data_sel.Value() == DataSelect::Data32Low,
                         eop.data_sel.Value() == DataSelect::Data64, eop.data_lo, eop.data_hi,
-                        rbx_snap, Common::UniqueFunction<void>{[eop] {
+                        rbx_snap, Common::UniqueFunction<void>{[this, eop] {
                             eop.SignalFence(
-                                [](void* address, u64 data, u32 num_bytes) {
+                                [this](void* address, u64 data, u32 num_bytes) {
                                     ASSERT(Core::Memory::Instance()->TryWriteBacking(
                                         address, &data, num_bytes, 2));
+                                    NoteHostWrite(address, num_bytes, false); // sotc: SOTC_NATIVE=1
                                 },
                                 [] {
                                     Platform::IrqC::Instance()->Signal(
@@ -4333,14 +4354,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const PM4CmdEventWriteEop eop = *event_eop;
                     const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
                     // A GPU copy of the label's page must not be reused with the old value.
-                    if (eop.data_sel.Value() != DataSelect::None) {
+                    if (eop.data_sel.Value() != DataSelect::None && SotcNative::TracksGuestPages()) {
                         rasterizer->InvalidateMemory(label, 8, true);
                     }
                     rasterizer->GetScheduler().DeferPriorityOperation([this, eop] {
                         eop.SignalFence(
-                            [](void* address, u64 data, u32 num_bytes) {
+                            [this](void* address, u64 data, u32 num_bytes) {
                                 ASSERT(Core::Memory::Instance()->TryWriteBacking(address, &data,
                                                                                  num_bytes, 2));
+                                NoteHostWrite(address, num_bytes, false); // sotc: SOTC_NATIVE=1
                             },
                             [] {
                                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
@@ -4473,6 +4495,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         std::memcpy(address, data.data(), data_size);
                         Core::MemoryManager::NoteHostWrite(std::bit_cast<VAddr>(address),
                                                            data_size, 4);
+                        NoteHostWrite(address, data_size); // sotc: SOTC_NATIVE=1
                         if (rbx && rasterizer) { // sotc: SOTC_RB_EXACT rule 7
                             RbxNoteWritten(rbx_snap);
                         }
@@ -4717,7 +4740,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         ~PcRingAscDepth() { --pc_ring_asc_depth; }
     } const pc_ring_asc;
     if (pc_ring_asc.top && rasterizer && (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8)) {
-        BackOrRun([r = rasterizer] { VideoCore::PcRingCopy::OnSubmitStart(*r); });
+        BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); });
     }
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
@@ -4978,6 +5001,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     std::memcpy(address, data.data(), data_size);
                     Core::MemoryManager::NoteHostWrite(reinterpret_cast<VAddr>(address), data_size,
                                                        4);
+                    NoteHostWrite(address, data_size); // sotc: SOTC_NATIVE=1
                     if (rbx && rasterizer) { // sotc: SOTC_RB_EXACT rule 7
                         RbxNoteWritten(rbx_snap);
                     }
@@ -5093,13 +5117,16 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     const auto job = QueueDeferredLabel(
                         1, release.Address<VAddr>(), ds == DataSelect::Data32Low,
                         ds == DataSelect::Data64, release.data_lo, release.data_hi, rbx_snap,
-                        Common::UniqueFunction<void>{[release, pipe_id] {
+                        Common::UniqueFunction<void>{[this, release, pipe_id] {
                             release.SignalFence(
                                 [pipe_id] {
                                     Platform::IrqC::Instance()->Signal(
                                         static_cast<Platform::InterruptId>(pipe_id));
                                 },
                                 [](VAddr, u16, u16) {});
+                            if (release.data_sel.Value() != DataSelect::GdsMemStore) {
+                                NoteHostWrite(release.Address<void*>(), 8, false); // sotc: SOTC_NATIVE=1
+                            }
                         }});
                     if (honest_defer) {
                         job->label_kind = SotcLabels::Kind::ReleaseMem;
@@ -5122,6 +5149,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
                                                true);
                     });
+                if (release.data_sel.Value() != DataSelect::GdsMemStore) {
+                    NoteHostWrite(release.Address<void*>(), 8, false); // sotc: SOTC_NATIVE=1
+                }
                 if (rbx_label) {
                     RbxNoteWritten(rbx_snap); // rule 7: early label
                 }

@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
 namespace SotcNative {
@@ -50,6 +51,14 @@ enum class Kind : uint8_t {
 /// reads it waits for the upload. PerFrame: queued too, and marked CPU-modified by the draw thread (the bind
 /// then uploads the current bytes). GpuWritten: nothing queued.
 void Announce(uint64_t addr, uint64_t size, Kind kind);
+/// Number of Announce calls so far (monotonic). Stamps queued announces; the command processor reads it when it
+/// picks a submit up, and the drain counts the entries newer than that (timing audit, Report).
+uint64_t AnnounceSeq();
+/// A PerFrame announce made before its writer finished (at the allocation of a block, at the entry of the writer)
+/// was found changed at a later check and announced again (native_hooks.cpp). same_frame: no SubmitDone came
+/// between the first announce and the change (a real late write); else the engine may just have rewritten it.
+void NoteLateWrite(uint64_t size, bool same_frame);
+
 /// The engine freed or decommitted [addr, addr + size): drop its device copy and any pending upload.
 void Release(uint64_t addr, uint64_t size);
 
@@ -68,6 +77,11 @@ void NoteDescriptor(uint64_t desc_addr, uint64_t base, uint64_t size, uint32_t f
 /// and a fault the tracker never caused (a write is made writable again, a read is not handled).
 void NoteSkippedReadback(uint64_t addr, uint64_t size);
 void NoteStrayFault(uint64_t addr, bool is_write, uint64_t rip);
+/// Mode 1 without tracking: the command processor wrote guest memory (WRITE_DATA, DUMP_CONST_RAM) and told the
+/// buffer and texture caches (Liverpool, the write fault of mode 0 did this); counted for the report.
+void NoteCpGuestWrite(uint64_t size);
+/// Mode 1: a GPU-written image whose memory the game reused (idle, fully rewritten by announces) is refreshed.
+void NoteImageReused();
 
 /// Verify (mode 2): a CPU write the announces did not cover (from the page tracker's fault path), a CPU
 /// read of GPU-written memory (from the readback path), a CPU wait on the GPU outside FrameWait.

@@ -44,6 +44,13 @@ NATIVE_PARTICLE_SHIFT 0x101817, ParticleRenderer_ShiftRecords after the record w
                       record (r14 + r15) and the destination record ([rbp-0x30] + r15), each stride bytes (u32 at
                       this+0x74), Persistent. Shares no site with the other hooks.
 
+Flicker brief 2 (SOTC_VERIFY=n1 misses, native_hooks.cpp "Flicker brief 2"):
+NATIVE_SUNSHADOW_AFCC0 / _B0100  Site, ResolveSunShadows and its twin: the 0x10-byte zero-copy backing, the 0x18-byte
+                      bind block and the 0x60-byte constants chunk, PerFrame (counter sun).
+NATIVE_UDATA_85ECD0 / _85E5D0  Wrap, user-data packets written into the command buffer at [rdi+0x90] (the packet
+                      writer 0x884240 itself cannot be hooked: jump table). Pre/post cursor delta, PerFrame (pkt).
+NATIVE_PALETTE_A3EE50 Wrap, cloth skeleton matrix palette (joints * 0x40 bytes from 0x12820), PerFrame (pal).
+
 Resource and texture hooks of the first batch (NATIVE_RES_COPY, NATIVE_TEX_COPY, NATIVE_TEX_TAIL_COPY,
 NATIVE_MIP_COPY, NATIVE_MIP_RELEASE) are unchanged; see docs/re-stutters/native/impl-writes.md.
 
@@ -58,15 +65,9 @@ EU_FINGERPRINT = '72c1d4a99c42e34dc0c26d714a7137aceb33616195d8a8d23087ae167e3bb2
 
 HOOKS = [
     # --- first batch (persistent resource and mip writes) ---
-    dict(
-        name='NATIVE_RES_COPY',
-        switch='SOTC_NATIVE',
-        group='native_res',
-        mode='site',
-        # mov ecx,[rbp-0x34]; mov r9d,[rbp-0x30]; mov r10d,[rbp-0x2c]; ...: after the memcpy call in 0x8be60
-        pattern='8b 4d cc 44 8b 4d d0 44 8b 55 d4 4d 89 fe 48 8b',
-        expected={EU_FINGERPRINT: 0x8bf50},
-    ),
+    # NATIVE_RES_COPY (a Site after the initial-data memcpy in 0x8be60) is gone: every guest memcpy is announced by
+    # the runtime (src/runtime.c), and its detour made the engine refuse NATIVE_ZC_CREATE on the same function, so
+    # no zero-copy buffer was ever announced (1 Nov, n1verify: 0x199c4f, 0xafe13 bound without an announce).
     dict(
         name='NATIVE_TEX_COPY',
         switch='SOTC_NATIVE',
@@ -316,6 +317,114 @@ HOOKS = [
         # binds 192 KiB ranges over it; announced PerFrame before the body (read at the next submit).
         pattern='55 48 89 e5 41 57 41 56 53 48 83 ec 18 4c 8b 3d ?? ?? ?? ?? 48 89 fb 49 89 ce',
         expected={EU_FINGERPRINT: 0x18c390},
+    ),
+    # --- SOTC_VERIFY=n1 misses: plain-store buffers that the GPU binds the same or next frame (flicker brief 2) ---
+    dict(
+        name='NATIVE_UBUF_198BB0',
+        switch='SOTC_NATIVE',
+        group='native_ubuf',
+        mode='site',
+        # sub_198bb0 (BPXPR pass-through builder), right after the fill loop of the 0x804 zero-copy buffer (16 bytes per
+        # element, plain stores at 0x199c4f / 0x199c7b / 0x199c80) and the following `call 0x8c0d0`: r12 = end of the buffer
+        # (the loop advanced it 0x10 per element), r13 = param_1 (element list [+0x70, +0x78)). The 0x8be60 creator
+        # announced the buffer before the loop wrote it. Displaced: mov rcx,[rbp-0x610] (no RIP-relative operand).
+        pattern='48 8b 8d f0 f9 ff ff 4c 8d 75 b0 be',
+        expected={EU_FINGERPRINT: 0x199d62},
+    ),
+    dict(
+        name='NATIVE_UBUF_1AF960',
+        switch='SOTC_NATIVE',
+        group='native_ubuf',
+        mode='wrap',
+        # sub_1af960 (rdi = builder, [rdi+8] = the object; rsi = element vector): fills the 0x12820 buffers at obj+0x48,
+        # +0x50, +0x58, +0x60 and +0x70; the +0x60 / +0x70 ones (plain stores at 0x1afb79 / 0x1afbfd) are written after
+        # the 0x8be60 creators ran.
+        pattern='55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 68 48 8b 05 ?? ?? ?? ?? 48 8d 1d ??',
+        expected={EU_FINGERPRINT: 0x1af960},
+    ),
+    dict(
+        name='NATIVE_UBUF_1B0440',
+        switch='SOTC_NATIVE',
+        group='native_ubuf',
+        mode='wrap',
+        # sub_1b0440 (rdi = builder, [rdi+8] = the object; rsi = element vector): fills obj+0x40 (0x14 bytes per element)
+        # and, through sub_1b0080 (plain stores at 0x1b00a9), obj+0x78 (0x40 bytes per element).
+        pattern='55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 18 49 89 f6 4c 8d 05 ??',
+        expected={EU_FINGERPRINT: 0x1b0440},
+    ),
+    # --- foliage displacer per-frame block (impl-grass): the 8-byte 0x12820 block of each displacer job variant ---
+    dict(
+        name='NATIVE_DISP_BLOCK_D83B0',
+        switch='SOTC_NATIVE',
+        group='native_chunk',
+        mode='site',
+        # sub_d83b0 after `call 0x12820` (block size 8): mov rsi,[r14+0xb0]; mov r12,rax. rax = the block, the store of
+        # [r14+0xb0] into it follows. The displaced mov has no RIP-relative or rel32 operand; the signature is unique.
+        pattern='49 8b b6 b0 00 00 00 49 89 c4 b9 10',
+        expected={EU_FINGERPRINT: 0xd852b},
+    ),
+    dict(
+        name='NATIVE_DISP_BLOCK_D8660',
+        switch='SOTC_NATIVE',
+        group='native_chunk',
+        mode='site',
+        # sub_d8660 after `call 0x12820`: mov rsi,[r14+0xb0]; mov r13,rax (same contract as NATIVE_DISP_BLOCK_D83B0).
+        pattern='49 8b b6 b0 00 00 00 49 89 c5 b9 10',
+        expected={EU_FINGERPRINT: 0xd87cf},
+    ),
+    # --- flicker brief 2 (n1verify misses): plain-store writers that no announce covered ---
+    dict(
+        name='NATIVE_SUNSHADOW_AFCC0',
+        switch='SOTC_NATIVE',
+        group='native_sun',
+        mode='site',
+        # sub_afcc0 (ResolveSunShadows) after the last plain store of its blocks: the 0x10-byte zero-copy backing at
+        # [[r15+0x10]+0xf28], the constants chunk at [r15+0xb0] and the 0x18-byte bind block in r12. Site 0xaff60 is
+        # `mov rax,[r14+0x1ae0]`, right after `mov [r12+0x10],rax` (the displaced instruction has no RIP-relative
+        # or rel32 operand).
+        pattern='49 8b 86 e0 1a 00 00 48 85 c0 74 ?? 48 8b 00 80 78 19 02 75 ?? 49 8d 7e 50 48 8d 75 b0 ba 02 00 00 00 4c 89 65 b0 e8 ?? ?? ?? ?? 48',
+        expected={EU_FINGERPRINT: 0xaff60},
+    ),
+    dict(
+        name='NATIVE_SUNSHADOW_B0100',
+        switch='SOTC_NATIVE',
+        group='native_sun',
+        mode='site',
+        # sub_b0100, the twin of sub_afcc0: after `mov [rbx+0x10],rax` (rbx = the 0x18-byte bind block, r14 = the
+        # shadow object). Site 0xb03bd is `mov rax,[r12+0x20]`.
+        pattern='49 8b 44 24 20 8b 70 14 49 8b 84 f4 d8 01 00 00 48 85 c0 74 ?? 48 8b 00 80 78 19 02 75 ?? 48 89',
+        expected={EU_FINGERPRINT: 0xb03bd},
+    ),
+    dict(
+        name='NATIVE_UDATA_85ECD0',
+        switch='SOTC_NATIVE',
+        group='native_pkt',
+        mode='wrap',
+        # sub_85ecd0 (binds a user-data block: a 35-byte wrapper that tail-jumps to the packet writer 0x884240, which
+        # cannot be hooked itself: its jump table is an unresolved indirect branch). rdi = the context whose command
+        # buffer object is at [rdi+0x90] (cursor at +0x10). Pre/post read the cursor: the packet words in between.
+        pattern='48 8b 8f a8 18 00 00 48',
+        expected={EU_FINGERPRINT: 0x85ecd0},
+    ),
+    dict(
+        name='NATIVE_UDATA_85E5D0',
+        switch='SOTC_NATIVE',
+        group='native_pkt',
+        mode='wrap',
+        # sub_85e5d0 (user-data flush: SET_SH_REG packets and the embedded user-data table into the command buffer
+        # at [rdi+0x90]). Same cursor contract as NATIVE_UDATA_85ECD0.
+        pattern='55 48 89 e5 41 57 41 56 41 54 53 49 89 fc 41 80 bc 24 b0 18',
+        expected={EU_FINGERPRINT: 0x85e5d0},
+    ),
+    dict(
+        name='NATIVE_PALETTE_A3EE50',
+        switch='SOTC_NATIVE',
+        group='native_pal',
+        mode='wrap',
+        # sub_a3ee50 (cloth skeleton matrix palette builder, callers sub_a3e170 and sub_a3fa30): returns a 0x12820
+        # block of (bytes of the index vector at param_1+0x90..0x98) * 16 filled with plain stores.
+        pattern='55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 28 4c 8d 05',
+        expected={EU_FINGERPRINT: 0xa3ee50},
     ),
 ]
 

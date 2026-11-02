@@ -31,6 +31,7 @@
 #include "../../../sotc/native/native.h"       // sotc: SOTC_NATIVE (windows, announces, frame ticket)
 #include "../../../sotc/native/native_draw.h" // sotc: SOTC_NATIVE draw-thread side
 #include "../../../sotc/native/verify.h"      // sotc: SOTC_VERIFY (NoteGpuConsume)
+#include "../../../sotc/native/n1verify.h"    // sotc: SOTC_VERIFY=n1 (NoteBind)
 #include "../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST (L1)
 #include <xxhash.h>                     // sotc: SOTC_PC_RING=8 verify (XXH3)
 #include "video_core/buffer_cache/pc_ring_copy.h"      // sotc: SOTC_PC_RING=8 (HostMaintain)
@@ -1361,6 +1362,25 @@ void BufferCache::DiscardGpuModified(VAddr addr, u64 size) {
         gpu_modified_ranges.Subtract(addr, size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
+}
+
+bool BufferCache::NativeExactUpload(VAddr addr, u64 size) {
+    const Buffer* arena = ResidentArena(addr, size);
+    if (!arena) {
+        return false;
+    }
+    scheduler.AsyncSyncHost(); // sotc: N5 async: as SynchronizeMemoryFull, join moved dispatches first
+    const auto staging = staging_pool.Request(size, staging_pool.UploadType());
+    memory->CopySparseMemory(addr, staging.mapped, size);
+    staging.Flush();
+    const boost::container::small_vector<vk::BufferCopy, 1> copies{
+        vk::BufferCopy{staging.offset, addr - arena->cpu_addr, size}};
+    runtime.CopyBuffer(staging.buffer, arena, copies);
+    RecordCurrentWrite(addr, size);
+    // sotc: the exact copy sets no CPU bit, so the memory tracker's counters (mem_epoch, SotcGen,
+    // sync generations) would not see this CPU write; move them as a fault would.
+    memory_tracker->NoteCpuBytesChanged(addr, size);
+    return true;
 }
 
 void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
@@ -5841,6 +5861,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                                                         bool is_written, bool is_texel_buffer,
                                                         u32 mark_offset, u32 mark_size) {
     SotcLoadWarm::NoteBind(device_addr, size); // sotc: SOTC_LOAD_WARM (no-op when off)
+    if (SotcN1Verify::On() && SotcStats::t_draw_thread) { // sotc: SOTC_VERIFY=n1: the GPU binds this range
+        SotcN1Verify::NoteBind(device_addr, size, false);
+    }
     // sotc: SOTC_CLASS_TRACK: a GPU-bound granule is never CPU_ONLY. Draw thread only (the lookup
     // is rebuilt there); binds from other threads are rare and only delay the signal.
     if (SotcMemClasses::On() && SotcStats::t_draw_thread) {
@@ -7624,6 +7647,9 @@ void BufferCache::PcHostSubmitStart() {
 // GPU. None of them waits for the game thread, which is the only thread that calls this (the frame
 // boundary). WaitGpuIdle is the wait SubmitDone already does on that thread in the default gate.
 void BufferCache::PcHostNoteFrameRecorded(u64 seq) {
+    if (SotcN1Verify::On()) { // sotc: SOTC_VERIFY=n1: the draw thread's frame index
+        SotcN1Verify::NoteFrameRecorded(seq);
+    }
     // sotc: SOTC_NATIVE needs the same frame records for its frame ticket (NativeFrameWait).
     if (SotcPcRing::Ring8FlipWaitMode() != 2 && !SotcNative::On()) {
         return;
@@ -7801,19 +7827,47 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostServe(
 }
 
 // sotc: SOTC_NATIVE. Draw thread, once per submit: performs the queued announced uploads.
-void BufferCache::NativeDrain(u64 budget) {
+void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
     u64 spent = 0;
+    u64 warm_deferred = 0;
+    // sotc: the budget limits uploads only. A page mark costs nothing and has to reach every bind of this
+    // submit: stopping at the budget (as before, with marks counted as spent) carried the announces of the
+    // submit's own DCB, chunks and constants to a later drain, and the binds in between read them unmarked
+    // (a frame late). Marks are always made; Persistent uploads over the budget are postponed (native_warm).
+    while (!native_warm.empty() && spent < budget) {
+        const auto [warm_addr, warm_size] = native_warm.front();
+        native_warm.pop_front();
+        native_warm_bytes -= warm_size;
+        spent += DrainRange(warm_addr, warm_size);
+    }
     SotcNative::PendingUpload up{};
-    while (spent < budget && SotcNative::TakeUpload(up)) {
+    while (SotcNative::TakeUpload(up)) {
+        SotcNative::NoteDrainEntry(up.seq, pickup_seq, up.size);
         // The announce is the CPU write the fault path used to see. Images in the range are
         // invalidated as a guest write fault invalidates them (TextureCache::InvalidateMemory: dirty,
         // untracked, re-hashed at the next use), and the buffer range is marked CPU-modified. The mark
         // is needed for Persistent too: DrainRange skips a range that is not CPU-modified.
-        texture_cache.InvalidateMemory(up.addr, up.size);
+        texture_cache.InvalidateMemory(up.addr, up.size, !SotcNative::TracksGuestPages());
+        // sotc: without tracking, GPU-written bytes are never read back into guest memory, so a page
+        // mark over them would upload stale guest bytes over the GPU's (1 Nov: garbage geometry and
+        // textures after area loads). Only the announced bytes go up then.
+        if (!SotcNative::TracksGuestPages() && IsRegionGpuModified(up.addr, up.size) &&
+            NativeExactUpload(up.addr, up.size)) {
+            SotcNative::NoteExactUpload(up.size);
+            SotcN1Verify::NoteDrain(up.addr, up.size, true); // sotc: SOTC_VERIFY=n1 (announce record check)
+            spent += up.size;
+            continue;
+        }
+        SotcN1Verify::NoteDrain(up.addr, up.size, false); // sotc: SOTC_VERIFY=n1
         memory_tracker->MarkRegionAsCpuModified(up.addr, up.size);
         if (up.kind == SotcNative::Kind::PerFrame) {
             SotcNative::NoteMarked(up.size);
-            spent += up.size;
+            continue;
+        }
+        if (spent >= budget) {
+            native_warm.emplace_back(up.addr, up.size);
+            native_warm_bytes += up.size;
+            warm_deferred += up.size;
             continue;
         }
         // Persistent: the same sync the early bind uses (residency, CPU-dirty bytes copied; the copy
@@ -7823,6 +7877,29 @@ void BufferCache::NativeDrain(u64 budget) {
         SotcNative::NoteUploaded(bytes);
         spent += bytes;
     }
+    SotcNative::NoteDrainDone(warm_deferred, native_warm_bytes);
+}
+
+// sotc: SOTC_NATIVE=1. See buffer_cache.h. The page mark is what a write fault of mode 0 left behind
+// (CPU bit, bumped generations); over GPU-written bytes a mark would put stale guest bytes over the GPU's
+// at the next bind (nothing reads them back), so only the written bytes are copied, as NativeDrain does.
+// InvalidateMemory is not used for this: its readback callback drops the GPU bits of the whole page
+// (DiscardGpuModified) while the GPU bytes still live in the arena, and the write itself never reaches it.
+void BufferCache::NativeHostWrite(VAddr addr, u64 size, bool allow_exact) {
+    if (size == 0) {
+        return;
+    }
+    if (IsRegionGpuModified(addr, size)) {
+        if (!allow_exact) {
+            return;
+        }
+        if (NativeExactUpload(addr, size)) {
+            SotcNative::NoteExactUpload(size);
+            return;
+        }
+        // Not resident in one arena: the page mark of NativeDrain's fallback.
+    }
+    memory_tracker->MarkRegionAsCpuModified(addr, size);
 }
 
 // sotc: SOTC_NATIVE frame ticket (SotcNative::FrameBackend). The frame number is SubmitDone's count, the
@@ -8025,6 +8102,25 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
             for (const auto& copy : copies) {
                 SotcVerify::NoteGpuConsume(copy.dstOffset, copy.size, SotcVerify::ConsumePath::BufferUpload,
                                            size, is_written);
+            }
+            // sotc: SOTC VERIFY BYTES: the uploaded guest bytes against the native view (verify.h, part 5).
+            // A shader write bind marks its whole range GPU-written (read back by the next upload).
+            if (SotcVerify::BytesOn()) {
+                if (size <= SotcVerify::kBytesBindMax) {
+                    thread_local std::vector<u8> view_bytes;
+                    const SotcVerify::BindKind kind = SotcVerify::CurrentBindKind();
+                    for (const auto& copy : copies) {
+                        view_bytes.resize(copy.size);
+                        if (memory->TryCopySparseMemory(copy.dstOffset, view_bytes.data(), copy.size)) {
+                            SotcVerify::NoteUploadBytes(copy.dstOffset, copy.size, view_bytes.data(), kind);
+                        }
+                    }
+                    if (is_written) {
+                        SotcVerify::NoteGpuWrite(device_addr, size);
+                    }
+                } else {
+                    SotcVerify::NoteBytesSkipped();
+                }
             }
         }
         const SotcStats::FrameTimer frame_timer{SotcStats::FrameBuffer};

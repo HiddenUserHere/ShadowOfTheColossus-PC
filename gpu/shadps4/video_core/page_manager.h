@@ -127,6 +127,10 @@ public:
     /// state for it is read-write and the host protection is not (see FaultProtectScope).
     static void EnsureFaultPageWritable(VAddr page);
 
+    /// sotc: SOTC_VERIFY=n1 (gpu/sotc/native/n1verify.h). Protects [addr, addr + size) again from
+    /// the tracker's watcher state, after the N1VERIFY fault handler opened the pages. Draw thread.
+    static void N1VerifyRearm(VAddr addr, u64 size);
+
     /// sotc: SOTC_WRITE_DECL (bbgpu_declare_cpu_write, the runtime's memcpy/memset). The CPU is
     /// about to write [addr, addr + size) of guest memory. The pages a write fault would invalidate
     /// without a readback (write-protected, CPU-clean, no GPU data) are invalidated here, one call

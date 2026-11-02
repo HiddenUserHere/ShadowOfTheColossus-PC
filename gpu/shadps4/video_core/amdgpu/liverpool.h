@@ -539,6 +539,9 @@ private:
     void ProcessCommands();
     /// Writes an EOP/EOS fence value, keeping GPU caches of that memory coherent.
     void WriteFenceValue(void* address, u64 data, u32 num_bytes);
+    /// sotc: SOTC_NATIVE=1: the command processor wrote guest memory itself; tells the caches what the
+    /// write fault of mode 0 told them (Rasterizer::NoteHostWrite). A no-op in the other modes.
+    void NoteHostWrite(const void* address, u64 size, bool allow_exact = true);
     void Process(std::stop_token stoken);
 
     struct GpuQueue {

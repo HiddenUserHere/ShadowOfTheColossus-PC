@@ -145,6 +145,12 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool InvalidateMemoryOnGuestFault(VAddr addr, u64 size);
+    /// sotc: SOTC_NATIVE=1 (no page tracking): the command processor or draw thread wrote guest memory
+    /// [addr, addr + size) itself (WRITE_DATA, constant dumps, DMA on the host, label values). Mode 0 learned
+    /// it through the write fault; this tells the buffer cache and the texture cache. allow_exact: bytes over
+    /// GPU-written memory are copied to the arena (data the GPU reads); false for labels. No-op in modes 0 and
+    /// 2 (the tracker sees the write). Draw thread (or the command processor when there is none).
+    void NoteHostWrite(VAddr addr, u64 size, bool allow_exact = true);
     /// sotc: after a guest write fault at addr (BufferCache::MarkWriteAhead).
     void MarkWriteAhead(VAddr addr) {
         buffer_cache.MarkWriteAhead(addr);

@@ -75,10 +75,13 @@ uint64_t bbgpu_declare_cpu_write(void *address, uint64_t size, uint64_t return_a
 /* sotc: PC-native write announces for the runtime's copies (SOTC_NATIVE, gpu/sotc/native/native_hooks.cpp).
  * A code is 0 for nothing to announce, else 1 + SotcNative::Kind (1 Persistent, 2 PerFrame).
  * bbgpu_native_guest_write_kind(return_address): the code for a guest memcpy/memset/memmove whose caller is
- * return_address (the table of GPU-read destinations); lock-free. bbgpu_native_announce_write(dst, size, code)
+ * return_address (PerFrame for every caller while SOTC_NATIVE is on); lock-free. bbgpu_native_announce_write(dst, size, code)
  * announces [dst, dst+size) once the bytes landed; it takes a mutex (call it on the host stack). */
 uint32_t bbgpu_native_guest_write_kind(uint64_t return_address);
 void bbgpu_native_announce_write(void *dst, uint64_t size, uint32_t code);
+/* sotc: a file read landed [dst, dst+size) in guest memory: announced PerFrame (marked, never uploaded by the
+ * announce). Takes a mutex: call it on the host stack. */
+void bbgpu_native_announce_file_read(void *dst, uint64_t size);
 #ifdef __cplusplus
 }
 #endif

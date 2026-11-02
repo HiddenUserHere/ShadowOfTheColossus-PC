@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (TracksGuestPages)
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
@@ -566,6 +567,29 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     return true;
 }
 
+// sotc: SOTC_NATIVE=1 diagnostic (FLICKER-BRIEF2 audit). A replicate fill the HLE refuses runs on the GPU, and the
+// guest copy of its table stays as it was: without page tracking nothing reads it back for the CPU readers of
+// those tables (the SRT walker). The GPU-modified bits are sticky without readbacks, so more fills may be refused
+// than in mode 0. Printed every 5 s (draw thread only).
+static void NoteFillOnGpu(bool on_gpu) {
+    if (SotcNative::TracksGuestPages() && !SotcNative::Verify()) {
+        return;
+    }
+    static u64 runs = 0, gpu = 0;
+    static std::int64_t t0 = 0;
+    ++runs;
+    gpu += on_gpu ? 1 : 0;
+    const auto now = static_cast<std::int64_t>(SotcStats::NowNs());
+    if (t0 == 0) {
+        t0 = now;
+    } else if (now - t0 >= 5'000'000'000LL) {
+        std::fprintf(stderr, "SOTC NATIVE HLE fill: %llu replicate dispatches in 5 s, %llu refused (run on the GPU)\n",
+                     static_cast<unsigned long long>(runs), static_cast<unsigned long long>(gpu));
+        runs = gpu = 0;
+        t0 = now;
+    }
+}
+
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
     if (kHleSkipMode != 0) {
@@ -580,8 +604,10 @@ bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
             hle_skip_stats.runs.fetch_add(1, std::memory_order_relaxed);
         }
         if (!ExecuteReplicateShaderHLE(info, cs_program, rasterizer, wrote)) {
+            NoteFillOnGpu(true);
             return false;
         }
+        NoteFillOnGpu(false);
         if (kHleSkipMode != 0 && !wrote) {
             hle_skip_stats.noop.fetch_add(1, std::memory_order_relaxed);
         }

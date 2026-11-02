@@ -105,10 +105,56 @@ void Count(Counter c, uint64_t n = 1);
 /// As Count, and also records n under the caller address for the caller-split counters (a, b, c).
 void CountCaller(Counter c, uint64_t n, uint64_t caller);
 
+// ---- 5. Byte oracle (SOTC VERIFY BYTES) -----------------------------------------------------------
+// What mode 1 would hand the GPU differently from mode 0, byte for byte. The oracle keeps a "native view"
+// per 4 KiB page: the bytes the GPU holds as of the last upload of each byte (the old path's uploads, which
+// run in mode 2 and read the guest bytes). At each later upload it compares the guest bytes with the view:
+//   - a byte with an announce since its last refresh (announced) is refreshed: mode 1 uploads it;
+//   - a changed byte with no announce on it, but an announce on its page: mode 1's page-granular upload
+//     refreshes the page (covered_page), so it is not a mode 1 miss under that rule;
+//   - a changed byte with no announce on its page: a miss (miss_new the first time, miss_standing while the
+//     GPU keeps the stale bytes). The view keeps the old bytes, as mode 1 would.
+//   - a byte a shader wrote (gpu_origin, from a write bind): mode 1 keeps the GPU's bytes until an exact
+//     announce copies the byte, so a changed byte without an exact announce is a miss (miss_gpu_*).
+// Only binds of at most kBytesBindMax bytes and image uploads are compared. Views are capped (kViewPageCap).
+// Each miss is attributed to the RIP of the last write fault on its page (the page tracker, mode 2 only;
+// "unknown" when no fault was recorded).
+constexpr uint64_t kBytesBindMax = 64 * 1024;
+
+/// The bind kind of the uploads on this thread, for the SOTC VERIFY BYTES split.
+enum class BindKind : uint8_t { Vertex, Index, Constant, Storage, Texel, Image, Other, Count };
+BindKind CurrentBindKind();
+
+/// Sets the bind kind of the buffer uploads made in its scope (the rasterizer's bind sites).
+class BindKindScope {
+public:
+    explicit BindKindScope(BindKind kind);
+    ~BindKindScope();
+    BindKindScope(const BindKindScope&) = delete;
+    BindKindScope& operator=(const BindKindScope&) = delete;
+
+private:
+    BindKind prev_;
+};
+
+/// True when the byte oracle runs: SOTC_VERIFY and a native verify mode (SotcNative::Verify()).
+bool BytesOn();
+
+/// The old path uploads guest bytes [addr, addr + size) for the GPU; bytes = those guest bytes, read now.
+/// Compares them with the native view and refreshes the view as described above. Native verify only.
+void NoteUploadBytes(uint64_t addr, uint64_t size, const uint8_t* bytes, BindKind kind);
+
+/// A shader write bind covers [addr, addr + size): the GPU now holds bytes that differ from guest memory
+/// until the next upload of them (the old path reads them back there). Native verify only.
+void NoteGpuWrite(uint64_t addr, uint64_t size);
+
+/// A buffer bind above kBytesBindMax was not compared.
+void NoteBytesSkipped();
+
 // ---- Report ---------------------------------------------------------------------------------------
 
-/// The 5 s verify lines, appended to out: "SOTC VERIFY UNANNOUNCED", "SOTC VERIFY RANGE", "SOTC
-/// FRAMEDATA". Resets the window counters. Prints nothing when VerifyAll() is off and no native verify ran.
+/// The 5 s verify lines, appended to out: "SOTC VERIFY UNANNOUNCED", "SOTC VERIFY CONSUMED", "SOTC VERIFY
+/// BYTES" (part 5, byte oracle), "SOTC VERIFY RANGE", "SOTC FRAMEDATA". Resets the window counters. Prints nothing when VerifyAll() is off and no native verify ran.
 void Report(std::string& out, double seconds);
 
 /// The per-RIP aggregation of an unannounced write (called by SotcNative::VerifyUnannouncedWrite).

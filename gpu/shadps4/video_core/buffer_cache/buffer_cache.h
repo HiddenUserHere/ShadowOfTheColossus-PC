@@ -282,7 +282,13 @@ public:
     // sotc: SOTC_NATIVE (gpu/sotc/native). Draw thread, once per submit (cheap when nothing is queued):
     // performs queued announced uploads (Persistent through DrainRange, PerFrame as CPU-modified) until
     // budget bytes are uploaded.
-    void NativeDrain(u64 budget = u64{64} << 20);
+    /// pickup_seq: SotcNative::AnnounceSeq() when the command processor picked the submit up (timing counters).
+    void NativeDrain(u64 budget = u64{64} << 20, u64 pickup_seq = 0);
+    /// sotc: SOTC_NATIVE=1 (no tracking). The command processor or draw thread wrote guest memory itself
+    /// ([addr, addr + size), already written): the write fault of mode 0 told the cache, nothing does now.
+    /// A range holding GPU-written bytes gets exactly these bytes (allow_exact; else left alone, the host
+    /// write is a label nobody binds), any other range is marked CPU-modified. Draw thread, in stream order.
+    void NativeHostWrite(VAddr addr, u64 size, bool allow_exact);
 
     /// sotc: the arena holding [addr, addr + size) when the whole range is resident in one
     /// arena, else nullptr.
@@ -566,6 +572,15 @@ private:
     /// sotc: SOTC_NATIVE=1 (no tracking): the range stops being GPU-modified without a copy to guest
     /// memory. The CPU write that replaces the GPU bytes is announced; nothing reads them back.
     void DiscardGpuModified(VAddr addr, u64 size);
+    /// sotc: SOTC_NATIVE=1 (no tracking): copies exactly the guest bytes [addr, addr + size) into the
+    /// arena that holds them, without marking a page CPU-modified. For an announce over GPU-written
+    /// memory: a page mark would upload the whole page and put stale guest bytes over the GPU's.
+    /// False when no single arena holds the range (the caller marks the pages then).
+    bool NativeExactUpload(VAddr addr, u64 size);
+    /// sotc: SOTC_NATIVE. Persistent ranges the drain budget postponed. They are already marked CPU-modified
+    /// (a bind uploads them whatever happens here); a later drain only pre-uploads them. Draw thread only.
+    std::deque<std::pair<VAddr, u64>> native_warm;
+    u64 native_warm_bytes{};
     void FinishAsyncReadback(AsyncReadback& readback);
     /// sotc: true once the GPU copied an in-flight readback's data (its ahead copy, or its tick).
     bool IsReadbackComplete(const AsyncReadback& readback);

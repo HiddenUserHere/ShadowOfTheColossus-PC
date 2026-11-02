@@ -16,6 +16,18 @@
 //
 // Verify (SotcNative::Verify): nothing is served. The candidate's counts are kept for the call, and the
 // site after the load at 0x101a98 compares each exact count (r15d) with them.
+//
+// What the count feeds on the CPU (decomp, checked; the served value never reaches the GPU):
+// - ProcessStats retirement: count < 1 and the AutoDestroy grace (1 s since creation, or the forced flag)
+//   releases the system; the owner then sees an invalid handle.
+// - The system record +0xb4 (FUN_000fc2d0). Its only reader is FUN_000fc0a0 (scan of out/re/decomp), called by
+//   FUN_003096d0 (OnParticleCountBegin 0xb41adbdb / OnParticleCountEnd 0x7eb63229 events, kill event 0x3dbe79b1
+//   when the handle is gone), FUN_003bca70 (SetParticleCountVar: a float script variable) and FUN_003b0990
+//   (start/stop flag, ParticleCount).
+// - Draw submission (ParticleRenderer RenderTranslucent / RenderModels / PrepForRendering / UpdateSimulation) does
+//   not read the record: the particle draws use GPU-side data only.
+// So a served count that is one or two calls old moves those events, script variables and retirements by one or
+// two frames; it cannot change what the particle renderer draws. Counters: "older" and "fallback" in the report.
 #include "native_particles.h"
 
 #include <atomic>

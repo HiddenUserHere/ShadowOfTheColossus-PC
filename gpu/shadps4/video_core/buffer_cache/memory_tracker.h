@@ -489,6 +489,15 @@ public:
         });
     }
 
+    /// sotc: SOTC_NATIVE=1. Guest bytes changed by an exact copy (NativeExactUpload) that sets no CPU
+    /// bit. Moves the same counters a fault or MarkRegionAsCpuModified moves, so the memos keyed on
+    /// them (descriptor and bind caches, SotcGen sums) see the CPU write. Any thread.
+    void NoteCpuBytesChanged(VAddr cpu_addr, u64 size) noexcept {
+        SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds
+        BumpSyncGeneration(cpu_addr, size);
+        SotcGen::Bump(cpu_addr, size); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
+    }
+
     /// sotc: SOTC_SYNC_FAST. Sets gen to the sum of the write generations over [cpu_addr,
     /// cpu_addr + size) (RegionManager::SyncGenerationSum). False when the range is empty or a
     /// tracking region over it does not exist yet: ForEachUploadRange creates it with every page
