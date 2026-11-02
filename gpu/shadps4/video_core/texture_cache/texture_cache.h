@@ -538,6 +538,18 @@ public:
     /// the full path too and counts the hits that differ; the full path's answer is returned.
     [[nodiscard]] TexBind FindTextureIdentity(const TexIdentityKey& key, ImageDesc& desc,
                                               bool exact_fmt = false);
+    /// sotc: SOTC_TSLOT: what the identity memo answers for `key` when its entry holds, as a plain
+    /// bind takes it (FindTextureIdentity's hit, without the ImageDesc). Same checks (tex_epoch, uid,
+    /// Dirty, warm pending, track range, GenSumImage) and side effects (touch, GPU-bind evidence) as
+    /// the hit. The pre view info is not compared: `key` fixes it (ImageViewInfo reads the T# and
+    /// is_written / is_depth / is_array only). `want_view` also returns the view handle. False, and
+    /// nothing touched, when the entry does not hold.
+    struct TexSkip {
+        ImageId image_id{};
+        ImageViewInfo view_info{};
+        vk::ImageView view{};
+    };
+    [[nodiscard]] bool ProbeTextureIdentity(const TexIdentityKey& key, bool want_view, TexSkip& out);
     /// sotc: SOTC_GEN_TEX counters, appends one "SOTC TEX IDENTITY" line (nothing when off).
     static void ReportTexIdentity(std::string& out, double seconds);
     /// sotc: SOTC_RT_MAXEXTENT counters (render and depth target families), appends one

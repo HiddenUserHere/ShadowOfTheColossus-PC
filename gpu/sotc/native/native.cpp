@@ -78,6 +78,20 @@ struct Counters {
 Counters g_c;
 std::atomic<uint64_t> g_submitted_local{}; // frame counter when no backend is set
 std::atomic<size_t> g_pending_count{};     // size of g_pending (lock-free look)
+// sotc: SOTC_LEAN_SUBMIT=2 (verify). Bumped under g_mutex by every change that is not a draw-thread pop:
+// Announce (push or merge) and Release. A verify snapshot is compared only when the version did not move.
+uint64_t g_queue_version = 0;
+// sotc: SOTC_LEAN_SUBMIT=2 verify counters (printed by Report when the verify is on). compared: drains where the
+// snapshot was checked; raced: the queue changed (an announce or a release) between the snapshot and the end of
+// the drain, so it cannot be compared; mismatches: the snapshot differs from the entries the per-entry loop popped.
+std::atomic<uint64_t> g_take_compared{};
+std::atomic<uint64_t> g_take_raced{};
+std::atomic<uint64_t> g_take_mismatch{};
+// sotc: SOTC_LEAN_SUBMIT=2 (read once). The verify runs in NativeDrain; the report line is printed only then.
+const bool g_take_verify = [] {
+    const char* v = std::getenv("SOTC_LEAN_SUBMIT");
+    return v && v[0] == '2';
+}();
 std::atomic<uint64_t> g_announce_seq{};    // Announce calls (stamps PendingUpload::seq)
 
 std::mutex g_mutex; // the pending queue and the descriptor map
@@ -238,6 +252,7 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
     if (merged) {
         g_c.announce_merged.fetch_add(merged, std::memory_order_relaxed);
     }
+    ++g_queue_version;
     g_pending_count.store(PendingTotal(), std::memory_order_release);
 }
 
@@ -265,6 +280,7 @@ void Release(uint64_t addr, uint64_t size) {
         }
     }
     g_pending.swap(kept);
+    ++g_queue_version; // sotc: SOTC_LEAN_SUBMIT=2 verify (see g_queue_version)
     for (auto& m : g_overflow) {
         std::vector<std::pair<uint64_t, uint64_t>> parts;
         for (auto it = m.begin(); it != m.end();) {
@@ -467,6 +483,13 @@ void Report(std::string& out, double seconds) {
                       ull(take(g_c.drain_ranges)), ull(take(g_c.drain_pages)), ull(take(g_c.drain_invalidations)),
                       ull(take(g_c.drain_served)), ull(take(g_c.announce_served)), ull(take(g_c.announce_merged)));
         out += line;
+        if (g_take_verify) { // sotc: SOTC_LEAN_SUBMIT=2
+            std::snprintf(line, sizeof(line), "SOTC NATIVE TAKE VERIFY: compared %llu, raced %llu, mismatches %llu\n",
+                          ull(g_take_compared.exchange(0, std::memory_order_relaxed)),
+                          ull(g_take_raced.exchange(0, std::memory_order_relaxed)),
+                          ull(g_take_mismatch.exchange(0, std::memory_order_relaxed)));
+            out += line;
+        }
     }
     if (g_mode == 1) {
         std::snprintf(line, sizeof(line),
@@ -494,37 +517,101 @@ void Report(std::string& out, double seconds) {
 
 // ---- Draw-thread side (native_draw.h) ----
 
+// sotc: the pop rule of TakeUpload, shared with TakeUploads and PeekUploads. The queue front first; the
+// overflow (after the queue, one piece per pop) only when the queue is empty. Caller holds g_mutex. The
+// containers are templates so PeekUploads can run the same rule on copies.
+template <class Queue, class Overflow>
+bool PopUpload(Queue& pending, Overflow& overflow, PendingUpload& out) {
+    if (!pending.empty()) {
+        out = pending.front();
+        pending.pop_front();
+        return true;
+    }
+    for (int k = 0; k < 2; ++k) { // sotc: the overflow after the queue (see g_overflow)
+        auto& m = overflow[k];
+        if (m.empty()) {
+            continue;
+        }
+        auto it = m.begin();
+        const uint64_t piece = std::min<uint64_t>(kMaxUploadChunk, it->second - it->first);
+        out = PendingUpload{it->first, piece, k == 0 ? Kind::Persistent : Kind::PerFrame};
+        if (piece == it->second - it->first) {
+            m.erase(it);
+        } else {
+            const uint64_t rest_end = it->second;
+            const uint64_t rest = it->first + piece;
+            m.erase(it);
+            m.emplace(rest, rest_end);
+        }
+        return true;
+    }
+    return false;
+}
+
 bool TakeUpload(PendingUpload& out) {
     if (g_pending_count.load(std::memory_order_acquire) == 0) {
         return false;
     }
     std::scoped_lock lock{g_mutex};
-    if (g_pending.empty()) {
-        for (int k = 0; k < 2; ++k) { // sotc: the overflow after the queue (see g_overflow)
-            auto& m = g_overflow[k];
-            if (m.empty()) {
-                continue;
-            }
-            auto it = m.begin();
-            const uint64_t piece = std::min<uint64_t>(kMaxUploadChunk, it->second - it->first);
-            out = PendingUpload{it->first, piece, k == 0 ? Kind::Persistent : Kind::PerFrame};
-            if (piece == it->second - it->first) {
-                m.erase(it);
-            } else {
-                const uint64_t rest_end = it->second;
-                const uint64_t rest = it->first + piece;
-                m.erase(it);
-                m.emplace(rest, rest_end);
-            }
-            g_pending_count.store(PendingTotal(), std::memory_order_release);
-            return true;
-        }
+    if (!PopUpload(g_pending, g_overflow, out)) {
         return false;
     }
-    out = g_pending.front();
-    g_pending.pop_front();
     g_pending_count.store(PendingTotal(), std::memory_order_release);
     return true;
+}
+
+// sotc: SOTC_LEAN_SUBMIT=1. The same pops as repeated TakeUpload calls, under one lock.
+size_t TakeUploads(std::vector<PendingUpload>& out, size_t max) {
+    if (g_pending_count.load(std::memory_order_acquire) == 0) {
+        return 0;
+    }
+    std::scoped_lock lock{g_mutex};
+    size_t n = 0;
+    PendingUpload up{};
+    while (n < max && PopUpload(g_pending, g_overflow, up)) {
+        out.push_back(up);
+        ++n;
+    }
+    if (n != 0) {
+        g_pending_count.store(PendingTotal(), std::memory_order_release);
+    }
+    return n;
+}
+
+// sotc: SOTC_LEAN_SUBMIT=2 (verify). What TakeUploads would pop from the queue now, on copies: the queue is
+// not changed. Returns the queue version of that state (see g_queue_version).
+uint64_t PeekUploads(std::vector<PendingUpload>& out) {
+    std::scoped_lock lock{g_mutex};
+    std::deque<PendingUpload> pending(g_pending);
+    std::map<uint64_t, uint64_t> overflow[2] = {g_overflow[0], g_overflow[1]};
+    PendingUpload up{};
+    while (PopUpload(pending, overflow, up)) {
+        out.push_back(up);
+    }
+    return g_queue_version;
+}
+
+void VerifyTakeUploads(const std::vector<PendingUpload>& snapshot, const std::vector<PendingUpload>& popped,
+                       uint64_t version) {
+    bool same_version = false;
+    {
+        std::scoped_lock lock{g_mutex};
+        same_version = g_queue_version == version;
+    }
+    if (!same_version) {
+        g_take_raced.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_take_compared.fetch_add(1, std::memory_order_relaxed);
+    bool differs = snapshot.size() != popped.size();
+    for (size_t i = 0; !differs && i < snapshot.size(); ++i) {
+        const PendingUpload& a = snapshot[i];
+        const PendingUpload& b = popped[i];
+        differs = a.addr != b.addr || a.size != b.size || a.kind != b.kind || a.seq != b.seq || a.served != b.served;
+    }
+    if (differs) {
+        g_take_mismatch.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void SetFrameBackend(const FrameBackend& backend) {

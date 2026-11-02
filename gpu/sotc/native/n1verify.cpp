@@ -496,18 +496,15 @@ const char* WhoName(Who who) {
 
 } // namespace
 
-bool On() {
-    static const bool on = [] {
-        const char* native = std::getenv("SOTC_NATIVE");
-        const char* verify = std::getenv("SOTC_VERIFY");
-        const bool v = native && native[0] == '1' && verify && (verify[0] == 'n' || verify[0] == 'N') &&
-                       verify[1] == '1' && verify[2] == '\0';
-        if (v) {
-            std::fprintf(stderr, "SOTC N1VERIFY: on (mode 1 plus record-only page protection; diagnostic)\n");
-        }
-        return v;
-    }();
-    return on;
+bool InitOn() {
+    const char* native = std::getenv("SOTC_NATIVE");
+    const char* verify = std::getenv("SOTC_VERIFY");
+    const bool v = native && native[0] == '1' && verify && (verify[0] == 'n' || verify[0] == 'N') &&
+                   verify[1] == '1' && verify[2] == '\0';
+    if (v) {
+        std::fprintf(stderr, "SOTC N1VERIFY: on (mode 1 plus record-only page protection; diagnostic)\n");
+    }
+    return v;
 }
 
 Who Classify(uint64_t rip, bool gpu_side_thread) {

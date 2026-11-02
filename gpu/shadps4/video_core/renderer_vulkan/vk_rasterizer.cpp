@@ -25,6 +25,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/sotc_lod_stats.h"
+#include "video_core/texture_cache/tsharp_slot_cache.h" // sotc: SOTC_TSLOT
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -5557,10 +5558,26 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     // sotc: SOTC_N5_BDA_BUFFERS (vk_bda_table.h): 1 writes no descriptor for the slots the table
     // serves, 2 writes them and counts what 1 would drop. 0 when the device lacks bufferDeviceAddress.
     const u32 n5_buffers = BdaN5BuffersActive(instance);
+    // sotc: W1 diagnostic. The BDA table build is logged on the first frame only (flip 0), at most
+    // kBdaLogLines lines per process.
+    const bool bda_log = bda_stage && SotcStats::flip_count.load(std::memory_order_relaxed) == 0;
+    static std::atomic<u32> bda_logged{0};
+    constexpr u32 kBdaLogLines = 256;
+    const auto bda_log_line = [&] {
+        return bda_log && bda_logged.fetch_add(1, std::memory_order_relaxed) < kBdaLogLines;
+    };
     if (bda_stage) {
         bda_table.Begin(static_cast<u32>(stage.buffers.size()),
                         buffer_cache.GetStreamBuffer().BufferDeviceAddress());
         bind_cache_uncacheable = true; // the table is per draw
+        if (bda_log_line()) {
+            LOG_INFO(Render_Vulkan,
+                     "SOTC BDA first frame: stage {:#x} table of {} slots, null address {:#x}, "
+                     "{} buffer infos before it (static capacity {}), SOTC_N5_BDA {} SOTC_N5_BDA_BUFFERS {}",
+                     stage.pgm_hash, stage.buffers.size(),
+                     buffer_cache.GetStreamBuffer().BufferDeviceAddress(), buffer_infos.size(),
+                     buffer_infos.capacity(), n5_bda, n5_buffers);
+        }
     }
     for (const auto& desc : stage.buffers) {
         if (desc.IsSpecial()) {
@@ -5633,10 +5650,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 table_bytes = static_cast<u32>(bda_table.Bytes());
                 u64 offset{};
-                if (!bda_table.Lookup(stage.pgm_hash, buffer_cache.StreamGeneration(), &offset)) {
+                const bool table_reused =
+                    bda_table.Lookup(stage.pgm_hash, buffer_cache.StreamGeneration(), &offset);
+                if (!table_reused) {
                     offset = vk_buffer.Copy(bda_table.Words(), table_bytes, alignment);
                     // The generation after the copy: the copy may have wrapped the ring.
                     bda_table.Store(stage.pgm_hash, buffer_cache.StreamGeneration(), offset);
+                }
+                if (bda_log_line()) {
+                    LOG_INFO(Render_Vulkan,
+                             "SOTC BDA first frame: stage {:#x} table {} B at stream offset {:#x} "
+                             "(reused {}), buffer infos {} of {}",
+                             stage.pgm_hash, table_bytes, offset, table_reused, buffer_infos.size() + 1,
+                             buffer_infos.capacity());
                 }
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, table_bytes);
             } else {
@@ -5856,6 +5882,18 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     const bool has_address = buffer->HasBufferDeviceAddress();
                     bda_table.SetBlock(buf_index, has_address ? buffer->BufferDeviceAddress() : 0,
                                        buffer->SizeBytes(), offset, size);
+                    if (bda_log_line()) {
+                        const bool is_stream = static_cast<const void*>(buffer) ==
+                                               static_cast<const void*>(&buffer_cache.GetStreamBuffer());
+                        LOG_INFO(Render_Vulkan,
+                                 "SOTC BDA first frame: stage {:#x} slot {} vbase {:#x} size {:#x} "
+                                 "buffer {} address {:#x} buffer size {:#x} offset {:#x} "
+                                 "bda_slot {} drop_desc {}",
+                                 stage.pgm_hash, buf_index, vbase, size,
+                                 is_stream ? "stream" : "other",
+                                 has_address ? buffer->BufferDeviceAddress() : 0ULL,
+                                 buffer->SizeBytes(), offset, bda_slot, drop_desc);
+                    }
                     if ((n5_bda == 2 || n5_buffers == 2) && bda_slot && has_address) {
                         // Verify: the address the table gives must be the descriptor buffer's device
                         // address plus the offset the descriptor would have started at.
@@ -6479,6 +6517,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 }
 
+// sotc: SOTC_TSLOT: a binding whose ImageDesc the first loop of BindTexturesFull did not build (its
+// identity memo entry answered it). The second pass builds the descriptor from these when the image
+// needs a rebind. `view_info` is the view info the memo gave.
+struct LazyBind {
+    u32 index;
+    AmdGpu::Image tsharp;
+    const Shader::ImageResource* resource;
+    VideoCore::ImageViewInfo view_info;
+};
+
 void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                                   u32 set, const PreparedResources* pr, const PrStage* pr_stage,
                                   const TexBlockKey* tex_key, TexBlockMemo* rec) {
@@ -6500,6 +6548,11 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
         rec->bindless_push.fill(0);
     }
     const u32 first_image_idx = image_infos.size();
+    // sotc: SOTC_TSLOT: the switch; the T# of each stage image, read once (the bindless branch uses
+    // it); the bindings the first loop left without a descriptor (lazy_binds).
+    const int tslot_mode = VideoCore::TsharpSlotCache::Mode();
+    boost::container::small_vector<AmdGpu::Image, 8> stage_sharps;
+    boost::container::small_vector<LazyBind, 8> lazy_binds;
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
@@ -6513,6 +6566,7 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
         }
         ++image_index;
         const auto tsharp = pi ? pi->tsharp : image_desc.GetSharp(stage);
+        stage_sharps.push_back(tsharp);
         if (image_desc.array_size != 0) {
             store_ok = false; // sotc: SOTC_TEX_BLOCK: descriptor arrays are not stored
             // dynamic_tsharp_array_size (from Pink-shadPS4): one binding per table element, then a
@@ -6661,18 +6715,6 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
         const u32 num_bindings = pi ? pi->num_bindings : image_desc.NumBindings(stage);
 
         for (auto i = 0; i < num_bindings; i++) {
-            auto& [image_id, desc] = image_bindings.emplace_back(
-                std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
-
-            if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                ASSERT(num_bindings == 1);
-                desc.view_info.range.base.level += image_desc.constant_mip_index;
-                desc.view_info.range.extent.levels = 1;
-            } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                desc.view_info.range.base.level += i;
-                desc.view_info.range.extent.levels = 1;
-            }
-
             // sotc: SOTC_GEN_TEX (texture_cache FindTextureIdentity): a sampled texture whose T# words,
             // binding bits, image and guest range generation are as at its last clean bind skips the
             // FindImage lookup, the overlap scan and the refresh.
@@ -6683,9 +6725,43 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
                          u64{image_desc.is_array} << 2 | u64{image_desc.is_r128} << 3 |
                          u64{image_desc.constant_mip_index} << 8 |
                          u64(image_desc.mip_fallback_mode) << 16 | u64(image_desc.post_op) << 24;
-            image_id = desc.type == VideoCore::TextureCache::BindingType::Texture
-                           ? texture_cache.FindTextureIdentity(tkey, desc).image_id
-                           : texture_cache.FindImage(desc);
+            // sotc: SOTC_TSLOT: a plain sampled T# (one binding, no mip fallback, not written, no
+            // recording of the texture block or the bind cache) whose identity memo entry holds takes
+            // its image and view info from the memo, and builds no ImageDesc. Mode 2 takes the full
+            // path below too and compares the two answers (the full path's answer is used).
+            const bool plain = num_bindings == 1 && !image_desc.is_written &&
+                               mip_fallback_mode == Shader::MipStorageFallbackMode::None && !rec &&
+                               !bind_cache_recording;
+            VideoCore::TextureCache::TexSkip skip{};
+            const bool skipped = tslot_mode != 0 && plain &&
+                                 texture_cache.ProbeTextureIdentity(tkey, tslot_mode == 2, skip);
+            auto& [image_id, desc] = image_bindings.emplace_back();
+            if (skipped && tslot_mode == 1) {
+                image_id = skip.image_id;
+                desc.view_info = skip.view_info;
+                lazy_binds.push_back(LazyBind{static_cast<u32>(image_bindings.size() - 1), tsharp,
+                                              &image_desc, skip.view_info});
+            } else {
+                desc = VideoCore::TextureCache::ImageDesc(tsharp, image_desc);
+                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    ASSERT(num_bindings == 1);
+                    desc.view_info.range.base.level += image_desc.constant_mip_index;
+                    desc.view_info.range.extent.levels = 1;
+                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    desc.view_info.range.base.level += i;
+                    desc.view_info.range.extent.levels = 1;
+                }
+                image_id = desc.type == VideoCore::TextureCache::BindingType::Texture
+                               ? texture_cache.FindTextureIdentity(tkey, desc).image_id
+                               : texture_cache.FindImage(desc);
+                if (skipped) { // sotc: SOTC_TSLOT=2: the skip's answer is compared with this one
+                    const bool same =
+                        image_id == skip.image_id && desc.view_info == skip.view_info &&
+                        *texture_cache.GetImage(image_id).FindView(desc.view_info).image_view ==
+                            skip.view;
+                    VideoCore::TsharpSlotCache::NoteTexVerify(same);
+                }
+            }
             // sotc: SOTC_LOAD_WARM: record the plain single-binding sampled textures for the next
             // load of this area (load_warm.h); storage and mip-fallback binds are not replayed.
             if (SotcLoadWarm::TexturesEnabled() && num_bindings == 1 &&
@@ -6751,6 +6827,14 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
                 store_ok = false; // sotc: SOTC_TEX_BLOCK: found again, not stored
+                // sotc: SOTC_TSLOT: a lazy binding gets the descriptor the first loop did not build,
+                // with the view info its memo gave (what the full path's descriptor holds here).
+                for (const LazyBind& lazy : lazy_binds) {
+                    if (lazy.index == entry) {
+                        desc = VideoCore::TextureCache::ImageDesc(lazy.tsharp, *lazy.resource);
+                        desc.view_info = lazy.view_info;
+                    }
+                }
                 image_id = texture_cache.FindImage(desc);
                 if (bind_cache_recording && SotcStats::kBindCacheFrame) {
                     BindCacheNoteLookup(desc, image_id); // sotc: SOTC_BIND_CACHE_FRAME
@@ -6925,9 +7009,41 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
             const u32 heap_slot = Shader::BindlessImageSlotOf(stage, image_index);
             if (heap_slot != Shader::NO_BINDLESS_IMAGE_SLOT) {
                 const u32 key = Shader::BindlessImageKeyOf(stage, stage.images[image_index]);
-                const VideoCore::BindlessRef ref =
-                    BindlessImageIndex(*bindless_images, texture_cache, image_id, desc, key,
-                                       image_infos[image_info_idx].imageLayout);
+                const vk::ImageLayout layout = image_infos[image_info_idx].imageLayout;
+                // sotc: SOTC_TSLOT: a T# whose cached answer still holds (same image, view info, and
+                // the heap holds the view in this layout) takes its slot without the view lookup.
+                // The T# is read here, not from the prepared resources: it only picks the entry,
+                // the image and view info checked against the bind decide. SOTC_TSLOT=2 runs the old
+                // resolution too, compares, and uses its answer.
+                VideoCore::BindlessRef ref{};
+                VideoCore::TsharpSlotCache* tslot = nullptr;
+                AmdGpu::Image sharp{};
+                u64 image_uid = 0;
+                VideoCore::TsharpSlotCache::Entry* hit = nullptr;
+                if (image_id && (tslot = VideoCore::TsharpSlotCache::For(*bindless_images))) {
+                    sharp = stage_sharps[image_index];
+                    image_uid = texture_cache.GetImage(image_id).image_uid;
+                    hit = tslot->Find(sharp, key, image_id, image_uid, desc.view_info, layout);
+                }
+                const bool verify = hit && VideoCore::TsharpSlotCache::Mode() == 2;
+                if (hit && !verify) {
+                    ref = {key, hit->slot, hit->view};
+                    bindless_images->Use(key, hit->slot);
+                    if (bindless_images->Mode() == 2) {
+                        bindless_images->Verify(key, hit->slot, hit->view);
+                    }
+                } else {
+                    ref = BindlessImageIndex(*bindless_images, texture_cache, image_id, desc, key,
+                                             layout);
+                    if (tslot) {
+                        if (verify) {
+                            tslot->NoteVerify(hit->slot == ref.slot && hit->view == ref.view);
+                        }
+                        if (ref.slot != 0) {
+                            tslot->Store(sharp, key, image_id, image_uid, desc.view_info, ref);
+                        }
+                    }
+                }
                 const u32 shift = (heap_slot & 1) * 16;
                 auto& word = bindless_slots.image_words[heap_slot / 2];
                 word = (word & ~(0xFFFFu << shift)) | (ref.slot << shift);

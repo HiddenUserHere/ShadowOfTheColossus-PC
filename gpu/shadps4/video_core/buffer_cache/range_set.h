@@ -10,7 +10,11 @@
 #include <boost/pool/pool.hpp>
 #include <boost/pool/pool_alloc.hpp>
 #include <boost/pool/poolfwd.hpp>
+#include <algorithm>
+#include <utility>
+#include <vector>
 #include "common/types.h"
+#include "video_core/sotc_generation.h" // sotc: SOTC_FLAT_NOTES mode and its counters
 
 namespace VideoCore {
 
@@ -26,91 +30,137 @@ struct RangeSet {
                                  RangeSetsAllocator>;
     using IntervalType = typename IntervalSet::interval_type;
 
+    /// sotc: SOTC_FLAT_NOTES: how many intervals AddFast remembers as contained in the set.
+    static constexpr size_t KnownSlots = 16;
+
     explicit RangeSet() = default;
     ~RangeSet() = default;
 
-    /// sotc: returns whether the set grew (false: already contained).
+    /// sotc: returns whether the set grew (false: already contained). SOTC_FLAT_NOTES=2 also adds to
+    /// shadow_set and counts a disagreement; the shadow's answer is returned.
     bool Add(VAddr base_address, size_t size) {
-        const VAddr end_address = base_address + size;
-        IntervalType interval{base_address, end_address};
-        // sotc: draws mark the same written buffers again and again; a lookup costs far less
-        // than an insertion that changes nothing.
-        if (const auto it = m_ranges_set.find(interval);
-            it != m_ranges_set.end() && boost::icl::contains(*it, interval)) {
-            return false;
+        if (SotcGen::FlatNotesMode() == 2) {
+            const bool primary = AddIn(m_ranges_set, base_address, size);
+            const bool shadow = AddIn(shadow_set, base_address, size);
+            if (primary != shadow) {
+                SotcGen::Count(SotcGen::Stat::FlatMismatch);
+            }
+            return shadow;
         }
-        m_ranges_set.add(interval);
-        return true;
+        return AddIn(m_ranges_set, base_address, size);
+    }
+
+    /// sotc: SOTC_FLAT_NOTES: Add, but an interval inside a remembered one (contained in the set when
+    /// it was remembered; every change of the set forgets them) returns false without the lookup.
+    /// Same result and same set as Add in every mode. Mode 2: the remembered path runs on m_ranges_set
+    /// and the plain Add on shadow_set; the results must agree (FlatMismatch), the shadow's is returned.
+    bool AddFast(VAddr base_address, size_t size) {
+        const int mode = SotcGen::FlatNotesMode();
+        if (mode == 0 || size == 0) {
+            return Add(base_address, size);
+        }
+        bool grew = false;
+        if (KnownContains(base_address, size)) {
+            SotcGen::Count(SotcGen::Stat::FlatAddHit);
+        } else {
+            SotcGen::Count(SotcGen::Stat::FlatAddMiss);
+            grew = AddIn(m_ranges_set, base_address, size);
+            Remember(IntervalType{base_address, base_address + size});
+        }
+        if (mode == 2) {
+            const bool shadow = AddIn(shadow_set, base_address, size);
+            if (shadow != grew) {
+                SotcGen::Count(SotcGen::Stat::FlatMismatch);
+            }
+            return shadow;
+        }
+        return grew;
+    }
+
+    /// sotc: true when [base_address, base_address + size) lies inside one remembered interval, so the set
+    /// contains it. Read-only: the caller holds the lock that guards the set.
+    bool KnownContains(VAddr base_address, size_t size) const {
+        const IntervalType interval{base_address, base_address + size};
+        for (size_t i = 0; i < known_count; ++i) {
+            if (boost::icl::contains(known[i], interval)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void Subtract(VAddr base_address, size_t size) {
-        const VAddr end_address = base_address + size;
-        IntervalType interval{base_address, end_address};
-        m_ranges_set.subtract(interval);
+        ForgetKnown();
+        if (SotcGen::FlatNotesMode() == 2) {
+            SubtractIn(shadow_set, base_address, size);
+        }
+        SubtractIn(m_ranges_set, base_address, size);
     }
 
     void Clear() {
+        ForgetKnown();
+        if (SotcGen::FlatNotesMode() == 2) {
+            shadow_set.clear();
+        }
         m_ranges_set.clear();
     }
 
     /// sotc: SOTC_RB_TICK write ring.
     bool Empty() const {
-        return m_ranges_set.empty();
+        return Answer([](const IntervalSet& set) { return set.empty(); });
     }
 
     /// sotc: exchanges the contents without copying (the ring files a tick's writes).
     void Swap(RangeSet& other) {
         m_ranges_set.swap(other.m_ranges_set);
+        shadow_set.swap(other.shadow_set);
+        ForgetKnown();
+        other.ForgetKnown();
     }
 
     bool Contains(VAddr base_address, size_t size) const {
-        const VAddr end_address = base_address + size;
-        IntervalType interval{base_address, end_address};
-        return boost::icl::contains(m_ranges_set, interval);
+        const IntervalType interval{base_address, base_address + size};
+        return Answer([&](const IntervalSet& set) { return boost::icl::contains(set, interval); });
     }
 
     bool Intersects(VAddr base_address, size_t size) const {
-        const VAddr end_address = base_address + size;
-        IntervalType interval{base_address, end_address};
-        return boost::icl::intersects(m_ranges_set, interval);
+        const IntervalType interval{base_address, base_address + size};
+        return Answer([&](const IntervalSet& set) { return boost::icl::intersects(set, interval); });
     }
 
     template <typename Func>
     void ForEach(Func&& func) const {
-        if (m_ranges_set.empty()) {
+        if (SotcGen::FlatNotesMode() != 2) {
+            ForEachIn(m_ranges_set, func);
             return;
         }
-
-        for (const auto& set : m_ranges_set) {
-            const VAddr inter_addr_end = set.upper();
-            const VAddr inter_addr = set.lower();
-            func(inter_addr, inter_addr_end);
+        std::vector<std::pair<VAddr, VAddr>> primary, shadow;
+        ForEachIn(m_ranges_set, [&](VAddr lo, VAddr hi) { primary.emplace_back(lo, hi); });
+        ForEachIn(shadow_set, [&](VAddr lo, VAddr hi) { shadow.emplace_back(lo, hi); });
+        if (primary != shadow) {
+            SotcGen::Count(SotcGen::Stat::FlatMismatch);
+        }
+        for (const auto& [lo, hi] : shadow) {
+            func(lo, hi);
         }
     }
 
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (m_ranges_set.empty()) {
+        if (SotcGen::FlatNotesMode() != 2) {
+            ForEachInRangeIn(m_ranges_set, base_addr, size, func);
             return;
         }
-        const VAddr start_address = base_addr;
-        const VAddr end_address = start_address + size;
-        const IntervalType search_interval{start_address, end_address};
-        auto it = m_ranges_set.lower_bound(search_interval);
-        if (it == m_ranges_set.end()) {
-            return;
+        std::vector<std::pair<VAddr, VAddr>> primary, shadow;
+        ForEachInRangeIn(m_ranges_set, base_addr, size,
+                         [&](VAddr lo, VAddr hi) { primary.emplace_back(lo, hi); });
+        ForEachInRangeIn(shadow_set, base_addr, size,
+                         [&](VAddr lo, VAddr hi) { shadow.emplace_back(lo, hi); });
+        if (primary != shadow) {
+            SotcGen::Count(SotcGen::Stat::FlatMismatch);
         }
-        auto end_it = m_ranges_set.upper_bound(search_interval);
-        for (; it != end_it; it++) {
-            VAddr inter_addr_end = it->upper();
-            VAddr inter_addr = it->lower();
-            if (inter_addr_end > end_address) {
-                inter_addr_end = end_address;
-            }
-            if (inter_addr < start_address) {
-                inter_addr = start_address;
-            }
-            func(inter_addr, inter_addr_end);
+        for (const auto& [lo, hi] : shadow) {
+            func(lo, hi);
         }
     }
 
@@ -129,6 +179,97 @@ struct RangeSet {
     }
 
     IntervalSet m_ranges_set;
+
+private:
+    static bool AddIn(IntervalSet& set, VAddr base_address, size_t size) {
+        const VAddr end_address = base_address + size;
+        IntervalType interval{base_address, end_address};
+        // sotc: draws mark the same written buffers again and again; a lookup costs far less
+        // than an insertion that changes nothing.
+        if (const auto it = set.find(interval); it != set.end() && boost::icl::contains(*it, interval)) {
+            return false;
+        }
+        set.add(interval);
+        return true;
+    }
+
+    static void SubtractIn(IntervalSet& set, VAddr base_address, size_t size) {
+        const VAddr end_address = base_address + size;
+        IntervalType interval{base_address, end_address};
+        set.subtract(interval);
+    }
+
+    /// Mode 2 reader check: the query on both sets, a disagreement counted, the shadow's answer returned.
+    template <typename Query>
+    bool Answer(Query&& query) const {
+        if (SotcGen::FlatNotesMode() != 2) {
+            return query(m_ranges_set);
+        }
+        const bool primary = query(m_ranges_set);
+        const bool shadow = query(shadow_set);
+        if (primary != shadow) {
+            SotcGen::Count(SotcGen::Stat::FlatMismatch);
+        }
+        return shadow;
+    }
+
+    template <typename Func>
+    static void ForEachIn(const IntervalSet& set, Func&& func) {
+        if (set.empty()) {
+            return;
+        }
+
+        for (const auto& interval : set) {
+            const VAddr inter_addr_end = interval.upper();
+            const VAddr inter_addr = interval.lower();
+            func(inter_addr, inter_addr_end);
+        }
+    }
+
+    template <typename Func>
+    static void ForEachInRangeIn(const IntervalSet& set, VAddr base_addr, size_t size, Func&& func) {
+        if (set.empty()) {
+            return;
+        }
+        const VAddr start_address = base_addr;
+        const VAddr end_address = start_address + size;
+        const IntervalType search_interval{start_address, end_address};
+        auto it = set.lower_bound(search_interval);
+        if (it == set.end()) {
+            return;
+        }
+        auto end_it = set.upper_bound(search_interval);
+        for (; it != end_it; it++) {
+            VAddr inter_addr_end = it->upper();
+            VAddr inter_addr = it->lower();
+            if (inter_addr_end > end_address) {
+                inter_addr_end = end_address;
+            }
+            if (inter_addr < start_address) {
+                inter_addr = start_address;
+            }
+            func(inter_addr, inter_addr_end);
+        }
+    }
+
+    /// Remembers an interval that the set contains now (the oldest slot is overwritten when all are used).
+    /// The valid slots are always [0, known_count): writes start at 0 after every ForgetKnown.
+    void Remember(const IntervalType& interval) {
+        known[known_next] = interval;
+        known_next = (known_next + 1) % KnownSlots;
+        known_count = std::min(known_count + 1, KnownSlots);
+    }
+
+    /// Every change that can remove content from the set forgets the remembered intervals.
+    void ForgetKnown() {
+        known_count = 0;
+        known_next = 0;
+    }
+
+    IntervalSet shadow_set;                // sotc: SOTC_FLAT_NOTES=2 only: the plain set, kept in step
+    IntervalType known[KnownSlots];         // sotc: SOTC_FLAT_NOTES=1,2: intervals the set contains
+    size_t known_count = 0;
+    size_t known_next = 0;
 };
 
 template <typename T>

@@ -22,6 +22,7 @@
 #include <tlhelp32.h>
 #include <wchar.h>
 #include <mmsystem.h>
+#include <signal.h> /* sotc: SIGABRT for the fail-fast diagnostic */
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -1150,6 +1151,65 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
+/* sotc: fail-fast diagnostic (W1, BDA). std::terminate, abort() and the CRT invalid-parameter check
+ * end in __fastfail (exit code 0xc0000409), which bypasses the unhandled-exception filter, so they
+ * are handled here: a line with the cause and the host stack, then the process ends. This file is
+ * C: the C++ runtime is reached through its Itanium ABI names (libstdc++ is static in bb-probe), so
+ * the type of the active exception is printed mangled (N6Common14AssertFailureE, St9bad_alloc), but
+ * its what() is not. */
+extern void *__cxa_current_exception_type(void);
+/* Itanium C++ ABI: a std::type_info is { vtable pointer, const char *mangled name } (type_info::name is
+ * inline in libc++, so there is no symbol to call). */
+static const char *sotc_type_info_name(const void *type) { return ((const char *const *)type)[1]; }
+extern void (*sotc_set_terminate(void (*handler)(void)))(void) __asm__("_ZSt13set_terminatePFvvE");
+static volatile LONG sotc_fatal_seen;
+static void sotc_fatal_stack(void) {
+    void *frames[32];
+    char where[MAX_PATH+64];
+    USHORT count=CaptureStackBackTrace(1,32,frames,NULL);
+    for (USHORT i=0;i<count;++i) {
+        describe_address(where,sizeof(where),(uintptr_t)frames[i]);
+        fprintf(stderr,"    #%u %s\n",(unsigned)i,where);
+    }
+    fflush(stderr);
+}
+static void sotc_fatal_end(void) {
+    fflush(stdout);
+    fflush(stderr);
+    _exit(134);
+}
+static void sotc_terminate_handler(void) {
+    if (InterlockedExchange(&sotc_fatal_seen,1)) sotc_fatal_end();
+    const void *type=__cxa_current_exception_type();
+    if (type) fprintf(stderr,"SOTC FATAL: std::terminate, uncaught exception of type %s\n",sotc_type_info_name(type));
+    else fprintf(stderr,"SOTC FATAL: std::terminate without an active exception\n");
+    sotc_fatal_stack();
+    sotc_fatal_end();
+}
+static void sotc_abort_handler(int sig) {
+    (void)sig;
+    if (InterlockedExchange(&sotc_fatal_seen,1)) sotc_fatal_end();
+    fprintf(stderr,"SOTC FATAL: abort() (SIGABRT)\n");
+    sotc_fatal_stack();
+    sotc_fatal_end();
+}
+static void sotc_invalid_parameter(const wchar_t *expression, const wchar_t *function,
+                                   const wchar_t *file, unsigned int line, uintptr_t reserved) {
+    char expr[256]="?", func[128]="?", path[MAX_PATH]="?";
+    (void)reserved;
+    if (expression) WideCharToMultiByte(CP_UTF8,0,expression,-1,expr,sizeof(expr),NULL,NULL);
+    if (function) WideCharToMultiByte(CP_UTF8,0,function,-1,func,sizeof(func),NULL,NULL);
+    if (file) WideCharToMultiByte(CP_UTF8,0,file,-1,path,sizeof(path),NULL,NULL);
+    if (InterlockedExchange(&sotc_fatal_seen,1)) sotc_fatal_end();
+    fprintf(stderr,"SOTC FATAL: invalid parameter in %s (%s:%u): %s\n",func,path,line,expr);
+    sotc_fatal_stack();
+    sotc_fatal_end();
+}
+static void sotc_install_fail_fast_diagnostics(void) {
+    sotc_set_terminate(sotc_terminate_handler);
+    signal(SIGABRT,sotc_abort_handler);
+    _set_invalid_parameter_handler(sotc_invalid_parameter);
+}
 /* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
  * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
 uint32_t runtime_thread_tcb_offset(void);
@@ -1706,6 +1766,7 @@ int main(int argc, char **argv) {
         CreateThread(NULL,0,strcmp(getenv("SOTC_PROFILE"),"*") ? profiler : profiler_all,
                      (void *)getenv("SOTC_PROFILE"),0,NULL);
     SetUnhandledExceptionFilter(unhandled_fault);
+    sotc_install_fail_fast_diagnostics(); /* sotc: W1, the terminate / SIGABRT / invalid-parameter lines */
     if (getenv("BB_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
         strict.RaiseExceptionOnInvalidHandleReference=1;

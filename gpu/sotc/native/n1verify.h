@@ -38,8 +38,13 @@
 
 namespace SotcN1Verify {
 
-/// SOTC_NATIVE=1 and SOTC_VERIFY=n1 (read once).
-bool On();
+/// sotc: the environment read of SOTC_NATIVE=1 and SOTC_VERIFY=n1 (n1verify.cpp; prints the banner when on).
+bool InitOn();
+/// sotc: SOTC_NATIVE=1 and SOTC_VERIFY=n1, read once at static initialisation. It was a function-local static
+/// behind a call on every per-bind guard; now On() is a plain load of this flag in every translation unit.
+inline const bool kOnFlag = InitOn();
+/// SOTC_NATIVE=1 and SOTC_VERIFY=n1.
+inline bool On() { return kOnFlag; }
 
 /// Who made the access: decided from the faulting RIP and thread.
 enum class Who : uint8_t {

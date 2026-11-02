@@ -36,6 +36,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +51,15 @@ inline const bool kEnabled = [] {
     const char* v = std::getenv("SOTC_WRITE_EXTENT");
     return v && v[0] == '1';
 }();
+
+/// sotc: SOTC_FLAT_NOTES (read once). 0: NoteMark finds its entry by a linear scan (today's code). 1: an
+/// open-addressing table only. 2: the scan answers and the table is compared (flat mismatches, must read 0).
+inline const int kFlatMode = [] {
+    const char* v = std::getenv("SOTC_FLAT_NOTES");
+    return (v && v[0] == '1') ? 1 : ((v && v[0] == '2') ? 2 : 0);
+}();
+
+using FlatClock = std::chrono::steady_clock;
 
 struct Rule {
     uint64_t hash;
@@ -149,21 +159,80 @@ struct RingItem {
 struct State {
     static constexpr size_t MaxEntries = 512;
     static constexpr size_t RingSize = 4096;
+    static constexpr size_t TableSize = 1024; // sotc: SOTC_FLAT_NOTES: twice MaxEntries (a power of two)
     std::mutex mutex;
-    std::vector<Entry> entries;
+    std::vector<Entry> entries; // never erased: an entry's index is stable
     std::vector<RingItem> ring;
     size_t ring_next = 0;
     uint64_t unattributed = 0;
     uint64_t total_marked = 0;
+    // sotc: SOTC_FLAT_NOTES: slot -> entry index + 1 (0: empty). Filled only when kFlatMode != 0.
+    std::vector<uint32_t> table;
+    // sotc: SOTC_FLAT_NOTES window counters (ReportFlat takes and resets them).
+    uint64_t flat_marks = 0;
+    uint64_t flat_mismatch = 0;
+    uint64_t linear_ns = 0;
+    uint64_t table_ns = 0;
     State() {
         entries.reserve(MaxEntries);
         ring.reserve(RingSize);
+        if (kFlatMode != 0) {
+            table.assign(TableSize, 0);
+        }
     }
 };
 
 inline State& St() {
     static State state;
     return state;
+}
+
+/// Index of (hash, binding) in s.entries, or entries.size() when there is none (the linear scan).
+inline size_t LinearFind(const State& s, uint64_t hash, uint32_t binding) {
+    for (size_t i = 0; i < s.entries.size(); ++i) {
+        if (s.entries[i].hash == hash && s.entries[i].binding == binding) {
+            return i;
+        }
+    }
+    return s.entries.size();
+}
+
+/// sotc: SOTC_FLAT_NOTES: the first probe slot of (hash, binding) in the table.
+inline size_t TableSlot(uint64_t hash, uint32_t binding) {
+    const uint64_t h = (hash ^ (uint64_t{binding} << 40)) * 0x9E3779B97F4A7C15ull;
+    return static_cast<size_t>(h >> 32) & (State::TableSize - 1);
+}
+
+/// sotc: SOTC_FLAT_NOTES: the same answer as LinearFind, from the table (linear probing; the table holds at
+/// most MaxEntries of its TableSize slots, so a probe ends at an empty slot).
+inline size_t TableFind(const State& s, uint64_t hash, uint32_t binding) {
+    size_t slot = TableSlot(hash, binding);
+    for (size_t probe = 0; probe < State::TableSize; ++probe) {
+        const uint32_t v = s.table[slot];
+        if (v == 0) {
+            break;
+        }
+        const Entry& e = s.entries[v - 1];
+        if (e.hash == hash && e.binding == binding) {
+            return v - 1;
+        }
+        slot = (slot + 1) & (State::TableSize - 1);
+    }
+    return s.entries.size();
+}
+
+/// sotc: SOTC_FLAT_NOTES: records entries[index] in the table (its key is not in the table yet).
+inline void TableInsert(State& s, size_t index) {
+    size_t slot = TableSlot(s.entries[index].hash, s.entries[index].binding);
+    while (s.table[slot] != 0) {
+        slot = (slot + 1) & (State::TableSize - 1);
+    }
+    s.table[slot] = static_cast<uint32_t>(index + 1);
+}
+
+inline uint64_t NsSince(FlatClock::time_point t0) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(FlatClock::now() - t0).count());
 }
 
 /// BindBuffers, a written binding was marked: [mark_addr, mark_addr + mark_size) of the V#
@@ -173,17 +242,32 @@ inline void NoteMark(uint64_t hash, uint32_t binding, uintptr_t base, uint64_t r
     State& s = St();
     std::scoped_lock lock{s.mutex};
     size_t index = s.entries.size();
-    for (size_t i = 0; i < s.entries.size(); ++i) {
-        if (s.entries[i].hash == hash && s.entries[i].binding == binding) {
-            index = i;
-            break;
+    if (kFlatMode == 0) {
+        index = LinearFind(s, hash, binding);
+    } else {
+        if (kFlatMode == 2) {
+            const auto t0 = FlatClock::now();
+            index = LinearFind(s, hash, binding);
+            s.linear_ns += NsSince(t0);
         }
+        const auto t1 = FlatClock::now();
+        const size_t flat = TableFind(s, hash, binding);
+        s.table_ns += NsSince(t1);
+        if (kFlatMode == 1) {
+            index = flat;
+        } else if (flat != index) {
+            ++s.flat_mismatch;
+        }
+        ++s.flat_marks;
     }
     if (index == s.entries.size()) {
         if (index >= State::MaxEntries) {
             return;
         }
         s.entries.push_back({.hash = hash, .binding = binding});
+        if (kFlatMode != 0) {
+            TableInsert(s, index);
+        }
     }
     Entry& e = s.entries[index];
     e.marked_bytes += mark_size;
@@ -265,6 +349,27 @@ inline void Take(char* out, size_t out_size) {
     }
     s.unattributed = 0;
     s.total_marked = 0;
+}
+
+/// sotc: SOTC_FLAT_NOTES: the "SOTC FLAT NOTES (write marks)" text of the period into out, starts a new period.
+/// Empty when the switch is 0. Called from the SOTC_FPS report next to Take (driver.cpp).
+inline void ReportFlat(char* out, size_t out_size, double seconds) {
+    out[0] = 0;
+    if (kFlatMode == 0) {
+        return;
+    }
+    State& s = St();
+    std::scoped_lock lock{s.mutex};
+    const double secs = seconds > 0.0 ? seconds : 1.0;
+    std::snprintf(out, out_size,
+                  "SOTC FLAT NOTES (write marks): mode %d, marks %.0f/s, linear scan %.0f ns/s, table %.0f ns/s, "
+                  "mismatches %llu",
+                  kFlatMode, static_cast<double>(s.flat_marks) / secs, static_cast<double>(s.linear_ns) / secs,
+                  static_cast<double>(s.table_ns) / secs, static_cast<unsigned long long>(s.flat_mismatch));
+    s.flat_marks = 0;
+    s.flat_mismatch = 0;
+    s.linear_ns = 0;
+    s.table_ns = 0;
 }
 
 } // namespace SotcWriteExtent

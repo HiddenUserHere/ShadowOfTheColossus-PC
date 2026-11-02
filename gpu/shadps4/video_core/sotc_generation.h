@@ -60,25 +60,54 @@ inline bool Bumps() {
     return kBindMode != 0 || kDmaMode != 0;
 }
 
+/// sotc: SOTC_FLAT_NOTES (read once), for the flat notes of the GPU-modified sets (range_set.h): 0 off,
+/// 1 the remembered-interval add, 2 verify (shadow sets compared at every reader; mismatches counted).
+inline int FlatNotesMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_FLAT_NOTES");
+        return (v && v[0] == '1') ? 1 : ((v && v[0] == '2') ? 2 : 0);
+    }();
+    return mode;
+}
+
 /// True when [addr, addr + size) lies inside the tracked 40-bit space. Outside it Bump is a no-op
 /// and Sum does not see the range, so a cached answer must not be stored for it.
 inline bool Covered(u64 addr, u64 size) {
     return size != 0 && addr < (u64{1} << kAddrBits) && size <= (u64{1} << kAddrBits) - addr;
 }
 
+/// The granule loop of Bump (sotc_generation.cpp). Callers use Bump, which tests the switches first.
+void BumpRange(u64 addr, u64 size);
+
 /// Adds one to every granule that [addr, addr + size) touches. Any thread, lock-free. Call it
 /// AFTER the store that made the invalidation visible (release): a reader that loads the Sum
 /// before its sync and sees the old value is then ordered before the change.
-void Bump(u64 addr, u64 size);
+/// sotc: the early return is inline (no call when no switch reads the generations or the range is
+/// outside the tracked space); the same two tests lead BumpRange in the old single function.
+inline void Bump(u64 addr, u64 size) {
+    if (!Bumps() || !Covered(addr, size)) {
+        return;
+    }
+    BumpRange(addr, size);
+}
 
 /// Bump for the bits of one RegionManager word: word_base is the CPU address of its first page
 /// (256 KiB, aligned), page_mask has bit p set for page p of the word (4 KiB each). Bumps the
 /// granules that hold a set page. Any thread, lock-free.
 void BumpWordPages(u64 word_base, u64 page_mask);
 
+/// The sum loop of Sum (sotc_generation.cpp). Callers use Sum, which tests the range first.
+u64 SumRange(u64 addr, u64 size);
+
 /// Sum of the counters of the granules [addr, addr + size). It changes whenever any granule of
 /// the range was bumped since the last call that read it (counters only grow). Any thread.
-u64 Sum(u64 addr, u64 size);
+/// sotc: the range test is inline; SumRange does the loads.
+inline u64 Sum(u64 addr, u64 size) {
+    if (!Covered(addr, size)) {
+        return 0;
+    }
+    return SumRange(addr, size);
+}
 
 /// Counters reported by Report (window, reset by Report).
 enum class Stat : u32 {
@@ -88,6 +117,9 @@ enum class Stat : u32 {
     DmaRunSkip,         // SOTC_GEN_DMA: runs skipped by the DMA sweep
     DmaRunSync,         // SOTC_GEN_DMA: runs synced by the DMA sweep
     DmaVerifyMismatch,  // SOTC_GEN_DMA=2: skipped runs that would have uploaded bytes
+    FlatAddHit,         // SOTC_FLAT_NOTES: GPU-modified adds skipped by a remembered interval
+    FlatAddMiss,        // SOTC_FLAT_NOTES: GPU-modified adds that ran the set insert
+    FlatMismatch,       // SOTC_FLAT_NOTES=2: shadow set answers or add results that differ
     Count
 };
 

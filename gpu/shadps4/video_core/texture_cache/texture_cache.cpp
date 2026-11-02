@@ -30,7 +30,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_adaptive.h"
-#include "video_core/sotc_generation.h" // sotc: SOTC_GEN_TEX (guest range generations)
+#include "video_core/sotc_generation.h"
+#include "video_core/texture_cache/tsharp_slot_cache.h" // sotc: SOTC_TSLOT (identity skip) // sotc: SOTC_GEN_TEX (guest range generations)
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM (upload budget)
 #include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM (records and replay)
 #include "../../../sotc/native/native.h" // sotc: SotcNative::Verify
@@ -1501,7 +1502,11 @@ static std::atomic<u64> tid_mismatch{};
 int TextureCache::TexIdentityMode() {
     static const int mode = [] {
         const char* v = std::getenv("SOTC_GEN_TEX");
-        const int m = v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+        int m = v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+        // sotc: SOTC_TSLOT skips through this memo (ProbeTextureIdentity): it is on with it.
+        if (m == 0 && TsharpSlotCache::Mode() != 0) {
+            m = 1;
+        }
         if (m != 0 && !GenOn()) {
             LOG_WARNING(Render_Vulkan, "SOTC_GEN_TEX={} ignored: the generation tracking is off", m);
             return 0;
@@ -1648,6 +1653,55 @@ TextureCache::TexBind TextureCache::FindTextureIdentity(const TexIdentityKey& ke
         }
     }
     return {image_id, &view};
+}
+
+// sotc: SOTC_TSLOT: the identity memo's hit for a plain bind, without the ImageDesc (see the header).
+bool TextureCache::ProbeTextureIdentity(const TexIdentityKey& key, bool want_view, TexSkip& out) {
+    if (TexIdentityMode() == 0 || !tex_id_memos) {
+        return false;
+    }
+    const TexIdMemo& memo = (*tex_id_memos)[TexIdentityHash(key) % NumTexIdMemos];
+    std::unique_lock lock{mutex, std::defer_lock};
+    LockCounted(lock);
+    // The checks of FindTextureIdentity's check(), with exact_fmt false and no pre view info.
+    if (!memo.valid || !(memo.key == key) || memo.exact_fmt) {
+        TsharpSlotCache::NoteTexSkip(false);
+        return false;
+    }
+    if (memo.epoch != tex_epoch) {
+        TsharpSlotCache::NoteTexSkip(false);
+        return false;
+    }
+    const Image& state = slot_images[memo.image_id];
+    const VAddr begin = state.info.guest_address;
+    const u64 size = state.info.guest_size;
+    if (state.image_uid != memo.image_uid || False(state.flags & ImageFlagBits::Registered) ||
+        True(state.flags & ImageFlagBits::Dirty) || state.sotc_warm_pending ||
+        state.info.sotc_first_mip || state.track_addr != begin ||
+        state.track_addr_end != begin + size || GenSumImage(state) != memo.sum) {
+        TsharpSlotCache::NoteTexSkip(false);
+        return false;
+    }
+    // The memo hit's side effects, as apply() in FindTextureIdentity does them.
+    Image& image = slot_images[memo.image_id];
+    FlushTexProtect();
+    image.tick_prev_accessed = image.tick_accessed_last;
+    image.tick_accessed_last = scheduler.CurrentTick();
+    TouchImage(image);
+    if (SotcMemClasses::On() && SotcStats::t_draw_thread) {
+        SotcMemClasses::NoteGpuBind(image.info.guest_address, image.info.guest_size);
+    }
+    if (SotcPcPlaceGlue::On()) {
+        SotcPcPlaceGlue::Global().OnGpuBind(image.info.guest_address, image.info.guest_size);
+    }
+    out.image_id = memo.image_id;
+    out.view_info = memo.view_info;
+    out.view = vk::ImageView{};
+    if (want_view) {
+        out.view = *image.FindView(out.view_info).image_view;
+    }
+    TsharpSlotCache::NoteTexSkip(true);
+    return true;
 }
 
 void TextureCache::ReportTexIdentity(std::string& out, double seconds) {

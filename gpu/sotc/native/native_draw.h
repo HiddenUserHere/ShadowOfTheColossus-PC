@@ -4,7 +4,9 @@
 // are the hand-offs BufferCache uses at its submit start. Nothing else includes this.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "native.h"
 
@@ -23,6 +25,17 @@ struct PendingUpload {
 
 /// Draw thread. Pops the oldest pending upload. False when none is queued.
 bool TakeUpload(PendingUpload& out);
+
+/// sotc: SOTC_LEAN_SUBMIT=1. Draw thread. Pops up to max uploads, in the order repeated TakeUpload calls would,
+/// under one lock. Returns the count popped.
+size_t TakeUploads(std::vector<PendingUpload>& out, size_t max);
+/// sotc: SOTC_LEAN_SUBMIT=2 (verify). Draw thread. Copies what TakeUploads would pop now into out; the queue is
+/// not changed. Returns the queue version of that state.
+uint64_t PeekUploads(std::vector<PendingUpload>& out);
+/// sotc: SOTC_LEAN_SUBMIT=2 (verify). Draw thread. Compares a PeekUploads snapshot with the entries the per-entry
+/// loop popped. Counts a race (not compared) when the queue changed since the snapshot (announce or release).
+void VerifyTakeUploads(const std::vector<PendingUpload>& snapshot, const std::vector<PendingUpload>& popped,
+                       uint64_t version);
 
 /// The frame ticket's backend, set once by the rasterizer owner (BufferCache): the frame counter of the
 /// guest (SubmitDone calls) and the GPU ticket recorded for each frame.

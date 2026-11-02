@@ -49,6 +49,7 @@ extern "C" uintptr_t runtime_sotc_heap(void);
 extern "C" uintptr_t runtime_sotc_heap_table(void);
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA (BdaTableMode, arena memory flags)
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -6080,10 +6081,20 @@ u64 BufferCache::AddGpuModified(VAddr addr, u64 size) {
             return hot_seq;
         }
     }
-    bool grew;
-    {
+    // sotc: SOTC_FLAT_NOTES=1: a range the set is known to contain is answered under the shared lock
+    // (AddFast returns false for it and changes nothing, so no write lock is needed). Mode 2 and the
+    // other modes always take the write lock (AddFast: mode 0 is Add, mode 2 mirrors into the shadow).
+    bool grew = false;
+    bool known = false;
+    if (SotcGen::FlatNotesMode() == 1 && size != 0) {
+        std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+        known = gpu_modified_ranges.KnownContains(addr, size);
+    }
+    if (known) {
+        SotcGen::Count(SotcGen::Stat::FlatAddHit);
+    } else {
         std::unique_lock gpu_modified_lock{gpu_modified_mutex};
-        grew = gpu_modified_ranges.Add(addr, size);
+        grew = gpu_modified_ranges.AddFast(addr, size);
     }
     if (!clean_pages_used || size == 0 || (!grew && nogrow_skip)) {
         return hot_seq;
@@ -7853,20 +7864,51 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
     static thread_local std::vector<SotcNative::PendingUpload> merged;
     taken.clear();
     merged.clear();
-    SotcNative::PendingUpload up{};
-    while (SotcNative::TakeUpload(up)) {
-        SotcNative::NoteDrainEntry(up.seq, pickup_seq, up.size);
+    // sotc: SOTC_LEAN_SUBMIT (read once). 1: the queue is popped under one lock (TakeUploads) and then handled.
+    // 2: the per-entry loop as before (its result is used), checked against a snapshot of the queue taken before
+    // it (PeekUploads, VerifyTakeUploads; counted, not used). Unset or other: the per-entry loop as before.
+    static const int take_mode = [] {
+        const char* v = std::getenv("SOTC_LEAN_SUBMIT");
+        return v && v[0] == '1' ? 1 : (v && v[0] == '2' ? 2 : 0);
+    }();
+    static thread_local std::vector<SotcNative::PendingUpload> popped;
+    static thread_local std::vector<SotcNative::PendingUpload> snapshot;
+    popped.clear();
+    snapshot.clear();
+    const auto handle = [&](const SotcNative::PendingUpload& u) {
+        SotcNative::NoteDrainEntry(u.seq, pickup_seq, u.size);
         // The announce is the CPU write the fault path used to see. Images in the range are
         // invalidated as a guest write fault invalidates them (TextureCache::InvalidateMemory: dirty,
         // untracked, re-hashed at the next use), and the buffer range is marked CPU-modified. The mark
         // is needed for Persistent too: DrainRange skips a range that is not CPU-modified.
-        texture_cache.InvalidateMemory(up.addr, up.size, !SotcNative::TracksGuestPages());
+        texture_cache.InvalidateMemory(u.addr, u.size, !SotcNative::TracksGuestPages());
         ++invalidations;
-        if (up.served) {
+        if (u.served) {
             ++served;
-            continue;
+            return;
         }
-        taken.push_back(up);
+        taken.push_back(u);
+    };
+    if (take_mode == 1) {
+        SotcNative::TakeUploads(popped, ~size_t{0});
+        for (const auto& u : popped) {
+            handle(u);
+        }
+    } else {
+        uint64_t version = 0;
+        if (take_mode == 2) {
+            version = SotcNative::PeekUploads(snapshot);
+        }
+        SotcNative::PendingUpload up{};
+        while (SotcNative::TakeUpload(up)) {
+            if (take_mode == 2) {
+                popped.push_back(up);
+            }
+            handle(up);
+        }
+        if (take_mode == 2) {
+            SotcNative::VerifyTakeUploads(snapshot, popped, version);
+        }
     }
     std::sort(taken.begin(), taken.end(), [](const SotcNative::PendingUpload& a, const SotcNative::PendingUpload& b) {
         return a.kind != b.kind ? a.kind < b.kind : a.addr < b.addr;
@@ -8620,7 +8662,11 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
         -> std::optional<std::pair<vk::DeviceMemory, u64>> {
         // exact: only the asked size, for a nearly full card that has no 64 MiB left (#137).
         const u64 chunk_blocks = exact ? blocks : std::max<u64>(ARENA_CHUNK_SIZE >> block_shift, blocks);
+        // sotc: SOTC_BDA: arena buffers get device addresses (the BDA block table), so their memory
+        // needs VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT.
+        const vk::MemoryAllocateFlagsInfo bda_flags{.flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
         const vk::MemoryAllocateInfo alloc_info = {
+            .pNext = Vulkan::BdaTableMode(instance) != 0 ? &bda_flags : nullptr,
             .allocationSize = chunk_blocks << block_shift,
             .memoryTypeIndex = memory_type,
         };
@@ -8746,7 +8792,11 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocksHost(u64 blocks
     // A new chunk, mapped whole so that the CPU can reach any run in it. Not counted in
     // SotcStats::arena_bytes (the device eviction budget, ArenaUsedBytes): hrr_host_bytes only.
     const u64 chunk_blocks = std::max<u64>(ARENA_HOST_CHUNK_SIZE >> block_shift, blocks);
+    // sotc: SOTC_BDA: arena buffers get device addresses (the BDA block table), so their memory
+    // needs VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT.
+    const vk::MemoryAllocateFlagsInfo bda_flags{.flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
     const vk::MemoryAllocateInfo alloc_info = {
+        .pNext = Vulkan::BdaTableMode(instance) != 0 ? &bda_flags : nullptr,
         .allocationSize = chunk_blocks << block_shift,
         .memoryTypeIndex = memory_type,
     };

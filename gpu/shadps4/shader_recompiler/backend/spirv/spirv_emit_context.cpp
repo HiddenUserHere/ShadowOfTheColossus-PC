@@ -968,14 +968,25 @@ Id EmitContext::BdaPointer(Id address, Id elem_type) {
 Id EmitContext::BdaLoad(u32 handle, Id index, u32 elem_size, Id elem_type, Id zero,
                         Id result_type, u32 count) {
     const auto [address, valid] = BdaAddress(handle, index, elem_size, count);
-    boost::container::static_vector<Id, 4> ids;
+    // sotc: SOTC_BDA: the loads run only when the access is valid, as the guarded atomics do
+    // (emit_spirv_atomic.cpp). BdaAddress picks the block start for an invalid access, and a
+    // physical-address load there is not bounded by robustBufferAccess (a block smaller than the
+    // access reads past its end). The phi takes zero from the header.
+    const Id header = last_label;
+    const Id merge = BdaBeginIf(valid);
+    boost::container::static_vector<Id, 4> values;
     for (u32 i = 0; i < count; i++) {
         const Id elem_address = i == 0 ? address
                                        : OpIAdd(U64, address,
                                                 Constant(U64, static_cast<u64>(i * elem_size)));
-        const Id value = OpLoad(elem_type, BdaPointer(elem_address, elem_type),
-                                spv::MemoryAccessMask::Aligned, elem_size);
-        ids.push_back(OpSelect(elem_type, valid, value, zero));
+        values.push_back(OpLoad(elem_type, BdaPointer(elem_address, elem_type),
+                                spv::MemoryAccessMask::Aligned, elem_size));
+    }
+    const Id then_end = last_label;
+    BdaEndIf(merge);
+    boost::container::static_vector<Id, 4> ids;
+    for (u32 i = 0; i < count; i++) {
+        ids.push_back(OpPhi(elem_type, values[i], then_end, zero, header));
     }
     return count == 1 ? ids[0] : OpCompositeConstruct(result_type, ids);
 }

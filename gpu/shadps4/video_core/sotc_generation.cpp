@@ -72,11 +72,8 @@ void BumpGranule(u64 granule, u64 n) {
 
 } // namespace
 
-void Bump(u64 addr, u64 size) {
-    // sotc: no counter work at all while no switch reads the generations (call sites on hot paths).
-    if (!Bumps() || !Covered(addr, size)) {
-        return;
-    }
+// sotc: the caller (Bump, sotc_generation.h) tested Bumps() and Covered(addr, size) first.
+void BumpRange(u64 addr, u64 size) {
     const u64 first = addr >> kShift;
     const u64 last = (addr + size - 1) >> kShift;
     for (u64 g = first; g <= last; ++g) {
@@ -96,10 +93,8 @@ void BumpWordPages(u64 word_base, u64 page_mask) {
     }
 }
 
-u64 Sum(u64 addr, u64 size) {
-    if (!Covered(addr, size)) {
-        return 0;
-    }
+// sotc: the caller (Sum, sotc_generation.h) tested Covered(addr, size): the range is not empty and inside the space.
+u64 SumRange(u64 addr, u64 size) {
     const u64 first = addr >> kShift;
     const u64 last = (addr + size - 1) >> kShift;
     u64 sum = 0;
@@ -134,28 +129,40 @@ void Count(Stat s, u64 n) {
 }
 
 void Report(std::string& out, double seconds) {
-    if (!Bumps()) {
-        return;
-    }
     const auto take = [](Stat s) {
         return g_stats[static_cast<size_t>(s)].exchange(0, std::memory_order_relaxed);
     };
-    const u64 hit = take(Stat::BindHit);
-    const u64 miss = take(Stat::BindMiss);
-    const u64 bind_bad = take(Stat::BindVerifyMismatch);
-    const u64 skip = take(Stat::DmaRunSkip);
-    const u64 sync = take(Stat::DmaRunSync);
-    const u64 dma_bad = take(Stat::DmaVerifyMismatch);
-    char line[512];
-    std::snprintf(line, sizeof line,
-                  "SOTC GEN BIND: bind=%d dma=%d window=%.1fs memo hits=%llu misses=%llu "
-                  "verify mismatches=%llu; DMA runs skipped=%llu synced=%llu verify "
-                  "mismatches=%llu\n",
-                  kBindMode, kDmaMode, seconds, static_cast<unsigned long long>(hit),
-                  static_cast<unsigned long long>(miss), static_cast<unsigned long long>(bind_bad),
-                  static_cast<unsigned long long>(skip), static_cast<unsigned long long>(sync),
-                  static_cast<unsigned long long>(dma_bad));
-    out += line;
+    if (Bumps()) {
+        const u64 hit = take(Stat::BindHit);
+        const u64 miss = take(Stat::BindMiss);
+        const u64 bind_bad = take(Stat::BindVerifyMismatch);
+        const u64 skip = take(Stat::DmaRunSkip);
+        const u64 sync = take(Stat::DmaRunSync);
+        const u64 dma_bad = take(Stat::DmaVerifyMismatch);
+        char line[512];
+        std::snprintf(line, sizeof line,
+                      "SOTC GEN BIND: bind=%d dma=%d window=%.1fs memo hits=%llu misses=%llu "
+                      "verify mismatches=%llu; DMA runs skipped=%llu synced=%llu verify "
+                      "mismatches=%llu\n",
+                      kBindMode, kDmaMode, seconds, static_cast<unsigned long long>(hit),
+                      static_cast<unsigned long long>(miss), static_cast<unsigned long long>(bind_bad),
+                      static_cast<unsigned long long>(skip), static_cast<unsigned long long>(sync),
+                      static_cast<unsigned long long>(dma_bad));
+        out += line;
+    }
+    if (FlatNotesMode() != 0) {
+        const u64 hits = take(Stat::FlatAddHit);
+        const u64 misses = take(Stat::FlatAddMiss);
+        const u64 bad = take(Stat::FlatMismatch);
+        char line[256];
+        std::snprintf(line, sizeof line,
+                      "SOTC FLAT NOTES (gpu-modified set): mode %d, adds skipped %.0f/s, adds inserted %.0f/s, "
+                      "mismatches %llu\n",
+                      FlatNotesMode(), static_cast<double>(hits) / (seconds > 0.0 ? seconds : 1.0),
+                      static_cast<double>(misses) / (seconds > 0.0 ? seconds : 1.0),
+                      static_cast<unsigned long long>(bad));
+        out += line;
+    }
 }
 
 } // namespace SotcGen

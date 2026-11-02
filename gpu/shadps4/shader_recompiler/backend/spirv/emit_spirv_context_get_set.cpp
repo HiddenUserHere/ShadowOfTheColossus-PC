@@ -73,6 +73,9 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
 
 Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     const auto& buffer = ctx.buffers[handle];
+    if (buffer.bda) { // sotc: SOTC_BDA: a block-table buffer has no descriptor to index
+        return ctx.BdaLoad(handle, index, 4, ctx.U32[1], ctx.u32_zero_value, ctx.U32[1], 1);
+    }
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         index = ctx.OpIAdd(ctx.U32[1], index, offset);
     }

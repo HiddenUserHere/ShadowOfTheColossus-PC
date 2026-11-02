@@ -641,11 +641,22 @@ void HostMaintain(BufferCache& cache) {
 }
 
 void OnSubmitStart(Vulkan::Rasterizer& rasterizer, u64 announce_seq) {
+    // sotc: SOTC_LEAN_SUBMIT=1 (default off). The SOTC_VERIFY=n1 pass at the submit start is skipped when
+    // n1 verify is off. Its state (pending writes, re-arm list, suspects) is only written by producers
+    // behind SotcN1Verify::On() (n1verify.cpp NoteWriteFault / NoteReadFault, reached only from
+    // page_manager.cpp HandleN1VerifyFault, called under On() at page_manager.cpp:1428). Its counters are
+    // printed by Report, which returns early when off (n1verify.cpp:1301). Unset: the pass always runs.
+    static const bool lean_submit = [] {
+        const char* v = std::getenv("SOTC_LEAN_SUBMIT");
+        return v && v[0] == '1';
+    }();
     // sotc: SOTC_NATIVE: drain the announced uploads, on the draw thread, before any bind of this submit. No
     // import happens here; the HostMaintain hang noted below came from importing/holding at submit start.
     if (SotcNative::On()) {
         rasterizer.GetBufferCache().NativeDrain(u64{64} << 20, announce_seq);
-        SotcN1Verify::OnSubmitStart(); // sotc: SOTC_VERIFY=n1: resolve the pending writes, protect again
+        if (!lean_submit || SotcN1Verify::On()) {
+            SotcN1Verify::OnSubmitStart(); // sotc: SOTC_VERIFY=n1: resolve the pending writes, protect again
+        }
     }
     // sotc: mode 8 (host binds): no extents and no copies. The submit start imports and rings the
     // blocks (HostMaintain, before any bind of the submit) and closes the previous submit's

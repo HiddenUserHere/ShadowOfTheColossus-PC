@@ -41,6 +41,7 @@
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH report
 #include "video_core/renderer_vulkan/vk_parallel_record.h" // sotc: SOTC_N5_PARALLEL counters
 #include "video_core/renderer_vulkan/vk_bindless.h" // sotc: SOTC_N5_BINDLESS report
+#include "video_core/texture_cache/tsharp_slot_cache.h" // sotc: SOTC_TSLOT report
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_recorder.h" // sotc: SOTC_FUTEX_WAIT report
 #include "video_core/sotc_fps_cap.h"
@@ -1009,6 +1010,12 @@ void VideoOutDriver::Flip(const Request& req) {
                     SotcWriteExtent::Take(writes, sizeof(writes));
                     if (writes[0]) {
                         ReportPrintf(report, "SOTC GPU writes by shader: %s\n", writes);
+                    }
+                    // sotc: SOTC_FLAT_NOTES (sotc_write_extent.h, ReportFlat)
+                    char flat_notes[256];
+                    SotcWriteExtent::ReportFlat(flat_notes, sizeof(flat_notes), seconds);
+                    if (flat_notes[0]) {
+                        ReportPrintf(report, "%s\n", flat_notes);
                     }
                 }
                 // sotc: SOTC_HRR (dry run, buffer_cache/hrr.h): ranges that would be promoted
@@ -2078,6 +2085,13 @@ void VideoOutDriver::Flip(const Request& req) {
                 char n5_line[256];
                 if (heap->Report(n5_line, sizeof n5_line) != 0) {
                     report += n5_line;
+                    report += '\n';
+                }
+            }
+            if (VideoCore::TsharpSlotCache::Mode() != 0) { // sotc: SOTC_TSLOT
+                char tslot_line[512];
+                if (VideoCore::TsharpSlotCache::Report(tslot_line, sizeof tslot_line, seconds) != 0) {
+                    report += tslot_line;
                     report += '\n';
                 }
             }
