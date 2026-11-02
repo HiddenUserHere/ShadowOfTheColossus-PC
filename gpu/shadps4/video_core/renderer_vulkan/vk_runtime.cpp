@@ -874,6 +874,21 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
 
+void Runtime::NoteAddressedWrite() {
+    // The write may come from any stage; it is ordered by the pending global barrier like a buffer write.
+    memory_barrier.srcStageMask |= vk::PipelineStageFlagBits2::eAllCommands;
+    memory_barrier.srcAccessMask |= vk::AccessFlagBits2::eShaderWrite;
+    addressed_write_pending = true;
+}
+
+bool Runtime::MemoryBarrierPending() const noexcept {
+    return memory_barrier.srcStageMask != vk::PipelineStageFlagBits2::eNone;
+}
+
+bool Runtime::AddressedWritePending() const noexcept {
+    return addressed_write_pending;
+}
+
 void Runtime::FlushBarriers() {
     vk::DependencyInfo dep_info{};
 
@@ -897,6 +912,7 @@ void Runtime::FlushBarriers() {
 
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
+    addressed_write_pending = false; // sotc: SOTC_SHADER_ADDR, the barrier that ordered it is recorded
 
     image_barriers.clear();
     for (std::size_t i = 0; i < active_resources; ++i) {

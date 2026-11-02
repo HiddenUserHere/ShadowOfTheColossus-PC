@@ -21,6 +21,7 @@
 #include "../../../sotc/pc_ring.h" // sotc: SOTC_BPE_FIX (HostServed)
 #include "video_core/buffer_cache/bpe_heap_guard.h" // sotc: SOTC_BPE_FIX
 #include "video_core/renderdoc.h"
+#include "video_core/sotc_arch/addr_table.h"   // sotc: SOTC_ADDR_TABLE (the guest page table of SOTC_SHADER_ADDR)
 #include "video_core/sotc_arch/shader_addr.h" // sotc: SOTC_SHADER_ADDR, SOTC_MIRROR (sotc_arch.h)
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -156,6 +157,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     // sotc: SOTC_MIRROR: before SetRasterizer, which replays the live GPU mappings into Mirror::OnMap.
     SotcArch::Mirror::Init(instance, scheduler);
+    SotcArch::AddrTable::Init(instance, scheduler); // sotc: SOTC_ADDR_TABLE page table (no-op unless SOTC_ADDR_TABLE=1)
+    SotcArch::ShaderAddr::Init(instance); // sotc: SOTC_SHADER_ADDR=2 debug buffer (no-op otherwise; refuses bad combos)
     SotcArch::TableMemo::Init(instance, scheduler); // sotc: SOTC_HEAP (index table ring; no-op when unset)
     SotcArch::Heap::Init(instance);                 // sotc: SOTC_HEAP (logs the mode; no-op when unset)
     memory->SetRasterizer(this);
@@ -3221,11 +3224,23 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // runs), one window cannot describe them, so every shader-addressed range goes through the mirror.
     const bool packet_op = pipeline->HasPacketRange();
     shader_addr_touch = false;
+    sotc_addressed_writes.clear(); // sotc: SOTC_SHADER_ADDR, mirror coherence: this op's addressed writes only
+    // sotc: SOTC_SHADER_ADDR: the buffer writes recorded before this op, which a shader-addressed read of this op must
+    // be ordered after (see the end of this function).
+    const bool barrier_pending_before = runtime.MemoryBarrierPending();
     if (packet_op) {
-        const auto windows = SotcArch::Mirror::Windows();
-        draw_packet.mirror_guest_base = windows.empty() ? 0 : windows.front().guest_base;
-        draw_packet.mirror_device_base = windows.empty() ? 0 : windows.front().device_base;
-        draw_packet.mirror_size = windows.empty() ? 0 : windows.front().size;
+        // sotc: SOTC_ADDR_TABLE: the mirror words name the guest page table (same offsets): its window, its device
+        // address and its size (addr_table.h). The shader reads the table through them (TableAddresses).
+        if (SotcArch::AddrTable::On()) {
+            draw_packet.mirror_guest_base = SotcArch::AddrTable::WindowBase;
+            draw_packet.mirror_device_base = SotcArch::AddrTable::Base();
+            draw_packet.mirror_size = SotcArch::AddrTable::WindowSize;
+        } else {
+            const auto windows = SotcArch::Mirror::Windows();
+            draw_packet.mirror_guest_base = windows.empty() ? 0 : windows.front().guest_base;
+            draw_packet.mirror_device_base = windows.empty() ? 0 : windows.front().device_base;
+            draw_packet.mirror_size = windows.empty() ? 0 : windows.front().size;
+        }
         draw_packet.arena_guest_base = 0;
         draw_packet.arena_device_base = 0;
         draw_packet.arena_size = 0;
@@ -3248,7 +3263,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             }
         }
     }
-    draw_packet.index_table_address = 0;
+    // sotc: SOTC_SHADER_ADDR=2: the debug buffer's address (0 otherwise). SOTC_HEAP is refused with mode 2 (Init),
+    // so the heap branch below does not overwrite it.
+    draw_packet.index_table_address = SotcArch::ShaderAddr::VerifyAddress();
     if (heap_stage) {
         const auto table = SotcArch::TableMemo::Resolve(texture_cache, *heap_stage,
                                                         liverpool->DrawRegs().ta_bc_base);
@@ -3589,9 +3606,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     }
     // sotc: SOTC_N5_BINDLESS: the vector was sized for every image, and the heap images write no
     // descriptor: keep the writes made (the bind cache and the descriptor update count them).
-    if (bindless_images) {
+    // sotc: SOTC_SHADER_ADDR: a shader-addressed buffer keeps its slot in the sizing above but writes no descriptor,
+    // so the vector ends with zeroed entries (type 0, count 0, binding 0) that Pipeline::BindResources would push.
+    if (bindless_images || SotcArch::ShaderAddr::On()) {
         set_writes.resize(set_write_index);
         set_write_sets.resize(set_write_index);
+    }
+    // sotc: SOTC_SHADER_ADDR ordering. A shader-addressed read or write does not go through ObtainBuffer, so the
+    // runtime's per-buffer check never asks for the barrier that orders it after the buffer writes recorded before
+    // it (SOTC_PASSES=0 ignores shader_addr_touch). Those writes are pending in the runtime's memory barrier: the
+    // op flushes it when it touches memory by address, and any later op flushes it when an address write is pending.
+    if (SotcArch::ShaderAddr::On() &&
+        (shader_addr_touch ? barrier_pending_before : runtime.AddressedWritePending())) {
+        needs_barrier = true;
     }
 
     if (uses_dma) {
@@ -5353,7 +5380,7 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
-    for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+    for (const auto [buffer, offset, size, is_written, bound_addr] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
         const auto write_flag =
@@ -5368,9 +5395,76 @@ void Rasterizer::ResetBindings(bool is_compute) {
                                  vk::AccessFlagBits2::eIndexRead);
     }
     fixed_function_reads.clear();
+    // sotc: SOTC_SHADER_ADDR. Mirror coherence of this op: after it is recorded (the copies follow the writer).
+    if (SotcArch::ShaderAddr::On()) {
+        SotcMirrorAfterOp();
+    }
     bound_images.clear();
     bound_buffers.clear();
     needs_barrier = false;
+}
+
+// sotc: SOTC_SHADER_ADDR, mirror coherence. Two directions, one per kind of write (ARCH-DRAW: the mirror is the GPU's
+// view of guest memory, so it must hold every GPU write, and addressed writes must reach the buffers the descriptor
+// readers use). Forward: a written buffer binding of this op (bound_buffers, guest address known) is copied into the
+// mirror. Reverse: a range the shader wrote through the mirror is copied into its buffer.
+void Rasterizer::SotcMirrorAfterOp() {
+    bool wrote = false;
+    for (const auto& bound : bound_buffers) {
+        if (bound.is_written && bound.addr != 0 && bound.size != 0) {
+            wrote = true;
+            SotcMirrorFromBuffer(*bound.buffer, bound.offset, bound.addr, bound.size);
+        }
+    }
+    for (const auto& write : sotc_addressed_writes) {
+        wrote = true;
+        SotcMirrorToBuffer(write.addr, write.size);
+    }
+    sotc_addressed_writes.clear();
+    // sotc: A2b (aliases). Between the arena and the window there is no copy to order: a write through one alias is
+    // read through the other after a memory barrier, recorded here after the op that wrote.
+    if (wrote && SotcArch::Mirror::AliasActive()) {
+        scheduler.EndRendering();
+        SotcArch::Mirror::AliasBarrier(scheduler.CommandBuffer());
+    }
+}
+
+void Rasterizer::SotcMirrorFromBuffer(const VideoCore::Buffer& buffer, u64 offset, VAddr addr, u64 size) {
+    if (!SotcArch::Mirror::On() || SotcArch::AddrTable::On() || size == 0) { // sotc: not in table mode (addr_table.h)
+        return;
+    }
+    scheduler.EndRendering();
+    // The write of the op (or of the copy) is made visible to the transfer read by the runtime's barriers.
+    if (runtime.IsBufferAccessed(&buffer, offset, size)) {
+        runtime.FlushBarriers();
+    }
+    SotcArch::Mirror::SyncFromBuffer(scheduler, buffer.Handle(), offset, addr, size,
+                                     buffer.mem_type == VideoCore::MemoryType::Sparse);
+    runtime.AccessBuffer(&buffer, offset, size, vk::PipelineStageFlagBits2::eCopy,
+                         vk::AccessFlagBits2::eTransferRead);
+}
+
+void Rasterizer::SotcMirrorFromGuest(VAddr addr, u64 size) {
+    if (!SotcArch::Mirror::On() || SotcArch::AddrTable::On() || size == 0) { // sotc: not in table mode (addr_table.h)
+        return;
+    }
+    SotcArch::Mirror::Upload(scheduler, addr, size);
+}
+
+void Rasterizer::SotcMirrorToBuffer(VAddr addr, u64 size) {
+    if (!SotcArch::Mirror::On() || SotcArch::AddrTable::On() || size == 0) { // sotc: not in table mode (addr_table.h)
+        return;
+    }
+    // Obtained for writing: the range is GPU-modified from here on, so a CPU read downloads it.
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(addr, static_cast<u32>(size), true);
+    scheduler.EndRendering();
+    if (runtime.IsBufferAccessed(buffer, offset, size, true)) {
+        runtime.FlushBarriers();
+    }
+    SotcArch::Mirror::SyncToBuffer(scheduler, buffer->Handle(), offset, addr, size,
+                                   buffer->mem_type == VideoCore::MemoryType::Sparse);
+    runtime.AccessBuffer(buffer, offset, size, vk::PipelineStageFlagBits2::eCopy,
+                         vk::AccessFlagBits2::eTransferWrite);
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -5727,7 +5821,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     // The mirror window must exist: the shader reads these ranges through it (its bounds are the packet's mirror
     // words). The profile flag is set before the mirror is initialized, so the bind checks the windows themselves.
     const Shader::Profile* shader_addr_profile =
-        SotcArch::ShaderAddr::On() && !SotcArch::Mirror::Windows().empty() && !bda_stage
+        SotcArch::ShaderAddr::On() && (SotcArch::AddrTable::On() || !SotcArch::Mirror::Windows().empty()) && !bda_stage
             ? SotcArch::ShaderAddr::BindProfile()
             : nullptr;
     const auto shader_addressed = [&](const Shader::BufferResource& desc) {
@@ -5898,7 +5992,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const bool in_arena = draw_packet.arena_size != 0 &&
                                       vbase >= draw_packet.arena_guest_base &&
                                       vbase + size <= draw_packet.arena_guest_base + draw_packet.arena_size;
-                if (size != 0 && !in_arena && !SotcArch::Mirror::Touch(scheduler, vbase, size)) {
+                // sotc: SOTC_ADDR_TABLE: the range is made resident through the buffer cache (ObtainBuffer) and its
+                // page entries are written; no mirror (addr_table.h).
+                const bool touch_ok =
+                    size == 0 || in_arena ||
+                    (SotcArch::AddrTable::On()
+                         ? SotcArch::AddrTable::Touch(buffer_cache, scheduler, vbase, size, desc.is_written)
+                         : SotcArch::Mirror::Touch(scheduler, vbase, size));
+                if (!touch_ok) {
                     static std::atomic<u64> touch_refused{};
                     if (touch_refused.fetch_add(1, std::memory_order_relaxed) < 8) {
                         LOG_ERROR(Render_Vulkan, "SOTC SHADER_ADDR: mirror cannot hold {:#x}+{:#x} (pgm {:#x})",
@@ -5908,6 +6009,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 shader_addr_touch = true; // Passes::Decide: this op touches memory with no bound_buffers entry
                 if (desc.is_written) {
                     Passes::NoteWrite(); // sotc: SOTC_PASSES: a write the pass rule must see
+                    // sotc: SOTC_SHADER_ADDR, mirror coherence: the shader's writes went to the mirror; they are copied
+                    // back into the buffer after the op (SotcMirrorAfterOp). A range in the arena window is already there.
+                    // Mode 2 writes through the descriptor (the shader stores do not use the address): nothing to copy back.
+                    // sotc: SOTC_ADDR_TABLE writes the arena itself (the entries point there): nothing to copy back.
+                    if (size != 0 && !in_arena && !SotcArch::ShaderAddr::Verify() && !SotcArch::AddrTable::On()) {
+                        sotc_addressed_writes.push_back({vbase, size});
+                    }
                 }
             }
             if (shader_addressed(desc) && !SotcArch::ShaderAddr::Verify()) {
@@ -5918,6 +6026,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     if (SotcStats::kBindCacheRanges) {
                         BindCacheInvalidate(vbase, size);
                     }
+                    // sotc: the write has no buffer record (no AccessBuffer): the runtime's pending barrier must
+                    // carry it, so the next op that reads or writes memory orders after it (see BindResources).
+                    runtime.NoteAddressedWrite();
                 }
                 bind_cache_uncacheable = true; // the op's bind cache is not recorded: no buffer object to check
                 ++binding.unified;
@@ -6161,6 +6272,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 }
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
+                // sotc: SOTC_SHADER_ADDR, SotcMirrorAfterOp: a range written through this descriptor is copied into the
+                // mirror after the op. In mode 2 the shader-addressed ranges are written through their descriptor too.
+                if (!shader_addressed(desc) || SotcArch::ShaderAddr::Verify()) {
+                    bound_buffers.back().addr = vbase;
+                }
                 if (bind_cache_recording) { // sotc: SOTC_BIND_CACHE checks it is still clean
                     bind_cache_ranges_rec.emplace_back(vbase, size);
                     if (SotcStats::kBindCacheFrame && desc.is_formatted) {
@@ -7867,6 +7983,9 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         bind_cache_write_epoch.fetch_add(1, std::memory_order_relaxed);
     }
     runtime.FillBuffer(buffer, offset, num_bytes, value);
+    if (!is_gds && SotcArch::ShaderAddr::On()) { // sotc: SOTC_SHADER_ADDR, mirror coherence (SotcMirrorFromBuffer)
+        SotcMirrorFromBuffer(*buffer, offset, address, num_bytes);
+    }
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
@@ -7915,6 +8034,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         .size = num_bytes,
     };
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
+    if (!dst_gds && SotcArch::ShaderAddr::On()) { // sotc: SOTC_SHADER_ADDR, mirror coherence (SotcMirrorFromBuffer)
+        SotcMirrorFromBuffer(*dst_buffer, dst_offset, dst, num_bytes);
+    }
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {

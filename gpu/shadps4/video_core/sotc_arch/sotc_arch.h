@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -89,6 +90,51 @@ std::span<const Window> Windows();
 /// receives the first sample.size() bytes of addr, taken from the same bytes the copy stages for the GPU. True when
 /// the sample was taken (the range starts resident); a sampled range is therefore resident.
 bool Upload(Vulkan::Scheduler& scheduler, VAddr addr, u64 size, std::span<u8> sample = {});
+/// Draw thread, after a recorded op (ResetBindings): the GPU wrote guest range [addr, addr+size) into src at src_offset
+/// through a buffer. Copies it into the resident pages of the mirror; a non-resident page is made resident first (its
+/// fill from guest memory is overwritten by this copy). The caller ends rendering and makes src's pending writes
+/// visible. Records into the scheduler's command buffer, with barriers on both sides.
+/// sotc: peer_arena: src is a buffer-cache arena. Its aliased pages are the same memory as the mirror's, so they are
+/// skipped (no copy); aliased pages are copied when src is not an arena.
+void SyncFromBuffer(Vulkan::Scheduler& scheduler, vk::Buffer src, u64 src_offset, VAddr addr, u64 size,
+                    bool peer_arena);
+/// Draw thread, after a recorded op: the shader wrote guest range [addr, addr+size) through the mirror. Copies its
+/// resident pages into dst at dst_offset (the caller has obtained dst for writing and ends rendering first).
+/// sotc: peer_arena as in SyncFromBuffer (dst is an arena: aliased pages are already written).
+void SyncToBuffer(Vulkan::Scheduler& scheduler, vk::Buffer dst, u64 dst_offset, VAddr addr, u64 size,
+                  bool peer_arena);
+
+// sotc: A2b. Aliases (SOTC_MIRROR, single copy). The buffer cache binds device memory for a guest range into an arena
+// (EnsureResident) and unbinds it (UnbindResident). Each such bind is mirrored here: the same VkDeviceMemory and
+// memory offset are bound into the mirror window at (guest page - window base), so the page is one memory page seen
+// through two sparse buffers (VK_BUFFER_CREATE_SPARSE_ALIASED_BIT, sparseResidencyAliased). The arena blocks are 64 KiB
+// pages (block_size equals the sparse page alignment), so guest and memory offsets are both 64 KiB aligned and map
+// one to one: no shift, no copy. Alias ops are queued and submitted by the buffer cache in its arena bind submit
+// (TakeAliasCalls), so an alias unbind shares the arena unbind's submit, its waits and its frame fence.
+using ArenaHold = bool (*)(void* ctx, VAddr addr, u64 size);
+/// Registers the buffer cache hook that places [addr, addr+size) in an arena (its placement is aliased at once). The
+/// hook runs on the draw thread from Touch. nullptr clears it.
+void SetArenaHold(ArenaHold fn, void* ctx);
+/// True when the mirror aliases arena memory of this memory type (the window's memoryTypeBits include it).
+bool AliasAccepts(u32 memory_type);
+/// Queues the alias bind of [addr, addr+size) (whole 64 KiB pages) to memory at memory_offset. False when refused: a
+/// page is outside the window, a page is owned (own-page bind, kept: the old sync path then covers it), or the mirror
+/// is off. The pages are resident (aliased) from this call on.
+bool AliasBind(VAddr addr, u64 size, vk::DeviceMemory memory, u64 memory_offset);
+/// Queues the alias unbind of [addr, addr+size). Pages not aliased are skipped. Safe from any thread.
+void AliasUnbind(VAddr addr, u64 size);
+/// True while alias ops are queued (or any page is aliased: the buffer cache then sends its barriers).
+bool AliasActive();
+/// Records a global memory barrier between writes and reads through two aliases of the same memory (the mirror and an
+/// arena). Recorded after an op that wrote memory, while any page is aliased.
+void AliasBarrier(vk::CommandBuffer cmdbuf);
+/// One sparse bind call of the mirror buffer. Calls run in order; the last one is the wait the caller adds.
+struct AliasCall {
+    vk::Buffer buffer;
+    std::vector<vk::SparseMemoryBind> binds;
+};
+/// Takes every queued alias op as calls, split so that no page appears twice in one call.
+void TakeAliasCalls(std::vector<AliasCall>& out);
 void Report(char* out, u32 size, double seconds);
 } // namespace Mirror
 
@@ -97,6 +143,14 @@ void Report(char* out, u32 size, double seconds);
 // in its flat buffer and adds the window base from the push packet. This is the CPU replica of that formula.
 namespace ShaderAddr {
 bool On();
+/// The mode as the profile carries it (Shader::Profile::shader_addr): 0 off, 1 addresses, 2 verify.
+u8 Mode();
+/// SOTC_SHADER_ADDR=2 (verify): creates the debug buffer (host-visible, with a device address) and checks the
+/// refusals: SOTC_HEAP is on, or no mirror window exists. Refused runs exit. Called once, after Mirror::Init.
+void Init(const Vulkan::Instance& instance);
+/// The debug buffer's device address, for DrawPacket::index_table_address (0 unless mode 2). The packet
+/// field is free in mode 2 because SOTC_HEAP is refused with it.
+vk::DeviceAddress VerifyAddress();
 /// What the generated code computes for a V# (base, num_records/stride already decoded): the device address of
 /// guest address `base`, or 0 when the range is not in one window.
 vk::DeviceAddress Expected(VAddr base, u64 size);

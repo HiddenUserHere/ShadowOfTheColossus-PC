@@ -561,9 +561,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // sotc: SOTC_N5_BINDLESS, and SOTC_BINDLESS_SAMP: both heaps change the emitted SPIR-V.
         .bindless_images = Shader::BindlessImagesEnabled() || Shader::BindlessSamplersEnabled(),
         // sotc: SOTC_HEAP (the index table per draw, heap_images) and SOTC_SHADER_ADDR (buffer addresses
-        // from the V# words). Both off: the profile is the one of today.
+        // from the V# words; mode 2 = verify, a different profile and so a different cache key). Both off:
+        // the profile is the one of today.
         .heap_images = SotcArch::Heap::On(),
-        .shader_addr = SotcArch::ShaderAddr::On(),
+        .shader_addr = SotcArch::ShaderAddr::Mode(),
     };
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
     // the loading screen on meanwhile.

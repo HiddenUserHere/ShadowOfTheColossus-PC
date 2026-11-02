@@ -617,8 +617,11 @@ void PipelineCache::WarmUp() {
             // sizeof(Shader::Profile) is 68). Anything but 1 is off, as for the flags above.
             auto& heap_images = profile_data[offsetof(Shader::Profile, heap_images)];
             heap_images = heap_images == 1 ? 1 : 0;
+            // sotc: shader_addr is the mode (0, 1 or 2); anything else is off, as for the flags above.
             auto& shader_addr = profile_data[offsetof(Shader::Profile, shader_addr)];
-            shader_addr = shader_addr == 1 ? 1 : 0;
+            // sotc: 3 and 4 are the table modes of SOTC_ADDR_TABLE (addr_table.h); without them a saved profile
+            // would lose its mode and load the wrong SPIR-V.
+            shader_addr = (shader_addr >= 1 && shader_addr <= 4) ? shader_addr : 0;
             std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
         }
         compatible = profile_data.size() == sizeof(Shader::Profile) && cached_profile == profile;
@@ -764,6 +767,17 @@ bool Info::Deserialize(Serialization::Archive& ar) {
 
     info.Read(this, sizeof(Shader::InfoPersistent));
     info.Read(FlatBuf());
+    // sotc: has_flatbuf is an Info member, not part of InfoPersistent, so the record above leaves it false. A cached
+    // shader then reads as "no flat buffer" in ShaderAddrBuffer (host and recompiler), and the host binds its
+    // descriptors and never makes the mirror resident: shader-addressed reads return zero. The flag is set exactly
+    // when AddFlatbuf adds the Flatbuf resource (shader_info_collection_pass.cpp), and that resource is in the record.
+    has_flatbuf = false;
+    for (const auto& desc : buffers) {
+        if (desc.buffer_type == BufferType::Flatbuf) {
+            has_flatbuf = true;
+            break;
+        }
+    }
 
     return srt_info.Deserialize(ar);
 }

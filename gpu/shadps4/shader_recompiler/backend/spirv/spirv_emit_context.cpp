@@ -34,8 +34,10 @@ bool ShaderAddrBuffer(const Profile& profile, const Info& info, const BufferReso
         desc.sharp_fetch.summary == SharpFetch<AmdGpu::Buffer>::Summary::Invalid) {
         return false;
     }
-    // MTYPE 3 marks a buffer shared between invocations: it keeps the Coherent descriptor.
-    return desc.GetSharp(info).mtype != 3;
+    // The decision must depend only on what the compiled shader fixes: the host evaluates it again at every bind
+    // with that draw's V#, and a different answer leaves the shader reading a descriptor that was never bound
+    // (device lost). So no V# field (such as MTYPE 3, coherent) may enter it.
+    return true;
 }
 
 } // namespace Shader
@@ -88,6 +90,17 @@ void Name(EmitContext& ctx, Id object, std::string_view format_str, Args&&... ar
     ctx.Name(object, fmt::format(fmt::runtime(format_str), StageName(ctx.hw_stage),
                                  std::forward<Args>(args)...)
                          .c_str());
+}
+
+// sotc: SOTC_SHADER_ADDR modes (profile.shader_addr): 1 addresses, 2 verify, 3 addresses through the guest page table
+// (SOTC_ADDR_TABLE, addr_table.h), 4 table and verify. Table modes: the packet's mirror words are the table window
+// (mirror_guest_base, mirror_size) and the table's device address (mirror_device_base), and each access is translated
+// per page (TableAddresses).
+bool ShaderAddrVerifyMode(const Profile& profile) {
+    return profile.shader_addr == 2 || profile.shader_addr == 4;
+}
+bool ShaderAddrTableMode(const Profile& profile) {
+    return profile.shader_addr >= 3;
 }
 
 // sotc: SOTC_SHADER_ADDR: any guest buffer of the shader takes its address from the shader.
@@ -863,6 +876,13 @@ void EmitContext::DefinePushDataBlock() {
     }
     // sotc: SOTC_SHADER_ADDR: the window words of the packet (ShaderAddr*Offset, 72..120).
     const bool shader_addr = UsesShaderAddr(profile, info);
+    // sotc: SOTC_SHADER_ADDR=2: the debug buffer address at byte 64 (ShaderAddrVerifyDebugOffset). A stage with
+    // shader-addressed buffers has no bindless words, so the members here are the 7 of PushData (56 bytes).
+    const bool verify = shader_addr && ShaderAddrVerifyMode(profile);
+    if (verify) {
+        shader_addr_debug_member = static_cast<u32>(members.size());
+        members.push_back(U64);
+    }
     if (shader_addr) {
         shader_addr_member = static_cast<u32>(members.size());
         for (u32 word = 0; word < 6; ++word) {
@@ -907,6 +927,10 @@ void EmitContext::DefinePushDataBlock() {
             MemberDecorate(struct_type, shader_addr_member + member, spv::Decoration::Offset,
                            window_offsets[member]);
         }
+    }
+    if (verify) {
+        MemberDecorate(struct_type, shader_addr_debug_member, spv::Decoration::Offset,
+                       ShaderAddrVerifyDebugOffset);
     }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
@@ -993,8 +1017,8 @@ std::pair<Id, Id> EmitContext::LoadBdaBlock(u32 handle) {
 
 // sotc: SOTC_SHADER_ADDR. Mirrors AmdGpu::Buffer exactly: base = dw0 | (dw1 & 0xff) << 32 (base_address
 // is 40 bits), stride = dw1 bits 16..29, num_records = dw2, type = dw3 bits 30..31 (Valid() needs 0), and
-// GetSize = stride == 0 ? num_records : stride * num_records in u32. Window check: the whole range
-// [base, base + size) must lie in the arena window, else in mirror window 0 (push block words).
+// GetSize = stride == 0 ? num_records : stride * num_records in u32. Window check: base must lie in the arena
+// window, else in mirror window 0 (push block words); the size is clipped to that window's end.
 std::pair<Id, Id> EmitContext::LoadShaderAddrBlock(u32 handle) {
     const auto& desc = info.buffers[handle];
     const BufferSpv flat = buffers[flatbuf_index].Alias(PointerType::U32);
@@ -1047,28 +1071,193 @@ std::pair<Id, Id> EmitContext::LoadShaderAddrBlock(u32 handle) {
     const Id arena_size{push_u64(4)};
     const Id mirror_size{push_u64(5)};
 
-    // [base, base + size) inside [guest, guest + window_size), without wrapping. Returns the offset of base
-    // in the window (rel) and whether the whole range fits.
-    const auto fits = [&](Id guest, Id window_size) {
+    // sotc: SOTC_ADDR_TABLE (table modes). The block is the guest range itself, clipped to the table window
+    // (mirror_guest, mirror_size); TableAddresses translates each access. An invalid V# or a base outside the window
+    // gives size 0, so the access is invalid.
+    if (ShaderAddrTableMode(profile)) {
+        const Id table_rel{OpISub(U64, base, mirror_guest)};
+        const Id table_in{OpLogicalAnd(U1[1], OpUGreaterThanEqual(U1[1], base, mirror_guest),
+                                       OpULessThan(U1[1], table_rel, mirror_size))};
+        const Id table_room{OpISub(U64, mirror_size, table_rel)};
+        const Id table_bytes{OpSelect(U64, OpULessThanEqual(U1[1], size64, table_room), size64, table_room)};
+        const Id table_valid{OpLogicalAnd(U1[1], is_valid, table_in)};
+        return {base, OpSelect(U32[1], table_valid, OpUConvert(U32[1], table_bytes), u32_zero_value)};
+    }
+
+    // sotc: SOTC_SHADER_ADDR. [guest, guest + window_size) holds base (no wrap): rel is the offset of base in the
+    // window. Only the start must lie in the window; a range that runs past its end is clipped below.
+    const auto holds = [&](Id guest, Id window_size) {
         const Id from_start{OpUGreaterThanEqual(U1[1], base, guest)};
         const Id rel{OpISub(U64, base, guest)};
-        const Id inside{OpULessThanEqual(U1[1], rel, window_size)};
+        const Id inside{OpULessThan(U1[1], rel, window_size)};
+        return std::pair{rel, OpLogicalAnd(U1[1], from_start, inside)};
+    };
+    // sotc: the bytes of [base, base + size) that lie in the window, min(size, window_size - rel) (u64). The classic
+    // descriptor is clamped to the mapped memory the same way (ClampRangeSize in BindBuffers), so a V# whose
+    // num_records runs past the window keeps the bytes that are inside it instead of reading zero everywhere.
+    const auto clipped = [&](Id rel, Id window_size) {
         const Id room{OpISub(U64, window_size, rel)};
         const Id fits_size{OpULessThanEqual(U1[1], size64, room)};
-        return std::pair{rel, OpLogicalAnd(U1[1], from_start, OpLogicalAnd(U1[1], inside, fits_size))};
+        return OpSelect(U64, fits_size, size64, room);
     };
     // Arena first, then mirror window 0 (the same order as the host packet).
-    const auto [arena_rel, in_arena]{fits(arena_guest, arena_size)};
-    const auto [mirror_rel, in_mirror]{fits(mirror_guest, mirror_size)};
+    const auto [arena_rel, in_arena]{holds(arena_guest, arena_size)};
+    const auto [mirror_rel, in_mirror]{holds(mirror_guest, mirror_size)};
     const Id arena_address{OpIAdd(U64, arena_device, arena_rel)};
     const Id mirror_address{OpIAdd(U64, mirror_device, mirror_rel)};
     const Id address{OpSelect(U64, in_arena, arena_address, mirror_address)};
+    const Id arena_bytes{clipped(arena_rel, arena_size)};
+    const Id mirror_bytes{clipped(mirror_rel, mirror_size)};
+    const Id bytes{OpSelect(U64, in_arena, arena_bytes, mirror_bytes)};
 
-    // Outside both windows or invalid: size 0, so BdaAddress reports the access invalid.
+    // Base outside both windows or invalid V#: size 0, so BdaAddress reports the access invalid.
     const Id in_window{OpLogicalOr(U1[1], in_arena, in_mirror)};
     const Id valid{OpLogicalAnd(U1[1], is_valid, in_window)};
-    const Id block_size{OpSelect(U32[1], valid, size, u32_zero_value)};
+    const Id block_size{OpSelect(U32[1], valid, OpUConvert(U32[1], bytes), u32_zero_value)};
     return {address, block_size};
+}
+
+// sotc: SOTC_SHADER_ADDR=2. The guest base of the V# of buffer `handle` (dw0 | (dw1 & 0xff) << 32, as in
+// LoadShaderAddrBlock). Only the debug record reads it.
+Id EmitContext::LoadShaderAddrGuestBase(u32 handle) {
+    const auto& desc = info.buffers[handle];
+    const BufferSpv flat = buffers[flatbuf_index].Alias(PointerType::U32);
+    const auto dword = [&](u32 i) -> Id {
+        const auto& fetch = desc.sharp_fetch;
+        if (fetch.summary == SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+            const u32 index = u32{fetch.offsets[0]} + i;
+            return OpLoad(U32[1], OpAccessChain(flat.pointer_type, flat.id, u32_zero_value,
+                                                ConstU32(index)));
+        }
+        if ((fetch.load_mask >> i) & 1) {
+            return OpLoad(U32[1], OpAccessChain(flat.pointer_type, flat.id, u32_zero_value,
+                                                ConstU32(u32{fetch.offsets[i]})));
+        }
+        return ConstU32(fetch.immediates[i]);
+    };
+    const Id dw0{dword(0)};
+    const Id dw1{dword(1)};
+    const Id base_hi{OpShiftLeftLogical(
+        U64, OpUConvert(U64, OpBitFieldUExtract(U32[1], dw1, ConstU32(0u), ConstU32(8u))),
+        Constant(U64, 32ULL))};
+    return OpIAdd(U64, OpUConvert(U64, dw0), base_hi);
+}
+
+// sotc: SOTC_SHADER_ADDR=2 (verify). The loads of a shader-addressed buffer. Two reads of the same bytes:
+//   1. the descriptor (the classic path: buffer offset, alias, one access chain per element). Its value is the
+//      result, so rendering is the same as in mode 0; it is read whatever the address says.
+//   2. the shader address (BdaAddress, the same as mode 1). Only when all `count` elements lie in the block
+//      (valid): each lane is loaded and compared bitwise with its descriptor value. A differing lane appends one
+//      record to the debug buffer (push member shader_addr_debug_member; layout in resource.h).
+// The value of the address read never leaves its block, so no OpPhi is needed: the result is defined before the
+// first branch. Every counter and record write is an atomic on a physical pointer (emit_spirv_atomic.cpp, scope
+// Device, no semantics). An access outside the block counts as uncompared.
+Id EmitContext::ShaderAddrVerifyLoad(u32 handle, Id index, u32 elem_size, PointerType alias,
+                                     PointerSize offset_size, Id elem_type, Id result_type,
+                                     u32 count) {
+    const auto& spv_buffer = buffers[handle];
+    const auto [alias_id, pointer_type] = spv_buffer.Alias(alias);
+    const Id zero = alias == PointerType::U64 ? u64_zero_value : u32_zero_value;
+    Id desc_index{index};
+    if (const Id offset = spv_buffer.Offset(offset_size); Sirit::ValidId(offset)) {
+        desc_index = OpIAdd(U32[1], index, offset);
+    }
+    boost::container::static_vector<Id, 4> desc_values;
+    for (u32 i = 0; i < count; i++) {
+        const Id index_i = i == 0 ? desc_index : OpIAdd(U32[1], desc_index, ConstU32(i));
+        const Id ptr_i = OpAccessChain(pointer_type, alias_id, zero, index_i);
+        desc_values.push_back(OpLoad(elem_type, ptr_i));
+    }
+
+    // The address read: the same (address, valid) as a BDA load, and the block size and guest base for the record.
+    // sotc: SOTC_ADDR_TABLE (table modes): every element is translated (TableAddresses), not address + i * size.
+    const bool table = handle < buffers.size() && buffers[handle].shader_addr && ShaderAddrTableMode(profile);
+    boost::container::static_vector<Id, 4> table_addresses;
+    Id address{};
+    Id valid{};
+    if (table) {
+        valid = TableAddresses(handle, index, elem_size, count, table_addresses);
+        address = table_addresses[0];
+    } else {
+        const auto [first, ok] = BdaAddress(handle, index, elem_size, count);
+        address = first;
+        valid = ok;
+    }
+    const Id block_size{LoadBdaBlock(handle).second};
+    const Id guest_base{LoadShaderAddrGuestBase(handle)};
+    const Id debug_base{OpLoad(
+        U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), push_data_block,
+                           ConstU32(shader_addr_debug_member)))};
+    const auto debug_word = [&](u32 offset) {
+        return BdaPointer(OpIAdd(U64, debug_base, Constant(U64, static_cast<u64>(offset))), U32[1]);
+    };
+    const auto add_word = [&](u32 offset, Id value) {
+        const Id scope{ConstU32(static_cast<u32>(spv::Scope::Device))};
+        return OpAtomicIAdd(U32[1], debug_word(offset), scope, u32_zero_value, value);
+    };
+    const auto bits = [&](Id value) -> Id {
+        switch (alias) {
+        case PointerType::F32:
+            return OpUConvert(U64, OpBitcast(U32[1], value));
+        case PointerType::U64:
+            return value;
+        default:
+            return OpUConvert(U64, value);
+        }
+    };
+
+    // Outside the block (the descriptor read is 0 there under robustness): not compared.
+    const Id uncompared_merge = BdaBeginIf(OpLogicalNot(U1[1], valid));
+    add_word(ShaderAddrVerifyUncompared, ConstU32(1u));
+    BdaEndIf(uncompared_merge);
+
+    const Id merge = BdaBeginIf(valid);
+    add_word(ShaderAddrVerifyCompared, ConstU32(1u));
+    for (u32 i = 0; i < count; i++) {
+        const Id elem_address = table ? table_addresses[i]
+                                      : i == 0 ? address
+                                               : OpIAdd(U64, address,
+                                                        Constant(U64, static_cast<u64>(i * elem_size)));
+        const Id address_value = OpLoad(elem_type, BdaPointer(elem_address, elem_type),
+                                        spv::MemoryAccessMask::Aligned, elem_size);
+        const Id address_bits{bits(address_value)};
+        const Id desc_bits{bits(desc_values[i])};
+        const Id differs{OpINotEqual(U1[1], address_bits, desc_bits)};
+        const Id differ_merge = BdaBeginIf(differs);
+        add_word(ShaderAddrVerifyMismatch, ConstU32(1u));
+        const Id is_zero{OpIEqual(U1[1], address_bits, u64_zero_value)};
+        add_word(ShaderAddrVerifyMismatchZero,
+                 OpSelect(U32[1], is_zero, ConstU32(1u), u32_zero_value));
+        // One record. The slot counter may pass the capacity: a slot past it is dropped.
+        const Id slot{add_word(ShaderAddrVerifySlots, ConstU32(1u))};
+        const Id fits{OpULessThan(U1[1], slot, ConstU32(ShaderAddrVerifyCapacity))};
+        const Id record_merge = BdaBeginIf(fits);
+        const Id record_offset{OpIMul(U64, OpUConvert(U64, slot),
+                                      Constant(U64, static_cast<u64>(ShaderAddrVerifyRecordSize)))};
+        const Id record{OpIAdd(U64, debug_base,
+                               OpIAdd(U64, record_offset,
+                                      Constant(U64, static_cast<u64>(ShaderAddrVerifyRecordsOffset))))};
+        const auto field = [&](u32 offset, Id value, Id type, u32 size) {
+            OpStore(BdaPointer(OpIAdd(U64, record, Constant(U64, static_cast<u64>(offset))), type),
+                    value, spv::MemoryAccessMask::Aligned, size);
+        };
+        field(0, Constant(U64, info.pgm_hash), U64, 8);
+        field(8, elem_address, U64, 8);
+        field(16, guest_base, U64, 8);
+        field(24, OpUConvert(U64, block_size), U64, 8);
+        field(32, address_bits, U64, 8);
+        field(40, desc_bits, U64, 8);
+        field(48, ConstU32(static_cast<u32>(hw_stage)), U32[1], 4);
+        field(52, ConstU32(handle), U32[1], 4);
+        field(56, index, U32[1], 4);
+        field(60, ConstU32(i), U32[1], 4);
+        field(64, ConstU32(elem_size), U32[1], 4);
+        BdaEndIf(record_merge);
+        BdaEndIf(differ_merge);
+    }
+    BdaEndIf(merge);
+
+    return count == 1 ? desc_values[0] : OpCompositeConstruct(result_type, desc_values);
 }
 
 void EmitContext::HoistBdaBlocks() {
@@ -1082,6 +1271,12 @@ void EmitContext::HoistBdaBlocks() {
 }
 
 std::pair<Id, Id> EmitContext::BdaAddress(u32 handle, Id index, u32 elem_size, u32 count) {
+    // sotc: SOTC_ADDR_TABLE: the address of element 0 through the table, and the validity of all `count` elements.
+    if (handle < buffers.size() && buffers[handle].shader_addr && ShaderAddrTableMode(profile)) {
+        boost::container::static_vector<Id, 4> addresses;
+        const Id valid{TableAddresses(handle, index, elem_size, count, addresses)};
+        return {addresses[0], valid};
+    }
     // A hoisted block is valid in every block of the function; otherwise it is loaded here.
     const bool hoisted = handle < bda_blocks.size() && Sirit::ValidId(bda_blocks[handle].first);
     const auto [block_address, block_size] = hoisted ? bda_blocks[handle] : LoadBdaBlock(handle);
@@ -1095,7 +1290,15 @@ std::pair<Id, Id> EmitContext::BdaAddress(u32 handle, Id index, u32 elem_size, u
     const Id safe_index{OpSelect(U32[1], valid, index, u32_zero_value)};
     const Id byte_offset{OpIMul(U64, OpUConvert(U64, safe_index),
                                 Constant(U64, static_cast<u64>(elem_size)))};
-    return {OpIAdd(U64, block_address, byte_offset), valid};
+    Id byte_address{OpIAdd(U64, block_address, byte_offset)};
+    // sotc: SOTC_SHADER_ADDR (shader-addressed buffers only): the V# base need not be element aligned, but the
+    // classic descriptor path binds at an aligned base and reads elements from it. So the address is aligned down
+    // to elem_size: the same bytes as the descriptor, and the Aligned operand of the load or store holds.
+    if (handle < buffers.size() && buffers[handle].shader_addr) {
+        byte_address = OpBitwiseAnd(U64, byte_address,
+                                    Constant(U64, ~static_cast<u64>(elem_size - 1)));
+    }
+    return {byte_address, valid};
 }
 
 Id EmitContext::BdaPointer(Id address, Id elem_type) {
@@ -1105,6 +1308,9 @@ Id EmitContext::BdaPointer(Id address, Id elem_type) {
 
 Id EmitContext::BdaLoad(u32 handle, Id index, u32 elem_size, Id elem_type, Id zero,
                         Id result_type, u32 count) {
+    if (handle < buffers.size() && buffers[handle].shader_addr && ShaderAddrTableMode(profile)) {
+        return BdaLoadTable(handle, index, elem_size, elem_type, zero, result_type, count); // sotc: SOTC_ADDR_TABLE
+    }
     const auto [address, valid] = BdaAddress(handle, index, elem_size, count);
     // sotc: SOTC_BDA: the loads run only when the access is valid, as the guarded atomics do
     // (emit_spirv_atomic.cpp). BdaAddress picks the block start for an invalid access, and a
@@ -1131,6 +1337,10 @@ Id EmitContext::BdaLoad(u32 handle, Id index, u32 elem_size, Id elem_type, Id ze
 
 void EmitContext::BdaStore(u32 handle, Id index, u32 elem_size, Id elem_type, Id value,
                            u32 count) {
+    if (handle < buffers.size() && buffers[handle].shader_addr && ShaderAddrTableMode(profile)) {
+        BdaStoreTable(handle, index, elem_size, elem_type, value, count); // sotc: SOTC_ADDR_TABLE
+        return;
+    }
     const auto [address, valid] = BdaAddress(handle, index, elem_size, count);
     const Id merge{BdaBeginIf(valid)};
     for (u32 i = 0; i < count; i++) {
@@ -1139,6 +1349,95 @@ void EmitContext::BdaStore(u32 handle, Id index, u32 elem_size, Id elem_type, Id
                                                 Constant(U64, static_cast<u64>(i * elem_size)));
         const Id elem_value = count == 1 ? value : OpCompositeExtract(elem_type, value, i);
         OpStore(BdaPointer(elem_address, elem_type), elem_value, spv::MemoryAccessMask::Aligned,
+                elem_size);
+    }
+    BdaEndIf(merge);
+}
+
+// sotc: SOTC_ADDR_TABLE (table modes). The device addresses of the `count` elements of a shader-addressed buffer, one
+// table lookup per element. Element i sits at guest address g = (base + (index + i) * elem_size) & ~(elem_size - 1), the
+// same alignment as BdaAddress. Its page is p = (g - window) >> 14 and the table entry at table + 8 * p is the device
+// address of that page's first byte (0 when not resident). The address is entry + (g & 0x3fff). Returns valid: the
+// block holds the access AND every element has a non-zero entry. The entry loads are emitted before the caller's
+// branch, so they must be safe on an invalid access: then the page is taken as 0 (table[0] is a valid read).
+//
+// Example, a 2-element load (count 2, elem 4) that straddles a page boundary: element 0 at guest 0x700003FFC (page 0,
+// entry E0) and element 1 at guest 0x700004000 (page 1, entry E1). Both pages are resident, so the access is valid,
+// and the elements are at E0 + 0x3FFC and E1 + 0x0. They need not be contiguous (two backings), which is why each
+// element has its own entry and the loads never add i * elem_size to the first address.
+Id EmitContext::TableAddresses(u32 handle, Id index, u32 elem_size, u32 count,
+                               boost::container::static_vector<Id, 4>& addresses) {
+    const bool hoisted = handle < bda_blocks.size() && Sirit::ValidId(bda_blocks[handle].first);
+    const auto [guest_base, block_size] = hoisted ? bda_blocks[handle] : LoadBdaBlock(handle);
+    const u32 elem_shift = static_cast<u32>(std::countr_zero(elem_size));
+    const Id num_elements{OpShiftRightLogical(U32[1], block_size, ConstU32(elem_shift))};
+    const Id has_room{OpUGreaterThanEqual(U1[1], num_elements, ConstU32(count))};
+    const Id last_index{OpISub(U32[1], num_elements, ConstU32(count))};
+    const Id in_range{OpULessThanEqual(U1[1], index, last_index)};
+    const Id valid{OpLogicalAnd(U1[1], has_room, in_range)};
+    const Id safe_index{OpSelect(U32[1], valid, index, u32_zero_value)};
+
+    // The table words of the packet (mirror_guest, mirror_device): window base and the table's device address.
+    const auto push_word = [&](u32 member) {
+        return OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64),
+                                         push_data_block, ConstU32(shader_addr_member + member)));
+    };
+    const Id window_guest{push_word(0)};
+    const Id table_device{push_word(1)};
+
+    addresses.clear();
+    Id all_present{};
+    for (u32 i = 0; i < count; i++) {
+        const Id elem_index = i == 0 ? safe_index : OpIAdd(U32[1], safe_index, ConstU32(i));
+        const Id guest{OpBitwiseAnd(
+            U64,
+            OpIAdd(U64, guest_base,
+                   OpIMul(U64, OpUConvert(U64, elem_index), Constant(U64, static_cast<u64>(elem_size)))),
+            Constant(U64, ~static_cast<u64>(elem_size - 1)))};
+        // An invalid access uses page 0 (its entry load stays inside the table).
+        const Id rel{OpSelect(U64, valid, OpISub(U64, guest, window_guest), u64_zero_value)};
+        const Id page{OpShiftRightLogical(U64, rel, Constant(U64, 14ULL))};
+        const Id entry_address{OpIAdd(U64, table_device, OpIMul(U64, page, Constant(U64, 8ULL)))};
+        const Id entry{OpLoad(U64, BdaPointer(entry_address, U64), spv::MemoryAccessMask::Aligned, 8u)};
+        addresses.push_back(
+            OpIAdd(U64, entry, OpBitwiseAnd(U64, guest, Constant(U64, (1ULL << 14) - 1))));
+        const Id present{OpINotEqual(U1[1], entry, u64_zero_value)};
+        all_present = i == 0 ? present : OpLogicalAnd(U1[1], all_present, present);
+    }
+    return OpLogicalAnd(U1[1], valid, all_present);
+}
+
+// sotc: SOTC_ADDR_TABLE. BdaLoad with one translated address per element (TableAddresses), same structure as BdaLoad.
+Id EmitContext::BdaLoadTable(u32 handle, Id index, u32 elem_size, Id elem_type, Id zero,
+                             Id result_type, u32 count) {
+    boost::container::static_vector<Id, 4> addresses;
+    const Id valid{TableAddresses(handle, index, elem_size, count, addresses)};
+    const Id header = last_label;
+    const Id merge = BdaBeginIf(valid);
+    boost::container::static_vector<Id, 4> values;
+    for (u32 i = 0; i < count; i++) {
+        values.push_back(OpLoad(elem_type, BdaPointer(addresses[i], elem_type),
+                                spv::MemoryAccessMask::Aligned, elem_size));
+    }
+    const Id then_end = last_label;
+    BdaEndIf(merge);
+    boost::container::static_vector<Id, 4> ids;
+    for (u32 i = 0; i < count; i++) {
+        ids.push_back(OpPhi(elem_type, values[i], then_end, zero, header));
+    }
+    return count == 1 ? ids[0] : OpCompositeConstruct(result_type, ids);
+}
+
+// sotc: SOTC_ADDR_TABLE. BdaStore with one translated address per element. The branch covers every element, so a
+// store with any non-resident page is skipped whole (the access is not split).
+void EmitContext::BdaStoreTable(u32 handle, Id index, u32 elem_size, Id elem_type, Id value,
+                                u32 count) {
+    boost::container::static_vector<Id, 4> addresses;
+    const Id valid{TableAddresses(handle, index, elem_size, count, addresses)};
+    const Id merge{BdaBeginIf(valid)};
+    for (u32 i = 0; i < count; i++) {
+        const Id elem_value = count == 1 ? value : OpCompositeExtract(elem_type, value, i);
+        OpStore(BdaPointer(addresses[i], elem_type), elem_value, spv::MemoryAccessMask::Aligned,
                 elem_size);
     }
     BdaEndIf(merge);
@@ -1183,15 +1482,20 @@ void EmitContext::DefineBuffers() {
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
         // sotc: SOTC_SHADER_ADDR: the block comes from the V# words (LoadShaderAddrBlock); no descriptor.
         if (ShaderAddrBuffer(profile, info, desc)) {
-            spv_buffer.bda = true;
             spv_buffer.shader_addr = true;
-            ++binding.unified;
-            continue;
+            if (!ShaderAddrVerifyMode(profile)) {
+                spv_buffer.bda = true;
+                ++binding.unified;
+                continue;
+            }
+            // sotc: SOTC_SHADER_ADDR=2 (verify): the classic descriptor aliases below, as in mode 0. bda stays off,
+            // so stores and atomics use the descriptor; the loads compare (ShaderAddrVerifyLoad).
+            spv_buffer.shader_addr_verify = true;
         }
         // sotc: SOTC_BDA: a guest buffer that is not texel or coherent takes no descriptor; its
         // block table slot gives its address. Coherent buffers keep the descriptor (Coherent
         // decoration, which physical pointers do not get).
-        if (profile.bda_buffers && info.HasBdaBlockTable() &&
+        if (!spv_buffer.shader_addr_verify && profile.bda_buffers && info.HasBdaBlockTable() &&
             desc.buffer_type == BufferType::Guest && !desc.is_formatted && !is_coherent) {
             spv_buffer.bda = true;
             ++binding.unified;

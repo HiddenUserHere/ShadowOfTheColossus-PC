@@ -76,6 +76,10 @@ Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     if (buffer.bda) { // sotc: SOTC_BDA: a block-table buffer has no descriptor to index
         return ctx.BdaLoad(handle, index, 4, ctx.U32[1], ctx.u32_zero_value, ctx.U32[1], 1);
     }
+    if (buffer.shader_addr_verify) { // sotc: SOTC_SHADER_ADDR=2: descriptor value, compared with the address
+        return ctx.ShaderAddrVerifyLoad(handle, index, 4, PointerType::U32, PointerSize::B32,
+                                        ctx.U32[1], ctx.U32[1], 1);
+    }
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         index = ctx.OpIAdd(ctx.U32[1], index, offset);
     }
@@ -399,6 +403,11 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
         const Id zero = alias == PointerType::U32 ? ctx.u32_zero_value : ctx.f32_zero_value;
         return ctx.BdaLoad(handle, address, 4, data_types[1], zero, data_types[N], N);
     }
+    if (spv_buffer.shader_addr_verify) { // sotc: SOTC_SHADER_ADDR=2: descriptor value, compared with the address
+        const auto& data_types = alias == PointerType::U32 ? ctx.U32 : ctx.F32;
+        return ctx.ShaderAddrVerifyLoad(handle, address, 4, alias, PointerSize::B32, data_types[1],
+                                        data_types[N], N);
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -422,6 +431,10 @@ Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     if (spv_buffer.bda) { // sotc: SOTC_BDA
         return ctx.BdaLoad(handle, address, 1, ctx.U8, ctx.u8_zero_value, ctx.U8, 1);
     }
+    if (spv_buffer.shader_addr_verify) { // sotc: SOTC_SHADER_ADDR=2
+        return ctx.ShaderAddrVerifyLoad(handle, address, 1, PointerType::U8, PointerSize::B8,
+                                        ctx.U8, ctx.U8, 1);
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -435,6 +448,10 @@ Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
     if (spv_buffer.bda) { // sotc: SOTC_BDA
         return ctx.BdaLoad(handle, address, 2, ctx.U16, ctx.u16_zero_value, ctx.U16, 1);
+    }
+    if (spv_buffer.shader_addr_verify) { // sotc: SOTC_SHADER_ADDR=2
+        return ctx.ShaderAddrVerifyLoad(handle, address, 2, PointerType::U16, PointerSize::B16,
+                                        ctx.U16, ctx.U16, 1);
     }
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
@@ -465,6 +482,10 @@ Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
     if (spv_buffer.bda) { // sotc: SOTC_BDA
         return ctx.BdaLoad(handle, address, 8, ctx.U64, ctx.u64_zero_value, ctx.U64, 1);
+    }
+    if (spv_buffer.shader_addr_verify) { // sotc: SOTC_SHADER_ADDR=2
+        return ctx.ShaderAddrVerifyLoad(handle, address, 8, PointerType::U64, PointerSize::B64,
+                                        ctx.U64, ctx.U64, 1);
     }
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);

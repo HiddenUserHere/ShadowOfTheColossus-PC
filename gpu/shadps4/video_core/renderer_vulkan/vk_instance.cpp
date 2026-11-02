@@ -891,6 +891,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         sotc_sparse_queue_family = queue_family_index;
     }
     report_feature("sparse buffers", mirror_switch != 0, sparse_present, sotc_sparse_buffers);
+    // sotc: SOTC_MIRROR aliases (sotc_arch/mirror.cpp, A2b): sparseResidencyAliased is enabled only with the mirror.
+    sotc_sparse_aliased = sotc_sparse_buffers && features.sparseResidencyAliased;
+    report_feature("sparse aliasing", mirror_switch != 0, features.sparseResidencyAliased, sotc_sparse_aliased);
 
     // VK_EXT_device_generated_commands (SOTC_PASSES; sotc_arch/passes.cpp).
     bool dgc_feature = false;
@@ -1024,6 +1027,8 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
                 .shaderInt16 = features.shaderInt16,
                 .sparseBinding = features.sparseBinding,
                 .sparseResidencyBuffer = features.sparseResidencyBuffer,
+                // sotc: SOTC_MIRROR aliases (false unless the mirror runs: today's device features otherwise)
+                .sparseResidencyAliased = sotc_sparse_aliased,
             },
         },
         vk::PhysicalDeviceVulkan11Features{

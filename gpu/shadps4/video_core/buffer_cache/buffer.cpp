@@ -286,6 +286,10 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         buffer_ci.queueFamilyIndexCount = num_families;
         buffer_ci.pQueueFamilyIndices = families.data();
     }
+    // sotc: SOTC_MIRROR: arenas share their memory with the mirror window (sotc_arch/mirror.cpp, A2b).
+    if (mem_type == MemoryType::Sparse && instance.SotcSparseAliased()) {
+        buffer_ci.flags |= vk::BufferCreateFlagBits::eSparseAliased;
+    }
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, mem_type, &alloc_info);
 

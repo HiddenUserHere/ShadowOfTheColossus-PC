@@ -917,6 +917,10 @@ private:
     u64 pc_host_prev_boundary_seq{};
     /// sotc: SOTC_PC_RING=8. True when buffer is one of the host views (pc_host_views).
     [[nodiscard]] bool PcHostIsView(const Buffer* buffer);
+    /// sotc: SOTC_MIRROR (A2b). The mirror's hook (SotcArch::Mirror::SetArenaHold): places [addr, addr + size) in the
+    /// arenas (ObtainBuffer: bind, alias, upload). False when the range is not held (ring-8 host run, block shape).
+    static bool MirrorHoldThunk(void* ctx, VAddr addr, u64 size);
+    bool MirrorHold(VAddr addr, u64 size);
     /// sotc: SOTC_PC_RING=8. Caller holds pc_host_mutex. Records a served bind: its span for the
     /// per-submit unique bytes, and every SOTC_PC_RING8_VERIFY_SAMPLE-th one a hash (verify).
     void PcHostRecordBind(VAddr addr, u32 size, bool is_written);

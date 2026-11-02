@@ -42,6 +42,7 @@
 #include "video_core/renderer_vulkan/vk_parallel_record.h" // sotc: SOTC_N5_PARALLEL counters
 #include "video_core/renderer_vulkan/vk_bindless.h" // sotc: SOTC_N5_BINDLESS report
 #include "video_core/texture_cache/tsharp_slot_cache.h" // sotc: SOTC_TSLOT report
+#include "video_core/sotc_arch/addr_table.h" // sotc: SOTC_ADDR_TABLE report
 #include "video_core/sotc_arch/shader_addr.h" // sotc: draw architecture reports (sotc_arch.h)
 #include "video_core/sotc_arch/passes.h"      // sotc: SOTC_PASSES report
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -2113,6 +2114,9 @@ void VideoOutDriver::Flip(const Request& req) {
                 arch(SotcArch::Mirror::Report);
                 if (SotcArch::ShaderAddr::On()) {
                     arch(SotcArch::ShaderAddr::Report);
+                }
+                if (SotcArch::AddrTable::On()) {
+                    arch(SotcArch::AddrTable::Report);
                 }
                 if (SotcArch::SwitchMode("SOTC_PASSES") != 0) {
                     arch(SotcArch::Passes::Report);

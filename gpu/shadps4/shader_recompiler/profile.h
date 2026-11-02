@@ -73,10 +73,14 @@ struct Profile {
     /// indices from the index table of the draw (UsesHeapImages), not from push slots. Sits in the
     /// padding byte after bindless_images, so the profile keeps its size (vk_pipeline_serialization.cpp).
     bool heap_images{};
-    /// sotc: SOTC_SHADER_ADDR: guest buffers that are neither formatted nor coherent take their
-    /// base and size from their V# words in the flat buffer, and their window bases from the push
-    /// block (ShaderAddrBuffer in runtime_info.h). Last member: the cache check pads older profiles.
-    bool shader_addr{};
+    /// sotc: SOTC_SHADER_ADDR mode (SotcArch::ShaderAddr::Mode): 0 off, 1 guest buffers that are neither formatted
+    /// nor coherent take their base and size from their V# words in the flat buffer, and their window bases from
+    /// the push block (ShaderAddrBuffer in runtime_info.h), 2 verify: as 1, but each such buffer keeps its
+    /// descriptor for the value, and its loads compare the shader address with the descriptor (debug buffer).
+    /// 3 and 4 (SOTC_ADDR_TABLE, addr_table.h): as 1 and 2, but each access is translated through the guest page
+    /// table (the packet's mirror words are the table window) instead of the window words.
+    /// Last member: the cache check pads older profiles. Still one byte (u8 for bool), so sizeof(Profile) holds.
+    u8 shader_addr{};
 
     bool operator==(const Profile&) const = default;
 };

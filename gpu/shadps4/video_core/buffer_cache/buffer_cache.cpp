@@ -50,6 +50,7 @@ extern "C" uintptr_t runtime_sotc_heap_table(void);
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA (BdaTableMode, arena memory flags)
+#include "video_core/sotc_arch/addr_table.h"          // sotc: SOTC_ADDR_TABLE hooks (OnPlace, OnRemove)
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -540,6 +541,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_semaphore{instance} {
     // sotc: SOTC_ASYNC_UPLOAD (see async_upload.h).
     AsyncUpload::Init();
+    // sotc: SOTC_MIRROR (A2b): Touch of a range the mirror does not hold places it here (MirrorHold). Only used when
+    // the mirror is on; the hook itself costs nothing.
+    SotcArch::Mirror::SetArenaHold(&BufferCache::MirrorHoldThunk, this);
     // sotc: SOTC_NATIVE: the frame ticket (native.h FrameSubmitted / FrameWait / FrameCompleted).
     if (SotcNative::On()) {
         SotcNative::SetFrameBackend(SotcNative::FrameBackend{
@@ -657,6 +661,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 }
 
 BufferCache::~BufferCache() {
+    SotcArch::Mirror::SetArenaHold(nullptr, nullptr); // sotc: SOTC_MIRROR (A2b), this cache is going
     if (SotcNative::On()) {
         SotcNative::SetFrameBackend(SotcNative::FrameBackend{}); // sotc: SOTC_NATIVE, this cache is going
     }
@@ -7183,6 +7188,9 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& backing) {
         const u64 start = std::max(base_block, backing.start);
         const u64 end = std::min(end_block, backing.end);
+        // sotc: SOTC_ADDR_TABLE hook (arena migration): the resident blocks now live in the new arena.
+        SotcArch::AddrTable::OnPlace(start << block_shift, (end - start) << block_shift,
+                                     new_arena->BufferDeviceAddress() + ((start << block_shift) - first_addr));
         bind->binds.push_back(vk::SparseMemoryBind{
             .resourceOffset = (start - base_block) << block_shift,
             .size = (end - start) << block_shift,
@@ -7345,7 +7353,20 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.memory = device_memory;
         backing.offset = memory_block;
         resident_ranges.Add(backing);
+        // sotc: SOTC_ADDR_TABLE hook (placement): the page entries of the placed blocks point into this arena.
+        SotcArch::AddrTable::OnPlace(backing.start << block_shift, (backing.end - backing.start) << block_shift,
+                                     arena->BufferDeviceAddress() + (backing.start << block_shift) - arena->cpu_addr);
         ++resident_version; // sotc: invalidates the merged DMA runs
+        // sotc: SOTC_MIRROR (A2b). The window maps the same memory at the same blocks: one block is one 64 KiB page,
+        // so the block's memory offset is also the window page's (no shift). Refused memory types stay with own pages.
+        if (SotcArch::Mirror::On() && block_size == SotcArch::Mirror::PageSize) {
+            const auto owner = chunk_by_memory.find(static_cast<VkDeviceMemory>(device_memory));
+            if (owner != chunk_by_memory.end() && SotcArch::Mirror::AliasAccepts(owner->second->memory_type)) {
+                SotcArch::Mirror::AliasBind(range.start << block_shift,
+                                            (range.end - range.start) << block_shift, device_memory,
+                                            memory_block << block_shift);
+            }
+        }
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
 
@@ -7496,6 +7517,32 @@ bool BufferCache::PcHostIsView(const Buffer* buffer) {
         }
     }
     return false;
+}
+
+bool BufferCache::MirrorHoldThunk(void* ctx, VAddr addr, u64 size) {
+    return static_cast<BufferCache*>(ctx)->MirrorHold(addr, size);
+}
+
+bool BufferCache::MirrorHold(VAddr addr, u64 size) {
+    // sotc: SOTC_MIRROR (A2b). Places [addr, addr+size) in the arenas as ObtainBuffer does: the blocks are bound, each new
+    // block is aliased into the window (EnsureResident), and the bytes are uploaded. Only when one block is one 64 KiB
+    // page: the window aliases pages.
+    if (size == 0 || u64{block_size} != SotcArch::Mirror::PageSize) {
+        return false;
+    }
+    // Ring-8 host runs are imported memory: no arena holds them, so they are never aliased (own pages, drain upload).
+    if (SotcPcRing::Mode() == 8 && SotcPcRing::HostServed(addr, size)) {
+        return false;
+    }
+    const VAddr end = addr + size;
+    while (addr < end) {
+        // ObtainBuffer takes one arena page (4 GiB) and a 32-bit size: pieces of at most one arena chunk.
+        const VAddr page_end = ((addr >> ARENA_PAGE_BITS) + 1) << ARENA_PAGE_BITS;
+        const VAddr piece_end = std::min<VAddr>({end, page_end, addr + ARENA_CHUNK_SIZE});
+        (void)ObtainBuffer(addr, static_cast<u32>(piece_end - addr), false);
+        addr = piece_end;
+    }
+    return true;
 }
 
 u64 BufferCache::PcHostMarkCpu(VAddr addr, u64 size) {
@@ -7878,7 +7925,7 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
     // sotc: SOTC_MIRROR (SotcArch::Mirror). Every taken announce, served or not, is also uploaded to the mirror; the
     // arena path below is unchanged (the binds read the arenas until phase A3). =2 keeps one sampled range read back
     // from the mirror and compared with the guest bytes taken at its upload (see the block before the merged loop).
-    const bool mirror_on = SotcArch::Mirror::On();
+    const bool mirror_on = SotcArch::Mirror::On() && !SotcArch::AddrTable::On(); // sotc: no mirror in table mode
     static const int mirror_verify = SotcArch::SwitchMode("SOTC_MIRROR");
     struct MirrorCheck {
         VAddr addr;
@@ -9241,6 +9288,8 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
                (first_block << block_shift) < hot.addr + hot.size;
     });
     resident_ranges.Subtract(first_block, end_block);
+    // sotc: SOTC_ADDR_TABLE hook (unmap): the released pages are no longer resident.
+    SotcArch::AddrTable::OnRemove(first_block << block_shift, (end_block - first_block) << block_shift);
     ++resident_version; // sotc: invalidates the merged DMA runs
     // sotc: SOTC_GEN_BIND. The released blocks: memo answers for them are void.
     SotcGen::Bump(first_block << block_shift, (end_block - first_block) << block_shift);
@@ -9267,6 +9316,11 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
 void BufferCache::UnbindResident(std::span<const Backing> released) {
     ++bind_version; // sotc: SOTC_BIND_CACHE_XTICK: bindings of these ranges are void
     for (const Backing& range : released) {
+        // sotc: SOTC_MIRROR (A2b). The window's alias of these blocks is unbound by the same arena bind submit
+        // (SubmitPendingArenaBinds), with the same waits, so the memory is not reused before the window lets go of it.
+        if (SotcArch::Mirror::On()) {
+            SotcArch::Mirror::AliasUnbind(range.start << block_shift, (range.end - range.start) << block_shift);
+        }
         // sotc: the memory is unbound (zeroed when it comes back): its hashed uploads and granule
         // snapshots are void.
         EraseHashedUploads(range.start << block_shift, (range.end - range.start) << block_shift);
@@ -9520,6 +9574,8 @@ bool BufferCache::FinishEviction(std::chrono::steady_clock::time_point now, u16 
             });
         }
         resident_ranges.Subtract(range.start, range.end);
+        // sotc: SOTC_ADDR_TABLE hook (eviction, also HRR migration): the evicted pages are no longer resident.
+        SotcArch::AddrTable::OnRemove(addr, size);
     }
     if (!released.empty()) {
         UnbindResident(released);
@@ -9700,84 +9756,112 @@ void BufferCache::NoteFaultRebind(VAddr addr, u64 size) {
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     // sotc: binds stamp blocks with use_epoch; keep it current even when no eviction check runs.
     AdvanceUseEpoch(std::chrono::steady_clock::now());
-    if (pending_binds.empty()) {
+    // sotc: SOTC_MIRROR (A2b). The window's alias ops ride in these calls: an alias bind or unbind has the waits and the
+    // frame fence of the arena bind it mirrors. Calls run in order (each waits for the one before); call 0 carries the
+    // arena binds, and each further call one group of alias ops that repeats a page of an earlier call.
+    std::vector<SotcArch::Mirror::AliasCall> alias_calls;
+    if (SotcArch::Mirror::AliasActive()) {
+        SotcArch::Mirror::TakeAliasCalls(alias_calls);
+    }
+    if (pending_binds.empty() && alias_calls.empty()) {
         return;
     }
 
-    std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
-    buffer_binds.reserve(pending_binds.size());
-
-    for (const auto& binds : pending_binds) {
-        buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
-            .buffer = binds.arena->Handle(),
-            .bindCount = static_cast<u32>(binds.binds.size()),
-            .pBinds = binds.binds.data(),
-        });
-    }
-
-    const u64 signal_tick = memory_semaphore.NextTick();
-    const auto signal_sema = memory_semaphore.Handle();
-
-    // sotc: SOTC_UNBIND_GPU_WAIT: GPU-side waits instead of the CPU wait of ReleaseMemory. Both
-    // are timeline waits on values already queued (no wait on a signal that is not queued yet).
-    vk::Semaphore wait_semas[3];
-    u64 wait_ticks[3];
-    u32 num_waits = 0;
-    // sotc: SOTC_RB_TICK: transfer-queue readback copies read the arenas without being ordered
-    // by the graphics timeline; a bind (an unbind above all) must not run under one. The value
-    // was submitted already, so the wait cannot dangle.
-    if (const u64 rb_xfer = scheduler.XferLastReadbackTick(); rb_xfer != 0) {
-        wait_semas[num_waits] = scheduler.XferSemaphore();
-        wait_ticks[num_waits++] = rb_xfer;
-    }
-    if (pending_bind_wait_tick) {
-        wait_semas[num_waits] = scheduler.GetWorkSemaphore()->Handle();
-        wait_ticks[num_waits++] = std::exchange(pending_bind_wait_tick, 0);
-    }
-    if (unbind_bind_tick) {
-        wait_semas[num_waits] = memory_semaphore.Handle();
-        wait_ticks[num_waits++] = unbind_bind_tick;
-    }
-    // Set after the waits above: this bind must not wait for its own signal.
-    if (std::exchange(unbind_bind_next, false)) {
-        unbind_bind_tick = signal_tick;
-    }
-
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .waitSemaphoreValueCount = num_waits,
-        .pWaitSemaphoreValues = wait_ticks,
-        .signalSemaphoreValueCount = 1u,
-        .pSignalSemaphoreValues = &signal_tick,
-    };
-
-    const vk::BindSparseInfo sparse_info = {
-        .pNext = &timeline_si,
-        .waitSemaphoreCount = num_waits,
-        .pWaitSemaphores = wait_semas,
-        .bufferBindCount = static_cast<u32>(buffer_binds.size()),
-        .pBufferBinds = buffer_binds.data(),
-        .signalSemaphoreCount = 1u,
-        .pSignalSemaphores = &signal_sema,
-    };
-
-    info.AddWait(signal_sema, signal_tick);
-    // Queue access is serialized by submit_mutex, which the scheduler no longer holds here.
-    std::scoped_lock lk{Vulkan::Scheduler::submit_mutex};
-    const auto bind_start = std::chrono::steady_clock::now();
-    auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
-    // sotc: a bind of many ranges (an arena migration rebinds all of them) can take long.
-    if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - bind_start)
-                            .count();
-        ms >= 20) {
-        size_t num_binds = 0;
-        for (const auto& binds : pending_binds) {
-            num_binds += binds.binds.size();
+    const size_t num_calls = std::max<size_t>(1, alias_calls.size());
+    u64 last_tick = 0;
+    for (size_t call = 0; call < num_calls; ++call) {
+        std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
+        if (call == 0) {
+            buffer_binds.reserve(pending_binds.size() + 1);
+            for (const auto& binds : pending_binds) {
+                buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
+                    .buffer = binds.arena->Handle(),
+                    .bindCount = static_cast<u32>(binds.binds.size()),
+                    .pBinds = binds.binds.data(),
+                });
+            }
         }
-        LOG_WARNING(Render, "Sparse bind of {} ranges in {} arenas took {} ms", num_binds,
-                    pending_binds.size(), ms);
+        if (call < alias_calls.size()) {
+            const auto& alias = alias_calls[call];
+            buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
+                .buffer = alias.buffer,
+                .bindCount = static_cast<u32>(alias.binds.size()),
+                .pBinds = alias.binds.data(),
+            });
+        }
+
+        const u64 signal_tick = memory_semaphore.NextTick();
+        const auto signal_sema = memory_semaphore.Handle();
+
+        // sotc: SOTC_UNBIND_GPU_WAIT: GPU-side waits instead of the CPU wait of ReleaseMemory. Both
+        // are timeline waits on values already queued (no wait on a signal that is not queued yet).
+        vk::Semaphore wait_semas[3];
+        u64 wait_ticks[3];
+        u32 num_waits = 0;
+        if (call == 0) {
+            // sotc: SOTC_RB_TICK: transfer-queue readback copies read the arenas without being ordered
+            // by the graphics timeline; a bind (an unbind above all) must not run under one. The value
+            // was submitted already, so the wait cannot dangle.
+            if (const u64 rb_xfer = scheduler.XferLastReadbackTick(); rb_xfer != 0) {
+                wait_semas[num_waits] = scheduler.XferSemaphore();
+                wait_ticks[num_waits++] = rb_xfer;
+            }
+            if (pending_bind_wait_tick) {
+                wait_semas[num_waits] = scheduler.GetWorkSemaphore()->Handle();
+                wait_ticks[num_waits++] = std::exchange(pending_bind_wait_tick, 0);
+            }
+            if (unbind_bind_tick) {
+                wait_semas[num_waits] = memory_semaphore.Handle();
+                wait_ticks[num_waits++] = unbind_bind_tick;
+            }
+            // Set after the waits above: this bind must not wait for its own signal.
+            if (std::exchange(unbind_bind_next, false)) {
+                unbind_bind_tick = signal_tick;
+            }
+        } else {
+            // sotc: SOTC_MIRROR: the call before this one (same queue, same frame fence) comes first.
+            wait_semas[num_waits] = memory_semaphore.Handle();
+            wait_ticks[num_waits++] = last_tick;
+        }
+
+        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+            .waitSemaphoreValueCount = num_waits,
+            .pWaitSemaphoreValues = wait_ticks,
+            .signalSemaphoreValueCount = 1u,
+            .pSignalSemaphoreValues = &signal_tick,
+        };
+
+        const vk::BindSparseInfo sparse_info = {
+            .pNext = &timeline_si,
+            .waitSemaphoreCount = num_waits,
+            .pWaitSemaphores = wait_semas,
+            .bufferBindCount = static_cast<u32>(buffer_binds.size()),
+            .pBufferBinds = buffer_binds.data(),
+            .signalSemaphoreCount = 1u,
+            .pSignalSemaphores = &signal_sema,
+        };
+
+        // Queue access is serialized by submit_mutex, which the scheduler no longer holds here.
+        std::scoped_lock lk{Vulkan::Scheduler::submit_mutex};
+        const auto bind_start = std::chrono::steady_clock::now();
+        auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+        // sotc: a bind of many ranges (an arena migration rebinds all of them) can take long.
+        if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - bind_start)
+                                .count();
+            ms >= 20) {
+            size_t num_binds = 0;
+            for (const auto& binds : pending_binds) {
+                num_binds += binds.binds.size();
+            }
+            LOG_WARNING(Render, "Sparse bind of {} ranges in {} arenas took {} ms", num_binds,
+                        pending_binds.size(), ms);
+        }
+        last_tick = signal_tick;
     }
+    // The last call waits for the others (queue order): one wait for the next submit.
+    info.AddWait(memory_semaphore.Handle(), last_tick);
 
     pending_binds.clear();
 }

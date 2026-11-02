@@ -17,6 +17,7 @@
 #include "../../../sotc/pc_ring.h" // sotc: SOTC_BPE_FIX (HostServed)
 #include "video_core/buffer_cache/bpe_heap_guard.h" // sotc: SOTC_BPE_FIX
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_SHADER_ADDR, mirror coherence
 #include "video_core/sotc_shadow_cull.h" // sotc: SOTC_HLE_SHADOW_CULL
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -310,6 +311,13 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
                                         SotcPcRing::HostServed(piece, copies[i].size));
         }
         runtime.CopyBuffer(src_buf, dst_buf, vk_copies);
+        if (SotcArch::ShaderAddr::On()) { // sotc: SOTC_SHADER_ADDR, mirror coherence. Per copied piece: a gap between
+            // the pieces is not written by the GPU and keeps its bytes (see the SOTC_HLE_SKIP note above).
+            for (const auto& copy : vk_copies) {
+                const VAddr piece = dst_buf_sharp.base_address + (copy.dstOffset - dst_buf_offset + dst_offset_min);
+                rasterizer.SotcMirrorFromBuffer(*dst_buf, copy.dstOffset, piece, copy.size);
+            }
+        }
         batch_start = batch_end;
     }
 
@@ -373,6 +381,9 @@ static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8*
             return false;
         }
         wrote = true;
+        if (SotcArch::ShaderAddr::On()) { // sotc: SOTC_SHADER_ADDR, mirror coherence (the CPU wrote guest memory)
+            rasterizer.SotcMirrorFromGuest(address + offset, run_size);
+        }
         if (SotcStats::kCmdStats) {
             SotcStats::inv_hle.fetch_add(run_size, std::memory_order_relaxed);
         }
@@ -553,6 +564,15 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         }
         TraceHleFill(address, table_bytes, period, path);
         wrote = true;
+        if (SotcArch::ShaderAddr::On()) { // sotc: SOTC_SHADER_ADDR, mirror coherence
+            if (path == VideoCore::BufferCache::FillPathReplace) {
+                rasterizer.SotcMirrorFromGuest(address, table_bytes); // the CPU wrote guest memory
+            } else {
+                // The GPU filled the arena (recorded above): its copy into the mirror is recorded after the fill.
+                const auto [fill_buf, fill_off] = buffer_cache.ObtainBuffer(address, static_cast<u32>(table_bytes), false);
+                rasterizer.SotcMirrorFromBuffer(*fill_buf, fill_off, address, table_bytes);
+            }
+        }
         if (SotcStats::kCmdStats) {
             SotcStats::inv_hle.fetch_add(table_bytes, std::memory_order_relaxed);
         }
@@ -569,6 +589,9 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     }
     TraceHleFill(address, table_bytes, period, VideoCore::BufferCache::FillPathReplace);
     wrote = true;
+    if (SotcArch::ShaderAddr::On()) { // sotc: SOTC_SHADER_ADDR, mirror coherence (the CPU wrote guest memory)
+        rasterizer.SotcMirrorFromGuest(address, count * 4);
+    }
     if (SotcStats::kCmdStats) SotcStats::inv_hle.fetch_add(count * 4, std::memory_order_relaxed);
     rasterizer.InvalidateMemory(address, count * 4);
     return true;

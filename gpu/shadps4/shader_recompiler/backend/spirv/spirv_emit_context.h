@@ -6,6 +6,7 @@
 #include <array>
 #include <unordered_map>
 #include <utility>
+#include <boost/container/static_vector.hpp>
 #include <sirit/sirit.h>
 
 #include "shader_recompiler/backend/bindings.h"
@@ -378,6 +379,10 @@ public:
         /// sotc: SOTC_SHADER_ADDR: with bda, the block comes from the V# words and the window words
         /// of the push block (LoadBdaBlock), not from the block table.
         bool shader_addr{};
+        /// sotc: SOTC_SHADER_ADDR=2 (verify): the buffer keeps its classic descriptor aliases (bda is false), and
+        /// its loads return the descriptor value and compare it with the shader address (ShaderAddrVerifyLoad).
+        /// Stores and atomics use the descriptor only.
+        bool shader_addr_verify{};
 
         template <class Self>
         auto& Alias(this Self& self, PointerType alias) {
@@ -468,12 +473,22 @@ public:
     std::pair<Id, Id> LoadBdaBlock(u32 handle);
     /// sotc: SOTC_SHADER_ADDR. The same (address, size) pair as LoadBdaBlock, computed from the V# words
     /// of buffer `handle` in the flat buffer: address = window device base + (V# base - window guest
-    /// base) for the arena or mirror window that holds the whole range, size = GetSize's rule (u32);
-    /// size 0 when the V# is invalid or the range is in no window (every access is then out of range).
+    /// base) for the arena or mirror window that holds the V# base, size = GetSize's rule (u32) clipped to
+    /// that window's end; size 0 when the V# is invalid or the base is in no window (every access is then out of range).
     std::pair<Id, Id> LoadShaderAddrBlock(u32 handle);
     /// sotc: SOTC_SHADER_ADDR. Index of the first of the five window members of the push block
     /// (mirror guest, mirror device, arena guest, arena device, arena size; offsets 72..104).
     u32 shader_addr_member{};
+    /// sotc: SOTC_SHADER_ADDR=2. Index of the push member holding the debug buffer address (u64 at byte 64).
+    u32 shader_addr_debug_member{};
+    /// sotc: SOTC_SHADER_ADDR=2. Guest base address (u64) of the V# of buffer `handle`, from its flat buffer words.
+    Id LoadShaderAddrGuestBase(u32 handle);
+    /// sotc: SOTC_SHADER_ADDR=2. Loads `count` elements of buffer `handle` (index in elements of elem_size bytes)
+    /// through its descriptor, as the classic path does, and through the shader address (BdaAddress): each lane
+    /// whose two values differ appends one record to the debug buffer. Returns the descriptor value (the shader's
+    /// result). `alias` and `offset_size` select the descriptor alias and the buffer offset as the classic loads.
+    Id ShaderAddrVerifyLoad(u32 handle, Id index, u32 elem_size, PointerType alias,
+                            PointerSize offset_size, Id elem_type, Id result_type, u32 count);
     /// sotc: SOTC_BDA. Loads the block of every used BDA buffer once, in the entry block (called by
     /// Traverse before the first block's instructions), so each invocation reads its table slots
     /// once instead of at every access. The table is never written by the shader, so the values
@@ -484,6 +499,13 @@ public:
     /// gets the block start as its address, so a load from it stays in memory; the caller
     /// selects zero for it, and a store is guarded by BdaBeginIf.
     std::pair<Id, Id> BdaAddress(u32 handle, Id index, u32 elem_size, u32 count);
+    /// sotc: SOTC_ADDR_TABLE (table modes): the address of each of the count elements, through the page table (one
+    /// entry per element; spirv_emit_context.cpp). Returns valid: the access is in the block and every entry is set.
+    Id TableAddresses(u32 handle, Id index, u32 elem_size, u32 count,
+                      boost::container::static_vector<Id, 4>& addresses);
+    Id BdaLoadTable(u32 handle, Id index, u32 elem_size, Id elem_type, Id zero, Id result_type,
+                    u32 count);
+    void BdaStoreTable(u32 handle, Id index, u32 elem_size, Id elem_type, Id value, u32 count);
     /// sotc: SOTC_BDA. Loads `count` elements (elem_type) at `index`; zero when out of range.
     Id BdaLoad(u32 handle, Id index, u32 elem_size, Id elem_type, Id zero, Id result_type,
                u32 count);

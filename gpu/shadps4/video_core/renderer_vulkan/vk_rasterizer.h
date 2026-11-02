@@ -140,6 +140,15 @@ public:
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    /// sotc: SOTC_SHADER_ADDR, mirror coherence. Call after a GPU write of guest range [addr, addr+size) that `buffer`
+    /// holds at `offset` was recorded (FillBuffer, CopyBuffer, HLE copies). Copies it into the mirror.
+    void SotcMirrorFromBuffer(const VideoCore::Buffer& buffer, u64 offset, VAddr addr, u64 size);
+    /// sotc: SOTC_SHADER_ADDR, mirror coherence. Copies a range the shader wrote through the mirror into the buffer
+    /// object that descriptor readers and the CPU use (obtained for writing here, so readbacks see it).
+    void SotcMirrorToBuffer(VAddr addr, u64 size);
+    /// sotc: SOTC_SHADER_ADDR, mirror coherence. The CPU wrote guest range [addr, addr+size) (a write-through HLE fill):
+    /// its resident mirror pages take the guest bytes (SotcArch::Mirror::Upload, before this submit).
+    void SotcMirrorFromGuest(VAddr addr, u64 size);
     /// sotc: SOTC_BIND_CACHE_RANGES: a GPU write outside BindResources (shader HLE) drops the
     /// cached binds reading [addr, addr + size). No-op otherwise.
     void BindCacheNoteWrite(VAddr addr, u64 size);
@@ -446,6 +455,9 @@ private:
         u64 offset;
         u32 size;
         bool is_written;
+        /// sotc: SOTC_SHADER_ADDR. The guest address of the bound range (0: not guest memory, e.g. GDS). The mirror
+        /// copy after the op (ResetBindings, SyncMirrorAfterOp) needs it.
+        VAddr addr{};
     };
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
     /// Vertex/index buffers read by fixed-function stages of the current draw. They are recorded
@@ -694,6 +706,16 @@ private:
     /// sotc: SOTC_SHADER_ADDR. This op binds a shader-addressed buffer (no bound_buffers entry), so it touches
     /// memory: Passes::Decide must see it (BindResources resets it).
     bool shader_addr_touch{};
+    /// sotc: SOTC_SHADER_ADDR, mirror coherence. Guest ranges the op being bound writes through the mirror (the
+    /// shader-addressed written buffers, BindBuffers). ResetBindings copies them back into their buffers.
+    struct AddressedWrite {
+        VAddr addr;
+        u64 size;
+    };
+    std::vector<AddressedWrite> sotc_addressed_writes;
+    /// sotc: SOTC_SHADER_ADDR, ResetBindings (after the op is recorded): the GPU writes of the op reach the mirror
+    /// (bound written buffers) and the addressed writes reach their buffers (see SotcMirrorFromBuffer).
+    void SotcMirrorAfterOp();
     /// Whether the entry still depends on nothing that changed since it last checked (the
     /// stamps), updating its checkpoints; `reason` names what moved when not.
     bool BindCacheEntryFresh(BindCacheEntry& entry, u32& reason);

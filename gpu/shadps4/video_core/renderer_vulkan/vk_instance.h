@@ -633,6 +633,12 @@ public:
         return sotc_sparse_buffers;
     }
 
+    /// sotc: SOTC_MIRROR and sparseResidencyAliased (enabled at device creation). Sparse buffers made with
+    /// VK_BUFFER_CREATE_SPARSE_ALIASED_BIT, so that the mirror and an arena can bind the same memory.
+    bool SotcSparseAliased() const {
+        return sotc_sparse_aliased;
+    }
+
     /// sotc: returned when no queue family can bind sparse memory (SotcSparseBuffers() is false).
     static constexpr u32 NoSparseQueueFamily = ~u32{0};
 
@@ -867,6 +873,7 @@ private:
     bool sotc_unified_layouts{};            // sotc: see SotcUnifiedLayouts()
     bool sotc_descriptor_heap{};            // sotc: see SotcDescriptorHeap()
     bool sotc_sparse_buffers{};             // sotc: see SotcSparseBuffers()
+    bool sotc_sparse_aliased{};             // sotc: see SotcSparseAliased()
     u32 sotc_sparse_queue_family{NoSparseQueueFamily}; // sotc: see SotcSparseQueueFamily()
     bool sotc_device_generated_commands{};  // sotc: see SotcDeviceGeneratedCommands()
     bool sotc_buffer_device_address{};      // sotc: see SotcBufferDeviceAddress()

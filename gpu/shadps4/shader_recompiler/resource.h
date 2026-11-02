@@ -339,4 +339,23 @@ static constexpr u32 ShaderAddrArenaSizeOffset = 104;
 static constexpr u32 ShaderAddrMirrorSizeOffset = 120;
 static_assert(sizeof(PushData) == 56, "the SotcArch packet starts at 56 (PacketPushOffset)");
 
+/// sotc: SOTC_SHADER_ADDR=2 (verify). The debug buffer address is a u64 push member at byte 64, the packet's
+/// index_table_address (DrawPacket, PacketPushOffset + 8). A verify stage has no bindless words, so 56..71 is free.
+static constexpr u32 ShaderAddrVerifyDebugOffset = 64;
+/// Layout of the debug buffer (shader_addr.cpp reads it on the host): u32 words at 0 = loads compared, 4 =
+/// mismatched lanes, 8 = mismatched lanes whose address value is zero, 12 = record slots taken (may exceed the
+/// capacity), 16 = loads not compared (V# range invalid). Records of ShaderAddrVerifyRecordSize bytes from 32.
+static constexpr u32 ShaderAddrVerifyCompared = 0;
+static constexpr u32 ShaderAddrVerifyMismatch = 4;
+static constexpr u32 ShaderAddrVerifyMismatchZero = 8;
+static constexpr u32 ShaderAddrVerifySlots = 12;
+static constexpr u32 ShaderAddrVerifyUncompared = 16;
+static constexpr u32 ShaderAddrVerifyRecordsOffset = 32;
+static constexpr u32 ShaderAddrVerifyRecordSize = 72;
+static constexpr u32 ShaderAddrVerifyCapacity = 1024;
+// Record fields (byte offsets inside one record): pgm hash u64 @0, device address u64 @8 (the element address the
+// shader computed), V# guest base u64 @16, V# block size u64 @24 (zero-extended), address value bits u64 @32,
+// descriptor value bits u64 @40 (both zero-extended), hw stage u32 @48, buffer handle u32 @52, element index u32
+// @56, lane u32 @60, element size u32 @64, pad to 72.
+
 } // namespace Shader

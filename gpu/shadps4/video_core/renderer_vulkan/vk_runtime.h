@@ -88,6 +88,14 @@ public:
 
     void FlushBarriers();
 
+    /// sotc: SOTC_SHADER_ADDR. A shader-addressed write (no buffer record): it becomes part of the pending global
+    /// memory barrier, which FlushBarriers emits and clears.
+    void NoteAddressedWrite();
+    /// sotc: SOTC_SHADER_ADDR. True when a memory barrier is pending (a buffer write since the last FlushBarriers).
+    bool MemoryBarrierPending() const noexcept;
+    /// sotc: SOTC_SHADER_ADDR. True when a shader-addressed write is pending (cleared by FlushBarriers).
+    bool AddressedWritePending() const noexcept;
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 
@@ -109,6 +117,7 @@ private:
     std::size_t active_resources{};
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
+    bool addressed_write_pending{}; // sotc: SOTC_SHADER_ADDR, see NoteAddressedWrite
 };
 
 } // namespace Vulkan

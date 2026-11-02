@@ -16,6 +16,7 @@
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE windows
 #include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA / SOTC_N5_BDA
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/sotc_arch/addr_table.h" // sotc: SOTC_ADDR_TABLE
 
 extern "C" {
 const unsigned char* runtime_memory_backing_view(uint64_t* size);
@@ -436,7 +437,9 @@ void Init(const Instance& instance) {
              SotcNative::On();
     g_host = (pc_ring && pc_ring[0] == '8') || SotcNative::On(); // sotc: host arena binds
     // sotc: the device-address runs serve the block table of the host binds (vk_bda_table.h).
-    g_bda = g_host && BdaTableMode(instance) != 0;
+    // sotc: SOTC_ADDR_TABLE: the page table points shader-addressed ranges at these runs, so they need
+    // device addresses too.
+    g_bda = g_host && (BdaTableMode(instance) != 0 || SotcArch::AddrTable::On());
     if (instance.IsExternalMemoryHostEnabled()) {
         g_instance = &instance;
     }
