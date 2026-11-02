@@ -982,6 +982,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         LOG_WARNING(Render_Vulkan, "SOTC_N5_BINDLESS ignored: heap features or limits missing");
     }
     Shader::SetBindlessImagesEnabled(bindless_images);
+    // sotc: SOTC_HEAP needs both heaps (and SOTC_LAYOUT_UNIFIED): with one missing it is refused here, once, instead of
+    // building pipelines that misrender (sotc_arch/heap.cpp).
+    SotcArch::Heap::CheckRequirements(bindless_images, bindless_samplers);
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = queue_info_count,

@@ -423,6 +423,7 @@ private:
             Shader::HwStage hw_stage{};
             Shader::SwStage sw_stage{};
             u64 hash{};
+            u8 variant{}; ///< sotc: SOTC_HEAP stage variant (ShaderParams::variant); hash already includes it
             std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
             std::span<const u32> code;
             Shader::RuntimeInfo runtime_info{};

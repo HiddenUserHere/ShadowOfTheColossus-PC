@@ -26,6 +26,7 @@
 #include "../../../sotc/pc_ring.h"     // sotc: SotcPcRing::FullRingMode (stall guard in LockTimed)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "../sotc_generation.h"      // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA granule generations
+#include "video_core/sotc_arch/addr_table_hooks.h" // sotc: SOTC_ADDR_TABLE clean state (Dirty hooks)
 // sotc: SOTC_UNTRACK_MAX_MB (default 16 MiB), live (SotcLive): the cap of the untrack list.
 inline SotcLive::Int kUntrackMaxMb{"SOTC_UNTRACK_MAX_MB", 16};
 
@@ -1368,6 +1369,10 @@ private:
             if (SotcGen::Bumps() && changed) {
                 SotcGen::BumpWordPages(CpuAddress() + index * BYTES_PER_WORD, changed);
             }
+            // sotc: SOTC_ADDR_TABLE clean state. The same changes (CPU bits that rose, GPU bits that fell) clear the
+            // clean bits of the table pages they cover. This is the one choke point of region state: it runs under
+            // the region mutex, after the bit store and before the page is unprotected (addr_table.cpp, proof).
+            SotcArch::AddrTable::DirtyMask(CpuAddress() + index * BYTES_PER_WORD, changed);
         }
         return cpu_changed;
     }

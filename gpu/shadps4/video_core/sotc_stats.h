@@ -127,6 +127,9 @@ inline const int kOpComputeBind = [] {
 /// cache, hits taken, verify checks (would-be hits compared) and verify mismatches.
 inline std::atomic<uint64_t> op_compute_eligible{0}, op_compute_hits{0},
     op_compute_verify_checks{0}, op_compute_verify_mismatches{0};
+/// sotc: SOTC_PACKET counters (SOTC_FPS only): the packet ops (pipelines with the push packet) served by the frame
+/// bind cache, by the fast bind (same tick or wide), and by a full bind. Their sum is the packet ops bound.
+inline std::atomic<uint64_t> packet_cache_hits{0}, packet_fast_hits{0}, packet_full_binds{0};
 /// sotc: SOTC_BIND_CACHE_XTICK=1 (default off; needs SOTC_BIND_CACHE=1 and SOTC_BIND_CACHE_RANGES=1):
 /// cached binds survive the submit tick (the next hit of an entry in a new tick replays the
 /// per-tick side effects a full bind has: image and sampler stamps, arena block stamps), the

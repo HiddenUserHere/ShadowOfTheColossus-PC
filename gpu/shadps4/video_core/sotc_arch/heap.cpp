@@ -7,8 +7,10 @@
 // submitted frame can reference is never reused. VK_EXT_descriptor_heap is not used (runtime-array form only).
 
 #include <atomic>
+#include <cstdio>
 
 #include "common/logging/log.h"
+#include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_bindless.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/sotc_arch/sotc_arch.h"
@@ -16,15 +18,41 @@
 #include "video_core/texture_cache/sampler.h"
 
 namespace SotcArch::Heap {
+namespace {
+// Set by CheckRequirements when a requirement is missing on this device (process lifetime).
+std::atomic<bool> g_refused{false};
+} // namespace
 
 bool On() {
-    static const bool on = SwitchMode("SOTC_HEAP") != 0;
-    return on;
+    // The environment part is read once; the device part is final before any pipeline is built (the instance).
+    static const bool env_on = SwitchMode("SOTC_HEAP") != 0 && SwitchMode("SOTC_N5_BINDLESS") != 0 &&
+                               SwitchMode("SOTC_BINDLESS_SAMP") != 0 &&
+                               SwitchMode("SOTC_LAYOUT_UNIFIED") != 0;
+    return env_on && !g_refused.load(std::memory_order_relaxed);
 }
 
 bool UsesDescriptorHeap() {
     // VK_EXT_descriptor_heap is left for later: the emitted SPIR-V is the runtime-array form only.
     return false;
+}
+
+void CheckRequirements(bool bindless_images, bool bindless_samplers) {
+    if (SwitchMode("SOTC_HEAP") == 0) {
+        return;
+    }
+    const bool n5 = SwitchMode("SOTC_N5_BINDLESS") != 0;
+    const bool samp = SwitchMode("SOTC_BINDLESS_SAMP") != 0;
+    const bool layout = SwitchMode("SOTC_LAYOUT_UNIFIED") != 0;
+    if (n5 && samp && layout && bindless_images && bindless_samplers) {
+        return;
+    }
+    g_refused.store(true, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "SOTC HEAP refused: needs SOTC_N5_BINDLESS=1 (%s), SOTC_BINDLESS_SAMP=1 (%s), "
+                 "SOTC_LAYOUT_UNIFIED=1 (%s) and a device with the bindless arrays (%s); the run uses the "
+                 "descriptor path\n",
+                 n5 && bindless_images ? "ok" : "missing", samp && bindless_samplers ? "ok" : "missing",
+                 layout ? "ok" : "missing", bindless_images && bindless_samplers ? "ok" : "missing");
 }
 
 void Init(const Vulkan::Instance& instance) {
@@ -37,12 +65,7 @@ void Init(const Vulkan::Instance& instance) {
         return;
     }
     LOG_INFO(Render_Vulkan, "SOTC HEAP: VK_EXT_descriptor_heap not used (runtime-array form)");
-    if (VideoCore::BindlessImagesMode() == 0) {
-        LOG_WARNING(Render_Vulkan, "SOTC_HEAP=1 needs SOTC_NATIVE=1 and SOTC_N5_BINDLESS=1: image indices are null");
-    }
-    if (!instance.IsBindlessSamplersEnabled()) {
-        LOG_WARNING(Render_Vulkan, "SOTC_HEAP=1 needs SOTC_BINDLESS_SAMP=1: sampler indices are null");
-    }
+    (void)instance;
 }
 
 u32 NullImageIndex(u32 key) {

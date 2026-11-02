@@ -354,6 +354,9 @@ bool ImportRun(uint64_t guest_begin, uint64_t guest_end, const u8* host_begin) {
         RefuseRange("a run reaches outside the aligned view");
         return false;
     }
+    // sotc: SOTC_ADDR_TABLE: from here on the pages of this run are served by the run's memory, not by the arena
+    // they may point to. Their table entries and clean bits are dropped (the next Touch re-resolves them).
+    SotcArch::AddrTable::OnRemove(guest_begin, guest_end - guest_begin);
     // A stale run for this key is replaced, never destroyed: a submission may still read it.
     if (it != g_runs.end()) {
         g_retired.push_back(it->second);

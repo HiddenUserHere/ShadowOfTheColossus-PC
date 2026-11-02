@@ -160,6 +160,9 @@ struct Info : InfoPersistent {
     bool stores_tess_level_outer{};
     bool stores_tess_level_inner{};
     bool translation_failed{};
+    /// sotc: SOTC_HEAP stage variant (ShaderParams::variant). Read by UsesBindlessSamplers, BindlessImageSlotOf and
+    /// the heap decision, so the layout, the emitter and the host all see the same stage.
+    u8 variant{StageVariantDefault};
 
     std::array<Interpolation, IR::NumParams> fs_interpolation{};
 
@@ -168,6 +171,7 @@ struct Info : InfoPersistent {
         : InfoPersistent(stage_, l_stage_, params.hash) {
         PgmBase() = params.Base();
         UserData() = params.user_data;
+        variant = params.variant;
     }
 
     std::span<const u32>& UserData() noexcept {
@@ -299,5 +303,11 @@ u32 BindlessImageKeyOf(const Info& info, const ImageResource& image) noexcept;
 
 /// sotc: true when any image of the stage is in the bindless heap (BindlessImageSlotOf).
 bool UsesBindlessImages(const Info& info) noexcept;
+
+/// sotc: SOTC_HEAP. The static rules of a heap stage, decided from the stage alone (its shader and the process
+/// switches): true when the stage cannot be a heap stage (fmasks, too many images or samplers, storage or array
+/// images, mip fallbacks, images without a heap key, samplers that are not in the sampler heap). A heap stage that
+/// passes these answers every T#/S# through the index table (SotcArch::TableMemo), null slots included.
+bool HeapStaticRefusal(const Info& info) noexcept;
 
 } // namespace Shader

@@ -54,7 +54,8 @@ bool BindlessSamplersEnabled() {
 }
 
 bool UsesBindlessSamplers(const Info& info) {
-    if (!BindlessSamplersEnabled() || info.samplers.empty()) {
+    // sotc: SOTC_HEAP: a plain stage of a heap pipeline reads its samplers through descriptors.
+    if (!BindlessSamplersEnabled() || info.samplers.empty() || info.variant == StageVariantPlain) {
         return false;
     }
     return info.samplers.size() <= GetBindlessSamplerRange(info.sw_stage).count;
@@ -117,7 +118,8 @@ u32 BindlessImageKeyOf(const Info& info, const ImageResource& image) noexcept {
 }
 
 u32 BindlessImageSlotOf(const Info& info, u32 index) noexcept {
-    if (!BindlessImagesEnabled()) {
+    // sotc: SOTC_HEAP: a plain stage of a heap pipeline keeps the descriptors of its images.
+    if (!BindlessImagesEnabled() || info.variant == StageVariantPlain) {
         return NO_BINDLESS_IMAGE_SLOT;
     }
     // Slots go to the eligible images in order, up to the count of the stage; the rest keep
@@ -143,6 +145,27 @@ bool UsesBindlessImages(const Info& info) noexcept {
         }
     }
     return false;
+}
+
+// sotc: SOTC_HEAP. The most images a heap stage takes (the memo's block bound, TableMemo kMaxImages).
+constexpr u32 MaxHeapStageImages = 16;
+
+bool HeapStaticRefusal(const Info& info) noexcept {
+    if (!info.fmasks.empty() || info.images.size() > MaxHeapStageImages ||
+        info.samplers.size() > NUM_SAMPLERS || (info.images.empty() && info.samplers.empty())) {
+        return true;
+    }
+    for (u32 i = 0; i < info.images.size(); ++i) {
+        const auto& image = info.images[i];
+        // Storage images, descriptor arrays and mip fallbacks keep their descriptors (never in the heap).
+        if (image.is_written || image.array_size != 0 ||
+            image.mip_fallback_mode != MipStorageFallbackMode::None ||
+            BindlessImageSlotOf(info, i) == NO_BINDLESS_IMAGE_SLOT) {
+            return true;
+        }
+    }
+    // The samplers come from the sampler heap, through the index table.
+    return !info.samplers.empty() && !UsesBindlessSamplers(info);
 }
 
 bool LodFeedbackEnabled() {

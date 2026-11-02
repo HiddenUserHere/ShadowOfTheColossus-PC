@@ -159,12 +159,19 @@ vk::DeviceAddress Expected(VAddr base, u64 size);
 // ---------------------------------------------------------------------------------------------------------------
 // A4. Global descriptor heap (switch SOTC_HEAP) and per-table index memo.
 namespace Heap {
+/// SOTC_HEAP=1 (or 2) and its requirements met (CheckRequirements). Off means the pipelines are built as today.
 bool On();
 /// True when VK_EXT_descriptor_heap is used; false: descriptor indexing fallback.
 bool UsesDescriptorHeap();
+/// Called once by the instance, after the bindless flags are set. SOTC_HEAP needs SOTC_N5_BINDLESS=1,
+/// SOTC_BINDLESS_SAMP=1 and SOTC_LAYOUT_UNIFIED=1 (heap descriptors are written in GENERAL) and a device with the
+/// bindless arrays. When one is missing: one log line, and On() is false for the whole run (no misrendering).
+void CheckRequirements(bool bindless_images, bool bindless_samplers);
 /// The heap is the N5 bindless arrays (vk_bindless.cpp): one runtime array per image key, slot 0 = null view.
-/// Needs SOTC_N5_BINDLESS=1 and SOTC_BINDLESS_SAMP=1 (and SOTC_LAYOUT_UNIFIED, see TableMemo).
 void Init(const Vulkan::Instance& instance);
+/// True when a stage cannot be a heap stage: Shader::HeapStaticRefusal, or a host rule (the composite and UI rules
+/// of BindTexturesFull, which the memo does not answer). The pipeline cache calls it before it picks the heap variant.
+bool StageRefused(const Shader::Info& stage);
 u32 NullImageIndex(u32 key);
 u32 NullSamplerIndex();
 /// The view's slot in the array of `key` for `layout` (acquired when missing; released by the view's destructor

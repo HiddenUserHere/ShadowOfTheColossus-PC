@@ -14,10 +14,16 @@
 // Population: EnsureResident and the arena migration (OnPlace), ReleaseMemory and MaybeEvictCold (OnRemove), and
 // Touch, which asks the buffer cache for the range (ObtainBuffer: it places, syncs and serves ring-8 binds) and
 // writes the entries of the whole range from the single (buffer, offset) it returns.
+//
+// Clean state (sotc: SOTC_ADDR_TABLE fast path). Each table page has two bits: placed (its entry is not 0) and clean
+// (the entries on the device are the shadow's, and the bytes behind them match guest memory as of the last sync of the
+// page). A read Touch of a range whose pages are all placed and clean returns at once, with no ObtainBuffer. Events
+// that make a clean page stale clear its bit (Dirty, OnPlace, OnRemove); see addr_table.cpp for the ordering proof.
 #pragma once
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/sotc_arch/addr_table_hooks.h"
 
 namespace Vulkan {
 class Instance;
@@ -52,6 +58,8 @@ vk::DeviceAddress Base();
 /// (ObtainBuffer with is_written), writes the table entries of its pages and uploads the dirty table chunks on the
 /// upload command buffer, which runs before this submit's commands. False when the range is outside the window, has
 /// no device address, or the buffer cache refuses it (counted; the shader then reads zero for those pages).
+/// A read of a range whose pages are all placed and clean returns true at once (no ObtainBuffer); SOTC_SHADER_ADDR=2
+/// still runs the slow path and only counts the fast path it would have taken.
 bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size, bool is_written);
 
 /// The buffer cache placed [addr, addr+size) at device address device_addr (any thread). Only the shadow changes; the

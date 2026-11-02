@@ -88,10 +88,13 @@ constexpr u64 kRingAlign = 16;
 static_assert(sizeof(AmdGpu::Image) == 4 * sizeof(u64));
 static_assert(sizeof(AmdGpu::Sampler) == 2 * sizeof(u64));
 
-enum class Miss : u8 { None, Absent, Candidate, Generation, Dirty, Sampler };
+enum class Miss : u8 { None, Absent, Candidate, Generation, Dirty, Sampler, Unmapped };
 
 struct ImageRecord {
     bool null{};
+    /// sotc: null because the guest mapping of the T# was not valid when it was resolved: a later map can make it
+    /// valid, so a hit checks the mapping again (CheckHit). Other nulls are decided by the key words.
+    bool unmapped{};
     bool lod{};
     u32 lod_bank{};
     VideoCore::ImageId found{};
@@ -135,6 +138,10 @@ struct Counters {
     std::atomic<u64> miss_generation{};
     std::atomic<u64> miss_dirty{};
     std::atomic<u64> miss_sampler{};
+    std::atomic<u64> miss_unmapped{};
+    /// sotc: SOTC_HEAP: T#s and S#s answered with the null slots instead of a refusal (fresh resolutions).
+    std::atomic<u64> null_answers{};
+    std::atomic<u64> null_unmapped{};
     std::atomic<u64> refused{};
     std::atomic<u64> not_stored{};
     std::atomic<u64> stores{};
@@ -181,39 +188,11 @@ bool UiLinearRule(const Shader::Info& stage) {
     return ui_linear && stage.images.size() == 1;
 }
 
-// Pure checks of the stage, before any side effect. Returns false for a stage the memo does not answer.
-bool Answerable(const Shader::Info& stage, AmdGpu::BorderColorBuffer border_color) {
-    if (!stage.fmasks.empty() || stage.images.size() > kMaxImages ||
-        stage.samplers.size() > kMaxSamplers || (stage.images.empty() && stage.samplers.empty())) {
-        return false;
-    }
-    if (CompositeRule(stage) || UiLinearRule(stage)) {
-        return false;
-    }
-    for (const auto& image_desc : stage.images) {
-        if (image_desc.is_written || image_desc.array_size != 0 ||
-            image_desc.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
-            return false;
-        }
-        const AmdGpu::Image tsharp = image_desc.GetSharp(stage);
-        if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
-            continue; // a null binding: no guest mapping needed
-        }
-        // Decided by the guest memory map, which a later map can change: the draw path decides.
-        if (!Core::Memory::Instance()->IsValidGpuMapping(tsharp.Address(), 0) ||
-            !magic_enum::enum_contains(tsharp.GetDataFmt()) ||
-            !magic_enum::enum_contains(tsharp.GetNumberFmt())) {
-            return false;
-        }
-    }
-    for (const auto& sampler : stage.samplers) {
-        const AmdGpu::Sampler ssharp = sampler.GetSharp(stage);
-        if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
-                                border_color.Address() == 0)) {
-            return false; // the full bind logs and rewrites these
-        }
-    }
-    return true;
+// The stage is answerable unless it is refused: the static rules and the host rules are decided at pipeline creation
+// (Heap::StageRefused, the same predicate the recompiler uses). The dynamic cases (an unmapped T#, an invalid S#)
+// are answered with the null slots in ResolveFresh, so a heap stage never drops an op.
+bool Answerable(const Shader::Info& stage) {
+    return !Heap::StageRefused(stage);
 }
 
 u64 KeyOf(const Shader::Info& stage, AmdGpu::BorderColorBuffer border_color,
@@ -292,6 +271,12 @@ Miss CheckHit(VideoCore::TextureCache& tc, const Entry& e) {
     }
     for (u32 i = 0; i < e.num_images; ++i) {
         const ImageRecord& r = e.images[i];
+        if (r.unmapped) { // a guest map made the T# valid: the draw path binds its view now
+            if (Core::Memory::Instance()->IsValidGpuMapping(r.addr, 0)) {
+                return Miss::Unmapped;
+            }
+            continue;
+        }
         if (r.null) {
             continue;
         }
@@ -340,6 +325,23 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
         if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
             r.null = true;
             out[index] = Heap::NullImageIndex(Shader::BindlessImageKeyOf(stage, image_desc));
+            s.counters.null_answers.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        // The classic bind rejects a T# with invalid enums or an invalid guest mapping and binds a null descriptor
+        // (BindTexturesFull). The heap answers with the null slot, the same way. The mapping can change: such a
+        // record is checked again on each hit (CheckHit). The enums are part of the key, so they are static.
+        const bool valid_enums = magic_enum::enum_contains(tsharp.GetDataFmt()) &&
+                                 magic_enum::enum_contains(tsharp.GetNumberFmt());
+        if (!valid_enums || !Core::Memory::Instance()->IsValidGpuMapping(tsharp.Address(), 0)) {
+            r.null = true;
+            r.unmapped = valid_enums;
+            r.addr = tsharp.Address();
+            out[index] = Heap::NullImageIndex(Shader::BindlessImageKeyOf(stage, image_desc));
+            s.counters.null_answers.fetch_add(1, std::memory_order_relaxed);
+            if (valid_enums) {
+                s.counters.null_unmapped.fetch_add(1, std::memory_order_relaxed);
+            }
             continue;
         }
 
@@ -356,6 +358,7 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
             store = false;
             out[index] = Heap::NullImageIndex(Shader::BindlessImageKeyOf(stage, image_desc));
             r.null = true;
+            s.counters.null_answers.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         r.addr = tsharp.Address();
@@ -384,6 +387,7 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
             if (!r.bound) {
                 out[index] = Heap::NullImageIndex(Shader::BindlessImageKeyOf(stage, image_desc));
                 r.null = true;
+                s.counters.null_answers.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
         }
@@ -402,9 +406,17 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
     for (u32 j = 0; j < stage.samplers.size(); ++j) {
         const auto& sampler = stage.samplers[j];
         const AmdGpu::Sampler ssharp = sampler.GetSharp(stage);
+        // An invalid S# (or a custom border without its base) answers with the null sampler slot: the classic bind
+        // rewrites it as well and logs it. Static: both inputs are in the key.
+        if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                                border_color.Address() == 0)) {
+            out[num_images + j] = Heap::NullSamplerIndex();
+            s.counters.null_answers.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         u32 slot = Heap::NullSamplerIndex();
         (void)tc.GetSampler(ssharp, border_color, sampler.is_depth, &slot); // the bindless sampler slot
-        out[num_images + j] = slot; // a null sampler never reaches here: refused
+        out[num_images + j] = slot;
     }
     rec.num_bindings = num_images + static_cast<u32>(stage.samplers.size());
     rec.sampler_generation = tc.SamplerGeneration();
@@ -451,7 +463,7 @@ IndexTable Publish(Entry* entry, const std::array<u32, kMaxBindings>& indices, u
 } // namespace
 
 bool On() {
-    return Mode() != 0;
+    return Heap::On();
 }
 
 void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler) {
@@ -478,7 +490,7 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
     if (!s.ready) {
         return {};
     }
-    if (!Answerable(stage, border_color)) {
+    if (!Answerable(stage)) { // never for a stage the pipeline cache chose as heap (Heap::StageRefused)
         s.counters.refused.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
@@ -522,6 +534,7 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
         case Miss::Generation: s.counters.miss_generation.fetch_add(1, std::memory_order_relaxed); break;
         case Miss::Dirty: s.counters.miss_dirty.fetch_add(1, std::memory_order_relaxed); break;
         case Miss::Sampler: s.counters.miss_sampler.fetch_add(1, std::memory_order_relaxed); break;
+        case Miss::Unmapped: s.counters.miss_unmapped.fetch_add(1, std::memory_order_relaxed); break;
         case Miss::None: break;
         }
     }
@@ -576,8 +589,9 @@ void Report(char* out, u32 size, double seconds) {
     std::snprintf(
         out, size,
         "SOTC TABLEMEMO %.1f s: lookups %llu, hits %llu (%.0f%%), misses: absent %llu, "
-        "generation %llu, dirty %llu, sampler %llu, candidate %llu; refused %llu, not stored %llu; "
-        "stored %llu, evicted %llu, live %u/%u; ring overflow %llu; verify %llu, mismatches %llu\n",
+        "generation %llu, dirty %llu, sampler %llu, candidate %llu, unmapped %llu; refused %llu, "
+        "not stored %llu; stored %llu, evicted %llu, live %u/%u; null answers %llu (unmapped T# %llu); "
+        "ring overflow %llu; verify %llu, mismatches %llu\n",
         seconds, static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(hits),
         lookups ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0,
         static_cast<unsigned long long>(take(s.counters.miss_absent)),
@@ -585,13 +599,27 @@ void Report(char* out, u32 size, double seconds) {
         static_cast<unsigned long long>(take(s.counters.miss_dirty)),
         static_cast<unsigned long long>(take(s.counters.miss_sampler)),
         static_cast<unsigned long long>(take(s.counters.miss_candidate)),
+        static_cast<unsigned long long>(take(s.counters.miss_unmapped)),
         static_cast<unsigned long long>(take(s.counters.refused)),
         static_cast<unsigned long long>(take(s.counters.not_stored)),
         static_cast<unsigned long long>(take(s.counters.stores)),
         static_cast<unsigned long long>(take(s.counters.evictions)), live, kEntries,
+        static_cast<unsigned long long>(take(s.counters.null_answers)),
+        static_cast<unsigned long long>(take(s.counters.null_unmapped)),
         static_cast<unsigned long long>(take(s.counters.ring_overflow)),
         static_cast<unsigned long long>(take(s.counters.verify)),
         static_cast<unsigned long long>(take(s.counters.verify_mismatch)));
 }
 
 } // namespace SotcArch::TableMemo
+
+namespace SotcArch::Heap {
+
+bool StageRefused(const Shader::Info& stage) {
+    // The static rules (the recompiler's HeapStaticRefusal) and the composite and UI rules of the draw path, which
+    // the memo does not answer. Both are fixed for the run, so the pipeline cache decides once per program.
+    return Shader::HeapStaticRefusal(stage) || TableMemo::CompositeRule(stage) ||
+           TableMemo::UiLinearRule(stage);
+}
+
+} // namespace SotcArch::Heap

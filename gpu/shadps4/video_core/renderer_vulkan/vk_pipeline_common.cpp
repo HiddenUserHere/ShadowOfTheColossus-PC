@@ -168,8 +168,9 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
       is_compute{is_compute_} {
     stage_sets = !is_compute && profile.stage_bindings;
-    // sotc: SOTC_PACKET: the shader reads the DrawPacket when it was built with addresses or the heap.
-    packet_range = profile.shader_addr || profile.heap_images;
+    // sotc: SOTC_PACKET: the shader reads the DrawPacket when it was built with addresses or with a heap stage (the
+    // heap stage is known once the stages are set: see the layout of each pipeline).
+    packet_range = profile.shader_addr != 0;
 }
 
 Pipeline::~Pipeline() = default;
@@ -478,7 +479,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
         }
     }
     // sotc: SOTC_BINDLESS_SAMP: the sampler slots, after PushData (the second range of the layout).
-    if (uses_bindless_samplers) {
+    if (uses_slot_words) {
         cmdbuf.pushConstants(pipeline_layout, stage_flags, sizeof(push_data), sizeof(bindless_slots),
                              &bindless_slots);
     }

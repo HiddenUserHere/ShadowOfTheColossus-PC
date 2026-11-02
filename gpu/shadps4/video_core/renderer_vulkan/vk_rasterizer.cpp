@@ -98,7 +98,9 @@ static const bool kDedupState = [] {
 // sotc: SOTC_BINDLESS_SAMP: the samplers of this stage come from the global heap, not from set 0.
 // The same rule as Shader::UsesBindlessSamplers, whose profile flag is the instance flag.
 static bool IsBindlessStage(const Instance& instance, const Shader::Info& stage) {
+    // sotc: SOTC_HEAP: a plain stage of a heap pipeline reads its samplers through descriptors (UsesBindlessSamplers).
     return instance.IsBindlessSamplersEnabled() && !stage.samplers.empty() &&
+           stage.variant != Shader::StageVariantPlain &&
            stage.samplers.size() <= Shader::GetBindlessSamplerRange(stage.sw_stage).count;
 }
 
@@ -2901,6 +2903,7 @@ bool Rasterizer::BindResourceHash(const Pipeline* pipeline, u64& out) const {
 }
 
 void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma) {
+    fast_bind.addr.assign(packet_addr_rec.begin(), packet_addr_rec.end()); // sotc: SOTC_PACKET (empty otherwise)
     fast_bind.pipeline = pipeline;
     fast_bind.hash = hash;
     fast_bind.buffer_generation = BufferBindGeneration(); // sotc: BindVersion with BIND_CACHE_XTICK
@@ -3225,9 +3228,17 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     const bool packet_op = pipeline->HasPacketRange();
     shader_addr_touch = false;
     sotc_addressed_writes.clear(); // sotc: SOTC_SHADER_ADDR, mirror coherence: this op's addressed writes only
+    packet_addr_rec.clear();       // sotc: SOTC_PACKET: this op's shader-addressed buffers (BindBuffers)
     // sotc: SOTC_SHADER_ADDR: the buffer writes recorded before this op, which a shader-addressed read of this op must
     // be ordered after (see the end of this function).
     const bool barrier_pending_before = runtime.MemoryBarrierPending();
+    // sotc: SOTC_PACKET. The barrier rule of the end of this function (for the replays that return early).
+    const auto packet_barrier = [&] {
+        if (SotcArch::ShaderAddr::On() &&
+            (shader_addr_touch ? barrier_pending_before : runtime.AddressedWritePending())) {
+            needs_barrier = true;
+        }
+    };
     if (packet_op) {
         // sotc: SOTC_ADDR_TABLE: the mirror words name the guest page table (same offsets): its window, its device
         // address and its size (addr_table.h). The shader reads the table through them (TableAddresses).
@@ -3283,8 +3294,13 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // when this bind is not a read-only graphics bind (its writes and copies run before them).
     // sotc: SOTC_PARALLEL_RECORD: `prepared` holds the register-only inputs of this bind
     // (eligibility, push data, FastBindHash), computed ahead by a prep thread.
+    // sotc: SOTC_PACKET. A packet op takes the frame cache (SOTC_BIND_CACHE_FRAME: its hits replay the packet words and
+    // the addressed ranges, TryBindCacheFrame). Not the older cache, and not a heap stage: its index table is per op.
+    // The heap check is the profile's flag, not only the stages found: a heap pipeline keeps its index table per op.
+    const bool packet_heap_free = heap_stage == nullptr && !pipeline->GetProfile().heap_images;
+    const bool packet_cacheable = !packet_op || (SotcStats::kBindCacheFrame && packet_heap_free);
     const bool cache_eligible =
-        SotcStats::kBindCache && !packet_op && // sotc: SOTC_PACKET (see packet_op above)
+        SotcStats::kBindCache && packet_cacheable &&
         (prepared ? prepared->cache_eligible : BindCacheEligible(pipeline));
     if (SotcStats::kBindCache) {
         if (SotcStats::kBindCacheFrame) {
@@ -3364,16 +3380,18 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // sotc: the previous draw left these descriptors and push constants bound. Skip rebuilding
     // them when this draw needs exactly the same pipeline, push data, render targets and
     // resource handles. The generation bumps catch reallocated buffers/images and dead samplers.
-    // sotc: SOTC_PACKET: a packet op is never a fast bind (see packet_op above).
-    const bool fast_eligible = !packet_op && (prepared ? prepared->fast_static && !attachment_feedback_loop
-                                                       : FastBindEligible(pipeline));
+    // sotc: SOTC_PACKET: a packet op takes the fast bind unless it has a heap stage (its index table is per op). Its
+    // hits replay the addressed ranges (PacketAddrReplay) and the barrier rule (packet_barrier).
+    const bool fast_eligible = (!packet_op || packet_heap_free) &&
+                               (prepared ? prepared->fast_static && !attachment_feedback_loop
+                                         : FastBindEligible(pipeline));
     u64 fast_hash = 0;
     if (fast_eligible) {
         SotcStats::fast_bind_eligible.fetch_add(1, std::memory_order_relaxed);
         const auto input_push = prepared ? prepared->push_data : MakeUserData(liverpool->DrawRegs());
         fast_hash = prepared ? prepared->fast_hash : FastBindHash(pipeline, input_push);
         // Same state as the last full bind, ignoring the submit tick (SOTC_FASTBIND_WIDE needs it).
-        const bool fast_state_same =
+        bool fast_state_same =
             fast_bind.valid && fast_bind.pipeline == pipeline &&
             fast_bind.buffer_generation == BufferBindGeneration() &&
             fast_bind.texture_generation == texture_cache.BindGeneration() &&
@@ -3399,9 +3417,23 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             }
             BindDiffNote(mask, mask == 0);
         }
+        // sotc: SOTC_PACKET. A packet op's fast or wide hit touches its addressed ranges again, as its full bind did
+        // (Touch may place or evict buffers: a generation it moves ends the hit, and the full bind follows).
+        if (packet_op && fast_state_same &&
+            (fast_bind.tick == scheduler.CurrentTick() || SotcStats::kFastBindWide)) {
+            PacketAddrReplay(fast_bind.addr);
+            fast_state_same = fast_bind.buffer_generation == BufferBindGeneration() &&
+                              fast_bind.stream_generation == buffer_cache.StreamGeneration();
+        }
         if (fast_state_same && fast_bind.tick == scheduler.CurrentTick()) {
             fast_bind_hit = true;
             SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
+            if (packet_op) {
+                packet_barrier();
+                if (SotcStats::kFpsLog) {
+                    SotcStats::packet_fast_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             if (fast_bind.uses_dma) {
                 const SotcStats::SplitTimer dma_split{SotcStats::SplitBindDma};
                 buffer_cache.SynchronizeDmaBuffers();
@@ -3419,6 +3451,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             fast_bind.tick = scheduler.CurrentTick();
             if (SotcStats::kFpsLog) {
                 SotcStats::fast_bind_wide_hits.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (packet_op) {
+                packet_barrier(); // sotc: SOTC_PACKET (the ranges were touched above)
+                if (SotcStats::kFpsLog) {
+                    SotcStats::packet_fast_hits.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             if (fast_bind.uses_dma) {
                 buffer_cache.SynchronizeDmaBuffers();
@@ -3496,6 +3534,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
                 SotcStats::op_compute_hits.fetch_add(1, std::memory_order_relaxed);
             }
             // The arrays now hold this state: the next identical draw may take the fast bind.
+            if (packet_op) { // sotc: SOTC_PACKET (TryBindCacheFrame replayed the packet's ranges)
+                packet_barrier();
+                if (SotcStats::kFpsLog) {
+                    SotcStats::packet_cache_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             if (fast_eligible) {
                 CommitFastBind(pipeline, fast_hash, hit_dma);
             }
@@ -3674,8 +3718,36 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             CommitBindCache(pipeline, cache_hash, uses_dma, first_bound_buffer);
         }
     }
+    if (packet_op && SotcStats::kFpsLog) { // sotc: SOTC_PACKET: a full bind (no cache or fast hit)
+        SotcStats::packet_full_binds.fetch_add(1, std::memory_order_relaxed);
+    }
 
     return true;
+}
+
+void Rasterizer::PacketAddrReplay(const std::vector<PacketAddr>& ranges) {
+    // sotc: SOTC_PACKET. What BindBuffers does for each shader-addressed buffer of a full bind, for a replayed one: no
+    // descriptor, the range touched (Touch, or the mirror's Touch in mirror mode), and the skip counted without
+    // SOTC_SHADER_ADDR=2. Only read-only ranges get here: BindCacheEligible and FastBindStatic refuse a bind that
+    // writes a buffer, so the write side (Passes::NoteWrite, NoteAddressedWrite, the mirror copy back) never replays.
+    shader_addr_touch = !ranges.empty();
+    for (const auto& r : ranges) {
+        if (!SotcArch::ShaderAddr::Verify()) {
+            SotcArch::ShaderAddr::NoteSkip(r.size, r.written);
+        }
+        const bool touch_ok =
+            r.size == 0 ||
+            (SotcArch::AddrTable::On()
+                 ? SotcArch::AddrTable::Touch(buffer_cache, scheduler, r.addr, r.size, r.written)
+                 : SotcArch::Mirror::Touch(scheduler, r.addr, r.size));
+        if (!touch_ok) {
+            static std::atomic<u64> replay_touch_refused{};
+            if (replay_touch_refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_ERROR(Render_Vulkan, "SOTC SHADER_ADDR: replayed bind cannot hold {:#x}+{:#x}",
+                          r.addr, r.size);
+            }
+        }
+    }
 }
 
 bool Rasterizer::BindCacheEligible(const Pipeline* pipeline) const {
@@ -4607,14 +4679,24 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
                 if (stats) {
                     SotcStats::bf_flat_reused.fetch_add(1, std::memory_order_relaxed);
                 }
-                continue;
+            } else {
+                slot.offset = vk_buffer.Copy(flat, slot.size, alignment);
+                slot.hash = hash;
+                slot.gen = buffer_cache.StreamGeneration();
+                slot.tick = scheduler.CurrentTick();
+                if (stats) {
+                    SotcStats::bf_flat_copied.fetch_add(1, std::memory_order_relaxed);
+                }
             }
-            slot.offset = vk_buffer.Copy(flat, slot.size, alignment);
-            slot.hash = hash;
-            slot.gen = buffer_cache.StreamGeneration();
-            slot.tick = scheduler.CurrentTick();
-            if (stats) {
-                SotcStats::bf_flat_copied.fetch_add(1, std::memory_order_relaxed);
+            // sotc: SOTC_PACKET. The packet word of this flat buffer, as BindBuffers sets it (by the stage's kind).
+            if (entry->packet) {
+                const u64 address = vk_buffer.BufferDeviceAddress() + slot.offset;
+                if (st->sw_stage == Shader::SwStage::Fragment) {
+                    draw_packet.flatbuf_fragment_address = address;
+                } else if (st->sw_stage == Shader::SwStage::Vertex ||
+                           st->sw_stage == Shader::SwStage::Compute) {
+                    draw_packet.flatbuf_address = address;
+                }
             }
         }
     }
@@ -4680,6 +4762,19 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
             if (handle != s.handle || slot != s.slot) {
                 return refuse(true);
             }
+        }
+    }
+    // sotc: SOTC_PACKET. The addressed ranges of the packet op, touched as BindBuffers does; Touch may place or evict
+    // buffers, so the entry is checked again after it. The packet words that do not come from flat_slots are the
+    // ones the entry stored (its flat buffer copy is valid while the stream generation is unchanged, as its buffers).
+    if (entry->packet) {
+        if (!entry->refresh) {
+            draw_packet.flatbuf_address = entry->packet_flat[0];
+            draw_packet.flatbuf_fragment_address = entry->packet_flat[1];
+        }
+        PacketAddrReplay(entry->addr);
+        if (u32 reason; !BindCacheEntryFresh(*entry, reason)) {
+            return stale(reason);
         }
     }
     {
@@ -4799,6 +4894,8 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
     if (stats) {
         SotcStats::bind_cache_hits.fetch_add(1, std::memory_order_relaxed);
     }
+    // sotc: SOTC_PACKET. The hit's addressed ranges are this op's: CommitFastBind keeps them for the fast binds.
+    packet_addr_rec.assign(entry->addr.begin(), entry->addr.end());
     return true;
 }
 
@@ -4922,6 +5019,11 @@ void Rasterizer::CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool u
     entry->repairs.assign(bind_cache_repairs_rec.begin(), bind_cache_repairs_rec.end());
     entry->samplers.assign(bind_cache_samplers_rec.begin(), bind_cache_samplers_rec.end());
     entry->tex_watch.assign(tex_watch.begin(), tex_watch.end());
+    // sotc: SOTC_PACKET. A packet op's hit refreshes the packet words (flat_slots, or these two when there are none)
+    // and replays its addressed ranges (TryBindCacheFrame).
+    entry->packet = pipeline->HasPacketRange();
+    entry->packet_flat = {draw_packet.flatbuf_address, draw_packet.flatbuf_fragment_address};
+    entry->addr.assign(packet_addr_rec.begin(), packet_addr_rec.end());
     entry->made_tick = state.tick;
     entry->stamp_tick = state.tick; // the full bind just made this tick's stamps
     entry->stamp_epoch = 0;         // block stamps due at the first hit
@@ -6007,6 +6109,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     }
                 }
                 shader_addr_touch = true; // Passes::Decide: this op touches memory with no bound_buffers entry
+                // sotc: SOTC_PACKET. A replayed bind (bind cache, fast bind) touches the same range again (PacketAddrReplay).
+                // Only a shader-addressed buffer of a packet op comes here (its profile is the packet's), so this is
+                // always a packet op.
+                packet_addr_rec.push_back({vbase, size, desc.is_written});
+                if (bind_cache_recording && size != 0) {
+                    bind_cache_ranges_rec.emplace_back(vbase, size); // what a GPU write to the range invalidates
+                }
+                if (bind_cache_recording && SotcStats::kBindCacheXtick) {
+                    // The mapping under the range is checked at each hit (mapping_changed), as for a descriptor.
+                    bind_cache_repairs_rec.push_back({vbase, vsize, size, nullptr, 0, false});
+                }
                 if (desc.is_written) {
                     Passes::NoteWrite(); // sotc: SOTC_PASSES: a write the pass rule must see
                     // sotc: SOTC_SHADER_ADDR, mirror coherence: the shader's writes went to the mirror; they are copied
@@ -6030,7 +6143,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     // carry it, so the next op that reads or writes memory orders after it (see BindResources).
                     runtime.NoteAddressedWrite();
                 }
-                bind_cache_uncacheable = true; // the op's bind cache is not recorded: no buffer object to check
+                // sotc: SOTC_PACKET. A read-only addressed range is replayed by a hit (packet_addr_rec); a written one
+                // is not eligible (BindCacheEligible), so this flag only guards that case.
+                if (desc.is_written) {
+                    bind_cache_uncacheable = true;
+                }
                 ++binding.unified;
                 ++binding.buffer;
                 continue;

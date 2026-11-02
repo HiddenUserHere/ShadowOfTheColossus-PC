@@ -496,6 +496,8 @@ public:
         SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds
         BumpSyncGeneration(cpu_addr, size);
         SotcGen::Bump(cpu_addr, size); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
+        // sotc: SOTC_ADDR_TABLE clean state: the exact copy changed the bytes of the arena under these pages.
+        SotcArch::AddrTable::Dirty(cpu_addr, size);
     }
 
     /// sotc: SOTC_SYNC_FAST. Sets gen to the sum of the write generations over [cpu_addr,

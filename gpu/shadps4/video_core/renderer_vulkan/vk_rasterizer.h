@@ -501,6 +501,13 @@ private:
     VAddr hudless_vo{};          ///< this draw: the video out image it renders to, 0 none
     vk::Format hudless_vo_format{};
     u32 hudless_vo_width{}, hudless_vo_height{};
+    /// sotc: SOTC_PACKET. A shader-addressed buffer of a packet op: no descriptor, but its range is made resident
+    /// by Touch in every bind (BindBuffers). A bind cache entry or a fast bind of a packet op replays these.
+    struct PacketAddr {
+        VAddr addr{};
+        u64 size{};    ///< the clamped size BindBuffers used (0: nothing to touch)
+        bool written{}; ///< never replayed: a written buffer is not eligible for the caches
+    };
     /// sotc: descriptor state of the previous graphics draw (SOTC_FAST_BIND). Valid only while
     /// the same command buffer, pipeline, push data and resource generations are current.
     struct FastBindState {
@@ -513,6 +520,8 @@ private:
         u64 tick{};
         bool uses_dma{};
         bool valid{};
+        /// sotc: SOTC_PACKET: the addressed ranges of that bind, touched again by each fast or wide hit.
+        std::vector<PacketAddr> addr;
     };
     FastBindState fast_bind{};
     bool fast_bind_hit{};
@@ -622,6 +631,11 @@ private:
         u64 map_epoch{};
         u64 made_frame{};
         bool uses_stream{};    ///< holds a flat buffer copy in the stream ring
+        /// sotc: SOTC_PACKET. The bind was a packet op: a hit refreshes the packet's flat buffer addresses (from
+        /// flat_slots, or the two words below when the entry has none) and replays `addr` (PacketAddr).
+        bool packet{};
+        std::array<u64, 2> packet_flat{}; ///< flatbuf_address, flatbuf_fragment_address at the commit (no flat_slots)
+        std::vector<PacketAddr> addr;
         bool map_dependent{};  ///< bound a T# the guest mapping rejected (a map can change that)
         /// Bound a mip-tail image: FindImage's tail choice depends on which overlapping images are
         /// GPU-written (VideoCore::gpu_modified_epoch), checked at the hit.
@@ -713,6 +727,12 @@ private:
         u64 size;
     };
     std::vector<AddressedWrite> sotc_addressed_writes;
+    /// sotc: SOTC_PACKET. The shader-addressed buffers of the packet op being bound (BindBuffers records them, reset
+    /// by BindResources). CommitFastBind and the bind cache store them; a hit replays them (PacketAddrReplay).
+    std::vector<PacketAddr> packet_addr_rec;
+    /// sotc: SOTC_PACKET. Touches the ranges of a packet op's bind again (a hit, in place of BindBuffers): Touch,
+    /// the skipped-buffer counters and shader_addr_touch, as the full bind does.
+    void PacketAddrReplay(const std::vector<PacketAddr>& ranges);
     /// sotc: SOTC_SHADER_ADDR, ResetBindings (after the op is recorded): the GPU writes of the op reach the mirror
     /// (bound written buffers) and the addressed writes reach their buffers (see SotcMirrorFromBuffer).
     void SotcMirrorAfterOp();

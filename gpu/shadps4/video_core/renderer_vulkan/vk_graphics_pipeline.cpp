@@ -9,6 +9,7 @@
 
 #include "common/assert.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
+#include "shader_recompiler/backend/spirv/spirv_emit_context.h" // sotc: SOTC_HEAP (UsesHeapImages)
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
@@ -810,6 +811,7 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
     u32 num_sets{1};
     u32 binding{};
     uses_bindless_samplers = false;
+    uses_slot_words = false; // sotc: SOTC_HEAP
 
     for (const auto* stage : stages) {
         if (!stage) {
@@ -851,9 +853,16 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
         }
         // sotc: SOTC_BINDLESS_SAMP: the samplers of this stage come from the global heap instead.
         const bool bindless = Shader::UsesBindlessSamplers(*stage);
-        uses_bindless_samplers |= bindless;
         // sotc: SOTC_N5_BINDLESS: the heap image arrays are in the bindless set too.
-        uses_bindless_samplers |= Shader::UsesBindlessImages(*stage);
+        const bool bindless_images = Shader::UsesBindlessImages(*stage);
+        uses_bindless_samplers |= bindless || bindless_images;
+        // sotc: SOTC_HEAP: a heap stage reads its indices from the index table (the packet's), so it needs the heap set
+        // but no slot words, and the pipeline has the packet range. Every other bindless stage reads slot words.
+        const bool heap_stage = Shader::Backend::SPIRV::UsesHeapImages(*stage, profile);
+        if (heap_stage) {
+            packet_range = true;
+        }
+        uses_slot_words |= (bindless || bindless_images) && !heap_stage;
         for (const auto& sampler : stage->samplers) {
             if (bindless) {
                 break;
@@ -880,7 +889,7 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
                            ? vk::DescriptorSetLayoutCreateFlagBits::eDescriptorBufferEXT
                            : vk::DescriptorSetLayoutCreateFlagBits{};
     // sotc: SOTC_PACKET: a packet pipeline's range holds the DrawPacket after PushData (no slot words).
-    ASSERT_MSG(!(packet_range && uses_bindless_samplers),
+    ASSERT_MSG(!(packet_range && uses_slot_words),
                "packet pipeline with bindless slot words (the heap replaces them)");
     const vk::PushConstantRange push_constants = {
         .stageFlags = AllGraphicsStageBits,
@@ -906,7 +915,7 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
         .push_constants = push_constants,
         .trailing_set = uses_bindless_samplers ? desc_heap.BindlessSamplerLayout()
                                                : vk::DescriptorSetLayout{},
-        .slot_constants = uses_bindless_samplers ? slot_push_constants : vk::PushConstantRange{},
+        .slot_constants = uses_slot_words ? slot_push_constants : vk::PushConstantRange{},
     };
     const auto layouts = layout_cache.Get(request, owned_layouts);
     set_layouts = layouts.sets;

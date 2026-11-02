@@ -4,6 +4,7 @@
 #include <chrono>
 #include <boost/container/small_vector.hpp>
 
+#include "shader_recompiler/backend/spirv/spirv_emit_context.h" // sotc: SOTC_HEAP (UsesHeapImages)
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
@@ -58,8 +59,15 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         binding += num_bindings;
     }
     // sotc: SOTC_BINDLESS_SAMP: the samplers come from the global heap (set 1) instead.
-    uses_bindless_samplers =
-        Shader::UsesBindlessSamplers(*info) || Shader::UsesBindlessImages(*info);
+    const bool bindless_images = Shader::UsesBindlessImages(*info);
+    uses_bindless_samplers = Shader::UsesBindlessSamplers(*info) || bindless_images;
+    // sotc: SOTC_HEAP: a heap stage reads its indices from the index table (the packet's): the heap set, no slot words,
+    // and the packet range. Otherwise the bindless stage reads slot words, as before.
+    const bool heap_stage = Shader::Backend::SPIRV::UsesHeapImages(*info, profile);
+    if (heap_stage) {
+        packet_range = true;
+    }
+    uses_slot_words = uses_bindless_samplers && !heap_stage;
     for (const auto& sampler : info->samplers) {
         if (uses_bindless_samplers) {
             break;
@@ -73,7 +81,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     }
 
     // sotc: SOTC_PACKET: a packet pipeline's range holds the DrawPacket after PushData (no slot words).
-    ASSERT_MSG(!(packet_range && uses_bindless_samplers),
+    ASSERT_MSG(!(packet_range && uses_slot_words),
                "packet pipeline with bindless slot words (the heap replaces them)");
     const vk::PushConstantRange push_constants = {
         .stageFlags = vk::ShaderStageFlagBits::eCompute,
@@ -102,7 +110,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .push_constants = push_constants,
         .trailing_set = uses_bindless_samplers ? desc_heap.BindlessSamplerLayout()
                                                : vk::DescriptorSetLayout{},
-        .slot_constants = uses_bindless_samplers
+        .slot_constants = uses_slot_words
                               ? vk::PushConstantRange{
                                     .stageFlags = vk::ShaderStageFlagBits::eCompute,
                                     .offset = sizeof(Shader::PushData),

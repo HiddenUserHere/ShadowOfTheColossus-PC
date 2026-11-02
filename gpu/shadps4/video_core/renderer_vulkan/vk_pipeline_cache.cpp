@@ -1158,6 +1158,7 @@ void PipelineCache::QueueAsyncTranslate(HwStage hw_stage, SwStage sw_stage,
     t.hw_stage = hw_stage;
     t.sw_stage = sw_stage;
     t.hash = params.hash;
+    t.variant = params.variant; // sotc: SOTC_HEAP
     // The user data registers change with the next draws: the worker reads a copy. The code
     // stays in guest memory (inline constants are addressed from it).
     std::ranges::copy(params.user_data, t.user_data.begin());
@@ -1262,6 +1263,7 @@ void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
         .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{t.user_data},
         .code = t.code,
         .hash = t.hash,
+        .variant = t.variant, // sotc: SOTC_HEAP
     };
     auto binding = t.start;
     auto runtime_info = t.runtime_info;
@@ -2638,6 +2640,10 @@ bool PipelineCache::RefreshGraphicsStages() {
     fetch_shader = nullptr;
 
     Shader::Backend::Bindings binding{};
+    // sotc: SOTC_HEAP stage variants (ShaderParams::variant). The fragment is the heap stage of the pipeline when it
+    // qualifies (fragment_variant); the other stages are then plain (other_variant). Both default unless the switch is on.
+    u8 fragment_variant = Shader::StageVariantDefault;
+    u8 other_variant = Shader::StageVariantDefault;
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
@@ -2661,7 +2667,12 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
+        auto params = AmdGpu::GetParams(*pgm);
+        // sotc: SOTC_HEAP: a variant is a program of its own, so its hash differs (the program, memo and key caches).
+        params.variant = stage_out == SwStage::Fragment ? fragment_variant : other_variant;
+        if (params.variant != Shader::StageVariantDefault) {
+            params.hash = HashCombine(params.hash, params.variant);
+        }
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding, async_translate_ok);
         return !translation_pending;
@@ -2670,7 +2681,24 @@ bool PipelineCache::RefreshGraphicsStages() {
     infos.fill(nullptr);
     modules.fill(nullptr);
 
-    bind_stage(HwStage::Fragment, SwStage::Fragment);
+    // sotc: SOTC_HEAP: the fragment is bound as the heap candidate. It stays the heap stage when it passes the
+    // recompiler's static rules and the host's (Heap::StageRefused), and then the other stages are plain. A refused
+    // fragment is bound again as today, and the pipeline keeps the bindless path of its other stages.
+    if (profile.heap_images && profile.support_int64) {
+        const auto binding_before_fragment = binding;
+        fragment_variant = Shader::StageVariantHeap;
+        bind_stage(HwStage::Fragment, SwStage::Fragment);
+        const auto* heap_fs = infos[static_cast<u32>(SwStage::Fragment)];
+        if (heap_fs && !SotcArch::Heap::StageRefused(*heap_fs)) {
+            other_variant = Shader::StageVariantPlain;
+        } else if (heap_fs || !translation_pending) {
+            fragment_variant = Shader::StageVariantDefault;
+            binding = binding_before_fragment;
+            bind_stage(HwStage::Fragment, SwStage::Fragment);
+        }
+    } else {
+        bind_stage(HwStage::Fragment, SwStage::Fragment);
+    }
 
     const auto* fs_info = infos[static_cast<u32>(SwStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
@@ -2765,9 +2793,26 @@ bool PipelineCache::RefreshGraphicsStages() {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    std::tie(infos[0], modules[0], compute_key.value) =
-        GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
+    auto cs_params = AmdGpu::GetParams(cs_pgm);
+    // sotc: SOTC_HEAP: the compute stage is the heap stage when it qualifies (see RefreshGraphicsStages); otherwise
+    // it is compiled as today.
+    bool compute_bound = false;
+    if (profile.heap_images && profile.support_int64) {
+        auto heap_params = cs_params;
+        heap_params.variant = Shader::StageVariantHeap;
+        heap_params.hash = HashCombine(cs_params.hash, heap_params.variant);
+        std::tie(infos[0], modules[0], compute_key.value) =
+            GetProgram(HwStage::Compute, SwStage::Compute, heap_params, binding);
+        // A refused candidate is compiled again as today; a pending one answers on a later call.
+        compute_bound = !infos[0] || !SotcArch::Heap::StageRefused(*infos[0]);
+        if (!compute_bound) {
+            binding = {};
+        }
+    }
+    if (!compute_bound) {
+        std::tie(infos[0], modules[0], compute_key.value) =
+            GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
+    }
     return true;
 }
 

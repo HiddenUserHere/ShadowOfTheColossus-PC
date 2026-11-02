@@ -1631,6 +1631,11 @@ bool UsesHeapImages(const Info& info, const Profile& profile) {
     if (!profile.heap_images || !profile.support_int64) {
         return false;
     }
+    // sotc: SOTC_HEAP. Only the heap variant of a stage (chosen by the pipeline cache, which also applies the
+    // host rules) is a heap stage, and a stage with a static refusal never is.
+    if (info.variant != StageVariantHeap || HeapStaticRefusal(info)) {
+        return false;
+    }
     if (info.images.empty() && info.samplers.empty()) {
         return false;
     }

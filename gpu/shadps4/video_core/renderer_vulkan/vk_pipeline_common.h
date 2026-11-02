@@ -203,8 +203,12 @@ protected:
     /// sotc: SOTC_BINDLESS_SAMP: some stage reads its samplers from the global heap, so the layout
     /// has set 1 (the heap) and BindResources binds it.
     bool uses_bindless_samplers{};
+    /// sotc: SOTC_HEAP: some stage reads bindless slot words from the push constants (BindlessSamplerSlots). A heap
+    /// stage reads its indices from the index table instead, so it needs the heap set but no slot words.
+    bool uses_slot_words{};
     bool stage_sets{}; ///< sotc: a graphics pipeline with one descriptor set per stage
-    /// sotc: SOTC_PACKET: the push range carries the DrawPacket (PacketPushBytes), set from the profile.
+    /// sotc: SOTC_PACKET: the push range carries the DrawPacket (PacketPushBytes). Set from the profile (shader
+    /// addresses), and for a pipeline with a heap stage (set when its layout is built).
     bool packet_range{};
     vk::DeviceSize desc_layout_size{};             ///< sotc: descriptor buffer size of one set
     std::vector<vk::DeviceSize> desc_binding_offsets; ///< sotc: by binding number, in the set

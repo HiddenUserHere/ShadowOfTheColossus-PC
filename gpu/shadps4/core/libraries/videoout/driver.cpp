@@ -1345,6 +1345,17 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(uploads),
                              static_cast<unsigned long long>(busy));
             }
+            if (SotcStats::kFpsLog) { // sotc: SOTC_PACKET counters (sotc_stats.h)
+                const uint64_t cache = SotcStats::packet_cache_hits.exchange(0);
+                const uint64_t fast = SotcStats::packet_fast_hits.exchange(0);
+                const uint64_t full = SotcStats::packet_full_binds.exchange(0);
+                if (cache + fast + full != 0) {
+                    std::fprintf(stderr, "SOTC PACKET binds: bind cache %llu, fast %llu, full %llu\n",
+                                 static_cast<unsigned long long>(cache),
+                                 static_cast<unsigned long long>(fast),
+                                 static_cast<unsigned long long>(full));
+                }
+            }
             if (SotcStats::kFastBind) {
                 const uint64_t eligible = SotcStats::fast_bind_eligible.exchange(0);
                 const uint64_t hits = SotcStats::fast_bind_hits.exchange(0);
