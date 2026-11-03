@@ -7,9 +7,13 @@
 #include "probe_buildsync.h" // sotc: Wave D
 #include "probe_dt.h"
 #include "probe_drawtag.h"
+#include "probe_shadow_cache.h" // sotc: SOTC_SHADOW_CACHE (docs/re-backend/12-shadow-cache.md)
+#include "probe_prepass.h"      // sotc: SOTC_PREPASS_PROBE (docs/re-backend/04-depth-prepass.md section 9)
+#include "probe_frame_rings.h" // sotc: SOTC_FRAME_RINGS (docs/re-backend/10-ring-reuse.md)
 #include "particle_prev.h"
 #include "decommit_budget.h"
 #include "mip_budget.h"
+#include "texlife.h"        // sotc: SOTC_TEX_LIFECYCLE handlers
 #include "probe_scopes.h" // sotc: trace v2, engine profiler scopes (SOTC_TRACE_SCOPES)
 #include "ctl_server.h"   // sotc: SotC Lab
 #include "engine_cmd.h"
@@ -42,9 +46,13 @@ void RegisterAllHandlers() {
     SotcBuildSync::RegisterBuildSyncProbe();
     SotcProbes::RegisterDtProbe();
     SotcProbes::RegisterDrawTag();
+    SotcProbes::RegisterShadowCache(); // sotc: SOTC_SHADOW_CACHE
+    SotcProbes::RegisterPrepassProbe(); // sotc: SOTC_PREPASS_PROBE (observe only)
+    SotcFrameRings::Register(); // sotc: SOTC_FRAME_RINGS (RING_INIT hook, observe only)
     SotcProbes::RegisterParticlePrev();
     SotcDecommitBudget::RegisterDecommitBudget();
     SotcMipBudget::RegisterMipBudget();
+    SotcTexLife::RegisterTexLife(); // sotc: SOTC_TEX_LIFECYCLE (texture create/level/mip/destroy events)
     // sotc: trace v2, engine profiler scopes (SOTC_TRACE_SCOPES; the hook installs only when
     // SOTC_TRACE is also on, so the handler is harmless otherwise).
     SotcProbes::RegisterScopes();

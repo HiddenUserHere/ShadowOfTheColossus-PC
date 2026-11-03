@@ -724,6 +724,49 @@ void VKAPI_CALL CmdSetArray(VkCommandBuffer cmdbuf, u32 count, const Element* el
                  [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), count, copy); });
 }
 
+// sotc: SOTC_DRAW_MDI. The draw arrays (and the shared vertex offset) are copied: the producer reuses them.
+template <auto Member>
+void VKAPI_CALL CmdDrawMulti(VkCommandBuffer cmdbuf, u32 count, const VkMultiDrawInfoEXT* draws, u32 instances,
+                             u32 first_instance, u32 stride) {
+    if (!CommandRecorder::IsFake(cmdbuf)) {
+        return RealOf<Member>()(cmdbuf, count, draws, instances, first_instance, stride);
+    }
+    auto& rec = *g_recorder;
+    rec.Reserve(count * sizeof(VkMultiDrawInfoEXT) + 256);
+    std::vector<VkMultiDrawInfoEXT> packed(count);
+    for (u32 i = 0; i < count; ++i) {
+        std::memcpy(&packed[i], reinterpret_cast<const u8*>(draws) + size_t(i) * stride, sizeof(packed[i]));
+    }
+    const auto* copy = rec.Copy(packed.data(), count);
+    g_recorder->CountCommand();
+    rec.Run(BlockCategory::Draw, [=] {
+        RealOf<Member>()(g_recorder->Real(cmdbuf), count, copy, instances, first_instance,
+                         static_cast<u32>(sizeof(VkMultiDrawInfoEXT)));
+    });
+}
+
+template <auto Member>
+void VKAPI_CALL CmdDrawMultiIndexed(VkCommandBuffer cmdbuf, u32 count, const VkMultiDrawIndexedInfoEXT* draws,
+                                    u32 instances, u32 first_instance, u32 stride, const s32* vertex_offset) {
+    if (!CommandRecorder::IsFake(cmdbuf)) {
+        return RealOf<Member>()(cmdbuf, count, draws, instances, first_instance, stride, vertex_offset);
+    }
+    auto& rec = *g_recorder;
+    rec.Reserve(count * sizeof(VkMultiDrawIndexedInfoEXT) + 256);
+    std::vector<VkMultiDrawIndexedInfoEXT> packed(count);
+    for (u32 i = 0; i < count; ++i) {
+        std::memcpy(&packed[i], reinterpret_cast<const u8*>(draws) + size_t(i) * stride, sizeof(packed[i]));
+    }
+    const auto* copy = rec.Copy(packed.data(), count);
+    const bool has_offset = vertex_offset != nullptr;
+    const s32 offset = has_offset ? *vertex_offset : 0;
+    g_recorder->CountCommand();
+    rec.Run(BlockCategory::Draw, [=] {
+        RealOf<Member>()(g_recorder->Real(cmdbuf), count, copy, instances, first_instance,
+                         static_cast<u32>(sizeof(VkMultiDrawIndexedInfoEXT)), has_offset ? &offset : nullptr);
+    });
+}
+
 template <auto Member>
 void VKAPI_CALL CmdSetBlendConstants(VkCommandBuffer cmdbuf, const float constants[4]) {
     if (!CommandRecorder::IsFake(cmdbuf)) {
@@ -969,6 +1012,8 @@ void CommandRecorder::InstallThunks() {
         OVERRIDE(vkCmdSetColorWriteMaskEXT,
                  CmdSetFirstArray<&Dispatch::vkCmdSetColorWriteMaskEXT, VkColorComponentFlags>);
         OVERRIDE(vkCmdSetBlendConstants, CmdSetBlendConstants<&Dispatch::vkCmdSetBlendConstants>);
+        OVERRIDE(vkCmdDrawMultiEXT, CmdDrawMulti<&Dispatch::vkCmdDrawMultiEXT>); // sotc: SOTC_DRAW_MDI
+        OVERRIDE(vkCmdDrawMultiIndexedEXT, CmdDrawMultiIndexed<&Dispatch::vkCmdDrawMultiIndexedEXT>);
         OVERRIDE(vkCmdSetVertexInputEXT, CmdSetVertexInput<&Dispatch::vkCmdSetVertexInputEXT>);
         OVERRIDE(vkCmdBindVertexBuffers, CmdBindVertexBuffers<&Dispatch::vkCmdBindVertexBuffers>);
         OVERRIDE(vkCmdBindVertexBuffers2,

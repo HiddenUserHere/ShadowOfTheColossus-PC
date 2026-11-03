@@ -31,8 +31,10 @@
 #include "../../../sotc/mem_classes.h"   // sotc: SOTC_CLASS_TRACK bind signal
 #include "../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE bind evidence
 #include "../../../sotc/native/n1verify.h" // sotc: SOTC_VERIFY=n1 (NoteBind)
+#include "../../../sotc/texlife.h"        // sotc: SOTC_TEX_LIFECYCLE (engine texture generations)
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "video_core/texture_cache/tc_fast.h" // sotc: SOTC_TC_FAST_LOOKUP
 
 namespace AmdGpu {
 struct Liverpool;
@@ -535,6 +537,8 @@ public:
     static void ReportImageFrees(std::string& out, double seconds);
     /// sotc: C5 (SOTC_UNMAP_PARK): appends one line per window since the last call (mode 1 or 2).
     static void ReportUnmapPark(std::string& out, double seconds);
+    /// sotc: SOTC_TC_FAST_LOOKUP (tc_fast.h): appends one "SOTC TC FAST" line per window (mode 1 or 2).
+    static void ReportTcFast(std::string& out, double seconds);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -612,6 +616,13 @@ public:
     /// sotc: locks `mutex`, counting contention (SOTC_CMD_STATS, SOTC sys line) and the draw
     /// thread's wait for it (SOTC_FPS, SotcStats::DrawWait).
     static void LockCounted(std::unique_lock<ReentrantMutex>& lk) {
+        // sotc: SOTC_TC_FAST_LOOKUP>=1: this thread already holds the mutex (a batch hold or an
+        // outer lookup). A nested hold only counts depth, which the outer hold already covers, so
+        // the lock is left unowned: its destructor then unlocks nothing, the same net effect.
+        // Callers never unlock these locks early (texture_cache.cpp), so none of them checks ownership.
+        if (TcFast::Mode() != 0 && lk.mutex()->HeldByThisThread()) {
+            return;
+        }
         // sotc: SOTC_FPS alone only times the draw thread; other threads keep the plain lock()
         // (try_lock + lock costs a second asymmetric barrier on the biased mutex).
         // sotc: SOTC_TRACE alone also times the draw thread's wait here (its span).
@@ -642,6 +653,10 @@ public:
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
+    /// sotc: SOTC_TEX_LIFECYCLE mode 1: the protect flush that RefreshImage does first, for the
+    /// clean-image skip in UpdateImage (defined in texture_cache.cpp after FlushTexProtect's scope).
+    void TexLifeFastFlush();
+
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         std::unique_lock lk{mutex, std::defer_lock};
@@ -649,7 +664,27 @@ public:
         Image& image = slot_images[image_id];
         TrackImage(image_id);
         TouchImage(image);
-        RefreshImage(image);
+        // sotc: SOTC_TEX_LIFECYCLE (texlife.h). An engine texture's generation changes only on its
+        // events, so an image refreshed at the current generation and clean needs no RefreshImage
+        // (mode 1: skipped, its FlushTexProtect kept). Mode 2 always refreshes and counts a check
+        // when the generation is unchanged; the check is missed when the image was CPU or GPU
+        // written meanwhile (a write without an event).
+        const int tl_mode = SotcTexLife::Mode();
+        const uint32_t tl_gen = tl_mode != 0 ? SotcTexLife::StaticGen(image.info.guest_address) : 0;
+        const bool tl_unchanged = tl_gen != 0 && image.sotc_texlife_gen == tl_gen;
+        if (tl_mode == 1 && tl_unchanged &&
+            False(image.flags & (ImageFlagBits::Dirty | ImageFlagBits::GpuModified))) {
+            TexLifeFastFlush(); // as RefreshImage does first
+            SotcTexLife::NoteFast();
+        } else {
+            const bool tl_written =
+                True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::GpuDirty));
+            RefreshImage(image);
+            if (tl_mode == 2 && tl_unchanged) {
+                SotcTexLife::NoteVerify(tl_written);
+            }
+            image.sotc_texlife_gen = tl_gen;
+        }
         NoteBoundImage(image);
     }
 

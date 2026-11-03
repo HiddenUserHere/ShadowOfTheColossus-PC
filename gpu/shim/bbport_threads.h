@@ -43,9 +43,19 @@ inline void MakeBackground() {
 inline bool CpuSetsEnabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_CPUSETS");
-        return v && v[0] == '1';
+        return v && (v[0] == '1' || v[0] == '2');
     }();
     return enabled;
+}
+
+/// sotc: SOTC_CPUSETS=2: the four role cores are whole (both SMT siblings): workers take only other cores, and the
+/// process default CPU sets (every thread that picks no set, the game's included) exclude them.
+inline bool CpuSetsWholeCores() {
+    static const bool whole = [] {
+        const char* v = std::getenv("SOTC_CPUSETS");
+        return v && v[0] == '2';
+    }();
+    return whole;
 }
 
 /// sotc: CPU set layout, built once from GetSystemCpuSetInformation (on first use).
@@ -140,6 +150,24 @@ inline const CpuLayout& GetCpuLayout() {
         }
         for (std::size_t i = 0; i < 4; ++i) {
             out.exclusive[i] = cores[i].front().id;
+        }
+        if (CpuSetsWholeCores()) {
+            // Workers and the default set: every logical CPU of the cores after the four role cores.
+            std::vector<ULONG> rest;
+            for (std::size_t i = 4; i < cores.size(); ++i) {
+                for (const Entry& e : cores[i]) {
+                    rest.push_back(e.id);
+                }
+            }
+            out.siblings = rest;
+            out.usable = true;
+            const BOOL set = SetProcessDefaultCpuSets(GetCurrentProcess(), rest.data(), static_cast<ULONG>(rest.size()));
+            std::fprintf(stderr,
+                         "sotc: SOTC_CPUSETS=2: role cores %u %u %u %u whole; workers and the process default on %zu "
+                         "logical CPUs of the other cores%s\n",
+                         cores[0].front().core, cores[1].front().core, cores[2].front().core, cores[3].front().core,
+                         rest.size(), set ? "" : " (SetProcessDefaultCpuSets failed)");
+            return out;
         }
         for (const auto& core : cores) {
             if (core.front().efficiency != fastest) {

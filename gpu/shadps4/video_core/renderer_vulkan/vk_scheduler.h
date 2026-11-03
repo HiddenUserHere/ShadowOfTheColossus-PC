@@ -19,6 +19,7 @@
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/sotc_draw_merge.h" // sotc: SOTC_DRAW_MERGE_STATS=1, the graphics bind epoch (NoteBind)
 #include "vulkan/vulkan.hpp"
 
 namespace tracy {
@@ -756,6 +757,7 @@ public:
 
     /// Returns the current command buffer.
     vk::CommandBuffer CommandBuffer() const {
+        SotcDrawMerge::NoteBind(); // sotc: SOTC_DRAW_MERGE_STATS=1, a recording outside a draw bumps the epoch
         if (redirect) { // sotc: SOTC_N5_ASYNC_COMPUTE, see AsyncBegin
             return redirect;
         }

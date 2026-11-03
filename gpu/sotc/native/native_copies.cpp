@@ -20,6 +20,10 @@
 // that it is never reached before the ring wraps).
 // sotc: SOTC_FLAT_NOTES: the base index and the pending FIFOs exist as std::map (the default) and/or as vectors
 // sorted by base with the same keys (FlatMode). The walk of a write is then a walk over contiguous memory.
+// sotc: SOTC_NATIVE_COPIES_PAGES (PagesMode): the entries of both indexes are also kept under the 64 KiB granules
+// they cover (g_gr_base, g_gr_pend), with a lock-free count per hashed granule (g_filter_counts). A written bind
+// then looks at the granules it touches only: no entry there means no tree walk and no lock. The overlaps found are
+// the ones the map walk finds (the same entries, the same order, the same pops).
 #include "native_copies.h"
 
 #include <algorithm>
@@ -122,6 +126,11 @@ struct Counters {
     std::atomic<uint64_t> flat_map_ns{0};    // time of the std::map walks (modes 0 and 2)
     std::atomic<uint64_t> flat_vec_ns{0};    // time of the flat walks (modes 1 and 2)
     std::atomic<uint64_t> flat_mismatch{0};  // mode 2: answers of the flat indexes that differ from the map's
+    // sotc: SOTC_NATIVE_COPIES_PAGES window counters (Report prints them when the switch is set)
+    std::atomic<uint64_t> pages_writes{0};     // written binds that reached the page index
+    std::atomic<uint64_t> pages_empty{0};      // of those, no entry under their granules (lock-free answer)
+    std::atomic<uint64_t> pages_checked{0};    // candidate entries the page walk examined
+    std::atomic<uint64_t> pages_mismatch{0};   // mode 2: writes whose page walk found other overlaps than the map walk
 };
 Counters g_c;
 
@@ -267,10 +276,115 @@ void FlatPendingRemove(const Entry* e) {
     }
 }
 
-void RemoveFromIndexes(const Entry* e) {
+// sotc: SOTC_NATIVE_COPIES_PAGES (read once). 0: the std::maps only (today's code). 1: the page index answers the
+// writes: a write with no entry under its granules returns before the lock, the others take the page walk instead of
+// the map walk. 2: the page walk is read next to the map walk (before the map pops) and the overlaps of the two are
+// compared (verify mismatches must read 0). The page index needs the std::maps (FlatMode 0): with SOTC_FLAT_NOTES
+// on, PagesOn is false and the writes take the flat walks as before.
+int PagesMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_NATIVE_COPIES_PAGES");
+        return (v && v[0] == '1') ? 1 : ((v && v[0] == '2') ? 2 : 0);
+    }();
+    return mode;
+}
+bool PagesOn() {
+    static const bool on = PagesMode() != 0 && FlatMode() == 0;
+    return on;
+}
+
+// sotc: SOTC_NATIVE_COPIES_PAGES. A granule is 64 KiB of guest address space. g_gr_base maps a granule to the entries
+// of g_by_base whose [base, base + bytes) it covers, g_gr_pend the same for the entries of the g_pending queues. An
+// entry is in an index exactly while the std::map holds it there (the same add and remove points), and under all of
+// its granules or none. Owned by the registration lock (g_mutex).
+constexpr uint64_t kGranuleShift = 16;
+// A write spanning more granules than this is not scanned granule by granule (the index is walked instead).
+constexpr uint64_t kMaxScanGranules = 1024;
+// The lock-free filter: a hashed slot counts the (entry, granule) pairs of both indexes that hash to it. Zero in a
+// slot means no entry covers any granule of that slot. Written under g_mutex, read without it (PagesFilterEmpty).
+constexpr unsigned kFilterBits = 16;
+using GranuleIndex = std::unordered_map<uint64_t, std::vector<Entry*>>;
+GranuleIndex g_gr_base;
+GranuleIndex g_gr_pend;
+std::atomic<uint32_t> g_filter_counts[size_t{1} << kFilterBits];
+std::vector<Entry*> g_pg_base; // scratch of CollectPages (guarded by g_mutex)
+std::vector<Entry*> g_pg_pend;
+
+size_t FilterSlot(uint64_t granule) {
+    return static_cast<size_t>((granule * 0x9E3779B97F4A7C15ull) >> (64 - kFilterBits));
+}
+
+// Adds e under each of its granules. Caller holds g_mutex.
+void GranuleAdd(GranuleIndex& index, Entry* e) {
+    const uint64_t g0 = e->base >> kGranuleShift;
+    const uint64_t g1 = (e->base + e->bytes - 1) >> kGranuleShift;
+    for (uint64_t g = g0; g <= g1; ++g) {
+        index[g].push_back(e);
+        g_filter_counts[FilterSlot(g)].fetch_add(1, std::memory_order_release);
+    }
+}
+
+// Removes e from its granules when it is in the index (an entry not in it changes nothing). Caller holds g_mutex.
+void GranuleRemove(GranuleIndex& index, Entry* e) {
+    const uint64_t g0 = e->base >> kGranuleShift;
+    const uint64_t g1 = (e->base + e->bytes - 1) >> kGranuleShift;
+    const auto first = index.find(g0);
+    if (first == index.end() || std::find(first->second.begin(), first->second.end(), e) == first->second.end()) {
+        return;
+    }
+    for (uint64_t g = g0; g <= g1; ++g) {
+        const auto it = index.find(g);
+        auto& list = it->second;
+        list.erase(std::find(list.begin(), list.end(), e));
+        if (list.empty()) {
+            index.erase(it);
+        }
+        g_filter_counts[FilterSlot(g)].fetch_sub(1, std::memory_order_release);
+    }
+}
+
+void BaseIndexAdd(Entry* e) {
+    if (PagesOn()) {
+        GranuleAdd(g_gr_base, e);
+    }
+}
+void BaseIndexRemove(Entry* e) {
+    if (PagesOn()) {
+        GranuleRemove(g_gr_base, e);
+    }
+}
+void PendIndexAdd(Entry* e) {
+    if (PagesOn()) {
+        GranuleAdd(g_gr_pend, e);
+    }
+}
+void PendIndexRemove(Entry* e) {
+    if (PagesOn()) {
+        GranuleRemove(g_gr_pend, e);
+    }
+}
+
+// Lock-free: true when no entry of either index covers a granule of [addr, addr + size), so no entry overlaps the
+// write. False when one may (also when the write spans too many granules to ask). Any thread.
+bool PagesFilterEmpty(uint64_t addr, uint64_t size) {
+    const uint64_t g0 = addr >> kGranuleShift;
+    const uint64_t g1 = (addr + size - 1) >> kGranuleShift;
+    if (g1 - g0 >= kMaxScanGranules) {
+        return false;
+    }
+    for (uint64_t g = g0; g <= g1; ++g) {
+        if (g_filter_counts[FilterSlot(g)].load(std::memory_order_acquire) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void RemoveFromIndexes(Entry* e) {
     if (UseMap()) {
         if (auto it = g_by_base.find(e->base); it != g_by_base.end() && it->second == e) {
             g_by_base.erase(it);
+            BaseIndexRemove(e);
         }
     }
     if (UseFlat() && FlatFindBase(e->base) == e) {
@@ -289,6 +403,7 @@ void RemoveFromIndexes(const Entry* e) {
         }
     }
     if (e->single) {
+        PendIndexRemove(e);
         if (UseMap()) {
             if (auto it = g_pending.find(e->base); it != g_pending.end()) {
                 auto& q = it->second;
@@ -312,7 +427,7 @@ void RemoveFromIndexes(const Entry* e) {
 // Drops the oldest entries the ring overwrote or the record cap pushes out. Caller holds g_mutex.
 void PruneLocked(uint64_t completed) {
     while (!g_entries.empty() && (!Valid(g_entries.front()) || g_entries.size() > kMaxRecords)) {
-        const Entry& e = g_entries.front();
+        Entry& e = g_entries.front();
         if (!Valid(e)) {
             g_c.pruned_ring.fetch_add(1, std::memory_order_relaxed);
             if (e.frame + kNeededFrames >= completed) {
@@ -337,6 +452,7 @@ void ExpirePendingLocked(uint64_t completed) {
         for (auto it = g_pending.begin(); it != g_pending.end();) {
             auto& q = it->second;
             while (!q.empty() && q.front()->frame <= completed) {
+                PendIndexRemove(q.front());
                 q.pop_front();
                 g_c.expired.fetch_add(1, std::memory_order_relaxed);
             }
@@ -400,12 +516,14 @@ void CollectMap(uint64_t addr, uint64_t size, uint64_t scan_lo, uint64_t submitt
     for (auto it = g_pending.lower_bound(scan_lo); it != g_pending.end() && it->first < addr + size;) {
         auto& q = it->second;
         while (!q.empty() && !Valid(*q.front())) {
+            PendIndexRemove(q.front());
             q.pop_front();
         }
         if (!q.empty()) {
             Entry& e = *q.front();
             const uint64_t end = e.base + e.bytes;
             if (addr < end) {
+                PendIndexRemove(&e);
                 q.pop_front();
                 const uint64_t lo = addr > e.base ? addr : e.base;
                 const uint64_t hi = addr + size < end ? addr + size : end;
@@ -465,6 +583,117 @@ void CollectFlat(uint64_t addr, uint64_t size, uint64_t scan_lo, uint64_t submit
             ++p;
         }
     }
+}
+
+// sotc: SOTC_NATIVE_COPIES_PAGES. The entries of an index under the granules of [addr, addr + size), appended to out
+// (an entry under several of them is appended several times; SortUniqueByBase drops the copies). Caller holds g_mutex.
+void GatherCandidates(const GranuleIndex& index, uint64_t addr, uint64_t size, std::vector<Entry*>& out) {
+    const uint64_t g0 = addr >> kGranuleShift;
+    const uint64_t g1 = (addr + size - 1) >> kGranuleShift;
+    if (g1 - g0 < kMaxScanGranules) {
+        for (uint64_t g = g0; g <= g1; ++g) {
+            if (const auto it = index.find(g); it != index.end()) {
+                out.insert(out.end(), it->second.begin(), it->second.end());
+            }
+        }
+    } else {
+        for (const auto& [g, list] : index) {
+            if (g >= g0 && g <= g1) {
+                out.insert(out.end(), list.begin(), list.end());
+            }
+        }
+    }
+}
+
+// Sorts the candidates by base and keeps one per base (a base is one entry of g_by_base, and one pending queue).
+void SortUniqueByBase(std::vector<Entry*>& v) {
+    std::sort(v.begin(), v.end(), [](const Entry* a, const Entry* b) { return a->base < b->base; });
+    v.erase(std::unique(v.begin(), v.end(), [](const Entry* a, const Entry* b) { return a->base == b->base; }), v.end());
+}
+
+// sotc: SOTC_NATIVE_COPIES_PAGES. The overlaps CollectMap finds, taken from the granule indexes instead of the maps:
+// the same entries, in the same order (the base index by ascending base, then the pending writes by ascending base),
+// and the same pops when pop is set. Only the candidates under the write's granules are looked at. pop: take the
+// pending writes as CollectMap does (mode 1). !pop: read only (mode 2 reads before the map walk pops; the front of a
+// queue is then its first valid entry). count: the window counters are updated. Caller holds g_mutex.
+void CollectPages(uint64_t addr, uint64_t size, uint64_t submitted, bool count, bool pop, std::vector<Overlap>& out) {
+    const uint64_t limit = addr + size; // a registration at or above it cannot overlap the write
+    uint64_t checked = 0;
+    std::vector<Entry*>& bases = g_pg_base;
+    bases.clear();
+    GatherCandidates(g_gr_base, addr, size, bases);
+    SortUniqueByBase(bases);
+    for (Entry* ep : bases) {
+        Entry& e = *ep;
+        if (e.base >= limit) {
+            break;
+        }
+        ++checked;
+        const uint64_t end = e.base + e.bytes;
+        if (addr >= end || !Valid(e)) {
+            continue;
+        }
+        if (e.single) {
+            // Its write is paired through the pending queue; a write with nothing waiting at the base is not its own.
+            if (g_pending.find(e.base) == g_pending.end() && count) {
+                g_c.unpaired.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+        const uint64_t lo = addr > e.base ? addr : e.base;
+        const uint64_t hi = addr + size < end ? addr + size : end;
+        out.push_back(Overlap{&e, lo, hi});
+    }
+    std::vector<Entry*>& pend = g_pg_pend;
+    pend.clear();
+    GatherCandidates(g_gr_pend, addr, size, pend);
+    SortUniqueByBase(pend);
+    for (const Entry* ep : pend) {
+        if (ep->base >= limit) {
+            break;
+        }
+        ++checked;
+        const auto it = g_pending.find(ep->base);
+        if (it == g_pending.end()) {
+            continue;
+        }
+        auto& q = it->second;
+        Entry* front = nullptr;
+        if (pop) {
+            while (!q.empty() && !Valid(*q.front())) {
+                PendIndexRemove(q.front());
+                q.pop_front();
+            }
+            front = q.empty() ? nullptr : q.front();
+        } else {
+            for (Entry* c : q) {
+                if (Valid(*c)) {
+                    front = c;
+                    break;
+                }
+            }
+        }
+        if (front) {
+            const uint64_t end = front->base + front->bytes;
+            if (addr < end) {
+                if (pop) {
+                    PendIndexRemove(front);
+                    q.pop_front();
+                }
+                const uint64_t lo = addr > front->base ? addr : front->base;
+                const uint64_t hi = addr + size < end ? addr + size : end;
+                out.push_back(Overlap{front, lo, hi});
+                if (count) {
+                    g_c.paired.fetch_add(1, std::memory_order_relaxed);
+                    MaxInto(g_c.write_lag_max, submitted > front->frame ? submitted - front->frame : 0);
+                }
+            }
+        }
+        if (pop && q.empty()) {
+            g_pending.erase(it);
+        }
+    }
+    g_c.pages_checked.fetch_add(checked, std::memory_order_relaxed);
 }
 
 bool SameOverlaps(const std::vector<Overlap>& a, const std::vector<Overlap>& b) {
@@ -626,7 +855,13 @@ bool Register(uint64_t key, uint64_t seq, uint64_t base, uint64_t bytes, uint64_
         g_filter.Add(base, bytes, +1); // sotc: SOTC_WRITE_JOURNAL: the entry's pages join the counts
     }
     if (UseMap()) {
+        if (PagesOn()) {
+            if (auto old = g_by_base.find(base); old != g_by_base.end()) {
+                BaseIndexRemove(old->second); // sotc: SOTC_NATIVE_COPIES_PAGES: the replaced entry leaves its granules
+            }
+        }
         g_by_base[base] = e;
+        BaseIndexAdd(e);
     }
     if (UseFlat()) {
         FlatSetBase(base, e);
@@ -634,6 +869,7 @@ bool Register(uint64_t key, uint64_t seq, uint64_t base, uint64_t bytes, uint64_
     if (single_write) {
         if (UseMap()) {
             g_pending[base].push_back(e);
+            PendIndexAdd(e);
         }
         if (UseFlat()) {
             FlatPendingPush(base, e);
@@ -758,6 +994,19 @@ void NoteWrittenBind(vk::CommandBuffer cmdbuf, vk::Buffer src, uint64_t src_offs
             return;
         }
     }
+    // sotc: SOTC_NATIVE_COPIES_PAGES: no entry under the write's granules means no overlap, so mode 1 returns here,
+    // before the lock, with nothing walked and nothing popped (the walk would find nothing either). Mode 2 goes on.
+    const bool pages = PagesOn();
+    if (pages) {
+        const bool empty = PagesFilterEmpty(addr, size);
+        g_c.pages_writes.fetch_add(1, std::memory_order_relaxed);
+        if (empty) {
+            g_c.pages_empty.fetch_add(1, std::memory_order_relaxed);
+            if (PagesMode() == 1 && !SotcWriteJournal::Verify()) {
+                return;
+            }
+        }
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
     const bool base_empty = Pick(g_by_base.empty(), g_flat_base.empty());
     const bool pending_empty = Pick(g_pending.empty(), g_flat_pending.empty());
@@ -770,7 +1019,20 @@ void NoteWrittenBind(vk::CommandBuffer cmdbuf, vk::Buffer src, uint64_t src_offs
     // Find every overlap first (the walk pops the pending writes it takes), then record them in that order.
     std::vector<Overlap>& out = g_overlaps;
     out.clear();
-    if (FlatMode() == 0) {
+    if (pages) {
+        if (PagesMode() == 1) {
+            CollectPages(addr, size, submitted, true, true, out);
+        } else {
+            // Mode 2: the page walk reads the queues before the map walk pops them; the two must agree.
+            std::vector<Overlap>& check = g_overlaps_check;
+            check.clear();
+            CollectPages(addr, size, submitted, false, false, check);
+            CollectMap(addr, size, scan_lo, submitted, true, out);
+            if (!SameOverlaps(out, check)) {
+                g_c.pages_mismatch.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    } else if (FlatMode() == 0) {
         CollectMap(addr, size, scan_lo, submitted, true, out);
     } else {
         g_c.flat_writes.fetch_add(1, std::memory_order_relaxed);
@@ -919,6 +1181,19 @@ void Report(std::string& out, double seconds) {
                       "ns/s, flat mismatches %llu\n",
                       FlatMode(), static_cast<double>(walks) / secs, static_cast<double>(map_ns) / secs,
                       static_cast<double>(vec_ns) / secs, static_cast<unsigned long long>(bad));
+        out += line;
+    }
+    if (PagesMode() != 0) {
+        // sotc: SOTC_NATIVE_COPIES_PAGES: window totals (not rates), the same window as the line above.
+        const uint64_t writes = take(g_c.pages_writes);
+        const uint64_t empty = take(g_c.pages_empty);
+        const uint64_t checked = take(g_c.pages_checked);
+        const uint64_t mismatch = take(g_c.pages_mismatch);
+        std::snprintf(line, sizeof line,
+                      "SOTC NATIVE COPIES pages: writes %llu, empty fast %llu, entries checked %llu, verify mismatches "
+                      "%llu\n",
+                      static_cast<unsigned long long>(writes), static_cast<unsigned long long>(empty),
+                      static_cast<unsigned long long>(checked), static_cast<unsigned long long>(mismatch));
         out += line;
     }
 }

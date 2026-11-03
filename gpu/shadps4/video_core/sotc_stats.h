@@ -138,13 +138,15 @@ inline const bool kBindCacheMeta = [] {
 inline std::atomic<uint64_t> meta_clear_narrowed{0}, meta_clear_flushes_avoided{0},
     meta_clear_entries_killed{0};
 /// sotc: SOTC_OP_COMPUTE_BIND (default 0; needs SOTC_BIND_CACHE, _RANGES, _XTICK and _FRAME, read
-/// here on their own, not from the other inline flags). 1: a read-only dispatch (no written buffer,
-/// no storage image, no DMA pointer, no shared memory) takes the frame bind cache as a read-only
-/// draw does, so its descriptors, barriers and buffer/image lookups are replayed on a hit instead
-/// of rebuilt (Rasterizer::BindResources). 2 (verify): dispatches never take a hit; each one whose
-/// entry would have been a hit (same key, valid, same flush and buffer version) is compared with
-/// the descriptors and push data the full bind just built. Stamps are not checked by the verify,
-/// so a stale entry can show as a mismatch; a mismatch on a fresh entry is a real difference.
+/// here on their own, not from the other inline flags). 1: a dispatch with no storage image, no DMA
+/// pointer, no sharp table and no shared memory takes the frame bind cache, and so does a bind whose
+/// written buffers are plain guest buffers (WrittenBindAdmitted: not texel, GDS or shader-addressed).
+/// A hit replays the descriptors, barriers, buffer/image lookups and the written bindings' side
+/// effects (ObtainBuffer, texture invalidation, host write note, range stamps: Rasterizer::ReplayOwnWrites).
+/// Written images, storage images and fmasks stay refused. 2 (verify): no hit is taken; each eligible
+/// bind whose entry would have been a hit is compared with the full bind (descriptors, push data, and
+/// the written-binding calls, WriteVerify). Stamps are not checked by the verify, so a stale entry can
+/// show as a mismatch; a mismatch on a fresh entry is a real difference.
 inline const int kOpComputeBind = [] {
     const auto on = [](const char* name) {
         const char* v = std::getenv(name);
@@ -161,6 +163,16 @@ inline const int kOpComputeBind = [] {
 /// cache, hits taken, verify checks (would-be hits compared) and verify mismatches.
 inline std::atomic<uint64_t> op_compute_eligible{0}, op_compute_hits{0},
     op_compute_verify_checks{0}, op_compute_verify_mismatches{0};
+/// sotc: SOTC_OP_COMPUTE_BIND written binds (SOTC_FPS only). wr_recorded: full binds that recorded a written buffer
+/// binding (and the dispatches among them in wr_compute_recorded); wr_stored: those stored in the frame cache;
+/// wr_hits: hits that replayed their written bindings (Rasterizer::ReplayOwnWrites) and the dispatch ones.
+inline std::atomic<uint64_t> wr_recorded{0}, wr_compute_recorded{0}, wr_stored{0}, wr_compute_stored{0},
+    wr_hits{0}, wr_compute_hits{0};
+/// The categories of the written-binding verify (mode 2): the write calls a replay would make against the calls the
+/// full bind made (number of writes, range, narrowing mark or dispatch, bound buffer and offset, note calls).
+enum WrVerifyCategory : uint32_t { WvCount, WvRange, WvMark, WvBinding, WvNote, WvCategories };
+inline constexpr const char* kWrVerifyNames[WvCategories] = {"count", "range", "mark", "binding", "note"};
+inline std::atomic<uint64_t> wr_verify_checks{0}, wr_verify_mismatch[WvCategories]{};
 /// sotc: SOTC_PACKET counters (SOTC_FPS only): the packet ops (pipelines with the push packet) served by the frame
 /// bind cache, by the fast bind (same tick or wide), and by a full bind. Their sum is the packet ops bound.
 inline std::atomic<uint64_t> packet_cache_hits{0}, packet_fast_hits{0}, packet_full_binds{0};
@@ -236,10 +248,16 @@ enum BindRefuseSite : uint32_t {
     RfMapAfter,     ///< the guest mapping changed after the repair (second check of the replay)
     RfSampler,      ///< a sampler of the entry is no longer the one the sampler cache returns
     RfImage,        ///< an image of the entry is dirty, unregistered, re-bound, a target or force-general
+    RfHeapDead,     ///< sotc: SOTC_BIND_CACHE_HEAP, a heap resolution the entry holds is no longer live (its BindSet killed)
+    RfHeapDecline,  ///< sotc: SOTC_BIND_CACHE_HEAP, the held heap images are declined now (HeapDeclineReason)
+    RfHeapShape,    ///< sotc: SOTC_BIND_CACHE_HEAP, the entry's heap stages are not the op's (should not happen)
+    RfHeapPublish,  ///< sotc: SOTC_BIND_CACHE_HEAP, the index table ring section is full
+    RfWriteReplay,  ///< sotc: SOTC_OP_COMPUTE_BIND: a written binding of the entry binds another buffer or offset now
     RfSites
 };
 inline constexpr const char* kBindRefuseSiteNames[RfSites] = {
-    "bindless", "flatsize", "map", "maprepair", "flattick", "mapafter", "sampler", "image"};
+    "bindless", "flatsize", "map", "maprepair", "flattick", "mapafter", "sampler", "image",
+    "heapdead", "heapdecline", "heapshape", "heappublish", "write"};
 inline std::atomic<uint64_t> bf_refuse[RfSites]{};
 inline std::atomic<uint64_t> bf_stored{0}, bf_replaced{0}, bf_not_stored_moved{0},
     bf_cross_frame_hits{0}, bf_narrowed{0};

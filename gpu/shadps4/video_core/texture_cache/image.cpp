@@ -21,6 +21,7 @@
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_prefetch.h"
+#include "video_core/texture_cache/tc_fast.h" // sotc: SOTC_TC_FAST_LOOKUP (FindView)
 #include "video_core/sotc_stats.h"
 
 #include <vk_mem_alloc.h>
@@ -480,6 +481,27 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
 Image::~Image() = default;
 
+// sotc: SOTC_TC_FAST_LOOKUP: the key of a view info, from every field operator<=> compares (type,
+// format, the range's base and extent, the four swizzles, min_lod, is_storage). Fields are hashed
+// one by one, never the raw bytes: padding is not defined, and equal infos must give equal keys.
+static u64 ViewKey(const ImageViewInfo& v) {
+    const auto mix = [](u64 h, u64 x) { return (h ^ x) * 0x9E3779B97F4A7C15ULL; };
+    u64 h = 0xCBF29CE484222325ULL;
+    h = mix(h, static_cast<u64>(v.type));
+    h = mix(h, static_cast<u64>(v.format));
+    h = mix(h, v.range.base.level);
+    h = mix(h, v.range.base.layer);
+    h = mix(h, v.range.extent.levels);
+    h = mix(h, v.range.extent.layers);
+    h = mix(h, static_cast<u64>(v.mapping.r));
+    h = mix(h, static_cast<u64>(v.mapping.g));
+    h = mix(h, static_cast<u64>(v.mapping.b));
+    h = mix(h, static_cast<u64>(v.mapping.a));
+    h = mix(h, v.min_lod);
+    h = mix(h, v.is_storage ? 1u : 0u);
+    return h;
+}
+
 ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_samples) {
     if (ensure_guest_samples && backing->num_samples > 1 != info.num_samples > 1) {
         runtime->SetBackingSamples(this, info.num_samples);
@@ -498,6 +520,40 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
         if (last < view_infos.size() && view_infos[last] == view_info) {
             return (*slot_image_views)[backing->image_view_ids[last]];
         }
+    }
+    // sotc: SOTC_TC_FAST_LOOKUP>=1: the search reads the 8-byte keys first (a contiguous array), and
+    // compares whole infos only where the key agrees. The first match is the same entry as below.
+    // Mode 2 also runs the linear search and counts a difference (the key answer is returned).
+    if (TcFast::Mode() != 0) {
+        const u64 key = ViewKey(view_info);
+        const auto& keys = backing->image_view_keys;
+        size_t found = keys.size();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == key && view_infos[i] == view_info) {
+                found = i;
+                break;
+            }
+        }
+        if (TcFast::Mode() == 2) {
+            const auto it = std::ranges::find(view_infos, view_info);
+            const size_t reference = it == view_infos.end()
+                                         ? keys.size()
+                                         : static_cast<size_t>(std::distance(view_infos.begin(), it));
+            TcFast::fast_verify_checks.fetch_add(1, std::memory_order_relaxed);
+            if (reference != found) {
+                TcFast::fast_verify_mismatch.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (found < keys.size()) {
+            backing->last_view = static_cast<u32>(found);
+            return (*slot_image_views)[backing->image_view_ids[found]];
+        }
+        const auto view_id = slot_image_views->insert(runtime->GetInstance(), view_info, *this);
+        backing->last_view = static_cast<u32>(backing->image_view_infos.size());
+        backing->image_view_infos.emplace_back(view_info);
+        backing->image_view_ids.emplace_back(view_id);
+        backing->image_view_keys.emplace_back(key);
+        return (*slot_image_views)[view_id];
     }
     const auto it = std::ranges::find(view_infos, view_info);
     if (it != view_infos.end()) {

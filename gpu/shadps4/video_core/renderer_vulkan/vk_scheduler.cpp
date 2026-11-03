@@ -187,6 +187,7 @@ void Scheduler::WaitSubmitted(u64 tick, bool kick) {
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
+    SotcDrawMerge::NoteBind(); // sotc: SOTC_DRAW_MERGE_STATS=1 (a render pass begin outside a draw)
     if (is_rendering && render_state == new_state) {
         return;
     }
@@ -272,6 +273,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering() {
+    SotcDrawMerge::NoteBind(); // sotc: SOTC_DRAW_MERGE_STATS=1 (a render pass end outside a draw)
     if (!is_rendering) {
         return;
     }
@@ -381,6 +383,7 @@ vk::CommandBuffer Scheduler::BeginAhead() {
 }
 
 void Scheduler::SubmitAheadAndWait() {
+    SotcDrawMerge::NoteSubmit(); // sotc: SOTC_DRAW_MDI (see SubmitExecution)
     if (work_semaphore.HasMarker()) {
         work_semaphore.RecordMarker(ahead_cmdbuf, Semaphore::MarkerSlot::Ahead,
                                     static_cast<u32>(++ahead_sequence));
@@ -1350,6 +1353,7 @@ void Scheduler::RequireExternalWait(vk::Semaphore sem, u64 value, vk::PipelineSt
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    SotcDrawMerge::NoteSubmit(); // sotc: SOTC_DRAW_MDI, an open multi-draw run is recorded before the submit
     // Only the queue operations take submit_mutex (the sparse binds of on_submit take it on
     // their own): with the recorder, holding it while queueing commands could wait for the
     // recording thread, which needs it for its submits.

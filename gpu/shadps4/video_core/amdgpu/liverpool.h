@@ -697,6 +697,7 @@ private:
         u8 func_kind{3}; ///< sotc: SOTC_FPS accounting: 0 write data, 1 EOP/EOS/release, 2 DMA, 3 other
         BackWd wd; ///< sotc: SOTC_WD_FUSE: applied before the op (num_segs == 0: none)
         bool is_indexed{};
+        u8 prepass_mark{}; ///< sotc: SOTC_NO_PREPASS=3 (SotcPrepassProbe::CpClassify): 1 drop, 2+ promote
         u16 vertex_sgpr_offset{};
         u16 instance_sgpr_offset{};
         u32 index_offset{};

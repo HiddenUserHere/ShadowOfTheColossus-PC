@@ -64,12 +64,15 @@
 #include "video_core/sotc_draw_merge.h" // sotc: SOTC_DRAW_MERGE_STATS report
 #include "../../../../sotc/hooks.h"      // sotc: SotcHookStats::Report
 #include "../../../../sotc/write_decl.h" // sotc: SotcWriteDecl::Report
+#include "../../../../sotc/probe_prepass.h" // sotc: SOTC_PREPASS_PROBE report
 #include "../../../../sotc/probes.h"     // sotc: engine probe report lines
+#include "video_core/sotc_prepass_probe.h" // sotc: SOTC_PREPASS_PROBE depth readers report
 #include "../../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK report (plan step 6)
 #include "../../../../sotc/pc_ring.h"     // sotc: SOTC_PC_RING report
 #include "../../../../sotc/native/native.h" // sotc: SOTC_NATIVE report
 #include "../../../../sotc/native/native_sync.h" // sotc: SOTC_NATIVE frame ticket report
 #include "../../../../sotc/native/verify.h" // sotc: SOTC_VERIFY report
+#include "../../../../sotc/texlife.h"     // sotc: SOTC_TEX_LIFECYCLE report
 #include "../../../../sotc/native/n1verify.h" // sotc: SOTC_VERIFY=n1 report
 #include "../../../../sotc/native/native_results.h" // sotc: SOTC_NATIVE results report
 #include "../../../../sotc/native/native_particles.h" // sotc: SOTC_NATIVE_PARTICLES report
@@ -97,6 +100,9 @@ uint64_t runtime_memory_chunk_opens_locked(void);
 #include "../../../../sotc/probe_buildsync.h" // sotc: Wave D report lines
 #include "../../../../sotc/probe_dt.h"
 #include "../../../../sotc/probe_drawtag.h"
+#include "../../../../sotc/probe_shadow_cache.h" // sotc: SOTC_SHADOW_CACHE
+#include "../../../../sotc/probe_frame_rings.h" // sotc: SOTC_FRAME_RINGS report
+#include "../../../../sotc/probe_drawsite.h" // sotc: SOTC_DRAW_SITES
 #include "../../../../sotc/probe_scopes.h" // sotc: trace v2 engine scopes report
 #include "../../../../sotc/particle_prev.h"
 #include "../../../../sotc/ram_report.h" // sotc: SOTC_RAM_REPORT
@@ -105,6 +111,7 @@ uint64_t runtime_memory_chunk_opens_locked(void);
 #include "../../../../sotc/mip_budget.h"
 #include "video_core/buffer_cache/buffer_cache.h"     // sotc: VideoCore::ReportReadbackRips (B6)
 #include "video_core/texture_cache/texture_cache.h"   // sotc: ReportImageFrees / ReportUnmapPark (B4/C5)
+#include "video_core/sotc_noprepass.h"                // sotc: SOTC_NO_PREPASS=2 report
 
 // sotc: SOTC_TINY_ASYNC (vk_pipeline_cache.cpp).
 namespace Vulkan {
@@ -115,6 +122,7 @@ void ReportPipeMemo(std::string& out, double seconds); // sotc: SOTC_PIPE_MEMO
 void ReportPipeDirty(std::string& out, double seconds); // sotc: SOTC_PIPE_DIRTY
 void ReportPipeFast(std::string& out, double seconds); // sotc: SOTC_PIPE_FAST
 void ReportOpSet(std::string& out, double seconds); // sotc: SOTC_OPSET_STATS
+void ReportPassStats(std::string& out, double seconds); // sotc: SOTC_PASS_STATS
 void ReportSpecMemo(std::string& out, double seconds); // sotc: SOTC_SPEC_MEMO
 void ReportPipeGpl(std::string& out, double seconds); // sotc: SOTC_PIPE_GPL
 } // namespace Vulkan
@@ -697,6 +705,7 @@ void VideoOutDriver::Flip(const Request& req) {
         static u32 flips = 0;
         static uint64_t commands_seen = 0; // sotc: SotcStats::commands at the last line
         ++flips;
+        SotcNoPrepass::NoteFrame(); // sotc: SOTC_NO_PREPASS=2 frame count of the window
         const auto now = std::chrono::steady_clock::now();
         // sotc: frame times of this window, and where the command processor spent the time of
         // slow frames (SotcStats::FrameTimer sites) -> the "SOTC FRAMES" line.
@@ -1494,6 +1503,27 @@ void VideoOutDriver::Flip(const Request& req) {
                             SotcStats::op_compute_verify_checks.exchange(0)),
                         static_cast<unsigned long long>(
                             SotcStats::op_compute_verify_mismatches.exchange(0)));
+                    // sotc: SOTC_OP_COMPUTE_BIND written binds: recorded, stored and replayed by a hit (dispatches in
+                    // brackets), and the mode-2 verify of their write calls by category.
+                    char wv[200]{};
+                    size_t wi = 0;
+                    for (uint32_t c = 0; c < SotcStats::WvCategories; ++c) {
+                        wi += std::snprintf(wv + wi, sizeof(wv) - wi, "%s%s %llu", c ? ", " : "",
+                                            SotcStats::kWrVerifyNames[c],
+                                            static_cast<unsigned long long>(
+                                                SotcStats::wr_verify_mismatch[c].exchange(0)));
+                    }
+                    std::fprintf(
+                        stderr,
+                        "SOTC OP COMPUTE BIND written: recorded %llu (dispatch %llu), stored %llu "
+                        "(dispatch %llu), hits %llu (dispatch %llu), verify checks %llu, mismatches [%s]\n",
+                        static_cast<unsigned long long>(SotcStats::wr_recorded.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::wr_compute_recorded.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::wr_stored.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::wr_compute_stored.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::wr_hits.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::wr_compute_hits.exchange(0)),
+                        static_cast<unsigned long long>(SotcStats::wr_verify_checks.exchange(0)), wv);
                 }
                 std::fprintf(stderr,
                              "SOTC BIND CACHE hits %llu/%llu (%.1f%%), refused %llu, not stored "
@@ -2195,6 +2225,12 @@ void VideoOutDriver::Flip(const Request& req) {
             // sotc: stutter-architecture counters (engine hooks, declared writes, tiny pipelines,
             // short sleeps); each prints only when its switch or SOTC_FPS gave it activity.
             SotcHookStats::Report(report, seconds);
+            SotcNoPrepass::Report(report, seconds); // sotc: SOTC_NO_PREPASS=2 (measurement only)
+            SotcProbes::ReportPrepassProbe(report, seconds); // sotc: SOTC_PREPASS_PROBE (observe only)
+            SotcPrepassProbe::ReportReaders(report);         // sotc: SOTC_PREPASS_PROBE (depth readers)
+            SotcPrepassProbe::ReportArgs(report);            // sotc: SOTC_PREPASS_PROBE (XPR records)
+            SotcPrepassProbe::ReportSkip(report);            // sotc: SOTC_NO_PREPASS=1
+            SotcPrepassProbe::ReportCpSkip(report);          // sotc: SOTC_NO_PREPASS=3
             SotcWriteDecl::Report(report, seconds);
             Vulkan::SotcTinyAsyncReport(report, seconds);
             Vulkan::ReportN5Pso(report, seconds); // sotc: SOTC_N5_PSO
@@ -2265,6 +2301,7 @@ void VideoOutDriver::Flip(const Request& req) {
                     arch(SotcArch::Heap::Report);
                     arch(SotcArch::TableMemo::Report); // sotc: SOTC_HEAP table memo (hits, misses by reason, binds)
                     arch(SotcArch::TableMemo::BindSetReport); // sotc: SOTC_BINDSET (replays, kills by event, verify)
+                    arch(SotcArch::TableMemo::HeapReport);    // sotc: SOTC_BIND_CACHE_HEAP (holds, kills, verify)
                 }
                 if (SotcArch::AddrTable::On()) {
                     arch(SotcArch::AddrTable::Report);
@@ -2283,6 +2320,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 }
             }
             SotcGen::Report(report, seconds); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
+            VideoCore::WriteSetFlat::Report(report, seconds); // sotc: SOTC_WRITE_SCOPE_FLAT (every 5 s)
             if (SotcSyncEvents::On()) { // sotc: SOTC_SYNC_EVENTS (journal, drain, bind skip)
                 SotcSyncEvents::Report(report, seconds);
             }
@@ -2317,6 +2355,7 @@ void VideoOutDriver::Flip(const Request& req) {
             Vulkan::ReportPipeDirty(report, seconds); // SOTC_PIPE_DIRTY
             Vulkan::ReportPipeFast(report, seconds); // SOTC_PIPE_FAST
             Vulkan::ReportOpSet(report, seconds);    // sotc: SOTC_OPSET_STATS
+            Vulkan::ReportPassStats(report, seconds); // sotc: SOTC_PASS_STATS
             Vulkan::ReportSpecMemo(report, seconds); // SOTC_SPEC_MEMO
             Shader::ReportBindlessCache(report, seconds); // SOTC_BINDLESS_CACHE_VERIFY
             Vulkan::ReportPipeGpl(report, seconds); // SOTC_PIPE_GPL
@@ -2327,12 +2366,17 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcBuildSync::ReportBuildSyncProbe(report, seconds);      // SOTC_BUILDSYNC_PROBE
             SotcProbes::ReportDtProbe(report, seconds);               // SOTC_DT_PROBE
             SotcProbes::ReportDrawTag(report, seconds);               // SOTC_DRAW_TAG
+            SotcProbes::ReportShadowCache(report, seconds);           // sotc: SOTC_SHADOW_CACHE
+            SotcFrameRings::Report(report, seconds);                  // SOTC_FRAME_RINGS
+            SotcProbes::ReportDrawSites(report, seconds);             // SOTC_DRAW_SITES
             SotcDecommitBudget::ReportDecommitBudget(report, seconds); // SOTC_DECOMMIT_BUDGET
             SotcMipBudget::ReportMipBudget(report, seconds);          // SOTC_MIP_BUDGET
+            SotcTexLife::Report(report);                              // sotc: SOTC_TEX_LIFECYCLE
             VideoCore::TextureCache::ReportImageFrees(report, seconds); // B4 (SOTC_FPS)
             VideoCore::TextureCache::ReportTexIdentity(report, seconds); // sotc: SOTC_GEN_TEX
             VideoCore::TextureCache::ReportRtMaxExtent(report, seconds); // sotc: SOTC_RT_MAXEXTENT
             VideoCore::TextureCache::ReportUnmapPark(report, seconds);  // SOTC_UNMAP_PARK
+            VideoCore::TextureCache::ReportTcFast(report, seconds);     // sotc: SOTC_TC_FAST_LOOKUP
             Vulkan::ReportFlipWait(report, seconds);                  // B5 (SOTC_FPS)
             Vulkan::ReportPresent(report, seconds);                   // SOTC_PRESENT_FRAMES / SOTC_FPS
             VideoCore::ReportReadbackRips(report, seconds);           // B6 (SOTC_FPS)

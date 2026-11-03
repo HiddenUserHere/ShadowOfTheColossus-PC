@@ -306,7 +306,8 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
-        vk::PhysicalDeviceFaultFeaturesEXT, vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
+        vk::PhysicalDeviceFaultFeaturesEXT, vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
+        vk::PhysicalDeviceMultiDrawFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -399,6 +400,16 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    // sotc: SOTC_DRAW_MDI. The extension is enabled only with its multiDraw feature (read first).
+    const bool multi_draw_feature = feature_chain.get<vk::PhysicalDeviceMultiDrawFeaturesEXT>().multiDraw;
+    multi_draw = multi_draw_feature && add_extension(VK_EXT_MULTI_DRAW_EXTENSION_NAME);
+    if (multi_draw) {
+        max_multi_draw_count = physical_device
+                                   .getProperties2<vk::PhysicalDeviceProperties2,
+                                                   vk::PhysicalDeviceMultiDrawPropertiesEXT>()
+                                   .get<vk::PhysicalDeviceMultiDrawPropertiesEXT>()
+                                   .maxMultiDrawCount;
+    }
     // sotc: SOTC_PIPE_GPL=1 (off by default): a cold graphics pipeline is fast-linked from four
     // libraries (vk_graphics_pipeline.cpp). Needs VK_KHR_pipeline_library, added first; nothing
     // is enabled unless the feature is supported.
@@ -1146,6 +1157,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{
             .vertexInputDynamicState = true,
         },
+        vk::PhysicalDeviceMultiDrawFeaturesEXT{
+            .multiDraw = true, // sotc: SOTC_DRAW_MDI, see multi_draw
+        },
         vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT{
             .graphicsPipelineLibrary = true, // sotc: SOTC_PIPE_GPL, see above
         },
@@ -1232,6 +1246,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     }
     if (!vertex_input_dynamic_state) {
         device_chain.unlink<vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT>();
+    }
+    if (!multi_draw) {
+        device_chain.unlink<vk::PhysicalDeviceMultiDrawFeaturesEXT>();
     }
     if (!graphics_pipeline_library) {
         device_chain.unlink<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();

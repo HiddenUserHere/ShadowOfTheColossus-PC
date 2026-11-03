@@ -274,10 +274,26 @@ struct IndexTable {
 /// the bound image (the depth image of a stencil one), its view range as the classic bind's transition uses it, and
 /// the null image when the T# is null (image id invalid).
 constexpr u32 kMaxBindImages = 16;
+/// sotc: SOTC_BIND_CACHE_HEAP. The index entries of one resolution: the images then the samplers (kMaxImages +
+/// NUM_SAMPLERS in table_memo.cpp, asserted there).
+constexpr u32 kMaxBindIndices = 32;
+/// sotc: SOTC_BIND_CACHE_HEAP. A stored resolution (a BindSet, table_memo.cpp): its entry index and the serial it was
+/// stored under. Live while that entry is still valid with the same serial (HeapLive); an event that kills the BindSet
+/// makes every reference to it dead, with no per-reference bookkeeping.
+struct HeapRef {
+    u32 entry{};
+    u64 serial{};
+    bool valid{};
+};
 struct TableBinds {
-    u32 count{};
+    u32 count{};       ///< images (the bound ones are in image / range)
+    u32 index_count{}; ///< index entries (images + samplers) in `index`
     std::array<VideoCore::ImageId, kMaxBindImages> image{};
     std::array<VideoCore::SubresourceRange, kMaxBindImages> range{};
+    /// sotc: SOTC_BIND_CACHE_HEAP. The indices the resolution wrote, and the BindSet they came from (valid when the
+    /// resolution was a stored BindSet; FillBinds sets it).
+    std::array<u32, kMaxBindIndices> index{};
+    HeapRef ref{};
 };
 bool On();
 /// Creates the per-tick index ring (rasterizer constructor, when On()).
@@ -332,6 +348,32 @@ void NoteTransitSkipped();
 void NoteTransitVerify(bool barrier);
 /// sotc: SOTC_BINDSET. One line for the 5 s report (counters reset on read); empty when the layer is off.
 void BindSetReport(char* out, u32 size, double seconds);
+/// sotc: SOTC_BIND_CACHE_HEAP. The effective mode: 0 off, 1 a bind cache hit replays the heap resolution it stored
+/// (HeapReplay) instead of TableMemo::Resolve, 2 the same plus a fresh Resolve compared with the stored one. Off unless
+/// SOTC_BINDSET=1, SOTC_BIND_CACHE_PACKET=1 and the frame bind cache are on too (the events are what keep a hold valid).
+int HeapHoldMode();
+/// sotc: SOTC_BIND_CACHE_HEAP. The hold is live: the events queued so far are applied first (the caller holds the
+/// texture cache lock), then the BindSet is still valid under its serial and not dropped by the time rule. Mutates
+/// only what the events and the time rule would mutate anyway.
+bool HeapLive(VideoCore::TextureCache& texture_cache, const HeapRef& ref);
+/// sotc: SOTC_BIND_CACHE_HEAP. Replays a live hold as a BindSet hit does (stamps, LRU, heap slot use, the bound
+/// images' bind evidence) and publishes its index table for this tick. `binds` (optional) receives the images of the
+/// resolution. Returns device_address 0 when the hold is not live or the publish overflowed; the caller then refuses.
+/// Call only after HeapLive returned true for `ref` under the same lock.
+IndexTable HeapReplay(VideoCore::TextureCache& texture_cache, const HeapRef& ref, u32 index_count,
+                      u64 tick, TableBinds* binds);
+/// sotc: SOTC_BIND_CACHE_HEAP. Whether two resolutions of one stage name the same indices and images (mode 2).
+bool SameBinds(const TableBinds& a, const TableBinds& b);
+/// sotc: SOTC_BIND_CACHE_HEAP counters: a stage replayed from a hold (resolve_skipped: no Resolve ran for it), a bind
+/// cache entry whose hold was dead at a lookup, a hold the decline rule refused, a stored hold, a verify comparison
+/// and its mismatch.
+void NoteHeapHit(bool resolve_skipped);
+void NoteHeapDead();
+void NoteHeapDeclined();
+void NoteHeapStored();
+void NoteHeapVerify(bool match);
+/// sotc: SOTC_BIND_CACHE_HEAP. One line for the 5 s report (counters reset on read); empty when the mode is off.
+void HeapReport(char* out, u32 size, double seconds);
 void Report(char* out, u32 size, double seconds);
 } // namespace TableMemo
 

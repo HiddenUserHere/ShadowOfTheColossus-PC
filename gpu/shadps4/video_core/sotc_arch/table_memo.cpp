@@ -161,6 +161,7 @@ constexpr u32 kMaxSamplers = Shader::NUM_SAMPLERS;
 constexpr u32 kMaxBindings = kMaxImages + kMaxSamplers;
 constexpr u32 kKeyWords = 3 + 5 * kMaxImages + 3 * kMaxSamplers;
 static_assert(kKeyWords == PreKey::kMaxWords, "sotc: PreKey holds the words of KeyOf");
+static_assert(kMaxBindings <= kMaxBindIndices, "sotc: TableBinds::index holds every index of a stage");
 constexpr u32 kEntries = 4096;          // power of two; open addressing
 constexpr u32 kProbe = 8;               // probe window; the least recently used entry of it is replaced
 constexpr u32 kSections = 4;            // ring sections, one per tick modulo kSections
@@ -299,6 +300,17 @@ struct Counters {
     std::atomic<u64> transit_stale{};
     /// sotc: SOTC_HEAP_UI_LINEAR: ops whose bound image takes the bilinear rewrite of the point samplers (hits and fresh).
     std::atomic<u64> ui_linear_ops{};
+    /// sotc: SOTC_BIND_CACHE_HEAP. Stage replays of a bind cache hold (resolves skipped in mode 1), the holds found dead
+    /// at a lookup, the holds the decline rule refused, the holds stored, and mode 2's comparisons with their mismatches.
+    std::atomic<u64> heap_hits{};
+    std::atomic<u64> heap_skipped{};
+    std::atomic<u64> heap_dead{};
+    std::atomic<u64> heap_declined{};
+    std::atomic<u64> heap_stored{};
+    std::atomic<u64> heap_verify{};
+    std::atomic<u64> heap_verify_mismatch{};
+    /// sotc: SOTC_BIND_CACHE_HEAP. The BindSet kills by cause, kept for the HEAP report (BindSetReport resets its own).
+    std::array<std::atomic<u64>, kBindSetCauses> hk_killed{};
 };
 
 struct State {
@@ -738,11 +750,18 @@ IndexTable Publish(Entry* entry, const std::array<u32, kMaxBindings>& indices, u
 }
 
 // The images of an entry for the op (SOTC_HEAP real mode): the bound image of each non-null T#, with its range.
+// sotc: SOTC_BIND_CACHE_HEAP: also the indices and, for a stored BindSet, its reference (HeapLive).
 void FillBinds(const Entry& e, TableBinds* binds) {
     binds->count = e.num_images;
     for (u32 i = 0; i < e.num_images; ++i) {
         binds->image[i] = e.images[i].null ? VideoCore::ImageId{} : e.images[i].bound;
         binds->range[i] = e.images[i].range;
+    }
+    binds->index_count = e.num_bindings;
+    std::copy_n(e.indices.begin(), e.num_bindings, binds->index.begin());
+    binds->ref = {};
+    if (e.bindset) { // a stored BindSet lives in the table (its address is the entry's index)
+        binds->ref = HeapRef{static_cast<u32>(&e - s.entries.get()), e.serial, true};
     }
 }
 
@@ -782,6 +801,7 @@ void KillList(State::LinkList& list, BindSet::Cause cause) {
         if (LinkLive(l)) {
             s.entries[l.entry].valid = false;
             s.counters.bs_killed[static_cast<u32>(cause)].fetch_add(1, std::memory_order_relaxed);
+            s.counters.hk_killed[static_cast<u32>(cause)].fetch_add(1, std::memory_order_relaxed); // sotc: HEAP report
         }
     }
     if (list.gate && !list.links.empty()) {
@@ -864,6 +884,8 @@ void KillCandidates(std::vector<std::pair<u64, u64>>& ranges) {
             e.valid = false;
             s.counters.bs_killed[static_cast<u32>(BindSet::Cause::Range)].fetch_add(
                 1, std::memory_order_relaxed);
+            s.counters.hk_killed[static_cast<u32>(BindSet::Cause::Range)].fetch_add(
+                1, std::memory_order_relaxed); // sotc: HEAP report
         }
     }
     std::erase_if(s.candidates, [](const State::Link& l) { return !LinkLive(l); });
@@ -1045,6 +1067,8 @@ void DrainEvents() {
                     e.valid = false;
                     s.counters.bs_killed[static_cast<u32>(BindSet::Cause::Sampler)].fetch_add(
                         1, std::memory_order_relaxed);
+                    s.counters.hk_killed[static_cast<u32>(BindSet::Cause::Sampler)].fetch_add(
+                        1, std::memory_order_relaxed); // sotc: HEAP report
                 }
             }
         }
@@ -1335,6 +1359,7 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
         }
         s.counters.not_stored.fetch_add(1, std::memory_order_relaxed);
         if (binds) {
+            fresh.indices = indices; // sotc: SOTC_BIND_CACHE_HEAP: FillBinds copies them (no BindSet: no ref)
             FillBinds(fresh, binds);
         }
         return Publish(nullptr, indices, count, tick);
@@ -1379,6 +1404,86 @@ IndexTable Resolve(VideoCore::TextureCache& texture_cache, const Shader::Info& s
         FillBinds(slot, binds);
     }
     return Publish(&slot, indices, count, tick);
+}
+
+// sotc: SOTC_BIND_CACHE_HEAP. The mode in effect. The holds rest on the BindSet events (mode 1 of SOTC_BINDSET) and on the
+// packet cache's own key (SOTC_BIND_CACHE_PACKET=1): either one off, a hold could outlive a change it does not see.
+int HeapHoldMode() {
+    static const int env = SwitchMode("SOTC_BIND_CACHE_HEAP");
+    if (env == 0 || !s.ready || ActiveBindSetMode() != 1 || SotcStats::kBindCachePacket != 1 ||
+        !SotcStats::kBindCacheFrame) {
+        return 0;
+    }
+    return env;
+}
+
+// sotc: SOTC_BIND_CACHE_HEAP. The hold's BindSet is live: its entry still valid under the hold's serial. The queued events
+// are applied first (the texture cache lock is held by the caller). A candidate the time rule now replaces is killed
+// here, as Resolve kills it on a hit.
+bool HeapLive(VideoCore::TextureCache& texture_cache, const HeapRef& ref) {
+    if (!ref.valid || ref.entry >= kEntries) {
+        return false;
+    }
+    DrainEvents();
+    Entry& e = s.entries[ref.entry];
+    if (!e.valid || !e.bindset || e.serial != ref.serial) {
+        return false;
+    }
+    if (TimeStale(texture_cache, e)) {
+        s.counters.bs_time_stale.fetch_add(1, std::memory_order_relaxed);
+        e.valid = false;
+        return false;
+    }
+    return true;
+}
+
+IndexTable HeapReplay(VideoCore::TextureCache& texture_cache, const HeapRef& ref, u32 index_count,
+                      u64 tick, TableBinds* binds) {
+    if (!HeapLive(texture_cache, ref)) {
+        return {};
+    }
+    return BindSetReplay(texture_cache, s.entries[ref.entry], index_count, tick, binds);
+}
+
+bool SameBinds(const TableBinds& a, const TableBinds& b) {
+    if (a.count != b.count || a.index_count != b.index_count) {
+        return false;
+    }
+    if (!std::equal(a.index.begin(), a.index.begin() + a.index_count, b.index.begin())) {
+        return false;
+    }
+    for (u32 i = 0; i < a.count; ++i) {
+        if (a.image[i] != b.image[i] || (a.image[i] && a.range[i] != b.range[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void NoteHeapDead() {
+    s.counters.heap_dead.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteHeapDeclined() {
+    s.counters.heap_declined.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteHeapStored() {
+    s.counters.heap_stored.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteHeapHit(bool resolve_skipped) {
+    s.counters.heap_hits.fetch_add(1, std::memory_order_relaxed);
+    if (resolve_skipped) {
+        s.counters.heap_skipped.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void NoteHeapVerify(bool match) {
+    s.counters.heap_verify.fetch_add(1, std::memory_order_relaxed);
+    if (!match) {
+        s.counters.heap_verify_mismatch.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void NoteBindSkipped() {
@@ -1490,6 +1595,39 @@ void BindSetReport(char* out, u32 size, double seconds) {
         static_cast<unsigned long long>(take(s.counters.transit_stale)),
         static_cast<unsigned long long>(take(s.counters.bs_skipped)),
         static_cast<unsigned long long>(take(s.counters.bs_time_stale)), killed(BindSet::Cause::Range));
+}
+
+// sotc: SOTC_BIND_CACHE_HEAP. One line for the 5 s report (counters reset on read). The kills are the BindSet kills of
+// the table entries (hk_killed, counted beside bs_killed, which BindSetReport resets).
+void HeapReport(char* out, u32 size, double seconds) {
+    if (size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    const int mode = HeapHoldMode();
+    if (mode == 0) {
+        return;
+    }
+    const auto take = [](std::atomic<u64>& c) { return c.exchange(0, std::memory_order_relaxed); };
+    const auto delta = [&](BindSet::Cause cause) {
+        return static_cast<unsigned long long>(take(s.counters.hk_killed[static_cast<u32>(cause)]));
+    };
+    std::snprintf(
+        out, size,
+        "SOTC BIND HEAP %.1f s: mode %d, hits with cached heap %llu, resolves skipped %llu, dead at lookup %llu, "
+        "declined %llu, stored %llu; killed by event [image free %llu, dirty %llu, track %llu, rebind %llu, "
+        "depth %llu, image set %llu, slot %llu, sampler %llu, range %llu]; verify checked %llu, mismatches %llu",
+        seconds, mode, static_cast<unsigned long long>(take(s.counters.heap_hits)),
+        static_cast<unsigned long long>(take(s.counters.heap_skipped)),
+        static_cast<unsigned long long>(take(s.counters.heap_dead)),
+        static_cast<unsigned long long>(take(s.counters.heap_declined)),
+        static_cast<unsigned long long>(take(s.counters.heap_stored)),
+        delta(BindSet::Cause::ImageFree), delta(BindSet::Cause::ImageDirty),
+        delta(BindSet::Cause::ImageTrack), delta(BindSet::Cause::ImageRebind),
+        delta(BindSet::Cause::ImageDepth), delta(BindSet::Cause::ImageSet),
+        delta(BindSet::Cause::HeapSlot), delta(BindSet::Cause::Sampler), delta(BindSet::Cause::Range),
+        static_cast<unsigned long long>(take(s.counters.heap_verify)),
+        static_cast<unsigned long long>(take(s.counters.heap_verify_mismatch)));
 }
 
 } // namespace SotcArch::TableMemo

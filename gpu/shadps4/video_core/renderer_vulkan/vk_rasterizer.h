@@ -238,6 +238,10 @@ private:
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
                             const PreparedDraw* prepared = nullptr) const;
+    /// sotc: SOTC_DRAW_MERGE_STATS=1 (vk_rasterizer.cpp): the draw's content key before its bind. True when it joins the
+    /// last full bind: the caller then skips BindResources and the descriptor push. Always sets the pending bind.
+    bool MergeReuse(const GraphicsPipeline* pipeline, bool is_indexed, bool indirect, bool joinable,
+                    const PreparedDraw* prepared, u32 index_offset);
     /// sotc: SOTC_DRAW_MERGE_STATS (sotc_draw_merge.h): the merge key of one recorded draw and its run. Measurement only.
     void DrawMergeNote(const RenderState& state, const GraphicsPipeline* pipeline, bool is_indexed,
                        bool indirect, VAddr arg_address, u32 stride, u32 max_count, VAddr count_address,
@@ -376,9 +380,13 @@ private:
     /// sotc: SOTC_BIND_CACHE_FRAME (vk_rasterizer.cpp, see BindCacheEntry below). The table form of
     /// BindCacheSync / TryBindCache / CommitBindCache / BindCacheInvalidate.
     void BindCacheSyncFrame(const Pipeline* pipeline, bool eligible);
-    bool TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& uses_dma);
-    void CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool uses_dma,
-                              size_t first_bound_buffer);
+    /// sotc: SOTC_BIND_CACHE_HEAP. heap_mask: the heap stages of this op (BindCacheEntry::heap_mask), 0 when the op
+    /// resolves its heap eagerly. On a hit the held heap results are checked and replayed into bind_hold_addr / bind_hold_binds.
+    bool TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& uses_dma, u32 heap_mask);
+    /// Returns the entry stored (null when the bind was not stored).
+    struct BindCacheEntry;
+    BindCacheEntry* CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool uses_dma,
+                                         size_t first_bound_buffer);
     /// sotc: SOTC_BIND_CACHE_PACKET=2 (PacketVerify, PacketAddrRefresh: declared after BindCacheFindFrame).
     /// sotc: SOTC_BIND_CACHE_PACKET. The heap reason a heap stage's images would take the classic bind (1 target or
     /// forced general, 2 stencil, 3 rebind pending, 4 composite), 0 when BindHeapImages binds them. Caller holds the lock.
@@ -642,6 +650,22 @@ private:
         /// allocated it (StreamBuffer::AdvanceAndWatch), so a copy is reused only in that tick.
         u64 tick{~0ULL};
     };
+    /// sotc: SOTC_OP_COMPUTE_BIND. One written buffer binding of a bind (BindBuffers, the guest path): the ObtainBuffer
+    /// call it made (range, marks, texel is never set), the note calls it made, the narrowing dispatch it was made under
+    /// and the binding it answered. A hit replays these calls with its own state (ReplayOwnWrites); mode 2 compares them.
+    struct BindCacheWrite {
+        VAddr addr{};
+        u64 size{};
+        u32 mark_offset{};
+        u32 mark_size{};
+        u32 buf_index{};         ///< the descriptor's index in its stage (NoteMark)
+        u64 pgm_hash{};          ///< the stage (the NoteHostWrite tag, NoteMark)
+        u64 dispatch_groups{};   ///< t_direct_dispatch of the bind when it names this stage (else 0): the narrowing input
+        u64 dispatch_threads{};
+        bool note_again{};       ///< the bind ran NoteHostWrite after ObtainBuffer (kBindMarkOnce did not skip it)
+        const VideoCore::Buffer* buffer{}; ///< the binding ObtainBuffer answered
+        u64 offset{};
+    };
     struct BindCacheEntry {
         const Pipeline* pipeline{};
         u64 hash{};
@@ -704,6 +728,9 @@ private:
         /// sotc: SOTC_BIND_CACHE_PACKET: where each `addr` came from (PacketAddrRefresh); empty without the switch.
         std::vector<PacketAddrSrc> addr_src;
         bool map_dependent{};  ///< bound a T# the guest mapping rejected (a map can change that)
+        /// sotc: the map epoch at which the repairs' mappings were last found unchanged (TryBindCacheFrame's
+        /// mapping check is skipped while MapEpoch still reads it: MapMemory / UnmapMemory are the only changes).
+        u64 map_ok_epoch{~0ULL};
         /// Bound a mip-tail image: FindImage's tail choice depends on which overlapping images are
         /// GPU-written (VideoCore::gpu_modified_epoch), checked at the hit.
         bool tail_dependent{};
@@ -713,6 +740,15 @@ private:
         bool refresh{};
         std::vector<BindCacheFlatSlot> flat_slots;
         std::vector<std::pair<VAddr, VAddr>> tex_watch;
+        /// sotc: SOTC_BIND_CACHE_HEAP. The heap resolutions of a packet op of a heap pipeline, the held result of
+        /// TableMemo::Resolve: bit 0 the fragment/compute heap stage, bit 1 the vertex one. heap[k] is its index table and
+        /// images (its ref names the BindSet that keeps it live), heap_stage[k] its stage's position in GetStages.
+        u32 heap_mask{};
+        std::array<u32, 2> heap_stage{};
+        std::array<SotcArch::TableMemo::TableBinds, 2> heap{};
+        /// sotc: SOTC_OP_COMPUTE_BIND. The written bindings of the bind, in the order the full bind made them; a hit
+        /// replays them (ReplayOwnWrites).
+        std::vector<BindCacheWrite> own_writes;
     };
     /// The state every live entry was made in; a change flushes them all.
     struct BindCacheState {
@@ -765,6 +801,18 @@ private:
     u32 cur_bind_stage{};             ///< index (in GetStages) of the stage being bound
     bool bind_level2{};               ///< this bind's key is the resource identity
     Shader::PushData bind_input_push{}; ///< the draw's own push data (registers) before the bind
+    /// sotc: SOTC_OP_COMPUTE_BIND. The written bindings of the bind being recorded. Their range stamps are noted after the
+    /// commit (ApplyOwnWriteStamps), so the commit does not reject the entry for the bind's own writes.
+    std::vector<BindCacheWrite> bind_cache_writes_rec;
+    /// sotc: SOTC_OP_COMPUTE_BIND. Replays the written bindings of a hit: ObtainBuffer, the texture invalidation and the
+    /// host write note each made, then their stamps (the entry is fresh again after them). 0: replayed; 1: a binding
+    /// changed (the hit is refused); 2: the entry is stale (reason set).
+    int ReplayOwnWrites(BindCacheEntry& entry, u32& reason);
+    /// sotc: SOTC_OP_COMPUTE_BIND. The stamps of the recorded written bindings, noted after the commit of the bind
+    /// (made: the entry stored by it, or null). Clears the record.
+    void ApplyOwnWriteStamps(BindCacheEntry* made);
+    /// sotc: SOTC_OP_COMPUTE_BIND=2. The write calls a replay of the entry would make against the ones this full bind made.
+    void WriteVerify(const BindCacheEntry& ref);
     /// SOTC_FPS only: keys looked up in this game frame (distinct keys per frame).
     struct KeySeen {
         u64 key{};
@@ -854,6 +902,16 @@ private:
     bool PacketAddrRefresh(BindCacheEntry& entry);
     void PacketVerify(const BindCacheEntry& ref, size_t first_bound_buffer);
     BindCacheState bind_cache_state{};
+    /// sotc: SOTC_BIND_CACHE_HEAP. The heap decline check of a held resolution (HeapDeclineReason), under the lock.
+    u32 HeapHoldDecline(const Pipeline* pipeline, const BindCacheEntry& entry, u32 k);
+    /// sotc: SOTC_BIND_CACHE_HEAP. A hit's replayed heap results (per heap stage: binds, index table, the entry it came
+    /// from), and the op's fresh resolution that CommitBindCacheFrame stores (bind_rec_*).
+    SotcArch::TableMemo::TableBinds bind_hold_binds[2]{};
+    SotcArch::TableMemo::IndexTable bind_hold_addr[2]{};
+    const BindCacheEntry* bind_hold_src[2]{};
+    SotcArch::TableMemo::TableBinds bind_rec_heap[2]{};
+    u32 bind_rec_heap_mask{}; ///< the op's heap stages (0: none to store)
+    std::array<u32, 2> bind_rec_heap_stage{};
     u32 bind_cache_live{};
     u64 bind_cache_clock{};
     /// Bumped by GPU-side DMA writes (FillBuffer, CopyBuffer): flushes the cache.

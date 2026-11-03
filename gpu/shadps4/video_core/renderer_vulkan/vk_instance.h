@@ -253,6 +253,16 @@ public:
         return vertex_input_dynamic_state;
     }
 
+    /// sotc: SOTC_DRAW_MDI. VK_EXT_multi_draw is enabled with its multiDraw feature.
+    bool IsMultiDrawSupported() const {
+        return multi_draw;
+    }
+
+    /// sotc: SOTC_DRAW_MDI. maxMultiDrawCount of VK_EXT_multi_draw (0 when it is off).
+    u32 MaxMultiDrawCount() const {
+        return max_multi_draw_count;
+    }
+
     /// sotc: true when SOTC_PIPE_GPL=1 and VK_EXT_graphics_pipeline_library (with
     /// graphicsPipelineLibrary) is enabled. Read once in CreateDevice.
     bool IsGraphicsPipelineLibrary() const {
@@ -847,6 +857,8 @@ private:
     bool gpu_trace_host_domain{};    // sotc: see IsGpuTraceHostDomain()
     u32 timestamp_valid_bits{};      // sotc: see GetTimestampValidBits()
     bool custom_border_color{};
+    bool multi_draw{};                 // sotc: SOTC_DRAW_MDI, see IsMultiDrawSupported()
+    u32 max_multi_draw_count{};        // sotc: see MaxMultiDrawCount()
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};
     bool depth_clip_control{};

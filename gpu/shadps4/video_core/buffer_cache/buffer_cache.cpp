@@ -13,6 +13,7 @@
 #include <xxhash.h>
 
 #include "bbport_copy.h"
+#include "../../../sotc/probe_frame_rings.h" // sotc: SOTC_FRAME_RINGS (NoteWrite, NoteCpuPath)
 #include "common/alignment.h"
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
@@ -1384,6 +1385,7 @@ bool BufferCache::NativeExactUpload(VAddr addr, u64 size) {
         vk::BufferCopy{staging.offset, addr - arena->cpu_addr, size}};
     runtime.CopyBuffer(staging.buffer, arena, copies);
     RecordCurrentWrite(addr, size);
+    SotcFrameRings::NoteCpuPath(addr, size); // sotc: SOTC_FRAME_RINGS (this record is CPU-origin)
     // sotc: the exact copy sets no CPU bit, so the memory tracker's counters (mem_epoch, SotcGen,
     // sync generations) would not see this CPU write; move them as a fault would.
     memory_tracker->NoteCpuBytesChanged(addr, size);
@@ -6374,6 +6376,7 @@ void BufferCache::EraseHashedUploads(VAddr addr, u64 size) {
 
 void BufferCache::RecordCurrentWrite(VAddr addr, u64 size, u64 seq, bool gpu_write,
                                      bool pf_marked) {
+    SotcFrameRings::NoteWrite(addr, size); // sotc: SOTC_FRAME_RINGS (count only, nothing skipped)
     const u32 wd_mode = WriteDietMode();
     EraseHashedUploads(addr, size);
     // sotc: SOTC_RB_EXACT: any arena write over owed bytes takes them out of the owed downloads.
@@ -8565,6 +8568,27 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         }
         const SotcStats::FrameTimer frame_timer{SotcStats::FrameBuffer};
         tl_sync_bytes += total_size_bytes; // sotc: SOTC_LOAD_WARM (WarmRange's copied bytes)
+        // sotc: SOTC_BIG_SYNC_LOG=1 (diagnostic): the first 40 syncs of 8 MiB and more, with their buffer, so the
+        // ranges the port uploads whole every frame can be traced to their owner.
+        static const bool big_sync_log = [] {
+            const char* v = std::getenv("SOTC_BIG_SYNC_LOG");
+            return v && v[0] == '1';
+        }();
+        if (big_sync_log && total_size_bytes >= 8_MB &&
+            SotcStats::flip_count.load(std::memory_order_relaxed) > 900) { // gameplay, past the loads
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+                std::fprintf(stderr,
+                             "SOTC BIG SYNC: %zu bytes in %zu ranges, request %#llx+%#x written %d texel %d reason %u, "
+                             "arena %#llx size %#llx, first range %#llx+%#llx\n",
+                             total_size_bytes, copies.size(), (unsigned long long)device_addr, size, int(is_written),
+                             int(is_texel_buffer), tl_sync_reason,
+                             (unsigned long long)(arena ? arena->CpuAddr() : 0),
+                             (unsigned long long)(arena ? arena->SizeBytes() : 0),
+                             (unsigned long long)(copies.empty() ? 0 : copies[0].dstOffset),
+                             (unsigned long long)(copies.empty() ? 0 : copies[0].size));
+            }
+        }
         if (SotcStats::kFpsLog) {
             SotcStats::frame_copy_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
         }

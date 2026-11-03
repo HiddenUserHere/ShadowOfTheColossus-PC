@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_lod_stats.h"
+#include "video_core/sotc_prepass_probe.h" // sotc: SOTC_NO_PREPASS=3
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_OPCOST (OpCostScope below)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
@@ -1732,10 +1733,18 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
                          prep_workers ? TakePrepared(back_exec_seq) : nullptr);
         break;
     case BackOp::Kind::DrawIndirect:
+        if (op.prepass_mark == 1) { // sotc: SOTC_NO_PREPASS=3, an opaque pre-pass draw (its G-buffer draw lays the depth)
+            if (prep_workers) {
+                TakePrepared(back_exec_seq);
+            }
+            break;
+        }
+        SotcPrepassProbe::t_cp_mark = op.prepass_mark;
         rasterizer->DrawIndirect(op.is_indexed, op.address, op.offset, op.stride, op.max_count,
                                  op.count_address, op.vertex_sgpr_offset, op.instance_sgpr_offset,
                                  op.pipeline, true,
                                  prep_workers ? TakePrepared(back_exec_seq) : nullptr);
+        SotcPrepassProbe::t_cp_mark = 0;
         break;
     case BackOp::Kind::Dispatch:
         back_cs = op.cs;
@@ -1930,6 +1939,16 @@ void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u
     op.vertex_sgpr_offset = vertex_sgpr_offset;
     op.instance_sgpr_offset = instance_sgpr_offset;
     CaptureBackOp(op, pipeline);
+    op.prepass_mark = 0;
+    if (SotcPrepassProbe::CpSkipMode() && max_count == 1 && count_address == 0) { // sotc: SOTC_NO_PREPASS=3
+        bool discard = false;
+        if (pipeline) {
+            for (const auto* st : pipeline->GetStages()) {
+                discard |= st && st->sw_stage == Shader::SwStage::Fragment && st->has_discard;
+            }
+        }
+        op.prepass_mark = SotcPrepassProbe::CpClassify(regs, address + offset, pipeline != nullptr, discard);
+    }
     const bool pipe_writes = PipelineWrites(pipeline);
     BackPublish(back_strict && pipe_writes, pipe_writes);
 }

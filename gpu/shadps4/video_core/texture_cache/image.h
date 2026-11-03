@@ -194,6 +194,9 @@ public:
     /// (0: never). Counts track-untrack cycles of one image within one frame.
     u64 tex_track_tick{};
     u64 tex_untrack_tick{};
+    /// sotc: SOTC_TEX_LIFECYCLE: the registry generation of the engine texture at this image's
+    /// guest base, at its last refresh (0: never, or not a static engine texture).
+    u32 sotc_texlife_gen{};
     ImageId depth_id{};
     /// sotc: the depth/colour twin parked by ResolveDepthOverlap (unregistered, untracked, kept
     /// for the next conversion back); deleted together with this image.
@@ -213,6 +216,9 @@ public:
         std::vector<State> subresource_states;
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
+        // sotc: SOTC_TC_FAST_LOOKUP: a hash of each entry of image_view_infos (same index). Two equal
+        // infos have equal keys, so a key mismatch skips the full compare.
+        boost::container::small_vector<u64, 4> image_view_keys;
         u32 num_samples;
         // sotc: index of the view FindView returned last (SOTC_TEX_BIND_P1). The view lists
         // only grow and their entries never change, so an index stays valid for the backing's

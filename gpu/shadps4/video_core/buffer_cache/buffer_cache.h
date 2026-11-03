@@ -39,6 +39,7 @@ const unsigned char* runtime_memory_backing_pointer(uintptr_t address);
 const unsigned char* runtime_memory_backing_view(uint64_t* size);
 }
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/write_set.h" // sotc: SOTC_WRITE_SCOPE_FLAT (current_writes, write ring)
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -1046,7 +1047,7 @@ private:
     u64 AddGpuModified(VAddr addr, u64 size); ///< sotc: returns the hot sequence number (0: none)
 
     /// GPU writes recorded into the command buffer still being built (tick current_writes_tick).
-    RangeSet current_writes;
+    WriteSet current_writes; // sotc: SOTC_WRITE_SCOPE_FLAT: RangeSet (mode 0) or the flat set (write_set.h)
     u64 current_writes_tick{};
     /// sotc: SOTC_WRITE_DIET: pf_marked, set by ObtainBuffer when AddGpuModified already ran
     /// MarkInflightReadbacksDirty over this same range (its prefetch walk is then not repeated).
@@ -1061,7 +1062,7 @@ private:
     void RollCurrentWrites();
     struct WriteRingEntry {
         u64 tick{};
-        RangeSet set;
+        WriteSet set; // sotc: SOTC_WRITE_SCOPE_FLAT
     };
     static constexpr u32 NumWriteRing = 8;
     std::array<WriteRingEntry, NumWriteRing> write_ring; // default-initialized (RangeSet ctor)

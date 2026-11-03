@@ -176,6 +176,11 @@ void ReportTexProtect(u64 tick) {
 
 } // namespace
 
+// sotc: SOTC_TEX_LIFECYCLE mode 1 (texture_cache.h UpdateImage). The same flush RefreshImage starts with.
+void TextureCache::TexLifeFastFlush() {
+    FlushTexProtect();
+}
+
 struct TexProtectScope::Impl {
     PageManager::ProtectBatch batch{true};
 };
@@ -3586,10 +3591,25 @@ ImageId TextureCache::MemoLookup(const ImageInfo& info, bool exact_fmt, bool wri
     if (SotcStats::kFpsLog) { // sotc: SOTC FIND MEMO line (ReportTexProtect)
         memo_lookups.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!memo_enabled || memo.generation != MemoGeneration(info.guest_address) ||
-        memo.guest_address != info.guest_address || memo.guest_size != info.guest_size ||
-        !(memo.size == info.size) || memo.pixel_format != info.pixel_format ||
-        memo.type != info.type || memo.exact_fmt != exact_fmt || memo.writer != writer) {
+    // sotc: SOTC_TC_FAST_LOOKUP>=1. The same test, with the memo's own fields first: a slot holding
+    // another key (direct-mapped, so common) then misses without reading the generation array.
+    // All terms are plain reads, so the answer is the one of the test below.
+    const bool fast = TcFast::Mode() != 0;
+    if (fast) {
+        TcFast::fast_lookups.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (fast) {
+        if (!memo_enabled || memo.guest_address != info.guest_address ||
+            memo.guest_size != info.guest_size || !(memo.size == info.size) ||
+            memo.pixel_format != info.pixel_format || memo.type != info.type ||
+            memo.exact_fmt != exact_fmt || memo.writer != writer ||
+            memo.generation != MemoGeneration(info.guest_address)) {
+            return {};
+        }
+    } else if (!memo_enabled || memo.generation != MemoGeneration(info.guest_address) ||
+               memo.guest_address != info.guest_address || memo.guest_size != info.guest_size ||
+               !(memo.size == info.size) || memo.pixel_format != info.pixel_format ||
+               memo.type != info.type || memo.exact_fmt != exact_fmt || memo.writer != writer) {
         return {};
     }
     const Image& image = slot_images[memo.image_id];
@@ -3609,7 +3629,48 @@ ImageId TextureCache::MemoLookup(const ImageInfo& info, bool exact_fmt, bool wri
     if (SotcStats::kFpsLog) {
         memo_hits.fetch_add(1, std::memory_order_relaxed);
     }
+    if (fast) {
+        TcFast::fast_hits.fetch_add(1, std::memory_order_relaxed);
+        if (TcFast::Mode() == 2) {
+            // sotc: SOTC_TC_FAST_LOOKUP=2: the reference search of FindImage (same walk, same
+            // mip-tail filter, the last perfect match wins). Only reads, plus the Picked flag that
+            // ForEachImageInRegion sets and clears itself.
+            ImageId reference{};
+            ForEachImageInRegion(info.guest_address, info.guest_size,
+                                 [&](ImageId image_id, Image& candidate) {
+                                     if (writer && candidate.info.sotc_first_mip &&
+                                         False(candidate.flags & ImageFlagBits::GpuModified)) {
+                                         return;
+                                     }
+                                     if (IsPerfectMatch(candidate.info, info, exact_fmt)) {
+                                         reference = image_id;
+                                     }
+                                 });
+            TcFast::fast_verify_checks.fetch_add(1, std::memory_order_relaxed);
+            if (reference != memo.image_id) {
+                TcFast::fast_verify_mismatch.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     return memo.image_id;
+}
+
+void TextureCache::ReportTcFast(std::string& out, double seconds) {
+    if (TcFast::Mode() == 0) {
+        return;
+    }
+    const u64 lookups = TcFast::fast_lookups.exchange(0, std::memory_order_relaxed);
+    const u64 hits = TcFast::fast_hits.exchange(0, std::memory_order_relaxed);
+    const u64 mismatches = TcFast::fast_verify_mismatch.exchange(0, std::memory_order_relaxed);
+    const u64 checks = TcFast::fast_verify_checks.exchange(0, std::memory_order_relaxed);
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "SOTC TC FAST: lookups %llu, fast hits %llu, verify mismatches %llu "
+                  "(checks %llu, mode %u, %.1f s)\n",
+                  static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(hits),
+                  static_cast<unsigned long long>(mismatches),
+                  static_cast<unsigned long long>(checks), TcFast::Mode(), seconds);
+    out += line;
 }
 
 // sotc: mip-tail images (SOTC_MIP_TAIL). A read-only T# with base_level b > 0 never samples mips
