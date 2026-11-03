@@ -51,6 +51,28 @@ extern "C" uint64_t runtime_memory_generation(void);
 
 namespace Vulkan {
 
+// sotc: SOTC CACHE DIAG (vk_pipeline_serialization.cpp): 6 new programs, 7 unused (was: meta on disk; the disk read
+// on the command processor was a diagnostic only), 8 new permutations, 9 of them queued to a worker.
+constexpr int kCacheDiagCount = 10;
+extern std::atomic<u32> g_cache_diag[kCacheDiagCount];
+void CacheDiagReport(const char* when);
+static void CacheDiagNoteProgram(u64 hash) {
+    (void)hash;
+    g_cache_diag[6].fetch_add(1, std::memory_order_relaxed);
+    if ((g_cache_diag[6].load() + g_cache_diag[8].load()) % 128 == 0) {
+        CacheDiagReport("runtime");
+    }
+}
+static void CacheDiagNotePerm(bool async) {
+    g_cache_diag[8].fetch_add(1, std::memory_order_relaxed);
+    if (async) {
+        g_cache_diag[9].fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((g_cache_diag[6].load() + g_cache_diag[8].load()) % 128 == 0) {
+        CacheDiagReport("runtime");
+    }
+}
+
 // sotc: the saved driver pipeline cache (PipelineCache::SaveDriverCache).
 static bool DriverCacheEnabled() {
     static const bool enabled = [] {
@@ -1160,6 +1182,7 @@ void PipelineCache::QueueAsyncTranslate(HwStage hw_stage, SwStage sw_stage,
     t.sw_stage = sw_stage;
     t.hash = params.hash;
     t.variant = params.variant; // sotc: SOTC_HEAP
+    t.guest_hash = params.guest_hash;
     // The user data registers change with the next draws: the worker reads a copy. The code
     // stays in guest memory (inline constants are addressed from it).
     std::ranges::copy(params.user_data, t.user_data.begin());
@@ -1265,6 +1288,7 @@ void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
         .code = t.code,
         .hash = t.hash,
         .variant = t.variant, // sotc: SOTC_HEAP
+        .guest_hash = t.guest_hash,
     };
     auto binding = t.start;
     auto runtime_info = t.runtime_info;
@@ -2690,6 +2714,14 @@ bool PipelineCache::RefreshGraphicsStages() {
             params.guest_hash = params.hash; // sotc: Info::pgm_hash stays the game's hash
             params.hash = HashCombine(params.hash, params.variant);
         }
+        // sotc: SOTC_HEAP: a candidate refused before (this session or a saved one) is not translated again; the
+        // caller binds the stage's other variant, as for a refusal.
+        if (params.variant == Shader::StageVariantHeap && heap_refused.contains(params.hash)) {
+            key.stage_hashes[stage_out_idx] = 0;
+            infos[stage_out_idx] = nullptr;
+            modules[stage_out_idx] = nullptr;
+            return false;
+        }
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding, async_translate_ok);
         return !translation_pending;
@@ -2709,6 +2741,9 @@ bool PipelineCache::RefreshGraphicsStages() {
         if (heap_fs && !SotcArch::Heap::StageRefused(*heap_fs)) {
             other_variant = Shader::StageVariantPlain;
         } else if (heap_fs || !translation_pending) {
+            if (heap_fs) {
+                NoteHeapRefused(heap_fs->CacheHash());
+            }
             fragment_variant = non_heap_variant;
             binding = binding_before_fragment;
             bind_stage(HwStage::Fragment, SwStage::Fragment);
@@ -2763,6 +2798,9 @@ bool PipelineCache::RefreshGraphicsStages() {
             return !translation_pending;
         }
         if (heap_vs || !translation_pending) {
+            if (heap_vs) {
+                NoteHeapRefused(heap_vs->CacheHash());
+            }
             vertex_variant = other_variant;
             binding = binding_before_vertex;
             return bind_stage(stage_in, SwStage::Vertex);
@@ -2856,6 +2894,20 @@ bool PipelineCache::RefreshGraphicsStages() {
     return true;
 }
 
+void PipelineCache::NoteHeapRefused(u64 candidate_hash) {
+    if (!heap_refused.insert(candidate_hash).second) {
+        return;
+    }
+    // sotc: the whole list is written again (a few KiB): the session may end at any time (launcher Stop, _Exit).
+    std::vector<u8> blob(heap_refused.size() * sizeof(u64));
+    size_t offset = 0;
+    for (const u64 hash : heap_refused) {
+        std::memcpy(blob.data() + offset, &hash, sizeof(hash));
+        offset += sizeof(hash);
+    }
+    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "heap_refused", std::move(blob));
+}
+
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
@@ -2868,12 +2920,16 @@ bool PipelineCache::RefreshComputeKey() {
         heap_params.variant = Shader::StageVariantHeap;
         heap_params.guest_hash = cs_params.hash;
         heap_params.hash = HashCombine(cs_params.hash, heap_params.variant);
-        std::tie(infos[0], modules[0], compute_key.value) =
-            GetProgram(HwStage::Compute, SwStage::Compute, heap_params, binding);
-        // A refused candidate is compiled again as today; a pending one answers on a later call.
-        compute_bound = !infos[0] || !SotcArch::Heap::StageRefused(*infos[0]);
-        if (!compute_bound) {
-            binding = {};
+        // sotc: a candidate refused before (heap_refused) is not translated again.
+        if (!heap_refused.contains(heap_params.hash)) {
+            std::tie(infos[0], modules[0], compute_key.value) =
+                GetProgram(HwStage::Compute, SwStage::Compute, heap_params, binding);
+            // A refused candidate is compiled again as today; a pending one answers on a later call.
+            compute_bound = !infos[0] || !SotcArch::Heap::StageRefused(*infos[0]);
+            if (!compute_bound) {
+                NoteHeapRefused(infos[0]->CacheHash());
+                binding = {};
+            }
         }
     }
     if (!compute_bound) {
@@ -3164,6 +3220,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (async_ok && !program_cache.contains(params.hash) &&
         !in_place_programs.contains(params.hash)) {
         if (pending_programs.insert(params.hash).second) {
+            CacheDiagNoteProgram(params.hash);
             QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, nullptr, nullptr, 0);
         }
         translation_pending = true;
@@ -3171,6 +3228,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     }
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
+        CacheDiagNoteProgram(params.hash);
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
@@ -3334,6 +3392,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end() && async_ok && !program->translate_in_place) {
         if (std::ranges::find(program->pending_specs, spec) == program->pending_specs.end()) {
+            CacheDiagNotePerm(true);
             QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, program.get(), &spec,
                                 perm_idx);
             program->pending_specs.push_back(spec);
@@ -3345,6 +3404,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         return {nullptr, vk::ShaderModule{}, 0};
     }
     if (it == program->modules.end()) {
+        CacheDiagNotePerm(false);
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         auto runtime_info = rt;
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);

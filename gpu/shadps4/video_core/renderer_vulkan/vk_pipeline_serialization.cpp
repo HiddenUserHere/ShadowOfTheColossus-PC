@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <unordered_set>
@@ -68,12 +70,27 @@ static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 41u : 138
 // cached shader came back with both false: SOTC_NO_PREPASS=3 took alpha-tested pre-pass draws for opaque ones and
 // dropped them (grass without alpha, 3 Nov), and the host's storage-image checks (op writes, fast bind, bind cache)
 // missed cached shaders.
-static constexpr u32 ShaderMetaVersion = 25u;
+// 26: worker-translated variants (SOTC_HEAP, SOTC_SHADER_ADDR) lost ShaderParams::guest_hash, so their records hold
+// the variant-mixed hash as pgm_hash: the binary was never found at load, the game hash rules missed the program, and
+// the slot check kept the broken record against every rewrite. A cache folder without variants (neither switch)
+// still accepts 25, whose records are fine there (MetaVersionAccepted).
+static constexpr u32 ShaderMetaVersion = 26u;
+static constexpr u32 ShaderMetaVersionNoVariants = 25u;
+/// sotc: set by WarmUp from the profile before the cache is read: this folder's programs can be variants.
+static bool g_variant_folder = false;
+static bool MetaVersionAccepted(u32 version) {
+    return version == ShaderMetaVersion || (version == ShaderMetaVersionNoVariants && !g_variant_folder);
+}
 static const u32 PipelineKeyVersion =
     3u + (Shader::StageBindingsEnabled() ? 1000u : 0u) + (BindlessSamplersRequested() ? 2000u : 0u);
 } // namespace Serialization
 
 namespace Vulkan {
+
+// sotc: SOTC CACHE DIAG counters (defined before LoadGraphicsPipeline; also declared in vk_pipeline_cache.cpp).
+constexpr int kCacheDiagCount = 10;
+extern std::atomic<u32> g_cache_diag[kCacheDiagCount];
+void CacheDiagReport(const char* when);
 
 namespace {
 // sotc: where the boot-time preload spends its time (logged with "Preloaded N pipelines").
@@ -132,7 +149,7 @@ bool SlotHasCurrentMeta(u64 pgm_hash, size_t perm_idx) {
         u32 binary_version{};
         meta.Read(meta_version);
         meta.Read(binary_version);
-        return meta_version == Serialization::ShaderMetaVersion &&
+        return Serialization::MetaVersionAccepted(meta_version) &&
                binary_version == Serialization::ShaderBinaryVersion;
     } catch (const Serialization::CorruptedData&) {
         return false;
@@ -302,13 +319,15 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 meta_version{};
     meta.Read(meta_version);
-    if (meta_version != Serialization::ShaderMetaVersion) {
+    if (!Serialization::MetaVersionAccepted(meta_version)) {
+        g_cache_diag[1].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
     u32 binary_version{};
     meta.Read(binary_version);
     if (binary_version != Serialization::ShaderBinaryVersion) {
+        g_cache_diag[1].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
@@ -317,7 +336,11 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
-    return info.Deserialize(ar);
+    if (!info.Deserialize(ar)) {
+        g_cache_diag[2].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
 }
 
 void ComputePipelineKey::Serialize(Serialization::Archive& ar) const {
@@ -444,6 +467,19 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     return true;
 }
 
+// sotc: SOTC CACHE DIAG lines (always on). Why warm-up pipelines are stale, and what the game compiles at runtime (counted in
+// vk_pipeline_cache.cpp). One line at the end of the warm-up, one every 128 runtime compiles.
+std::atomic<u32> g_cache_diag[kCacheDiagCount]{};
+void CacheDiagReport(const char* when) {
+    std::fprintf(stderr,
+                 "SOTC CACHE DIAG %s: stale: meta missing %u, meta version %u, meta info %u, spv missing %u, "
+                 "perm conflict %u, no handle %u; runtime: new programs %u, new perms %u "
+                 "(async %u)\n",
+                 when, g_cache_diag[0].load(), g_cache_diag[1].load(), g_cache_diag[2].load(),
+                 g_cache_diag[3].load(), g_cache_diag[4].load(), g_cache_diag[5].load(), g_cache_diag[6].load(),
+                 g_cache_diag[8].load(), g_cache_diag[9].load());
+}
+
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     // Stages left over from a pipeline whose load failed half-way must not leak into this one:
     // a stale entry for a stage this key does not use would be bound without user data.
@@ -465,6 +501,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
                                            fmt::format("{:#018x}", hash), meta_blob);
         if (meta_blob.empty()) {
+            g_cache_diag[0].fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
@@ -503,6 +540,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         return true; // a refused one is dropped when collected (CollectAsyncPipelines)
     }
     if (!it.value()->Handle()) {
+        g_cache_diag[5].fetch_add(1, std::memory_order_relaxed);
         graphics_pipelines.erase(graphics_key);
         return false;
     }
@@ -515,7 +553,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     spec.info = &program->info;
     size_t perm_idx{};
     if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
-        return false;
+        return false; // counted by LoadShaderMeta (SOTC CACHE DIAG)
     }
 
     std::vector<u32> spv{};
@@ -526,6 +564,11 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             fmt::format("{:#018x}_{}", program->info.CacheHash(), perm_idx), spv);
     }
     if (spv.empty()) {
+        if (g_cache_diag[3].fetch_add(1, std::memory_order_relaxed) < 6) {
+            std::fprintf(stderr, "SOTC CACHE DIAG spv missing: %#018llx_%zu (pgm %#018llx, variant %u)\n",
+                         static_cast<unsigned long long>(program->info.CacheHash()), perm_idx,
+                         static_cast<unsigned long long>(program->info.pgm_hash), unsigned{program->info.variant});
+        }
         return false;
     }
 
@@ -564,6 +607,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                             "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
                             "preload",
                             perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
+                g_cache_diag[4].fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
             module = it->module;
@@ -617,6 +661,7 @@ void PipelineCache::WarmUp() {
             }
         }
         Storage::DataBase::Instance().SetVariant(std::move(key));
+        Serialization::g_variant_folder = profile.heap_images != 0 || profile.shader_addr != 0;
     }
     Storage::DataBase::Instance().Open();
 
@@ -678,6 +723,17 @@ void PipelineCache::WarmUp() {
         Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
                                            std::move(profile_data));
         return;
+    }
+
+    // sotc: SOTC_HEAP: the heap candidates refused by earlier sessions (PipelineCache::NoteHeapRefused).
+    {
+        std::vector<u8> refused;
+        Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "heap_refused", refused);
+        for (size_t offset = 0; offset + sizeof(u64) <= refused.size(); offset += sizeof(u64)) {
+            u64 hash{};
+            std::memcpy(&hash, refused.data() + offset, sizeof(hash));
+            heap_refused.insert(hash);
+        }
     }
 
     u32 num_pipelines{};
@@ -781,6 +837,7 @@ void PipelineCache::WarmUp() {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
     }
+    CacheDiagReport("warm-up");
     Storage::DataBase::Instance().FinishPreload();
 }
 

@@ -424,6 +424,10 @@ private:
             Shader::SwStage sw_stage{};
             u64 hash{};
             u8 variant{}; ///< sotc: SOTC_HEAP stage variant (ShaderParams::variant); hash already includes it
+            /// sotc: ShaderParams::guest_hash (the game's hash of a variant, 0 for the default). Without it the
+            /// worker's Info took the variant-mixed hash as pgm_hash: the hash rules missed the program, and its
+            /// CacheHash mixed the variant twice, so the binary (saved under hash) was never found again.
+            u64 guest_hash{};
             std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
             std::span<const u32> code;
             Shader::RuntimeInfo runtime_info{};
@@ -527,6 +531,12 @@ private:
     size_t async_priority_queued{}; ///< sotc: shadow graphics jobs right after those, oldest first
     std::unordered_set<u64> pending_programs; ///< new programs being translated (CP only)
     std::unordered_set<u64> in_place_programs; ///< failed on a worker: translated here (CP only)
+    /// sotc: SOTC_HEAP. Heap candidates (the variant's hash) that Heap::StageRefused refused, kept in the cache folder
+    /// ("heap_refused" blob, loaded by WarmUp). A refused candidate's program is in no saved pipeline, so without
+    /// this list it was translated again at every start (~850 shaders per session) only to be refused again.
+    /// CP only (RefreshGraphicsStages, RefreshComputeKey).
+    std::unordered_set<u64> heap_refused;
+    void NoteHeapRefused(u64 candidate_hash);
     bool async_translate_ok{};  ///< this draw may queue its translations (CP only)
     bool translation_pending{}; ///< a stage of this draw is being translated (CP only)
     std::vector<std::unique_ptr<AsyncPipelineJob>> async_done;

@@ -597,6 +597,9 @@ private:
         u64 tick{};
         bool uses_dma{};
         bool valid{};
+        /// sotc: SOTC_FPS measurement: valid was cleared by a dispatch (the descriptor arrays it names may still be
+        /// those of this bind). Counts the graphics binds that would have been fast-bind hits without it.
+        bool compute_cleared{};
         /// sotc: SOTC_PACKET: the addressed ranges of that bind, touched again by each fast or wide hit.
         std::vector<PacketAddr> addr;
     };

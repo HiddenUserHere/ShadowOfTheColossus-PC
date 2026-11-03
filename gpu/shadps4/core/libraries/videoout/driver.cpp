@@ -1402,6 +1402,21 @@ void VideoOutDriver::Flip(const Request& req) {
                     std::fprintf(stderr, "SOTC FASTBIND misses %llu (tick only %llu)\n",
                                  static_cast<unsigned long long>(misses),
                                  static_cast<unsigned long long>(tick_misses));
+                    if (const uint64_t tex_binds = SotcStats::tex_repeat_binds.exchange(0)) {
+                        // sotc: SOTC_TEX_REPEAT: the ceiling of a per-submit texture bind memo
+                        const uint64_t tick_hits = SotcStats::tex_repeat_tick_hits.exchange(0);
+                        const uint64_t frame_hits = SotcStats::tex_repeat_frame_hits.exchange(0);
+                        const uint64_t ticks = SotcStats::tex_repeat_ticks.exchange(0);
+                        std::fprintf(stderr,
+                                     "SOTC TEX REPEAT: %llu texture binds in %llu submits; repeat a T# of the same "
+                                     "submit %.1f%%, of the same frame %.1f%%\n",
+                                     static_cast<unsigned long long>(tex_binds), static_cast<unsigned long long>(ticks),
+                                     100.0 * double(tick_hits) / double(tex_binds),
+                                     100.0 * double(frame_hits) / double(tex_binds));
+                    }
+                    std::fprintf(stderr, "SOTC FASTBIND misses from a dispatch in between: %llu same tick, %llu other tick\n",
+                                 static_cast<unsigned long long>(SotcStats::fast_bind_compute_misses.exchange(0)),
+                                 static_cast<unsigned long long>(SotcStats::fast_bind_compute_tick_misses.exchange(0)));
                 }
                 if (const uint64_t wide = SotcStats::fast_bind_wide_hits.exchange(0)) {
                     std::fprintf(stderr, "SOTC FASTBIND wide %llu (SOTC_FASTBIND_WIDE)\n",

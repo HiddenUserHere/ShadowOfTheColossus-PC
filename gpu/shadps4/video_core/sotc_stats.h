@@ -413,6 +413,10 @@ inline std::atomic<uint64_t> fast_bind_wide_hits{0}; ///< SOTC_FASTBIND_WIDE: re
 /// and the misses where only the submit tick differed (the state was otherwise reusable).
 inline std::atomic<uint64_t> fast_bind_misses{0};
 inline std::atomic<uint64_t> fast_bind_tick_misses{0};
+/// sotc: fast-bind misses that only a dispatch in between caused (same tick / another tick), SOTC_FPS only.
+inline std::atomic<uint64_t> fast_bind_compute_misses{0}, fast_bind_compute_tick_misses{0};
+/// sotc: SOTC_TEX_REPEAT=1: texture binds, and the ones repeating a T# of the same submit / frame (vk_rasterizer.cpp).
+inline std::atomic<uint64_t> tex_repeat_binds{0}, tex_repeat_tick_hits{0}, tex_repeat_frame_hits{0}, tex_repeat_ticks{0};
 /// sotc: bumped whenever guest memory changes outside the GPU's own draws: a write by the command
 /// processor (constant RAM dumps, WRITE_DATA, DMA: MemoryManager::NoteHostWrite) or a CPU write
 /// the page tracking sees (MemoryTracker). A reused bind (SOTC_FAST_BIND) needs it unchanged: the

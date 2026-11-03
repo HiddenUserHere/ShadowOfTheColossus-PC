@@ -4156,6 +4156,7 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
     fast_bind.tick = scheduler.CurrentTick();
     fast_bind.uses_dma = uses_dma;
     fast_bind.valid = true;
+    fast_bind.compute_cleared = false;
 }
 
 // sotc: SOTC_PR_RESOLVE (default off; acts only with SOTC_PARALLEL_RECORD, since the prepared
@@ -4899,9 +4900,23 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             if (fast_state_same) {
                 SotcStats::fast_bind_tick_misses.fetch_add(1, std::memory_order_relaxed);
             }
+            // sotc: the same test with the dispatch's clear undone: a hit lost only to a dispatch in between.
+            if (!fast_bind.valid && fast_bind.compute_cleared && fast_bind.pipeline == pipeline &&
+                fast_bind.buffer_generation == BufferBindGeneration() &&
+                fast_bind.texture_generation == texture_cache.BindGeneration() &&
+                fast_bind.stream_generation == buffer_cache.StreamGeneration() &&
+                fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
+                fast_bind.hash == fast_hash) {
+                (fast_bind.tick == scheduler.CurrentTick() ? SotcStats::fast_bind_compute_misses
+                                                            : SotcStats::fast_bind_compute_tick_misses)
+                    .fetch_add(1, std::memory_order_relaxed);
+            }
         }
         push_data = input_push;
     } else {
+        if (SotcStats::kFpsLog && fast_bind.valid && pipeline->IsCompute()) {
+            fast_bind.compute_cleared = true; // sotc: SOTC_FPS, see FastBindState::compute_cleared
+        }
         fast_bind.valid = false;
         push_data = prepared ? prepared->push_data : MakeUserData(liverpool->DrawRegs());
     }
@@ -9869,6 +9884,42 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
         ++image_index;
         const auto tsharp = pi ? pi->tsharp : image_desc.GetSharp(stage);
         stage_sharps.push_back(tsharp);
+        // sotc: SOTC_TEX_REPEAT=1 (measurement only): how often a texture bind repeats a T# (and the binding's
+        // view-relevant flags) already bound in the same submit (tick) or the same frame, the ceiling of a per-submit
+        // memo of resolved texture binds. Draw thread only.
+        static const bool tex_repeat = [] {
+            const char* v = std::getenv("SOTC_TEX_REPEAT");
+            return v && v[0] == '1';
+        }();
+        if (tex_repeat) {
+            thread_local std::unordered_set<u64> seen_tick, seen_frame;
+            thread_local u64 tick_of_set = 0, frame_of_set = 0;
+            const u64 tick = scheduler.CurrentTick();
+            const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+            if (tick != tick_of_set) {
+                seen_tick.clear();
+                tick_of_set = tick;
+                SotcStats::tex_repeat_ticks.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (frame != frame_of_set) {
+                seen_frame.clear();
+                frame_of_set = frame;
+            }
+            u64 key = 0xcbf29ce484222325ull;
+            const auto* bytes = reinterpret_cast<const u8*>(&tsharp);
+            for (size_t b = 0; b < sizeof(tsharp); ++b) {
+                key = (key ^ bytes[b]) * 0x100000001b3ull;
+            }
+            key ^= (u64{image_desc.is_depth} << 1) ^ (u64{image_desc.is_written} << 2) ^
+                   (u64{image_desc.is_array} << 3);
+            SotcStats::tex_repeat_binds.fetch_add(1, std::memory_order_relaxed);
+            if (!seen_tick.insert(key).second) {
+                SotcStats::tex_repeat_tick_hits.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (!seen_frame.insert(key).second) {
+                SotcStats::tex_repeat_frame_hits.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (image_desc.array_size != 0) {
             store_ok = false; // sotc: SOTC_TEX_BLOCK: descriptor arrays are not stored
             // dynamic_tsharp_array_size (from Pink-shadPS4): one binding per table element, then a
