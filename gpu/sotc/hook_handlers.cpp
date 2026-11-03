@@ -9,7 +9,10 @@
 #include "probe_drawtag.h"
 #include "probe_shadow_cache.h" // sotc: SOTC_SHADOW_CACHE (docs/re-backend/12-shadow-cache.md)
 #include "probe_prepass.h"      // sotc: SOTC_PREPASS_PROBE (docs/re-backend/04-depth-prepass.md section 9)
+#include "probe_ops.h"          // sotc: SOTC_OPS_PROBE (docs/re-backend/14-draw-reduction.md, R4 and R6)
 #include "probe_frame_rings.h" // sotc: SOTC_FRAME_RINGS (docs/re-backend/10-ring-reuse.md)
+#include "probe_xpr_groups.h"  // sotc: SOTC_XPR_GROUPS (XPR_INDEX_CULL, observe only)
+#include "probe_vsize.h"       // sotc: SOTC_VSIZE_PROBE (VSIZE_VIEW_SITE, object map)
 #include "particle_prev.h"
 #include "decommit_budget.h"
 #include "mip_budget.h"
@@ -48,6 +51,9 @@ void RegisterAllHandlers() {
     SotcProbes::RegisterDrawTag();
     SotcProbes::RegisterShadowCache(); // sotc: SOTC_SHADOW_CACHE
     SotcProbes::RegisterPrepassProbe(); // sotc: SOTC_PREPASS_PROBE (observe only)
+    SotcProbes::RegisterOpsProbe();     // sotc: SOTC_OPS_PROBE (observe only)
+    SotcXprGroups::Register();          // sotc: SOTC_XPR_GROUPS (XPR_INDEX_CULL, observe only)
+    SotcVsizeProbe::RegisterVsizeHooks(); // sotc: SOTC_VSIZE_PROBE (VSIZE_VIEW_SITE, observe only)
     SotcFrameRings::Register(); // sotc: SOTC_FRAME_RINGS (RING_INIT hook, observe only)
     SotcProbes::RegisterParticlePrev();
     SotcDecommitBudget::RegisterDecommitBudget();

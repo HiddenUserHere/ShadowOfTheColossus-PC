@@ -18,6 +18,10 @@ int Mode();
 /// the CPU frame ring (fast ops F). Counts only; nothing is skipped.
 void NoteWrite(uint64_t addr, uint64_t size);
 
+/// sotc: SOTC_VSIZE_PROBE. 1 inside the CPU frame ring, 2 inside the GPU ring, 0 outside both, -1 when no
+/// ring was reported. Host-side read of the ranges RING_INIT stored.
+int RingOf(uint64_t addr, uint64_t size);
+
 /// Called from BufferCache::NativeExactUpload (the CPU copy path that also calls
 /// RecordCurrentWrite). Counts the in-ring records that came from that path, so X excludes them.
 void NoteCpuPath(uint64_t addr, uint64_t size);

@@ -56,7 +56,7 @@ static void config_read(void) {
     const int enabled = on && *on && strcmp(on, "0") != 0;
     if (enabled) {
         frame_ns = DET_NS_PER_SEC / env_u64("SOTC_DET_CLOCK_HZ", 30, 1, 1000);
-        stall_ns = env_u64("SOTC_DET_STALL_MS", 50, 1, 60000) * 1000000;
+        stall_ns = env_u64("SOTC_DET_STALL_MS", 50, 0, 60000) * 1000000; /* 0: never released */
         wait_cap_ns = env_u64("SOTC_DET_WAIT_CAP_MS", 10000, 1, 3600000) * 1000000;
         printf("Runtime: SOTC_DET_CLOCK: guest time is virtual, %llu Hz frames\n",
                (unsigned long long)(DET_NS_PER_SEC / frame_ns));
@@ -79,6 +79,21 @@ static uint64_t host_mono_ns(void) {
 }
 static uint64_t frame_index(void) { return bbgpu_flip_count(); }
 
+/* Called by SotcDetFlip::NoteFlipped (gpu side) on every flip: every 150 flips, the guest time that passed
+ * against the host time, so a run can be checked for running faster or slower than real time. */
+void det_clock_on_flip(uint64_t frame) {
+    static uint64_t real0, virt0, frame0;
+    if (!runtime_det_clock_on()) return;
+    const uint64_t real = host_mono_ns();
+    const uint64_t virt = atomic_load_explicit(&det_last, memory_order_relaxed);
+    if (frame0 == 0) { real0 = real; virt0 = virt; frame0 = frame; return; }
+    if ((frame - frame0) % 150 != 0) return;
+    const double r = (double)(real - real0) / 1e9, v = (double)(virt - virt0) / 1e9;
+    fprintf(stderr, "SOTC_DET_CLOCK: flip %llu, guest %.2f s in %.2f s real (x%.2f), stall releases %llu\n",
+            (unsigned long long)frame, v, r, r > 0 ? v / r : 0.0,
+            (unsigned long long)atomic_load_explicit(&stall_releases, memory_order_relaxed));
+}
+
 /* One step of the clock: a guest read (amount DET_STEP_NS) or a sleep (amount = its length).
  * Returns the new virtual time. Lock free; never moves backwards. */
 static uint64_t det_advance(uint64_t amount) {
@@ -91,13 +106,17 @@ static uint64_t det_advance(uint64_t amount) {
         atomic_store_explicit(&seen_frame, frame, memory_order_relaxed);
     }
     const uint64_t since = atomic_load_explicit(&seen_real, memory_order_relaxed);
-    const int escape = real > since && real - since > stall_ns;
+    const int escape = stall_ns != 0 && real > since && real - since > stall_ns;
+    /* A stalled frame lets time pass the boundary by the real time spent beyond the stall, no more: every thread
+     * adds its reads and sleeps to the one clock, so without this cap several sleeping threads ran the game's time
+     * several times faster than real time (the game reported 25 s at "starting game" for 7 s of boot). */
+    const uint64_t cap = escape ? limit + (real - since - stall_ns) : limit;
     uint64_t t = atomic_load_explicit(&det_last, memory_order_relaxed), next;
     do {
         const uint64_t cur = t < base ? base : t; /* a new frame starts at its own boundary */
         uint64_t want = cur + amount;
-        if (want > limit && !escape) want = cur < limit ? limit : cur;
-        else if (want > limit && cur < limit) atomic_fetch_add_explicit(&stall_releases, 1, memory_order_relaxed);
+        if (want > cap) want = cur < cap ? cap : cur;
+        if (escape && want > limit && cur <= limit) atomic_fetch_add_explicit(&stall_releases, 1, memory_order_relaxed);
         next = want;
     } while (!atomic_compare_exchange_weak_explicit(&det_last, &t, next, memory_order_acq_rel, memory_order_relaxed));
     return next;
@@ -121,6 +140,14 @@ uint64_t runtime_det_realtime_ns(void) {
     return (uint64_t)DET_EPOCH_NS + det_advance(DET_STEP_NS);
 }
 void runtime_det_advance_ns(uint64_t ns) { det_advance(ns); }
+/* The TSC is virtual only with SOTC_DET_CLOCK_TSC=1 (the rdtsc patch in probe.c follows the same rule). Otherwise
+ * sceKernelReadTsc and sceKernelGetTscFrequency stay the host's: a virtual 1 GHz frequency next to the real
+ * rdtsc made the game's own timer run ~3.7 times too fast. */
+int runtime_det_tsc_virtual(void) {
+    static int on = -1;
+    if (on < 0) on = runtime_det_clock_on() && getenv("SOTC_DET_CLOCK_TSC") != NULL;
+    return on;
+}
 uint64_t runtime_det_tsc(void) { return det_advance(DET_STEP_NS); }
 uint64_t runtime_det_tsc_frequency(void) { return DET_NS_PER_SEC; }
 uint64_t runtime_det_from_unix_ns(uint64_t unix_ns) {

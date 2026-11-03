@@ -40,7 +40,8 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     SOTC_DETERMINISTIC  1: the offline test mode (docs/sotc/OFFLINE-TESTS.md). Sets the defaults of
                       SOTC_DET_CLOCK, SOTC_DET_FLIP, SOTC_HEADLESS (2: a small monitor window that shows
                       the FPS overlay; 1: no window), SOTC_FPS (1: the FPS overlay and its counters),
-                      SOTC_DET_ROUTE, SOTC_NULL_AUDIO, SOTC_DET_IO and SOTC_LAB (with
+                      SOTC_DET_ROUTE, SOTC_DET_REALTIME (1: never faster than real time), SOTC_NULL_AUDIO,
+                      SOTC_DET_IO and SOTC_LAB (with
                       SOTC_LAB_ROUTE=user/routes/new-route.json), and turns the 30 FPS cap off
                       (SOTC_FPS_CAP=off). Each one is a setdefault: an explicit value (environment or
                       sotc.ini) still wins.
@@ -73,7 +74,7 @@ GAMEFLOW_MARK = 'st_gameflow() starting game'
 DETERMINISTIC_DEFAULTS = {
     'SOTC_DET_CLOCK': '1', 'SOTC_DET_FLIP': '1', 'SOTC_HEADLESS': '2', 'SOTC_FPS': '1',
     'SOTC_DET_ROUTE': '1', 'SOTC_NULL_AUDIO': '1', 'SOTC_DET_IO': '1', 'SOTC_LAB': '1',
-    'SOTC_LAB_ROUTE': 'user/routes/new-route.json', 'SOTC_FPS_CAP': 'off',
+    'SOTC_DET_REALTIME': '1', 'SOTC_LAB_ROUTE': 'user/routes/new-route.json', 'SOTC_FPS_CAP': 'off',
 }
 
 

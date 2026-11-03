@@ -63,6 +63,8 @@ extern "C" uintptr_t runtime_sotc_heap_table(void);
 #include <vk_mem_alloc.h>
 
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM
+#include "../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG
+#include "../../../sotc/probe_vsize.h"      // sotc: SOTC_VSIZE_PROBE (dirty bytes of a bind)
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH
 
@@ -77,6 +79,8 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 thread_local uint32_t tl_sync_reason = 0;
 // sotc: bytes this thread's buffer syncs uploaded (SOTC_LOAD_WARM: WarmRange returns its share).
 thread_local uint64_t tl_sync_bytes = 0;
+// sotc: SOTC_REGION_PREDRAIN: fresh (created, not yet synced) 16 MiB regions this thread's syncs cleared.
+thread_local uint32_t tl_fresh_touched = 0;
 // sotc: SOTC_LOAD_STREAM: > 0 while an early sync (WarmRange, DrainRange) runs on this thread. Its
 // copies may go to the copy threads, and its bytes count as early (not as draw-thread bind bytes).
 // Not tl_sync_reason: that is set only while SOTC_TRACE is on.
@@ -749,6 +753,16 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
         const char* v = std::getenv("SOTC_DROP_FAST");
         return v && v[0] == '1';
     }();
+    // sotc: SOTC_DROP_NATIVE=1 (default off; needs SOTC_DROP_FAST=1). Under SOTC_NATIVE=1 (mode 1, no SOTC_VERIFY=n1)
+    // no guest page is tracked and no readback is ever made (ReadMemory and DownloadMemory return first), and the
+    // GPU's writes never reach guest memory: the GPU-written state of an unmapped range is only forgotten, which
+    // DiscardGpuModified already does from guest threads. A range with GPU-written pages then needs no wait for the
+    // draw thread either (77 waits, 338 ms of the game's threads in 5 s of an area load). Command buffers still in
+    // the range keep the waiting path (CmdRangeInUse).
+    static const bool native_drop = [] {
+        const char* v = std::getenv("SOTC_DROP_NATIVE");
+        return v && v[0] == '1' && !SotcNative::TracksGuestPages() && !SotcN1Verify::On();
+    }();
     if (fast) {
         bool gpu_ranges;
         {
@@ -756,8 +770,25 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
             gpu_ranges = gpu_modified_ranges.Intersects(device_addr, size);
         }
         // sotc: SOTC_RB_EXACT: owed bytes are trimmed by the drop on the draw thread.
-        gpu_ranges = gpu_ranges || (rbx_owed_count.load(std::memory_order_relaxed) != 0 &&
-                                    RbxOwedIntersects(device_addr, size));
+        const bool rbx_owed = rbx_owed_count.load(std::memory_order_relaxed) != 0 &&
+                              RbxOwedIntersects(device_addr, size);
+        if (native_drop && gpu_ranges && !rbx_owed && !rb_prev_env &&
+            !liverpool->CmdRangeInUse(device_addr, size)) {
+            EraseGranuleSnapshots(device_addr, size);
+            DiscardGpuModified(device_addr, size);
+            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+            TraceRedirty("redirty unmap", device_addr, size);
+            SotcStats::drop_native.fetch_add(1, std::memory_order_relaxed);
+            // A written bind queued before the unmap can mark the range GPU-written again when it runs: the same
+            // forget again at the unmap's point of the command stream. It only drops GPU state the guest never
+            // sees and makes the range upload from guest memory, so a later mapping's data is not lost.
+            liverpool->SendOrderedCommand([this, device_addr, size] {
+                DiscardGpuModified(device_addr, size);
+                memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+            });
+            return;
+        }
+        gpu_ranges = gpu_ranges || rbx_owed;
         // sotc: the wait below also kept the range mapped until the command processor had read
         // the command buffers queued before the unmap. Skipping it while one of them lies in the
         // range let the parser read unmapped memory and stop on a zero packet (2 load sessions
@@ -5845,6 +5876,14 @@ u64 BufferCache::DrainRange(VAddr addr, u64 size) {
     return uploaded;
 }
 
+// sotc: SOTC_REGION_PREDRAIN (region_predrain.h Idle). A CPU-only class range is left to its owner.
+u64 BufferCache::PredrainRange(VAddr addr, u64 size) {
+    if (SotcRegionPredrain::InCpuOnlyClass(addr, size)) {
+        return 0;
+    }
+    return DrainRange(addr, size);
+}
+
 namespace {
 // sotc: SOTC_GEN_BIND bind memo (BufferCache::ObtainBuffer). A clean read binding of [addr, +size)
 // stores the arena it was bound in, with the SotcGen::Sum and BindVersion loaded BEFORE the sync
@@ -5938,6 +5977,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         }
     }
     const u64 verify_bytes_before = tl_sync_bytes;
+    tl_fresh_touched = 0; // sotc: SOTC_REGION_PREDRAIN, the fresh regions of this bind's syncs
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
@@ -6005,6 +6045,16 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                                          static_cast<std::uint64_t>(ns));
         }
     }
+    // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG (diagnostic, no behaviour change): the draw thread's
+    // own bind sync, with the bytes it copied and the fresh regions it touched (region_predrain.h).
+    if (SotcRegionPredrain::TrackOn() && SotcStats::t_draw_thread && tl_early_sync == 0) {
+        SotcRegionPredrain::NoteBindSync(device_addr, size, tl_sync_bytes - verify_bytes_before,
+                                         tl_fresh_touched);
+    }
+    // sotc: SOTC_VSIZE_PROBE (measurement only): the bytes this draw-thread sync copied, for the bind in progress.
+    if (SotcVsizeProbe::On() && SotcStats::t_draw_thread && tl_early_sync == 0) {
+        SotcVsizeProbe::NoteDirty(tl_sync_bytes - verify_bytes_before);
+    }
     if (memo_on) { // sotc: SOTC_GEN_BIND, store (or void the slot) after the sync
         if (verify_hit && tl_sync_bytes != verify_bytes_before) {
             SotcGen::Count(SotcGen::Stat::BindVerifyMismatch); // a bump the hit did not see
@@ -6028,6 +6078,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         // sotc: SOTC_WRITE_DIET: pf_marked, AddGpuModified just ran over the same range.
         RecordCurrentWrite(mark_addr, mark_len, hot_seq, true, true);
     }
+    return {arena, arena->Offset(device_addr)};
+}
+
+// sotc: SOTC_HLE_COPY_EXACT. The arena lookup and residency of ObtainBuffer's read path, without
+// its synchronization and bookkeeping (same GetArena and EnsureResident calls, so the same arena
+// and offset as ObtainBuffer returns for the range).
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferResident(VAddr device_addr, u32 size) {
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (device_addr + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    EnsureResident(arena, first_block, last_block);
     return {arena, arena->Offset(device_addr)};
 }
 
@@ -7247,6 +7308,10 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
         return address_space[first_page];
     }
 
+    // sotc: SOTC_UNBIND_DEFER: the deferred unbinds name the old arenas' pages; they go before the blocks move.
+    if (!deferred_unbinds.empty()) {
+        PushDeferredUnbinds(true);
+    }
     const auto migrate_start = std::chrono::steady_clock::now();
     SCOPE_EXIT {
         LOG_WARNING(Render, "Migrating arena: {} + {} MB of address space, {} ms",
@@ -7420,6 +7485,12 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     if (bind_ranges.Empty()) {
         cached = {resident_version, first_block, last_block + 1, use_epoch};
         return;
+    }
+    // sotc: SOTC_UNBIND_DEFER: blocks bound again before their deferred unbind went out. The unbind goes first, in a
+    // batch of its own (binds of one range within a batch are not ordered), or it would unbind the new memory.
+    if (!deferred_unbinds.empty() && DeferredUnbindOverlaps(first_block, last_block + 1)) {
+        PushDeferredUnbinds(true);
+        scheduler.Flush();
     }
     if (!evicted_ranges.Empty()) {
         for (const auto& range : bind_ranges) {
@@ -8100,6 +8171,20 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
     static thread_local u64 mirror_not_resident = 0;
     mirrored.clear();
     mirror_merged.clear();
+    // sotc: SOTC_NATIVE_INVAL_MERGE=1 (default off). The image invalidation of every announce (1.1 million per 5 s,
+    // most of them small copies into the same pages, against ~11k merged uploads) waits until the queue is taken:
+    // the announced ranges are merged where they overlap or touch, and a merged range with no image page (the same
+    // lock-free page test InvalidateMemory starts with) skips all of its announces. The others are invalidated one by
+    // one in the order they were taken, as before, so the per-announce rules (the native reuse of a GPU-written image
+    // that one announce covers whole) see the same ranges. All of it before any bind of this submit, as before.
+    static const bool inval_merge = [] {
+        const char* v = std::getenv("SOTC_NATIVE_INVAL_MERGE");
+        return v && v[0] == '1';
+    }();
+    static thread_local std::vector<std::pair<VAddr, u64>> inval;
+    static thread_local std::vector<u32> inval_order;
+    static thread_local std::vector<u8> inval_needed;
+    inval.clear();
     const auto handle = [&](const SotcNative::PendingUpload& u) {
         // sotc: SOTC_MIRROR: served ranges are uploaded too. The packet's arena window is 0 (the ring-8 arena is
         // many imported runs, not one window), so every shader-addressed range is read through the mirror.
@@ -8111,7 +8196,11 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
         // invalidated as a guest write fault invalidates them (TextureCache::InvalidateMemory: dirty,
         // untracked, re-hashed at the next use), and the buffer range is marked CPU-modified. The mark
         // is needed for Persistent too: DrainRange skips a range that is not CPU-modified.
-        texture_cache.InvalidateMemory(u.addr, u.size, !SotcNative::TracksGuestPages());
+        if (inval_merge) {
+            inval.emplace_back(u.addr, u.size);
+        } else {
+            texture_cache.InvalidateMemory(u.addr, u.size, !SotcNative::TracksGuestPages());
+        }
         ++invalidations;
         if (u.served) {
             ++served;
@@ -8138,6 +8227,43 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
         }
         if (take_mode == 2) {
             SotcNative::VerifyTakeUploads(snapshot, popped, version);
+        }
+    }
+    if (inval_merge && !inval.empty()) {
+        // Merged groups in address order; a group with an image page marks its announces for invalidation.
+        inval_order.resize(inval.size());
+        for (u32 i = 0; i < inval_order.size(); ++i) {
+            inval_order[i] = i;
+        }
+        std::sort(inval_order.begin(), inval_order.end(),
+                  [](u32 a, u32 b) { return inval[a].first < inval[b].first; });
+        inval_needed.assign(inval.size(), 0);
+        for (size_t g = 0; g < inval_order.size();) {
+            const VAddr lo = inval[inval_order[g]].first;
+            VAddr hi = lo + inval[inval_order[g]].second;
+            size_t end = g + 1;
+            // A group stays under 1 MiB: HasImagesExact answers true past 256 pages, which would mark it all.
+            constexpr u64 kMaxGroup = u64{1} << 20;
+            while (end < inval_order.size() && inval[inval_order[end]].first <= hi) {
+                const VAddr next_hi =
+                    std::max<VAddr>(hi, inval[inval_order[end]].first + inval[inval_order[end]].second);
+                if (next_hi - lo > kMaxGroup) {
+                    break;
+                }
+                hi = next_hi;
+                ++end;
+            }
+            if (texture_cache.HasImagesExact(lo, hi - lo)) {
+                for (size_t k = g; k < end; ++k) {
+                    inval_needed[inval_order[k]] = 1;
+                }
+            }
+            g = end;
+        }
+        for (size_t i = 0; i < inval.size(); ++i) {
+            if (inval_needed[i]) {
+                texture_cache.InvalidateMemory(inval[i].first, inval[i].second, !SotcNative::TracksGuestPages());
+            }
         }
     }
     std::sort(taken.begin(), taken.end(), [](const SotcNative::PendingUpload& a, const SotcNative::PendingUpload& b) {
@@ -8522,6 +8648,11 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
                                                        }
                                                    });
         trace_protect.a = copies.size();
+    }
+    // sotc: SOTC_REGION_PREDRAIN: the regions this sync covers are synced now, so they are no longer
+    // fresh (a region the walk above created counts as touched).
+    if (SotcRegionPredrain::TrackOn()) {
+        tl_fresh_touched += SotcRegionPredrain::NoteWindowSynced(device_addr, size);
     }
     if (scan_clean) { // sotc: SOTC_SYNC_PIPE, see SynchronizeMemory
         *scan_clean = clean;
@@ -9419,17 +9550,23 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
         const char* v = std::getenv("SOTC_UNBIND_GPU_WAIT");
         return v && v[0] == '1';
     }();
+    // sotc: SOTC_UNBIND_DEFER=1 (default off): the GPU-side wait of SOTC_UNBIND_GPU_WAIT without its CPU wait for
+    // the recording thread either; the unbind waits in deferred_unbinds (PushDeferredUnbinds).
+    static const bool unbind_defer = [] {
+        const char* v = std::getenv("SOTC_UNBIND_DEFER");
+        return v && v[0] == '1';
+    }();
     // Work recorded before the unmap may still write this memory, and sparse binds are not
     // ordered against earlier submissions: finish that work before unbinding, or the GPU
     // writes to unbound memory (WriteInvalid, device lost). Unmaps are rare, the sync is cheap.
     const auto sync_start = SotcStats::kFpsLog ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point{};
-    if (unbind_gpu_wait) {
+    if (unbind_gpu_wait || unbind_defer) {
         scheduler.Flush();
     } else {
         scheduler.Finish();
     }
-    if (SotcStats::kFpsLog) { // sotc: read only by the SOTC_FPS printer (sotc_stats.h)
+    if (SotcStats::kFpsLog && !unbind_defer) { // sotc: read only by the SOTC_FPS printer (sotc_stats.h)
         SotcStats::release_finish_count.fetch_add(1, std::memory_order_relaxed);
         SotcStats::release_finish_ns.fetch_add(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -9472,7 +9609,8 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
             }
         }
     }
-    UnbindResident(released);
+    // sotc: SOTC_UNBIND_DEFER: the work before the unmap is up to the last submitted tick (flushed above).
+    UnbindResident(released, unbind_defer ? scheduler.CurrentTick() - 1 : 0);
     std::erase_if(hot_readbacks, [&](const HotReadback& hot) {
         return hot.addr < (end_block << block_shift) &&
                (first_block << block_shift) < hot.addr + hot.size;
@@ -9488,7 +9626,7 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
         gpu_modified_ranges.Subtract(first_block << block_shift,
                                      (end_block - first_block) << block_shift);
     }
-    if (unbind_gpu_wait) {
+    if (unbind_gpu_wait && !unbind_defer) {
         // sotc: the unbind's bind waits for the last submitted work tick. The submit of that
         // tick may still sit with the recording thread: a wait queued before its signal blocks
         // the queue for good, so wait until it is queued (not until the GPU ran it).
@@ -9503,18 +9641,36 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     scheduler.Flush();
 }
 
-void BufferCache::UnbindResident(std::span<const Backing> released) {
+void BufferCache::UnbindResident(std::span<const Backing> released, u64 defer_tick) {
     ++bind_version; // sotc: SOTC_BIND_CACHE_XTICK: bindings of these ranges are void
+    for (const Backing& range : released) {
+        // sotc: the memory is unbound (zeroed when it comes back): its hashed uploads and granule
+        // snapshots are void.
+        EraseHashedUploads(range.start << block_shift, (range.end - range.start) << block_shift);
+        EraseGranuleSnapshots(range.start << block_shift, (range.end - range.start) << block_shift);
+        // Shaders reach arena memory through the BDA page table; a null entry faults the block
+        // back in (fault buffer) instead of touching unbound memory. Recorded now, after the work
+        // that may still use the blocks: a deferred unbind leaves no window where a later shader
+        // reaches them.
+        runtime.FillBuffer(bda_pagetable_buffer.get(), range.start * sizeof(vk::DeviceAddress),
+                           (range.end - range.start) * sizeof(vk::DeviceAddress), 0u);
+    }
+    if (defer_tick != 0) {
+        // sotc: SOTC_UNBIND_DEFER: the blocks stay bound and allocated until the work up to defer_tick is queued.
+        deferred_unbinds.push_back({{released.begin(), released.end()}, defer_tick});
+        SotcStats::unbind_deferred.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    PushUnbinds(released);
+}
+
+void BufferCache::PushUnbinds(std::span<const Backing> released) {
     for (const Backing& range : released) {
         // sotc: SOTC_MIRROR (A2b). The window's alias of these blocks is unbound by the same arena bind submit
         // (SubmitPendingArenaBinds), with the same waits, so the memory is not reused before the window lets go of it.
         if (SotcArch::Mirror::On()) {
             SotcArch::Mirror::AliasUnbind(range.start << block_shift, (range.end - range.start) << block_shift);
         }
-        // sotc: the memory is unbound (zeroed when it comes back): its hashed uploads and granule
-        // snapshots are void.
-        EraseHashedUploads(range.start << block_shift, (range.end - range.start) << block_shift);
-        EraseGranuleSnapshots(range.start << block_shift, (range.end - range.start) << block_shift);
         // Split at arena page boundaries, each page may belong to a different arena.
         for (u64 start = range.start; start < range.end;) {
             const u64 page = start >> blocks_per_arena_page_shift;
@@ -9529,12 +9685,44 @@ void BufferCache::UnbindResident(std::span<const Backing> released) {
             }
             start = end;
         }
-        // Shaders reach arena memory through the BDA page table; a null entry faults the block
-        // back in (fault buffer) instead of touching unbound memory.
-        runtime.FillBuffer(bda_pagetable_buffer.get(), range.start * sizeof(vk::DeviceAddress),
-                           (range.end - range.start) * sizeof(vk::DeviceAddress), 0u);
         FreeArenaBlocks(range.memory, range.offset, range.end - range.start);
     }
+}
+
+void BufferCache::PushDeferredUnbinds(bool force) {
+    size_t done = 0;
+    for (; done < deferred_unbinds.size(); ++done) {
+        const DeferredUnbind& unbind = deferred_unbinds[done];
+        if (!scheduler.IsSubmitted(unbind.tick)) {
+            if (!force) {
+                break;
+            }
+            const auto wait_start = std::chrono::steady_clock::now();
+            scheduler.WaitSubmitted(unbind.tick);
+            SotcStats::unbind_forced.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::unbind_forced_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start)
+                    .count(),
+                std::memory_order_relaxed);
+        }
+        // The sparse bind that carries it waits on the GPU for the work up to the tick (queued now, so the wait
+        // cannot sit before its signal on the queue), and every later bind waits for it (unbind_bind_tick).
+        PushUnbinds(unbind.released);
+        pending_bind_wait_tick = std::max(pending_bind_wait_tick, unbind.tick);
+        unbind_bind_next = true;
+    }
+    deferred_unbinds.erase(deferred_unbinds.begin(), deferred_unbinds.begin() + done);
+}
+
+bool BufferCache::DeferredUnbindOverlaps(u64 first, u64 end) const {
+    for (const DeferredUnbind& unbind : deferred_unbinds) {
+        for (const Backing& range : unbind.released) {
+            if (range.start < end && first < range.end) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
@@ -9946,6 +10134,10 @@ void BufferCache::NoteFaultRebind(VAddr addr, u64 size) {
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     // sotc: binds stamp blocks with use_epoch; keep it current even when no eviction check runs.
     AdvanceUseEpoch(std::chrono::steady_clock::now());
+    // sotc: SOTC_UNBIND_DEFER: the deferred unbinds whose work is queued by now go out with this bind.
+    if (!deferred_unbinds.empty()) {
+        PushDeferredUnbinds(false);
+    }
     // sotc: SOTC_MIRROR (A2b). The window's alias ops ride in these calls: an alias bind or unbind has the waits and the
     // frame fence of the arena bind it mirrors. Calls run in order (each waits for the one before); call 0 carries the
     // arena binds, and each further call one group of alias ops that repeats a page of an earlier call.

@@ -109,6 +109,23 @@ int Mode() {
     return ModeOnce();
 }
 
+// sotc: SOTC_VSIZE_PROBE. 1 inside the CPU frame ring, 2 inside the GPU one, 0 outside both, -1 when no ring
+// was reported (RING_INIT needs SOTC_FRAME_RINGS=1 to dispatch).
+int RingOf(uint64_t addr, uint64_t size) {
+    if (g_rings_found.load(std::memory_order_relaxed) == 0) {
+        return -1;
+    }
+    if (InCpuRing(addr, size)) {
+        return 1;
+    }
+    const uint64_t end = g_gpu_end.load(std::memory_order_acquire);
+    const uint64_t begin = g_gpu_begin.load(std::memory_order_relaxed);
+    if (end != 0 && size != 0 && addr >= begin && addr + size <= end) {
+        return 2;
+    }
+    return 0;
+}
+
 void NoteWrite(uint64_t addr, uint64_t size) {
     if (ModeOnce() == 0 || !InCpuRing(addr, size)) {
         return;

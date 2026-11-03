@@ -30,6 +30,7 @@
 #include "core/memory.h"
 #include "video_core/sotc_lod_stats.h"
 #include "video_core/sotc_draw_merge.h" // sotc: SOTC_DRAW_MERGE_STATS (counters and report)
+#include "video_core/sotc_vertex_extent.h" // sotc: SOTC_VERTEX_EXTENT (vertex binds to the draw's vertices)
 #include "video_core/texture_cache/tsharp_slot_cache.h" // sotc: SOTC_TSLOT
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -45,6 +46,8 @@
 #include "video_core/sotc_live.h"
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_write_extent.h"
+#include "video_core/sotc_read_extent.h"
+#include "video_core/sotc_shader_extent.h" // sotc: SOTC_SHADER_EXTENT
 #include "../../../sotc/native/native_copies.h" // sotc: PC-native GPU result copies
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (TracksGuestPages)
 #include "video_core/sotc_generation.h" // sotc: SOTC_PR_GEN (per-64 KiB generation sums)
@@ -69,6 +72,8 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM (texture records)
+#include "../../../sotc/region_predrain.h" // sotc: SOTC_BIG_BIND_LOG (bind context)
+#include "../../../sotc/probe_vsize.h"      // sotc: SOTC_VSIZE_PROBE (unbounded read-only binds)
 
 // sotc: SOTC_PR_RESOLVE. Generation of the runtime memory table (src/runtime_memory.c); odd while
 // a change is in progress. Same declaration as sotc_bininfo.cpp.
@@ -772,6 +777,32 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
         }
     }
     return {vertex_offset, instance_offset};
+}
+
+// sotc: SOTC_VERTEX_EXTENT: what BindVertexBuffers may narrow for this draw (sotc_vertex_extent.h). The offsets are the
+// ones the draw is issued with; a value read from user data is not exact (GetDrawOffsets reads it at this point).
+static SotcVertexExtent::Draw MakeVertexExtent(const AmdGpu::Regs& regs, const Shader::Info& info,
+                                               const Shader::Gcn::FetchShaderData& fetch_shader,
+                                               const PreparedDraw* prepared, bool is_indexed,
+                                               u32 index_offset, bool allowed) {
+    SotcVertexExtent::Draw draw{};
+    if (!SotcVertexExtent::kOn || !allowed) {
+        return draw;
+    }
+    const auto [vertex_offset, instance_offset] =
+        prepared && prepared->has_offsets
+            ? std::pair<u32, u32>{prepared->vertex_offset, prepared->instance_offset}
+            : GetDrawOffsets(regs, info, fetch_shader);
+    const bool has_fetch = !fetch_shader.Empty();
+    draw.enabled = true;
+    draw.indexed = is_indexed;
+    draw.index_offset = index_offset;
+    draw.vertex_offset = vertex_offset;
+    // GetDrawOffsets takes the vertex offset from user data when the packet has none (index_offset 0).
+    draw.vertex_exact = !(has_fetch && regs.index_offset == 0 && fetch_shader.vertex_offset_sgpr != -1);
+    draw.instance_offset = instance_offset;
+    draw.instance_exact = !(has_fetch && fetch_shader.instance_offset_sgpr != -1);
+    return draw;
 }
 
 void Rasterizer::EliminateFastClear() {
@@ -2659,6 +2690,62 @@ bool DirectArgsOn() {
     return on;
 }
 
+// sotc: SOTC_INDEX_EXTENT=1 (off by default). An indexed indirect draw binds its index buffer over the indices its
+// arguments read, not over the whole window of the registers. The bind's base does not move (the draws' firstIndex is
+// relative to it); only its size is shortened. Counters: IndexExtentStats, printed by ReportIndexExtent.
+bool IndexExtentOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_INDEX_EXTENT");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+namespace IndexExtentStats {
+std::atomic<u64> binds{};       // index binds of indirect draws whose arguments were readable on the CPU
+std::atomic<u64> narrowed{};    // of those, the binds whose size was shortened
+std::atomic<u64> bytes_saved{}; // index bytes the shortened binds left out of the register window
+} // namespace IndexExtentStats
+
+// sotc: SOTC_INDEX_EXTENT. The end of the indices an indexed indirect draw reads (max of firstIndex + indexCount over its
+// draws; the draws of the count buffer when there is one), from the arguments on the CPU. Read under the same condition as
+// DrawIndirect's direct arguments: no GPU write pending over the bytes, and a backing read. 0 when unknown: the bind keeps
+// the register window.
+u32 IndirectIndexExtent(Core::MemoryManager* memory, VideoCore::BufferCache& buffer_cache, VAddr arg_address,
+                        u32 stride, u32 max_count, VAddr count_address) {
+    if (stride != sizeof(VkDrawIndexedIndirectCommand) || max_count == 0) {
+        return 0;
+    }
+    u32 draws = max_count;
+    if (count_address != 0) {
+        u32 count = 0;
+        if (buffer_cache.IsRegionGpuModified(count_address, sizeof count) ||
+            !memory->TryReadBacking(count_address, &count, sizeof count)) {
+            return 0;
+        }
+        draws = std::min(count, max_count);
+    }
+    if (draws == 0) {
+        return 0;
+    }
+    const u64 bytes = u64{draws} * stride;
+    if (buffer_cache.IsRegionGpuModified(arg_address, bytes)) {
+        return 0;
+    }
+    static thread_local std::vector<VkDrawIndexedIndirectCommand> args;
+    args.resize(draws);
+    if (!memory->TryReadBacking(arg_address, args.data(), bytes)) {
+        return 0;
+    }
+    u64 end = 0;
+    for (const auto& a : args) {
+        // A draw with no indices or no instances reads no index.
+        if (a.indexCount != 0 && a.instanceCount != 0) {
+            end = std::max<u64>(end, u64{a.firstIndex} + a.indexCount);
+        }
+    }
+    return static_cast<u32>(std::min<u64>(end, 0xffffffffu));
+}
+
 // sotc: SOTC_DRAW_MDI=1. A joined draw's record: the draw's parameters, recorded at the run's flush.
 void MdiDefer(bool indexed, u32 count, u32 instances, s32 vertex_offset, u32 first_instance) {
     if (indexed) {
@@ -2689,6 +2776,25 @@ u64 MergeFastKey(u64 content, const AmdGpu::Regs& regs) {
     return h;
 }
 } // namespace
+
+// sotc: SOTC_INDEX_EXTENT=1. The 5 s line: index binds of indirect draws with readable arguments, how many were shortened,
+// and the index bytes left out of their window.
+void ReportIndexExtent(std::string& out, double seconds) {
+    if (!IndexExtentOn()) {
+        return;
+    }
+    const u64 binds = IndexExtentStats::binds.exchange(0, std::memory_order_relaxed);
+    const u64 narrowed = IndexExtentStats::narrowed.exchange(0, std::memory_order_relaxed);
+    const u64 saved = IndexExtentStats::bytes_saved.exchange(0, std::memory_order_relaxed);
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "SOTC INDEX EXTENT: %llu binds with readable arguments, %llu narrowed, %.1f MiB of index window "
+                  "left unbound (%.1f s)",
+                  static_cast<unsigned long long>(binds), static_cast<unsigned long long>(narrowed),
+                  double(saved) / (1024.0 * 1024.0), seconds);
+    out += line;
+    out += '\n';
+}
 
 bool Rasterizer::MergeReuse(const GraphicsPipeline* pipeline, bool is_indexed, bool indirect,
                             bool joinable, const PreparedDraw* prepared, u32 index_offset) {
@@ -2981,17 +3087,23 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
 
     // sotc: the binds below can submit the command buffer (arena allocation, readbacks,
     // releases); what was recorded before lands in the old one. Re-record vertex state then.
+    // sotc: SOTC_VERTEX_EXTENT: the vertex binds below narrow to this draw's vertices. Not under the MDI path
+    // (MdiMode 1): a joined draw of a run reuses the head's vertex binds.
+    const SotcVertexExtent::Draw vertex_extent =
+        MakeVertexExtent(regs, pipeline->GetStage(Shader::SwStage::Vertex), pipeline->GetFetchShader(),
+                         prepared, is_indexed, index_offset, SotcDrawMerge::MdiMode() != 1);
     u64 vertex_tick = scheduler.CurrentTick();
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhVertexIndex}; // sotc: SOTC_OP_PHASES
         {
             const SotcTrace::BindScope trace_step{"vertex buffers"}; // sotc: SOTC_TRACE
-            BindVertexBuffers(pipeline);
+            BindVertexBuffers(pipeline, &vertex_extent);
         }
         if (is_indexed) {
             BindIndexBuffer(index_offset);
         }
-        RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(index_offset); });
+        RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(index_offset); },
+                                &vertex_extent);
     }
 
     if (DecideOpBarrier(!bound_buffers.empty() || !fixed_function_reads.empty() || shader_addr_touch,
@@ -3150,6 +3262,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         Dlssg::NoteDraw(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache, runtime, scheduler);
     }
+    // sotc: SOTC_INDEX_EXTENT=1. The indices the arguments read (0 = keep the register window of the index bind). Not with
+    // SOTC_DRAW_MDI=1: a joined draw is recorded with the head's index bind, which would be too short for its indices.
+    const u32 index_extent =
+        is_indexed && IndexExtentOn() && SotcDrawMerge::MdiMode() != 1
+            ? IndirectIndexExtent(memory, buffer_cache, arg_address + offset, stride, max_count, count_address)
+            : 0;
     // sotc: SOTC_DRAW_MERGE_STATS=1. A direct-args candidate (one argument record) may join the last full bind. The
     // direct branch below re-checks its own conditions; when it is not taken, the general path binds in full.
     const bool indirect_candidate =
@@ -3214,9 +3332,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             BindVertexBuffers(pipeline);
         }
         if (is_indexed) {
-            BindIndexBuffer();
+            BindIndexBuffer(0, index_extent);
         }
-        RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(); });
+        RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed,
+                                [&] { BindIndexBuffer(0, index_extent); });
     }
 
     // sotc: SotC writes the arguments of most indirect draws with WRITE_DATA right before them
@@ -3336,7 +3455,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                                                   runtime.IsBufferAccessed(count_buffer, count_offset, 4));
     }
     // sotc: the argument buffers can submit too.
-    RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(); });
+    RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed,
+                            [&] { BindIndexBuffer(0, index_extent); });
 
     if (DecideOpBarrier(true, StagesWriteMemory(*pipeline))) { // the indirect arguments are read by the draw
         runtime.FlushBarriers();
@@ -4178,6 +4298,14 @@ static PrBuffer PrResolveBuffer(const Shader::Info& stage, const Shader::BufferR
     if (!desc.is_written && (out.vsize >= 0xFFFF0000ULL || size > MaxSaneBindingSize) &&
         unbounded_window != 0 && size > unbounded_window) {
         size = unbounded_window;
+    }
+    // sotc: SOTC_READ_EXTENT, as BindBuffers.
+    if (SotcReadExtent::kEnabled && !desc.is_written) {
+        size = SotcReadExtent::Limit(stage.pgm_hash, static_cast<u32>(&desc - stage.buffers.data()), size);
+    }
+    // sotc: SOTC_SHADER_EXTENT, as BindBuffers.
+    if (SotcShaderExtent::kEnabled) {
+        size = SotcShaderExtent::Limit(desc.is_written, desc.sotc_read_extent, out.vsize, size);
     }
     out.size = size;
     out.computed = true;
@@ -7352,21 +7480,23 @@ void Rasterizer::BindCacheVerify(const BindCacheEntry& old, size_t first_bound_b
 
 void Rasterizer::RebindVertexIfSubmitted(const GraphicsPipeline* pipeline, u64& vertex_tick,
                                          bool is_indexed,
-                                         const std::function<void()>& bind_index) {
+                                         const std::function<void()>& bind_index,
+                                         const SotcVertexExtent::Draw* extent) {
     // sotc: a submit while binding (arena allocation, readback, release) moved recording to a new
     // command buffer, and the vertex input, vertex and index buffers recorded before it stayed in
     // the old one: the draw would run without them (broken vertices; review of 2026-10-27).
     // Record them again; a second submit while doing so is rare, so retry a few times.
     for (int tries = 0; tries < 4 && vertex_tick != scheduler.CurrentTick(); ++tries) {
         vertex_tick = scheduler.CurrentTick();
-        BindVertexBuffers(pipeline);
+        BindVertexBuffers(pipeline, extent); // sotc: SOTC_VERTEX_EXTENT, the same draw's extent
         if (is_indexed) {
             bind_index();
         }
     }
 }
 
-void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline,
+                                   const SotcVertexExtent::Draw* extent) {
     const auto& regs = liverpool->DrawRegs();
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -7400,6 +7530,110 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         return;
     }
 
+    // sotc: SOTC_VERTEX_EXTENT: the size each binding is bound and synced with, the V# size unless the draw's vertices
+    // end before it (sotc_vertex_extent.h). The base is never changed, so every fetch address is the same.
+    VertexInputs<u64> sizes{};
+    for (const auto& buffer : guest_buffers) {
+        sizes.push_back(buffer.GetSize());
+    }
+    if (extent && extent->enabled) {
+        auto& counters = SotcVertexExtent::g_counters;
+        counters.draws.fetch_add(1, std::memory_order_relaxed);
+        // The last VertexIndex the draw fetches; false when it is not known exactly (the size is then kept).
+        const auto last_vertex = [&](u64& last) -> bool {
+            const u32 count = regs.num_indices;
+            if (count == 0 || !extent->vertex_exact) {
+                return false;
+            }
+            if (!extent->indexed) {
+                // draw(count, instances, firstVertex = vertex_offset): VertexIndex in [vertex_offset, vertex_offset + count).
+                last = u64{extent->vertex_offset} + count - 1;
+                return true;
+            }
+            // drawIndexed(count, ..., vertexOffset): VertexIndex = index + vertexOffset, with the indices BindIndexBuffer
+            // binds (index_offset, count). Primitive restart values are not fetched; a draw with restart keeps its size.
+            if ((regs.enable_primitive_restart & 1) != 0 || count > SotcVertexExtent::kMaxIndexScan) {
+                return false;
+            }
+            const bool index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+            const u32 index_size = index16 ? 2u : 4u;
+            const VAddr index_address =
+                regs.index_base_address.Address<VAddr>() + u64{extent->index_offset} * index_size;
+            const u64 index_bytes = u64{count} * index_size;
+            // The CPU reads guest memory only where the GPU wrote nothing unsynced (as the indirect arguments do).
+            if (buffer_cache.IsRegionGpuModified(index_address, index_bytes) ||
+                GuestWriteOverlap(index_address, index_bytes)) {
+                return false;
+            }
+            counters.scans.fetch_add(1, std::memory_order_relaxed);
+            u32 lowest = ~0u;
+            u32 highest = 0;
+            alignas(8) u8 raw[1024 * sizeof(u32)];
+            for (u32 done = 0; done < count; done += 1024) {
+                const u32 n = std::min<u32>(1024, count - done);
+                if (!memory->TryReadBacking(index_address + u64{done} * index_size, raw,
+                                            u64{n} * index_size)) {
+                    return false;
+                }
+                for (u32 k = 0; k < n; ++k) {
+                    u32 index = 0;
+                    if (index16) {
+                        u16 narrow = 0;
+                        std::memcpy(&narrow, raw + k * sizeof(u16), sizeof(u16));
+                        index = narrow;
+                    } else {
+                        std::memcpy(&index, raw + k * sizeof(u32), sizeof(u32));
+                    }
+                    lowest = std::min(lowest, index);
+                    highest = std::max(highest, index);
+                }
+            }
+            const s64 base_vertex = static_cast<s32>(extent->vertex_offset);
+            if (s64{lowest} + base_vertex < 0) {
+                return false; // a negative VertexIndex fetches before the base: keep the V# size
+            }
+            last = static_cast<u64>(s64{highest} + base_vertex);
+            return true;
+        };
+        bool vertex_looked = false;
+        bool vertex_known = false;
+        u64 last_vertex_index = 0;
+        for (size_t i = 0; i < guest_buffers.size() && i < bindings.size(); ++i) {
+            const auto& buffer = guest_buffers[i];
+            const u64 full = buffer.GetSize();
+            if (buffer.base_address == 0 || full == 0) {
+                continue;
+            }
+            // Each guest attribute is its own binding at attribute offset 0 (GetVertexInputs), so one fetch of
+            // element v reads [v * stride, v * stride + kMaxElemBytes) from the base; the end is the last fetch's.
+            const u64 stride = buffer.GetStride();
+            u64 end = 0; // 0: not known, the V# size stays
+            if (bindings[i].inputRate == vk::VertexInputRate::eVertex) {
+                if (!vertex_looked) {
+                    vertex_looked = true;
+                    vertex_known = last_vertex(last_vertex_index);
+                }
+                if (vertex_known) {
+                    end = SotcVertexExtent::FetchEnd(stride, last_vertex_index);
+                }
+            } else if (extent->instance_exact && regs.num_instances.NumInstances() != 0 &&
+                       bindings[i].divisor != 0) {
+                // The fetch index is instance / divisor, with instance over the draw's instances, from firstInstance.
+                const u64 last_instance = u64{extent->instance_offset} +
+                                          regs.num_instances.NumInstances() - 1;
+                end = SotcVertexExtent::FetchEnd(stride, last_instance / bindings[i].divisor);
+            }
+            if (end != 0) {
+                const u64 narrowed = SotcVertexExtent::Narrow(full, end);
+                if (narrowed < full) {
+                    sizes[i] = narrowed;
+                    counters.bindings.fetch_add(1, std::memory_order_relaxed);
+                    counters.bytes.fetch_add(full - narrowed, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+
     struct BufferRange {
         VAddr base_address;
         VAddr end_address;
@@ -7413,9 +7647,10 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 
     // Build list of ranges covering the requested buffers
     VertexInputs<BufferRange> ranges{};
-    for (const auto& buffer : guest_buffers) {
-        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
-            ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
+    for (size_t i = 0; i < guest_buffers.size(); ++i) {
+        const auto& buffer = guest_buffers[i];
+        if (buffer.base_address != 0 && sizes[i] > 0) {
+            ranges.emplace_back(buffer.base_address, buffer.base_address + sizes[i]);
         }
     }
 
@@ -7461,8 +7696,9 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     VertexInputs<vk::DeviceSize> host_offsets;
     VertexInputs<vk::DeviceSize> host_sizes;
     VertexInputs<vk::DeviceSize> host_strides;
-    for (const auto& buffer : guest_buffers) {
-        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+    for (size_t i = 0; i < guest_buffers.size(); ++i) {
+        const auto& buffer = guest_buffers[i];
+        if (buffer.base_address != 0 && sizes[i] > 0) {
             const auto host_buffer_info =
                 std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
                     return buffer.base_address >= range.base_address &&
@@ -7476,7 +7712,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
             host_buffers.emplace_back(VK_NULL_HANDLE);
             host_offsets.push_back(0);
         }
-        host_sizes.push_back(buffer.GetSize());
+        host_sizes.push_back(sizes[i]);
         host_strides.push_back(buffer.GetStride());
     }
 
@@ -7490,7 +7726,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     }
 }
 
-void Rasterizer::BindIndexBuffer(u32 index_offset) {
+void Rasterizer::BindIndexBuffer(u32 index_offset, u32 extent) {
     const auto& regs = liverpool->DrawRegs();
 
     // Figure out index type and size.
@@ -7501,7 +7737,19 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
         regs.index_base_address.Address<VAddr>() + index_offset * index_size;
 
     // Bind index buffer.
-    const u32 index_buffer_size = regs.num_indices * index_size;
+    // sotc: SOTC_INDEX_EXTENT. extent (the indices the draw reads from this base, 0 = unknown) shortens the size of the
+    // bind only: the base is the same, and the draws' firstIndex is relative to it. Never longer than the register window.
+    u32 index_count = regs.num_indices;
+    if (extent != 0) {
+        IndexExtentStats::binds.fetch_add(1, std::memory_order_relaxed);
+        if (extent < index_count) {
+            IndexExtentStats::narrowed.fetch_add(1, std::memory_order_relaxed);
+            IndexExtentStats::bytes_saved.fetch_add(u64{index_count - extent} * index_size,
+                                                    std::memory_order_relaxed);
+            index_count = extent;
+        }
+    }
+    const u32 index_buffer_size = index_count * index_size;
     SotcVerify::BindKindScope verify_kind{SotcVerify::BindKind::Index}; // sotc: SOTC VERIFY BYTES
     // sotc: SOTC_ADDR_VERTEX: the index range's buffer from the page table when it lies in one backing (ObtainRead).
     const auto [buffer, offset] =
@@ -8552,6 +8800,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     }
                     size = unbounded_window;
                 }
+                // sotc: SOTC_READ_EXTENT. A listed read-only binding is bound over the window its rule proves.
+                if (SotcReadExtent::kEnabled && !pb && !desc.is_written) {
+                    size = SotcReadExtent::Limit(stage.pgm_hash, buf_index, size);
+                }
+                // sotc: SOTC_SHADER_EXTENT. An unbounded read-only V# built by the shader is bound over the extent
+                // its loads were proven to stay in at translation (sotc_shader_extent.h).
+                if (SotcShaderExtent::kEnabled && !pb) {
+                    size = SotcShaderExtent::Limit(desc.is_written, desc.sotc_read_extent, vsize, size);
+                }
                 if (size != vsize) {
                     LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsize, size, stage.pgm_hash);
@@ -8659,8 +8916,23 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         maint_epoch = SotcPcRing::SubmitEpoch();
                         maint_version = SotcPcRing::BlockVersion();
                     }
+                    // sotc: SOTC_BIG_BIND_LOG: the shader and descriptor the bind's log line names (no behaviour change).
+                    const bool big_bind_log = SotcRegionPredrain::BigBindLogEnabled();
+                    if (big_bind_log) {
+                        const auto dsharp = desc.GetSharp(stage);
+                        SotcRegionPredrain::SetBindContext(
+                            stage.pgm_hash, static_cast<u32>(stage.hw_stage),
+                            static_cast<u32>(stage.sw_stage), buf_index, vbase, vsize,
+                            dsharp.num_records, dsharp.stride);
+                    }
+                    if (SotcVsizeProbe::On()) { // sotc: SOTC_VSIZE_PROBE: the dirty bytes of this bind's sync
+                        SotcVsizeProbe::ResetDirty();
+                    }
                     obtained = buffer_cache.ObtainBuffer(vbase, size, desc.is_written,
                                                          desc.is_formatted, mark_offset, mark_size);
+                    if (big_bind_log) {
+                        SotcRegionPredrain::ClearBindContext();
+                    }
                     if (memo) {
                         // The version after the call: it may have unbound or evicted other ranges.
                         const bool stream =
@@ -8679,6 +8951,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             SotcStats::bf_memo_misses.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
+                }
+                // sotc: SOTC_VSIZE_PROBE (measurement only): an unbounded read-only bind, with the dirty bytes of its
+                // own sync (zero when the memo answered).
+                if (SotcVsizeProbe::On() && !desc.is_written && vsize >= 0xFFFF0000ULL) {
+                    SotcVsizeProbe::NoteBind(stage, desc, buf_index, vbase, vsize, size,
+                                             obtain_called ? SotcVsizeProbe::Dirty() : 0);
                 }
                 // sotc: SOTC_BDA_DIRECT. ObtainBuffer ran for a ring-8 slot: its maintenance state is the one this
                 // call saw (direct_state), and the run's buffer is remembered for the next direct binds.

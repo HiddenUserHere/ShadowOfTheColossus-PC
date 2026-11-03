@@ -81,6 +81,18 @@ struct InfoPersistent {
         : hw_stage{hw_stage_}, sw_stage{sw_stage_}, pgm_hash{pgm_hash_} {}
 };
 
+/// sotc: SOTC_VSIZE_PROBE. Where one flattened-buffer dword came from: the SRT walker copies it from
+/// path[0] (a user data SGPR index holding a 48-bit table pointer), follows path[1..] (dword offsets
+/// of pointer loads) and reads the dword at table + src_off_dw. valid = false when a step is dynamic.
+/// Filled by FlattenExtendedUserdataPass (host bookkeeping only, no code change). Not serialized, so an
+/// Info restored from the pipeline cache has no entries.
+struct SotcSrtSource {
+    u32 dst_off_dw{};
+    u32 src_off_dw{};
+    std::vector<u32> path;
+    bool valid{};
+};
+
 struct Info;
 /// sotc: SOTC_N5_BINDLESS: the push slot of images[index] in the bindless image heap, or
 /// NO_BINDLESS_IMAGE_SLOT when it keeps a classic descriptor (see the declarations at the end).
@@ -127,6 +139,9 @@ struct Info : InfoPersistent {
     static constexpr u32 kInfoSlots = 6;
     std::array<InfoRuntime, kInfoSlots> runtime{};
     PersistentSrtInfo srt_info;
+    /// sotc: SOTC_VSIZE_PROBE provenance of the SRT-flattened dwords (see SotcSrtSource). Empty when the
+    /// switch is off or the Info came from the pipeline cache.
+    std::vector<SotcSrtSource> sotc_srt_sources;
 
     AttributeFlags loads{};
     AttributeFlags stores{};

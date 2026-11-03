@@ -18,6 +18,7 @@
 #include "../../bbgpu.h"
 #include "../hooks.h"
 #include "native.h"
+#include "../probe_vsize.h"  // sotc: SOTC_VSIZE_PROBE object map feed (NoteBpeEntry, observe only)
 #include "video_core/sotc_native_ring.h" // sotc: the ACE ring announce (SotcNativeRing::Announce, below)
 
 extern "C" {
@@ -427,6 +428,7 @@ HookAction CcbSubmit(GuestRegs& regs, void*) {
 // r9 = backing). A zero-copy resource (0x800) uses the caller's backing as its storage; the caller filter
 // keeps the per-frame builders in.
 HookAction ZeroCopyCreate(GuestRegs& regs, void*) {
+    SotcVsizeProbe::NoteBpeEntry(regs); // sotc: SOTC_VSIZE_PROBE (observe only; a no-op when the probe is off)
     if (!SotcNative::On() || (regs.r8 & 0x800) == 0 || regs.r9 == 0) {
         return HookAction::Continue;
     }

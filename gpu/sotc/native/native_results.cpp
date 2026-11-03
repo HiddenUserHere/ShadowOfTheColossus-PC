@@ -22,6 +22,7 @@
 // Water verify (mode 2 only, the read is kept there): the store of the ring read counts the changes of
 // +0x11c. No consumer reads +0x11c (gpuresults.md, Q1).
 #include "native_results.h"
+#include "../probe_xpr_groups.h" // sotc: SOTC_XPR_GROUPS (P0 measurement of the XPR draw loop)
 
 #include <atomic>
 #include <bit>
@@ -167,7 +168,7 @@ void CountRealMasks(uint64_t count, uint64_t mask_a, uint64_t mask_b, ConsumerCo
 }
 
 // Entry of the four mask consumers. rdi = the object; the mask is rsi (C1, C3, C4) or rsi and rdx (C2).
-HookAction OnMaskConsume(GuestRegs& regs, void* user) {
+HookAction OnMaskConsumeImpl(GuestRegs& regs, void* user) {
     const int which = static_cast<int>(reinterpret_cast<uintptr_t>(user));
     ConsumerCounters& c = g_masks[which];
     c.calls++;
@@ -218,6 +219,19 @@ HookAction OnMaskConsume(GuestRegs& regs, void* user) {
     }
     c.swapped++;
     return HookAction::Continue;
+}
+
+// sotc: SOTC_XPR_GROUPS (probe_xpr_groups.h): the P0 measurement of the XPR draw loop reads the mask the loop will
+// read, so it runs after the mask swap above. Observe only.
+HookAction OnMaskConsume(GuestRegs& regs, void* user) {
+    const HookAction action = OnMaskConsumeImpl(regs, user);
+    const int which = static_cast<int>(reinterpret_cast<uintptr_t>(user));
+    if (which == kVis) {
+        SotcXprGroups::OnConsume(regs);
+    } else if (which == kVisInd) {
+        SotcXprGroups::OnConsumeIndirect();
+    }
+    return action;
 }
 
 // Site after an XPR label spin (the skip target). rsi holds the label pointer on the skip path.

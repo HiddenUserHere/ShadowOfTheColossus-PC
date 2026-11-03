@@ -357,6 +357,7 @@ boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {
 } // namespace Core
 
 extern "C" int runtime_savedata_mounted(void); // src/runtime_savedata.c
+extern "C" void runtime_profile_finish(void);  // src/probe.c (SOTC_PROFILE)
 
 // Kernel services the vendored libraries call directly.
 namespace Libraries::Kernel {
@@ -480,6 +481,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         // sotc: offline runs (SOTC_FRAME_HASH, SOTC_FRAME_METRICS): their files end at the last frame.
         Vulkan::SotcFrameHash::DrainActive(500);
         SotcFrameMetrics::FlushAll();
+        runtime_profile_finish(); // sotc: SOTC_PROFILE: the report of a session shorter than its window
         std::fflush(stdout);
         std::_Exit(0);
     });

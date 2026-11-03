@@ -62,7 +62,13 @@ static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 41u : 138
 // sotc: 22 (from 21): the record ends with the stage variant (SOTC_HEAP). Without it a cached Plain or Heap
 // program came back as Default, so its layout disagreed with its binary (slot-word assert, device lost).
 // 23: a variant's pgm_hash is the game's hash again (Info::CacheHash keys the caches), so 22's variant records differ.
-static constexpr u32 ShaderMetaVersion = 23u;
+// 24: BufferResource::sotc_read_extent (SOTC_SHADER_EXTENT) makes the buffer records 4 bytes longer; cached programs
+// are translated once again (the SPIR-V itself is unchanged).
+// 25: the record ends with has_discard and has_storage_images. They are Info members outside InfoPersistent, so every
+// cached shader came back with both false: SOTC_NO_PREPASS=3 took alpha-tested pre-pass draws for opaque ones and
+// dropped them (grass without alpha, 3 Nov), and the host's storage-image checks (op writes, fast bind, bind cache)
+// missed cached shaders.
+static constexpr u32 ShaderMetaVersion = 25u;
 static const u32 PipelineKeyVersion =
     3u + (Shader::StageBindingsEnabled() ? 1000u : 0u) + (BindlessSamplersRequested() ? 2000u : 0u);
 } // namespace Serialization
@@ -597,6 +603,21 @@ void PipelineCache::WarmUp() {
         }
     } warming_scope;
 
+    // sotc: the variant key of the shader cache folder (DataBase::SetVariant): the binary version (its env terms),
+    // the profile's switch-driven members, and the switches that change the SPIR-V without being in either.
+    {
+        std::string key = fmt::format("bin{} lds{} gs{} stage{} bda{} bindless{} heap{} addr{}",
+                                      Serialization::ShaderBinaryVersion, profile.needs_lds_barriers,
+                                      profile.barycentric_via_gs, profile.stage_bindings, profile.bda_buffers,
+                                      profile.bindless_images, profile.heap_images, profile.shader_addr);
+        for (const char* name : {"SOTC_WQM_COPY", "SOTC_WAVE64_UNIFORM", "SOTC_WAVE64_IDENTITY",
+                                 "SOTC_TSHARP_ARRAY", "SHADPS4_IEEE_MINMAX"}) {
+            if (const char* v = std::getenv(name); v && *v) {
+                key += fmt::format(" {}={}", name, v);
+            }
+        }
+        Storage::DataBase::Instance().SetVariant(std::move(key));
+    }
     Storage::DataBase::Instance().Open();
 
     // Check if cache is compatible
@@ -778,6 +799,8 @@ void Info::Serialize(Serialization::Archive& ar) const {
     info.Write(FlatBuf());
     srt_info.Serialize(ar);
     info.Write(variant); // sotc: SOTC_HEAP, not part of InfoPersistent
+    info.Write(has_discard);        // sotc: version 25, not part of InfoPersistent either
+    info.Write(has_storage_images); // sotc: version 25
 }
 
 bool Info::Deserialize(Serialization::Archive& ar) {
@@ -802,6 +825,8 @@ bool Info::Deserialize(Serialization::Archive& ar) {
         return false;
     }
     info.Read(variant); // sotc: SOTC_HEAP, see Serialize
+    info.Read(has_discard);        // sotc: version 25, see Serialize
+    info.Read(has_storage_images); // sotc: version 25
     // sotc: the record is complete: the bindless answers, as the translation fixed them for this flat buffer.
     FillBindlessCache();
     return true;

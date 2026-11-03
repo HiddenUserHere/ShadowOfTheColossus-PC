@@ -136,6 +136,10 @@ struct BufferResource {
     bool is_formatted{};
     SharpFetchPostOp post_op{};
     u32 post_op_dw1_mask{};
+    /// sotc: SOTC_SHADER_EXTENT. For a read-only binding whose V# the shader builds with an immediate unbounded
+    /// num_records: the bytes from the V# base its loads can reach, proven at translation (sotc_shader_extent_pass.cpp).
+    /// 0 = not proven. Part of the cached Info (ShaderMetaVersion).
+    u32 sotc_read_extent{};
 
     bool IsSpecial() const noexcept {
         return buffer_type != BufferType::Guest;

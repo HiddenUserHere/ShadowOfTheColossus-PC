@@ -1517,13 +1517,14 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   '',
   ()),
  ('SOTC_PRESENT_WAIT',
-  'flag',
+  'flag_on',
   'present',
   ('Ritmo dos flips pela tela', 'Flip pacing by the display'),
   ('Ajusta os flips ao ritmo da tela, com a espera de apresentação do Vulkan; sem essa extensão '
-   'usa o temporizador. Experimental, desligado por padrão; sem medição registrada.',
+   'usa o temporizador. Ligado por padrão: sem ele, um frame se repetia de vez em quando '
+   '(animação irregular a 30 FPS).',
    'Paces the flips to the display using Vulkan present wait; without that extension it uses the '
-   'timer. Experimental, off by default; no measurement recorded.'),
+   'timer. On by default: without it a frame was repeated now and then (uneven animation at 30 FPS).'),
   '',
   ()),
  ('SOTC_REFLEX',

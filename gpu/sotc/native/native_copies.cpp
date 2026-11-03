@@ -67,6 +67,8 @@ struct Entry {
     uint64_t async;    // sotc: newest async queue tick of a copy in this registration (0: graphics only)
     uint64_t identity; // the object behind the key (0: unknown)
     bool single;       // one GPU write per registration: paired through g_pending
+    bool cf_base;      // sotc: SOTC_NATIVE_COPIES_FILTER: counted as the copying entry of its base
+    bool cf_pend;      // sotc: SOTC_NATIVE_COPIES_FILTER: counted as a waiting single-write registration
 };
 
 // One copy a write takes: the overlap [lo, hi) of the write with the registration e.
@@ -131,6 +133,10 @@ struct Counters {
     std::atomic<uint64_t> pages_empty{0};      // of those, no entry under their granules (lock-free answer)
     std::atomic<uint64_t> pages_checked{0};    // candidate entries the page walk examined
     std::atomic<uint64_t> pages_mismatch{0};   // mode 2: writes whose page walk found other overlaps than the map walk
+    // sotc: SOTC_NATIVE_COPIES_FILTER window counters (Report prints them when the switch is set)
+    std::atomic<uint64_t> cf_writes{0};        // written binds that asked the copy filter
+    std::atomic<uint64_t> cf_empty{0};         // of those, no copy-capable entry under their granules
+    std::atomic<uint64_t> cf_mismatch{0};      // mode 2: an empty answer whose map walk found an overlap (must be 0)
 };
 Counters g_c;
 
@@ -343,24 +349,94 @@ void GranuleRemove(GranuleIndex& index, Entry* e) {
     }
 }
 
+// sotc: SOTC_NATIVE_COPIES_FILTER (read once; default off). A written bind copies only from the entries the map walk
+// can take: the newest registration of a base that is not single-write, and the waiting single-write registrations
+// (g_pending). The consumed single-write registrations stay in g_by_base for seconds and the page index of
+// SOTC_NATIVE_COPIES_PAGES counts them too, so its filter is almost never empty; ~87% of the walks found nothing to
+// copy (13% of the draw thread in the frames of an area load). 1: hashed granule counts of those copy-capable entries
+// only, written at the same add and remove points as the maps; a write whose granules all read 0 overlaps no
+// copy-capable entry and returns before the lock (the walk would copy nothing; it only skips the "unpaired" count and
+// the pop of pending entries the ring overwrote, which the next walk or PruneLocked does). 2: the walk runs anyway and
+// an empty answer that found an overlap is counted (cf mismatches must read 0). Needs the std::maps only (FlatMode 0)
+// and no page index.
+int CopyFilterMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_NATIVE_COPIES_FILTER");
+        return (v && v[0] == '1') ? 1 : ((v && v[0] == '2') ? 2 : 0);
+    }();
+    return mode;
+}
+bool CopyFilterOn() {
+    static const bool on = CopyFilterMode() != 0 && FlatMode() == 0 && !PagesOn();
+    return on;
+}
+std::atomic<uint32_t> g_copy_counts[size_t{1} << kFilterBits];
+
+// Adds delta to the slots of e's granules. Caller holds g_mutex.
+void CopyCount(const Entry* e, int delta) {
+    if (e->bytes == 0) {
+        return;
+    }
+    const uint64_t g0 = e->base >> kGranuleShift;
+    const uint64_t g1 = (e->base + e->bytes - 1) >> kGranuleShift;
+    for (uint64_t g = g0; g <= g1; ++g) {
+        if (delta > 0) {
+            g_copy_counts[FilterSlot(g)].fetch_add(1, std::memory_order_release);
+        } else {
+            g_copy_counts[FilterSlot(g)].fetch_sub(1, std::memory_order_release);
+        }
+    }
+}
+
+// Lock-free: true when no copy-capable entry covers a granule of [addr, addr + size). Any thread.
+bool CopyFilterEmpty(uint64_t addr, uint64_t size) {
+    const uint64_t g0 = addr >> kGranuleShift;
+    const uint64_t g1 = (addr + size - 1) >> kGranuleShift;
+    if (g1 - g0 >= kMaxScanGranules) {
+        return false;
+    }
+    for (uint64_t g = g0; g <= g1; ++g) {
+        if (g_copy_counts[FilterSlot(g)].load(std::memory_order_acquire) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void BaseIndexAdd(Entry* e) {
     if (PagesOn()) {
         GranuleAdd(g_gr_base, e);
+    }
+    if (CopyFilterOn() && !e->single && !e->cf_base) {
+        CopyCount(e, +1);
+        e->cf_base = true;
     }
 }
 void BaseIndexRemove(Entry* e) {
     if (PagesOn()) {
         GranuleRemove(g_gr_base, e);
     }
+    if (e->cf_base) {
+        CopyCount(e, -1);
+        e->cf_base = false;
+    }
 }
 void PendIndexAdd(Entry* e) {
     if (PagesOn()) {
         GranuleAdd(g_gr_pend, e);
     }
+    if (CopyFilterOn() && !e->cf_pend) {
+        CopyCount(e, +1);
+        e->cf_pend = true;
+    }
 }
 void PendIndexRemove(Entry* e) {
     if (PagesOn()) {
         GranuleRemove(g_gr_pend, e);
+    }
+    if (e->cf_pend) {
+        CopyCount(e, -1);
+        e->cf_pend = false;
     }
 }
 
@@ -855,9 +931,10 @@ bool Register(uint64_t key, uint64_t seq, uint64_t base, uint64_t bytes, uint64_
         g_filter.Add(base, bytes, +1); // sotc: SOTC_WRITE_JOURNAL: the entry's pages join the counts
     }
     if (UseMap()) {
-        if (PagesOn()) {
+        if (PagesOn() || CopyFilterOn()) {
             if (auto old = g_by_base.find(base); old != g_by_base.end()) {
-                BaseIndexRemove(old->second); // sotc: SOTC_NATIVE_COPIES_PAGES: the replaced entry leaves its granules
+                // sotc: SOTC_NATIVE_COPIES_PAGES / _FILTER: the replaced entry leaves its granules
+                BaseIndexRemove(old->second);
             }
         }
         g_by_base[base] = e;
@@ -1007,6 +1084,19 @@ void NoteWrittenBind(vk::CommandBuffer cmdbuf, vk::Buffer src, uint64_t src_offs
             }
         }
     }
+    // sotc: SOTC_NATIVE_COPIES_FILTER: no copy-capable entry under the write's granules means nothing to copy, so mode
+    // 1 returns here, before the lock. Mode 2 goes on and checks the answer against the walk below.
+    bool cf_empty = false;
+    if (CopyFilterOn()) {
+        cf_empty = CopyFilterEmpty(addr, size);
+        g_c.cf_writes.fetch_add(1, std::memory_order_relaxed);
+        if (cf_empty) {
+            g_c.cf_empty.fetch_add(1, std::memory_order_relaxed);
+            if (CopyFilterMode() == 1) {
+                return;
+            }
+        }
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
     const bool base_empty = Pick(g_by_base.empty(), g_flat_base.empty());
     const bool pending_empty = Pick(g_pending.empty(), g_flat_pending.empty());
@@ -1052,6 +1142,9 @@ void NoteWrittenBind(vk::CommandBuffer cmdbuf, vk::Buffer src, uint64_t src_offs
                 Mismatch();
             }
         }
+    }
+    if (cf_empty && !out.empty()) {
+        g_c.cf_mismatch.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_NATIVE_COPIES_FILTER=2 verify
     }
     if (journal) {
         SotcWriteJournal::Count(SotcWriteJournal::g_counters.native_walks);
@@ -1194,6 +1287,19 @@ void Report(std::string& out, double seconds) {
                       "%llu\n",
                       static_cast<unsigned long long>(writes), static_cast<unsigned long long>(empty),
                       static_cast<unsigned long long>(checked), static_cast<unsigned long long>(mismatch));
+        out += line;
+    }
+    if (CopyFilterOn()) {
+        // sotc: SOTC_NATIVE_COPIES_FILTER: window totals, the same window as the lines above.
+        const uint64_t writes = take(g_c.cf_writes);
+        const uint64_t empty = take(g_c.cf_empty);
+        const uint64_t mismatch = take(g_c.cf_mismatch);
+        std::snprintf(line, sizeof line,
+                      "SOTC NATIVE COPIES filter: mode %d, writes %llu, nothing to copy %llu (%.1f%%, %s), verify "
+                      "mismatches %llu\n",
+                      CopyFilterMode(), static_cast<unsigned long long>(writes),
+                      static_cast<unsigned long long>(empty), writes ? 100.0 * double(empty) / double(writes) : 0.0,
+                      CopyFilterMode() == 1 ? "skipped" : "walked", static_cast<unsigned long long>(mismatch));
         out += line;
     }
 }

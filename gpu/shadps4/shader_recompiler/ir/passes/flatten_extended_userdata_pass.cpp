@@ -334,6 +334,11 @@ struct PassInfo {
     // the shared code generator when destroyed.
     std::optional<Xbyak::Label> clean_load_stub;
     bool uses_clean_load_stub = false;
+    // sotc: SOTC_VSIZE_PROBE. The provenance sink (null when off) and the pointer path of the table level
+    // being walked (path[0] = root SGPR, then the dword offsets of the pointer loads; see SotcSrtSource).
+    std::vector<SotcSrtSource>* sotc_sources = nullptr;
+    std::vector<u32> sotc_path;
+    bool sotc_path_ok = true;
 
     PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
         auto it = pointer_uses.find(inst);
@@ -352,6 +357,12 @@ struct PassInfo {
     }
 };
 } // namespace
+
+// sotc: SOTC_VSIZE_PROBE (read once): record where each walked dword comes from. Host bookkeeping only.
+static const bool kSotcVsizeRecord = [] {
+    const char* v = std::getenv("SOTC_VSIZE_PROBE");
+    return v && v[0] == '1';
+}();
 
 namespace Shader::Optimization {
 
@@ -1013,6 +1024,16 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
     ASSERT(use_list);
 
+    // sotc: SOTC_VSIZE_PROBE. This level's table pointer is loaded at off_dw of the level above: extend the path.
+    const bool sotc_prev_ok = pass_info.sotc_path_ok;
+    if (pass_info.sotc_sources) {
+        if (off_dw.IsImmediate()) {
+            pass_info.sotc_path.push_back(off_dw.U32());
+        } else {
+            pass_info.sotc_path_ok = false;
+        }
+    }
+
     // First copy all the src data from this tree level
     // That way, all data that was contiguous in the guest SRT is also contiguous in the
     // flattened buffer.
@@ -1044,6 +1065,12 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         }
         c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
 
+        if (pass_info.sotc_sources) { // sotc: SOTC_VSIZE_PROBE provenance (no code emitted)
+            const bool imm = src_off_dw.IsImmediate();
+            pass_info.sotc_sources->push_back(SotcSrtSource{
+                static_cast<u32>(pass_info.dst_off_dw), imm ? src_off_dw.U32() : 0u,
+                pass_info.sotc_path, imm && pass_info.sotc_path_ok});
+        }
         SetFlatbufOffset(use, pass_info.dst_off_dw);
         pass_info.dst_off_dw++;
     }
@@ -1055,6 +1082,12 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         }
     }
 
+    if (pass_info.sotc_sources) { // sotc: SOTC_VSIZE_PROBE, leave this level
+        if (off_dw.IsImmediate()) {
+            pass_info.sotc_path.pop_back();
+        }
+        pass_info.sotc_path_ok = sotc_prev_ok;
+    }
     PopPtr(c);
 }
 
@@ -1190,6 +1223,11 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
     auto& post_order = program.post_order_blocks;
     PassInfo pass_info;
     pass_info.pgm_hash = program.info.pgm_hash;
+    // sotc: SOTC_VSIZE_PROBE: the provenance of this program's walker (cleared first, so a re-run starts clean).
+    if (kSotcVsizeRecord) {
+        program.info.sotc_srt_sources.clear();
+        pass_info.sotc_sources = &program.info.sotc_srt_sources;
+    }
 
     // traverse at end and assign offsets to duplicate readconsts, using
     // vn_to_inst as the source

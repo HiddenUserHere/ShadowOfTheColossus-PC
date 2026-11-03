@@ -202,6 +202,11 @@ public:
                                                              u32 mark_offset = 0,
                                                              u32 mark_size = ~0u);
 
+    /// sotc: SOTC_HLE_COPY_EXACT. The arena and offset ObtainBuffer returns for [device_addr, +size),
+    /// with the residency it makes and nothing else: no synchronization, no GPU-modified mark, no
+    /// bind bookkeeping. The caller synchronizes the ranges it reads or writes with ObtainBuffer.
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferResident(VAddr device_addr, u32 size);
+
     /// Attempts to obtain a buffer without modifying the cache contents.
     /// sotc: pages_protected: the image's tracking write-protects all its pages (its guest copy
     /// may then run on the copy threads, SOTC_ASYNC_TEXTURE_UPLOAD).
@@ -288,6 +293,11 @@ public:
     /// copy; the next submit waits for the copy threads (WaitUpTo). Returns the bytes uploaded.
     /// Draw thread only (load_warm.h StreamIdle).
     u64 DrainRange(VAddr addr, u64 size);
+
+    /// sotc: SOTC_REGION_PREDRAIN: DrainRange for a 1 MiB piece of a fresh 16 MiB region, except that a
+    /// range in a SOTC_CLASS_TRACK CPU-only class is not uploaded (returns 0). Draw thread only
+    /// (region_predrain.h Idle).
+    u64 PredrainRange(VAddr addr, u64 size);
 
     // sotc: SOTC_NATIVE (gpu/sotc/native). Draw thread, once per submit (cheap when nothing is queued):
     // performs queued announced uploads (Persistent through DrainRange, PerFrame as CPU-modified) until
@@ -1149,8 +1159,26 @@ private:
     std::deque<PendingArenaRun> pending_arena_runs;
     void ReclaimArenaRuns();
     /// sotc: unbinds resident block ranges (zeroing their page table entries) and frees the
-    /// allocations left without blocks. The GPU must no longer use them.
-    void UnbindResident(std::span<const Backing> released);
+    /// allocations left without blocks. The GPU must no longer use them, unless defer_tick is set
+    /// (SOTC_UNBIND_DEFER): the page table entries go now, the sparse unbind and the free wait in
+    /// deferred_unbinds until the work up to defer_tick is queued (PushDeferredUnbinds).
+    void UnbindResident(std::span<const Backing> released, u64 defer_tick = 0);
+    /// sotc: the sparse unbind and the free of released ranges (the part of UnbindResident the GPU orders).
+    void PushUnbinds(std::span<const Backing> released);
+    /// sotc: SOTC_UNBIND_DEFER=1. ReleaseMemory no longer waits on the draw thread for the recording thread to queue
+    /// the work before an unmap (Scheduler::Finish or WaitSubmitted: 353 ms in 5 s of an area load). Its unbind waits
+    /// here until that work's tick is submitted, then goes out with the next sparse bind, which waits for the tick on
+    /// the GPU (pending_bind_wait_tick). Ticks only grow, so the front is the oldest.
+    struct DeferredUnbind {
+        boost::container::small_vector<Backing, 16> released;
+        u64 tick;
+    };
+    std::vector<DeferredUnbind> deferred_unbinds;
+    /// sotc: pushes the deferred unbinds whose tick is submitted (all of them with force, waiting for the recording
+    /// thread: a bind of their blocks is about to be queued and must come after the unbind).
+    void PushDeferredUnbinds(bool force);
+    /// sotc: true when a deferred unbind holds a block of [first, end).
+    bool DeferredUnbindOverlaps(u64 first, u64 end) const;
     /// sotc: per arena block, the use epoch (seconds, wrapping, 0 = never) of its last bind.
     u16* block_last_use{};
     /// sotc: blocks MaybeEvictCold gave back and nothing bound again yet.

@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include "core/memory.h"
@@ -98,13 +99,9 @@ struct MarkRun {
     vk::DeviceSize hi;
 };
 
-// The pieces (dstOffset, size) sorted by start, with the ones that overlap or touch merged: the
-// result is sorted and disjoint, and its union is the union of the pieces.
-void MergeMarkRuns(std::span<const vk::BufferCopy> pieces, std::vector<MarkRun>& runs) {
-    runs.clear();
-    for (const auto& piece : pieces) {
-        runs.push_back({piece.dstOffset, piece.dstOffset + piece.size});
-    }
+// Sorts `runs` by start and merges the ones that overlap or touch: the result is sorted and
+// disjoint, and its union is the union of the input.
+void SortAndMergeRuns(std::vector<MarkRun>& runs) {
     std::sort(runs.begin(), runs.end(),
               [](const MarkRun& a, const MarkRun& b) { return a.lo < b.lo; });
     std::size_t out = 0;
@@ -119,6 +116,70 @@ void MergeMarkRuns(std::span<const vk::BufferCopy> pieces, std::vector<MarkRun>&
         runs.resize(out + 1);
     }
 }
+
+// The pieces (dstOffset, size) sorted by start, with the ones that overlap or touch merged: the
+// result is sorted and disjoint, and its union is the union of the pieces.
+void MergeMarkRuns(std::span<const vk::BufferCopy> pieces, std::vector<MarkRun>& runs) {
+    runs.clear();
+    for (const auto& piece : pieces) {
+        runs.push_back({piece.dstOffset, piece.dstOffset + piece.size});
+    }
+    SortAndMergeRuns(runs);
+}
+
+// sotc: SOTC_HLE_COPY_EXACT. The source byte intervals (srcOffset, size) of the pieces, sorted, the
+// overlapping or touching ones merged (no gap is ever included). Empty pieces are skipped.
+void MergeSourceRuns(std::span<const vk::BufferCopy> pieces, std::vector<MarkRun>& runs) {
+    runs.clear();
+    for (const auto& piece : pieces) {
+        if (piece.size != 0) {
+            runs.push_back({piece.srcOffset, piece.srcOffset + piece.size});
+        }
+    }
+    SortAndMergeRuns(runs);
+}
+
+// sotc: SOTC_HLE_COPY_EXACT=1 (default off). The batch's source and destination spans are obtained
+// without synchronization (BufferCache::ObtainBufferResident: the same arena, residency and offset
+// ObtainBuffer gives), and the synchronization is made per exact range instead of per span:
+//  - source: each run of source bytes the batch's copies read (MergeSourceRuns) is synchronized
+//    with ObtainBuffer(run, false), before the copies are recorded, as the span was;
+//  - destination: each piece is synchronized and marked GPU-modified by its ObtainBuffer(piece,
+//    true) (or by its merged mark run with SOTC_HLE_SKIP=1 or 2), as before. The span's read sync
+//    is not made.
+// Why the GPU copies see and leave the same bytes as with the spans:
+//  (1) Every byte a copy reads lies in a source run, and the pages of the runs are synchronized
+//      before the copies are recorded. A page only partly inside a run is synchronized whole, and
+//      the span synchronized that same page too, so the copies see the same uploaded bytes.
+//  (2) Every byte a copy writes lies in a destination piece. The pieces are marked GPU-modified and
+//      synchronized by the same ObtainBuffer(piece, true) calls as before, so the marked state is
+//      unchanged. The span's read sync uploaded the CPU-dirty pages of the pieces too; the write
+//      sync of each piece does that as well, before its mark.
+//  (3) A page the span sync uploaded but no run or piece covers is neither read nor written by the
+//      copies, and it is not GPU-modified (the marks cover the pages of the pieces only). It keeps
+//      its CPU-dirty bit, so the next bind or DMA sweep that covers it uploads it, as for any CPU write.
+//  (4) The GPU copy of a page that becomes GPU-modified holds the same bytes in both paths: the
+//      mark's write sync uploads all its CPU-dirty bytes first. Readbacks (ReadMemory, from a guest
+//      write fault in InvalidateMemory) only touch GPU-modified pages, so they write back the same
+//      bytes. The sync path does not call ReadMemory.
+//  (5) Order: all source runs are synchronized before the destination marks, as the span was, and
+//      the copies are recorded after both. The handles name the same arena and offsets.
+// Not covered by the proof: the span-level bind hooks (SOTC_LOAD_WARM, SOTC_CLASS_TRACK,
+// SOTC_PC_PLACE, SOTC_HRR) now see the runs and pieces; they are bookkeeping, not the sync.
+// SOTC_PC_RING=8 (host arena binds, decided per bind) keeps the span path.
+const bool kHleCopyExact = [] {
+    const char* v = std::getenv("SOTC_HLE_COPY_EXACT");
+    return v && v[0] == '1';
+}();
+
+// Bytes of the exact requests in the 5 s window, and the bytes the old spans would have requested
+// (source span, destination span, destination pieces). Requested range sizes, not uploaded bytes:
+// the tracker works on whole pages, so the uploads can be larger. Atomics, drained by the report.
+struct HleCopyExactStats {
+    std::atomic<u64> synced{0};
+    std::atomic<u64> spans{0};
+};
+HleCopyExactStats hle_copy_exact_stats;
 
 // Verify (mode 2). True when `runs` is exactly the union of `pieces`: every piece lies inside one
 // run, the runs are sorted and disjoint, and their total length equals the length of the union
@@ -210,6 +271,11 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         rasterizer.BindCacheNoteWrite(dst_buf_sharp.base_address + lo, hi - lo);
     }
 
+    // sotc: SOTC_HLE_COPY_EXACT. The copy commands are merged the same way either way; only the
+    // synchronized byte ranges differ. Not with SOTC_PC_RING=8: its binds are served from host
+    // memory per span, which the exact path does not model, so that keeps the span path.
+    const bool exact = kHleCopyExact && SotcPcRing::Mode() != 8;
+
     static constexpr vk::DeviceSize MaxDistanceForMerge = 64_MB;
     u32 batch_start = 0;
     u32 batch_end = 0;
@@ -245,16 +311,47 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         }
 
         // Obtain buffers for the total source and destination ranges.
-        const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBuffer(
-            src_buf_sharp.base_address + src_offset_min, src_offset_max - src_offset_min, false);
+        // sotc: SOTC_HLE_COPY_EXACT: the spans are obtained without synchronization; the exact
+        // ranges are synchronized below (see kHleCopyExact for why that is the same result).
+        const auto [src_buf, src_buf_offset] =
+            exact ? buffer_cache.ObtainBufferResident(src_buf_sharp.base_address + src_offset_min,
+                                                      src_offset_max - src_offset_min)
+                  : buffer_cache.ObtainBuffer(src_buf_sharp.base_address + src_offset_min,
+                                              src_offset_max - src_offset_min, false);
         // sotc: the merged range is obtained for reading only and just the copied pieces are
         // marked GPU-written. Marking the whole range made readbacks bring back the gaps between
         // the copies from the GPU's stale copy, over what the CPU wrote there since (the game
         // moves streamed textures with this shader; its allocator keeps free-list nodes in the
         // gaps: heap corruption).
-        const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(
-            dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min, false);
+        const auto [dst_buf, dst_buf_offset] =
+            exact ? buffer_cache.ObtainBufferResident(dst_buf_sharp.base_address + dst_offset_min,
+                                                      dst_offset_max - dst_offset_min)
+                  : buffer_cache.ObtainBuffer(dst_buf_sharp.base_address + dst_offset_min,
+                                              dst_offset_max - dst_offset_min, false);
         const auto pieces = std::span{copies}.subspan(batch_start, batch_end - batch_start);
+        if (exact) {
+            // sotc: SOTC_HLE_COPY_EXACT. The source runs the copies read are synchronized, one bind
+            // per run, before the marks below and before the copies are recorded. The destination
+            // pieces are synchronized by their marks, as before.
+            static std::vector<MarkRun> src_runs;
+            MergeSourceRuns(pieces, src_runs);
+            u64 src_run_bytes = 0;
+            for (const auto& run : src_runs) {
+                (void)buffer_cache.ObtainBuffer(src_buf_sharp.base_address + run.lo,
+                                                static_cast<u32>(run.hi - run.lo), false);
+                src_run_bytes += run.hi - run.lo;
+            }
+            u64 dst_piece_bytes = 0;
+            for (const auto& piece : pieces) {
+                dst_piece_bytes += piece.size;
+            }
+            hle_copy_exact_stats.synced.fetch_add(src_run_bytes + dst_piece_bytes,
+                                                  std::memory_order_relaxed);
+            hle_copy_exact_stats.spans.fetch_add(
+                (src_offset_max - src_offset_min) + (dst_offset_max - dst_offset_min) +
+                    dst_piece_bytes,
+                std::memory_order_relaxed);
+        }
         // sotc: SOTC_HLE_SKIP. Mode 0: one mark per copy (unchanged). Mode 1: one mark per
         // merged run (the union of the copies, so the same GPU-written bytes). Mode 2: the
         // per-copy marks, as in mode 0, then the merged runs are checked (see the top).
@@ -322,6 +419,25 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     }
 
     return true;
+}
+
+// sotc: SOTC_HLE_COPY_EXACT report (driver.cpp, every 5 s; prints only with the switch on): the
+// bytes the exact requests synchronized in the window, against the bytes the spans would have.
+void ReportHleCopyExact(std::string& out, double seconds) {
+    if (!kHleCopyExact) {
+        return;
+    }
+    const u64 synced = hle_copy_exact_stats.synced.exchange(0, std::memory_order_relaxed);
+    const u64 spans = hle_copy_exact_stats.spans.exchange(0, std::memory_order_relaxed);
+    const double mb = 1024.0 * 1024.0;
+    const double window = seconds > 0.0 ? seconds : 1.0;
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "SOTC HLE copy exact: synced %.2f MB (%.2f MB/s), the spans would have synced "
+                  "%.2f MB (%.2f MB/s), %.1f%% of them\n",
+                  synced / mb, synced / mb / window, spans / mb, spans / mb / window,
+                  spans ? 100.0 * static_cast<double>(synced) / static_cast<double>(spans) : 0.0);
+    out += line;
 }
 
 // sotc: Shadow of the Colossus fills small tables every frame with a compute shader:

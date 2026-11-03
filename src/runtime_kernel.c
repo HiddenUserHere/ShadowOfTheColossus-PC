@@ -105,7 +105,7 @@ static ABI uint64_t process_time_frequency(void) { return 1000000000; }
 static int tsc_from_qpc;
 void runtime_tsc_use_qpc(void) { tsc_from_qpc=1; }
 static uint64_t host_tsc(void) {
-    if (runtime_det_clock_on()) return runtime_det_tsc(); /* sotc: SOTC_DET_CLOCK, the same clock as the rdtsc patch */
+    if (runtime_det_tsc_virtual()) return runtime_det_tsc(); /* sotc: SOTC_DET_CLOCK_TSC, the same clock as the rdtsc patch */
 #ifdef _WIN32
     if (tsc_from_qpc) return compat_qpc_tsc();
 #endif
@@ -114,7 +114,7 @@ static uint64_t host_tsc(void) {
 static ABI uint64_t read_tsc(void) { return host_tsc(); }
 static uint64_t tsc_hz;
 static ABI uint64_t tsc_frequency(void) {
-    if (runtime_det_clock_on()) return runtime_det_tsc_frequency(); /* sotc: SOTC_DET_CLOCK */
+    if (runtime_det_tsc_virtual()) return runtime_det_tsc_frequency(); /* sotc: SOTC_DET_CLOCK_TSC: the frequency must match the TSC the game reads (real rdtsc otherwise) */
 #ifdef _WIN32
     if (tsc_from_qpc) return compat_qpc_tsc_frequency();
 #endif

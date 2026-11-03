@@ -143,6 +143,9 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
     Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Optimization::CollectShaderInfoPass(program, profile);
+    // sotc: SOTC_SHADER_EXTENT. On the final IR (nothing below changes a load or its address); runs whatever the
+    // switch says, so cached programs carry the extents (the host decides whether to use them).
+    Shader::Optimization::SotcShaderExtentPass(program, runtime_info);
     Shader::IR::DumpProgram(program, info);
     // sotc: the Info is complete: its bindless answers are fixed here, before the SPIR-V is emitted from it.
     info.FillBindlessCache();

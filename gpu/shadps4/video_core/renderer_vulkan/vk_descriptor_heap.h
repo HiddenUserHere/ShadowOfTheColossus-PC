@@ -126,6 +126,8 @@ private:
         u32 end{};    ///< one past the last slot
         u32 cursor{}; ///< next free slot (absolute)
         std::vector<u64> chunk_tick; ///< per chunk: tick of its last write
+        u64 count_tick{};            ///< sotc: SOTC_HEAP_EARLY_FLUSH: the tick written_in_tick counts for
+        u32 written_in_tick{};       ///< sotc: slots this ring wrote in count_tick
     };
     u32 AllocRing(SlotRing& ring, u32 count, Scheduler& scheduler);
     bool Probe(const Instance& instance, const vk::PhysicalDeviceDescriptorHeapPropertiesEXT& props);
@@ -203,5 +205,9 @@ void DescriptorHeapForgetSampler(VkSampler sampler);
 /// sotc: one line for the 5 s report, counters reset on read: "SOTC DESCRIPTOR_HEAP ...". Returns the length
 /// written, 0 when the mode is not active.
 u32 DescriptorHeapReport(char* out, u32 size);
+
+/// sotc: the ring wait line of the 5 s report (counters reset on read): waits per second, the wraps onto the open
+/// tick among them, host time in waits, and SOTC_HEAP_EARLY_FLUSH submits. seconds = window length. 0 when off.
+u32 DescriptorHeapWaitReport(char* out, u32 size, double seconds);
 
 } // namespace Vulkan

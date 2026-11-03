@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include "shader_recompiler/ir/basic_block.h"
@@ -49,5 +51,11 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
 void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile);
 void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_info,
                                const Profile& profile);
+/// sotc: SOTC_SHADER_EXTENT. Sets BufferResource::sotc_read_extent of the read-only shader-built V#s; IR unchanged.
+void SotcShaderExtentPass(IR::Program& program, const RuntimeInfo& runtime_info);
+/// sotc: the bytes the loads of one buffer binding can read in `blocks` (0 = not bounded, `reason` says why).
+/// workgroup_size bounds LocalInvocationId (null: not a compute shader). Used by the pass and its offline test.
+u32 SotcBufferReadExtent(const IR::BlockList& blocks, u32 binding,
+                         const std::array<u32, 3>* workgroup_size, std::string* reason);
 
 } // namespace Shader::Optimization

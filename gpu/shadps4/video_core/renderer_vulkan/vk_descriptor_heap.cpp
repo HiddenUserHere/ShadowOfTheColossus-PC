@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +58,21 @@ std::atomic<u64> g_refused{};
 std::atomic<u64> g_ring_waits{};
 std::atomic<u64> g_heap_binds{};
 std::atomic<u64> g_pushes{};
+// sotc: the ring waits by cause, reported every 5 s by DescriptorHeapWaitReport (taken there, not in the line above).
+std::atomic<u64> g_wait_events{};     ///< AllocRing waits on the scheduler
+std::atomic<u64> g_wait_same_tick{};  ///< of them: a wrap onto chunks of the recording still open (flush + GPU drain)
+std::atomic<u64> g_wait_ns{};         ///< host time spent in those waits
+std::atomic<u64> g_early_flushes{};   ///< SOTC_HEAP_EARLY_FLUSH submits
+
+// sotc: SOTC_HEAP_EARLY_FLUSH=1 (off by default): a ring submits the recording once it has written half its slots
+// within one tick, so a later wrap reuses chunks of an older tick, which the GPU has usually finished.
+bool HeapEarlyFlushOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_HEAP_EARLY_FLUSH");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
 
 /// sotc: the create info of an image view as the heap writes need it. `info.pNext` points at `usage` when set.
 struct RegisteredView {
@@ -376,6 +392,21 @@ u32 DescriptorHeapBuffers::AllocRing(SlotRing& ring, u32 count, Scheduler& sched
     if (count > ring.end - ring.begin) {
         return HeapNoSlot;
     }
+    // sotc: SOTC_HEAP_EARLY_FLUSH: the writes of this ring in the open tick are counted; past half the ring the
+    // recording is submitted first, so the slots written from now on belong to a new tick.
+    if (HeapEarlyFlushOn()) {
+        if (ring.count_tick != scheduler.CurrentTick()) {
+            ring.count_tick = scheduler.CurrentTick();
+            ring.written_in_tick = 0;
+        }
+        if (ring.written_in_tick + count > (ring.end - ring.begin) / 2) {
+            scheduler.Flush();
+            ring.count_tick = scheduler.CurrentTick();
+            ring.written_in_tick = 0;
+            g_early_flushes.fetch_add(1, std::memory_order_relaxed);
+        }
+        ring.written_in_tick += count;
+    }
     // The ring is never split: a request that does not fit before the end starts at the beginning again.
     bool wrapped = false;
     if (ring.cursor + count > ring.end) {
@@ -395,7 +426,17 @@ u32 DescriptorHeapBuffers::AllocRing(SlotRing& ring, u32 count, Scheduler& sched
         // with a render pass open). Only a wrap back onto the current tick's chunks must wait.
         const u64 tick = ring.chunk_tick[chunk];
         if ((tick != current || wrapped) && !scheduler.IsFree(tick)) {
+            const bool same_tick = tick == current;
+            const auto wait_start = std::chrono::steady_clock::now();
             scheduler.Wait(tick);
+            g_wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - wait_start)
+                                                     .count()),
+                                std::memory_order_relaxed);
+            g_wait_events.fetch_add(1, std::memory_order_relaxed);
+            if (same_tick) {
+                g_wait_same_tick.fetch_add(1, std::memory_order_relaxed);
+            }
             g_ring_waits.fetch_add(1, std::memory_order_relaxed);
         }
         ring.chunk_tick[chunk] = scheduler.CurrentTick();
@@ -734,6 +775,26 @@ u32 DescriptorHeapReport(char* out, u32 size) {
         outcome(HeapFallback::PacketRange), outcome(HeapFallback::NoHeaps),
         outcome(HeapFallback::RingSize), take(g_draws), take(g_descriptors), take(g_refused),
         take(g_ring_waits), take(g_heap_binds), take(g_pushes));
+    return n < 0 ? 0 : static_cast<u32>(n);
+}
+
+u32 DescriptorHeapWaitReport(char* out, u32 size, double seconds) {
+    if (!DescriptorHeapActive()) {
+        return 0;
+    }
+    const u64 events = g_wait_events.exchange(0, std::memory_order_relaxed);
+    const u64 same_tick = g_wait_same_tick.exchange(0, std::memory_order_relaxed);
+    const u64 wait_ns = g_wait_ns.exchange(0, std::memory_order_relaxed);
+    const u64 flushes = g_early_flushes.exchange(0, std::memory_order_relaxed);
+    const double window = seconds > 0.0 ? seconds : 1.0;
+    const int n = std::snprintf(
+        out, size,
+        "SOTC DESCRIPTOR_HEAP WAITS 5 s: ring waits %llu (%.1f/s), wrap onto open tick %llu, "
+        "wait %.1f ms (%.1f ms/s), early flush %s submits %llu",
+        static_cast<unsigned long long>(events), static_cast<double>(events) / window,
+        static_cast<unsigned long long>(same_tick), static_cast<double>(wait_ns) / 1e6,
+        static_cast<double>(wait_ns) / 1e6 / window, HeapEarlyFlushOn() ? "on" : "off",
+        static_cast<unsigned long long>(flushes));
     return n < 0 ? 0 : static_cast<u32>(n);
 }
 

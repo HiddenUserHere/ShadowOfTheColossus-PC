@@ -504,13 +504,33 @@ static DWORD WINAPI hang_watchdog(void *unused) {
 #define PROFILE_SLOTS 65536
 typedef struct { uintptr_t address; unsigned leaf, inclusive; } ProfileSlot;
 static ProfileSlot *profile_slots;
-static void profile_add(uintptr_t address, int leaf) {
+/* sotc: SOTC_PROFILE_SLOW_MS=<ms> (with SOTC_PROFILE_OUT): the samples of frames longer than that (flip to flip of
+ * bbgpu_flip_count, seen from the profiler) also go to a second table, written to <SOTC_PROFILE_OUT>.slow in the same
+ * format: what the thread did in the stalls (an area load) apart from the steady frames around them. A frame's
+ * samples wait in profile_pending until its flip shows whether it was slow. */
+static ProfileSlot *profile_slow_slots;
+#define PROFILE_DEPTH 33
+#define PROFILE_PENDING 4096
+typedef struct { uintptr_t chain[PROFILE_DEPTH]; int n; } ProfileSample;
+static ProfileSample *profile_pending;
+static void profile_add_to(ProfileSlot *table, uintptr_t address, int leaf) {
     size_t i=(address*0x9E3779B97F4A7C15ull)>>48;
     for (size_t n=0;n<PROFILE_SLOTS;++n,i=(i+1)&(PROFILE_SLOTS-1)) {
-        ProfileSlot *s=&profile_slots[i];
+        ProfileSlot *s=&table[i];
         if (!s->address) s->address=address;
         if (s->address==address) { if (leaf) ++s->leaf; ++s->inclusive; return; }
     }
+}
+static void profile_add(uintptr_t address, int leaf) { profile_add_to(profile_slots,address,leaf); }
+static void profile_write(const char *path, ProfileSlot *table, unsigned samples) {
+    char where[MAX_PATH+64];
+    FILE *out=fopen(path,"w");
+    for (size_t i=0; out && i<PROFILE_SLOTS; ++i) {
+        if (!table[i].address) continue;
+        describe_address(where,sizeof(where),table[i].address);
+        fprintf(out,"%s %u %u\n",where,table[i].leaf,table[i].inclusive);
+    }
+    if (out) { fprintf(out,"samples %u\n",samples); fclose(out); }
 }
 /* (system leaf, first own caller) pairs. */
 typedef struct { uintptr_t leaf, caller; unsigned count; } ProfilePair;
@@ -531,6 +551,16 @@ static int profile_by_leaf(const void *a, const void *b) {
 }
 static int profile_by_inclusive(const void *a, const void *b) {
     return (int)((const ProfileSlot *)b)->inclusive-(int)((const ProfileSlot *)a)->inclusive;
+}
+/* sotc: a window close (gpu/shim/bbgpu.cpp, before its _Exit) or exit() ends the sampling early and waits for the
+ * report, so a session that ends before SOTC_PROFILE_DELAY + SOTC_PROFILE_SECONDS still writes it. profile_done is
+ * NULL until sampling starts. */
+static volatile LONG profile_stop;
+static HANDLE profile_done;
+void runtime_profile_finish(void) {
+    if (!profile_done) return;
+    InterlockedExchange(&profile_stop,1);
+    WaitForSingleObject(profile_done,20000);
 }
 static DWORD WINAPI profiler(void *name) {
     typedef HRESULT (WINAPI *Describe)(HANDLE, PWSTR *);
@@ -557,16 +587,52 @@ static DWORD WINAPI profiler(void *name) {
     HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,target);
     profile_slots=calloc(PROFILE_SLOTS,sizeof(*profile_slots));
     if (!thread || !profile_slots) return 0;
+    const char *slow_env=getenv("SOTC_PROFILE_SLOW_MS");
+    const double slow_ms=slow_env && getenv("SOTC_PROFILE_OUT") ? atof(slow_env) : 0.0;
+    if (slow_ms>0) {
+        profile_slow_slots=calloc(PROFILE_SLOTS,sizeof(*profile_slow_slots));
+        profile_pending=calloc(PROFILE_PENDING,sizeof(*profile_pending));
+    }
+    const int slow_on=profile_slow_slots && profile_pending;
+    unsigned slow_frames=0, slow_samples=0, frames=0;
+    int pending=0;
+    uint64_t last_flips=0;
+    LARGE_INTEGER qpf, last_flip_at={0};
+    QueryPerformanceFrequency(&qpf);
+    profile_done=CreateEventA(NULL,TRUE,FALSE,NULL);
     const ULONGLONG end=GetTickCount64()+(ULONGLONG)(seconds ? atoi(seconds) : 15)*1000;
     unsigned samples=0;
     timeBeginPeriod(1);
-    while (GetTickCount64()<end) {
+    while (GetTickCount64()<end && !profile_stop) {
+        if (slow_on) {
+            /* A flip closes the frame the pending samples belong to. */
+            const uint64_t flips=bbgpu_flip_count();
+            if (flips!=last_flips) {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                const double ms=1000.0*(double)(now.QuadPart-last_flip_at.QuadPart)/(double)qpf.QuadPart;
+                if (last_flips && ms>slow_ms) {
+                    ++slow_frames;
+                    for (int p=0;p<pending;++p) {
+                        ++slow_samples;
+                        for (int k=0;k<profile_pending[p].n;++k)
+                            profile_add_to(profile_slow_slots,profile_pending[p].chain[k],k==0);
+                    }
+                }
+                if (last_flips) ++frames;
+                pending=0;
+                last_flips=flips;
+                last_flip_at=now;
+            }
+        }
         if (SuspendThread(thread)!=(DWORD)-1) {
             CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
             if (GetThreadContext(thread,&c)) {
                 ++samples;
                 profile_add((uintptr_t)c.Rip,1);
                 const uintptr_t leaf=(uintptr_t)c.Rip;
+                ProfileSample *sample=slow_on && pending<PROFILE_PENDING ? &profile_pending[pending++] : NULL;
+                if (sample) { sample->chain[0]=leaf; sample->n=1; }
                 int first_own=1;
                 /* sotc: RtlVirtualUnwind on a snapshot taken mid-prologue can read a garbage
                  * address; that fault ended the whole game (ntdll, "not ours", unhandled). The
@@ -590,6 +656,7 @@ static DWORD WINAPI profiler(void *name) {
                     }
                     if (!c.Rip) break;
                     profile_add((uintptr_t)c.Rip,0);
+                    if (sample && sample->n<PROFILE_DEPTH) sample->chain[sample->n++]=(uintptr_t)c.Rip;
                     /* The first frame in the loader/GPU library that leads to a system leaf:
                      * who waits, locks or calls the driver. */
                     if (first_own && (uintptr_t)c.Rip-(uintptr_t)GetModuleHandleA(NULL)<0x4000000 &&
@@ -609,14 +676,13 @@ static DWORD WINAPI profiler(void *name) {
     fprintf(stderr,"SOTC profile of %s: %u samples\n",(const char *)name,samples);
     /* SOTC_PROFILE_OUT=<file>: every sampled address (module offset, leaf, inclusive), for
      * per-function totals offline (tools/profile_sym.py --functions). */
-    if (getenv("SOTC_PROFILE_OUT")) {
-        FILE *out=fopen(getenv("SOTC_PROFILE_OUT"),"w");
-        for (size_t i=0; out && i<PROFILE_SLOTS; ++i) {
-            if (!profile_slots[i].address) continue;
-            describe_address(where,sizeof(where),profile_slots[i].address);
-            fprintf(out,"%s %u %u\n",where,profile_slots[i].leaf,profile_slots[i].inclusive);
-        }
-        if (out) { fprintf(out,"samples %u\n",samples); fclose(out); }
+    if (getenv("SOTC_PROFILE_OUT")) profile_write(getenv("SOTC_PROFILE_OUT"),profile_slots,samples);
+    if (slow_on) {
+        char path[MAX_PATH+16];
+        snprintf(path,sizeof(path),"%s.slow",getenv("SOTC_PROFILE_OUT"));
+        profile_write(path,profile_slow_slots,slow_samples);
+        fprintf(stderr,"SOTC profile slow frames: %u of %u frames over %.1f ms, %u samples -> %s\n",
+                slow_frames,frames,slow_ms,slow_samples,path);
     }
     qsort(profile_slots,PROFILE_SLOTS,sizeof(*profile_slots),profile_by_leaf);
     fprintf(stderr,"  leaf:\n");
@@ -639,6 +705,7 @@ static DWORD WINAPI profiler(void *name) {
         fprintf(stderr,"  %5.1f%% %s\n",100.0*profile_slots[i].inclusive/samples,where);
     }
     fflush(stderr);
+    if (profile_done) SetEvent(profile_done);
     return 0;
 }
 /* sotc: SOTC_PROFILE=*: every thread of the process, from SOTC_PROFILE_DELAY for
@@ -653,18 +720,28 @@ static DWORD WINAPI profiler(void *name) {
 typedef struct { uint32_t thread; uintptr_t address; unsigned leaf, inclusive; } AllSlot;
 typedef struct {
     DWORD tid; HANDLE handle; char name[64]; ULONG64 cycles; unsigned busy;
+    unsigned slow_busy; /* sotc: SOTC_PROFILE_SLOW_MS: busy samples inside slow frames */
     FILETIME kernel0, user0, kernel1, user1;
 } AllThread;
 static AllSlot *all_slots;
+/* sotc: SOTC_PROFILE_SLOW_MS (with SOTC_PROFILE=* and SOTC_PROFILE_OUT): the samples of frames longer than that, as
+ * the one-thread profiler keeps them (profile_pending), in a second table written to <SOTC_PROFILE_OUT>.slow: what
+ * every thread did during the stalls (an area load) apart from the steady frames. */
+static AllSlot *all_slow_slots;
+#define ALL_DEPTH 25
+#define ALL_PENDING 16384
+typedef struct { uint32_t thread; int n; uintptr_t chain[ALL_DEPTH]; } AllSample;
+static AllSample *all_pending;
 static AllThread all_threads[ALL_MAX_THREADS];
-static void all_add(uint32_t thread, uintptr_t address, int leaf) {
+static void all_add_to(AllSlot *table, uint32_t thread, uintptr_t address, int leaf) {
     size_t i=((address*0x9E3779B97F4A7C15ull)^((uint64_t)(thread+1)*0xC2B2AE3D27D4EB4Full))>>46;
     for (size_t n=0;n<ALL_SLOTS;++n,i=(i+1)&(ALL_SLOTS-1)) {
-        AllSlot *s=&all_slots[i];
+        AllSlot *s=&table[i];
         if (!s->address) { s->address=address; s->thread=thread; }
         if (s->address==address && s->thread==thread) { if (leaf) ++s->leaf; ++s->inclusive; return; }
     }
 }
+static void all_add(uint32_t thread, uintptr_t address, int leaf) { all_add_to(all_slots,thread,address,leaf); }
 static int all_by_busy(const void *a, const void *b) {
     return (int)all_threads[*(const uint32_t *)b].busy-(int)all_threads[*(const uint32_t *)a].busy;
 }
@@ -684,6 +761,7 @@ static DWORD WINAPI profiler_all(void *unused) {
     Sleep((delay ? atoi(delay) : 20)*1000);
     all_slots=calloc(ALL_SLOTS,sizeof(*all_slots));
     if (!all_slots) return 0;
+    profile_done=CreateEventA(NULL,TRUE,FALSE,NULL);
     uint32_t count=0;
     HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
     THREADENTRY32 te={.dwSize=sizeof(te)};
@@ -704,11 +782,43 @@ static DWORD WINAPI profiler_all(void *unused) {
         GetThreadTimes(h,&created,&exited,&t->kernel0,&t->user0);
     }
     CloseHandle(snapshot);
+    const char *slow_env=getenv("SOTC_PROFILE_SLOW_MS");
+    const double slow_ms=slow_env && getenv("SOTC_PROFILE_OUT") ? atof(slow_env) : 0.0;
+    if (slow_ms>0) {
+        all_slow_slots=calloc(ALL_SLOTS,sizeof(*all_slow_slots));
+        all_pending=calloc(ALL_PENDING,sizeof(*all_pending));
+    }
+    const int slow_on=all_slow_slots && all_pending;
+    unsigned slow_frames=0, frames=0, pending=0;
+    uint64_t last_flips=0;
+    LARGE_INTEGER qpf, last_flip_at={0};
+    QueryPerformanceFrequency(&qpf);
     const ULONGLONG end=GetTickCount64()+(ULONGLONG)(seconds ? atoi(seconds) : 10)*1000;
     unsigned rounds=0;
     timeBeginPeriod(1);
-    while (GetTickCount64()<end) {
+    while (GetTickCount64()<end && !profile_stop) {
         ++rounds;
+        if (slow_on) {
+            /* A flip closes the frame the pending samples belong to. */
+            const uint64_t flips=bbgpu_flip_count();
+            if (flips!=last_flips) {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                const double ms=1000.0*(double)(now.QuadPart-last_flip_at.QuadPart)/(double)qpf.QuadPart;
+                if (last_flips && ms>slow_ms) {
+                    ++slow_frames;
+                    for (unsigned p=0;p<pending;++p) {
+                        const AllSample *sm=&all_pending[p];
+                        ++all_threads[sm->thread].slow_busy;
+                        for (int k=0;k<sm->n;++k) all_add_to(all_slow_slots,sm->thread,sm->chain[k],k==0);
+                    }
+                }
+                if (last_flips) ++frames;
+                pending=0;
+                last_flips=flips;
+                last_flip_at=now;
+            }
+        }
         for (uint32_t i=0;i<count;++i) {
             AllThread *t=&all_threads[i];
             ULONG64 cycles;
@@ -719,6 +829,8 @@ static DWORD WINAPI profiler_all(void *unused) {
             if (GetThreadContext(t->handle,&c)) {
                 ++t->busy;
                 all_add(i,(uintptr_t)c.Rip,1);
+                AllSample *sample=slow_on && pending<ALL_PENDING ? &all_pending[pending++] : NULL;
+                if (sample) { sample->thread=i; sample->chain[0]=(uintptr_t)c.Rip; sample->n=1; }
                 /* As the one-thread profiler: a bad unwind resumes here instead of ending the game. */
                 sigjmp_buf unwind_recover;
                 volatile int depth=0;
@@ -737,6 +849,7 @@ static DWORD WINAPI profiler_all(void *unused) {
                     }
                     if (!c.Rip) break;
                     all_add(i,(uintptr_t)c.Rip,0);
+                    if (sample && sample->n<ALL_DEPTH) sample->chain[sample->n++]=(uintptr_t)c.Rip;
                 }
                 runtime_fault_recover=NULL;
             }
@@ -786,7 +899,35 @@ static DWORD WINAPI profiler_all(void *unused) {
         }
         if (out) fclose(out);
     }
+    if (slow_on) {
+        /* The busiest threads of the slow frames, and the same dump format for the slow table. */
+        uint32_t slow_order[ALL_MAX_THREADS];
+        for (uint32_t i=0;i<count;++i) slow_order[i]=i;
+        for (uint32_t a=0;a<count;++a)
+            for (uint32_t b=a+1;b<count;++b)
+                if (all_threads[slow_order[b]].slow_busy>all_threads[slow_order[a]].slow_busy) {
+                    const uint32_t x=slow_order[a]; slow_order[a]=slow_order[b]; slow_order[b]=x;
+                }
+        fprintf(stderr,"SOTC profile slow frames: %u of %u frames over %.1f ms\n",slow_frames,frames,slow_ms);
+        for (uint32_t r=0;r<count && r<30 && all_threads[slow_order[r]].slow_busy;++r) {
+            const AllThread *t=&all_threads[slow_order[r]];
+            fprintf(stderr,"  %6u slow busy (%6u in all)  tid %5lu  '%s'\n",t->slow_busy,t->busy,t->tid,t->name);
+        }
+        char path[MAX_PATH+16];
+        snprintf(path,sizeof(path),"%s.slow",getenv("SOTC_PROFILE_OUT"));
+        FILE *out=fopen(path,"w");
+        for (uint32_t i=0;out && i<count;++i)
+            fprintf(out,"thread %lu %u %s\n",all_threads[i].tid,all_threads[i].slow_busy,all_threads[i].name);
+        for (size_t s=0;out && s<ALL_SLOTS;++s) {
+            if (!all_slow_slots[s].address) continue;
+            describe_address(where,sizeof(where),all_slow_slots[s].address);
+            fprintf(out,"%lu %s %u %u\n",all_threads[all_slow_slots[s].thread].tid,where,all_slow_slots[s].leaf,
+                    all_slow_slots[s].inclusive);
+        }
+        if (out) fclose(out);
+    }
     fflush(stderr);
+    if (profile_done) SetEvent(profile_done);
     return 0;
 }
 static DWORD WINAPI stacks_watcher(void *path) {
@@ -1363,7 +1504,7 @@ void runtime_call_on_host_stack(void (*fn)(void *), void *arg) { fn(arg); }
  * check. */
 static void *tsc_clock;
 static void choose_tsc(void) {
-    if (runtime_det_clock_on() && getenv("SOTC_DET_CLOCK_TSC")) { /* sotc: SOTC_DET_CLOCK_TSC=1: rdtsc reads the virtual clock too (off: the game crashed in a HUD formatter at the route start, 3 Nov) */
+    if (runtime_det_tsc_virtual()) { /* sotc: SOTC_DET_CLOCK_TSC=1: rdtsc reads the virtual clock too (off: the game crashed in a HUD formatter at the route start, 3 Nov) */
         puts("Runtime: SOTC_DET_CLOCK: the game's rdtsc reads the virtual clock");
         tsc_clock=(void *)runtime_det_tsc;
         return;
@@ -1840,9 +1981,11 @@ int main(int argc, char **argv) {
     AddVectoredExceptionHandler(1, vectored_fault);
     if (getenv("BB_FAULT_RING")) fault_ring_open(getenv("BB_FAULT_RING"));
     if (getenv("BB_STACKS_TRIGGER")) CreateThread(NULL,0,stacks_watcher,(void *)getenv("BB_STACKS_TRIGGER"),0,NULL);
-    if (getenv("SOTC_PROFILE"))
+    if (getenv("SOTC_PROFILE")) {
+        atexit(runtime_profile_finish);
         CreateThread(NULL,0,strcmp(getenv("SOTC_PROFILE"),"*") ? profiler : profiler_all,
                      (void *)getenv("SOTC_PROFILE"),0,NULL);
+    }
     SetUnhandledExceptionFilter(unhandled_fault);
     sotc_install_fail_fast_diagnostics(); /* sotc: W1, the terminate / SIGABRT / invalid-parameter lines */
     if (getenv("BB_STRICT_HANDLES")) {

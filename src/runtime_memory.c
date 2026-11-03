@@ -2216,8 +2216,63 @@ static uint64_t cached_mapped_length(uintptr_t address, uint64_t size) {
     }
     return length>=size ? size : 0;
 }
+/* sotc: true when address lies in no VMA (a gap, or past the last one), read without the lock like
+ * vma_lookup_fast; 0 also when the array kept changing (the caller takes the lock). */
+static int vma_gap_fast(uintptr_t address) {
+    for (int tries=0; tries<4; ++tries) {
+        const uint64_t s=__atomic_load_n(&vma_seq,__ATOMIC_ACQUIRE);
+        if (s & 1) continue;
+        const Vma *v=__atomic_load_n(&vmas,__ATOMIC_ACQUIRE);
+        const size_t n=__atomic_load_n(&vma_count,__ATOMIC_RELAXED);
+        size_t lo=0, hi=n;
+        while (lo<hi) {
+            size_t mid=(lo+hi)/2;
+            if (__atomic_load_n(&v[mid].end,__ATOMIC_RELAXED)<=address) lo=mid+1; else hi=mid;
+        }
+        const int gap=lo==n || __atomic_load_n(&v[lo].start,__ATOMIC_RELAXED)>address;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&vma_seq,__ATOMIC_RELAXED)!=s) continue;
+        return gap;
+    }
+    return 0;
+}
+/* sotc: SOTC_CLAMP_FAST=1 (default off). The GPU clamps every buffer bind to the mapped memory, and an
+ * unbounded V# (a 64 MiB window) always ends past its mapping: cached_mapped_length answers only a
+ * fully mapped range, so those clamps took the read lock, ~6% of the draw thread in the frames of an
+ * area load, waiting for the guest's map batches (user's session, 3 Nov). The same walk as the locked
+ * loop below, from the cached regions: adjacent mappings add up, and a reserved region or a gap ends
+ * it with the length so far. 0: not answered (an uncached region, too many hops), take the lock. */
+static int cached_clamp(uintptr_t address, uint64_t size, uint64_t *out) {
+    uint64_t length=0;
+    for (unsigned hops=0; length<size && hops<8; ++hops) {
+        const uintptr_t at=address+length;
+        const CachedRegion *c=cached_region_q(at,address+size);
+        if (!c) {
+            if (!vma_gap_fast(at)) return 0;
+            *out=length;
+            return 1;
+        }
+        if (c->kind==KIND_RESERVED) {
+            *out=length;
+            return 1;
+        }
+        length=c->end-address;
+    }
+    if (length<size) return 0;
+    *out=size;
+    return 1;
+}
+static int clamp_fast_on(void) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_CLAMP_FAST"); on=v && v[0]=='1'; }
+    return on;
+}
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
     if (size && cached_mapped_length(address,size)==size) return size;
+    if (size && clamp_fast_on() && !(runtime_disabled_optimizations & 1)) {
+        uint64_t length;
+        if (cached_clamp(address,size,&length)) return length;
+    }
     read_lock();
     uint64_t length=0;
     for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {

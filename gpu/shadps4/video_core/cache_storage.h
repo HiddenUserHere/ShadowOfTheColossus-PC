@@ -30,6 +30,10 @@ public:
         return *Common::Singleton<DataBase>::Instance();
     }
 
+    /// sotc: the shader variant this session translates for (flags that change the SPIR-V or the profile). Set
+    /// before Open: a folder holds one variant, and another variant gets a folder of its own instead of
+    /// overwriting the binaries or resetting the cache (~800 shaders translated again on every flag switch).
+    void SetVariant(std::string key);
     void Open();
     void Close();
     void Clear();
@@ -66,6 +70,7 @@ private:
 
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
+    std::string variant_key{}; ///< sotc: SetVariant
     bool opened{};
     /// sotc: every loose cache file read up front (in parallel) for the boot preload, by file
     /// name; ordered like an NTFS directory listing. Emptied by FinishPreload.

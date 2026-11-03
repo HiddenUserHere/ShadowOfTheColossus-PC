@@ -365,6 +365,12 @@ target_include_directories(barycentric-gs-test PRIVATE shim shadps4 third_party/
 target_compile_options(barycentric-gs-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(barycentric-gs-test PRIVATE bbgpu)
 
+# sotc: SOTC_SHADER_EXTENT read extent analysis on hand-built IR.
+add_executable(shader-extent-test EXCLUDE_FROM_ALL ../tests/test_sotc_shader_extent.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(shader-extent-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(shader-extent-test PRIVATE -UNDEBUG)
+target_link_libraries(shader-extent-test PRIVATE bbgpu)
+
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)

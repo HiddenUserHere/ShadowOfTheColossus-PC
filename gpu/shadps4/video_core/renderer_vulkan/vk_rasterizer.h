@@ -30,6 +30,10 @@ namespace Core {
 class MemoryManager;
 }
 
+namespace SotcVertexExtent {
+struct Draw; // sotc: SOTC_VERTEX_EXTENT (sotc_vertex_extent.h)
+}
+
 namespace Vulkan {
 
 class GraphicsPipeline;
@@ -422,9 +426,13 @@ private:
     /// sotc: records vertex input, vertex and index buffers again when a submit happened since
     /// vertex_tick (the draw moved to a new command buffer).
     void RebindVertexIfSubmitted(const GraphicsPipeline* pipeline, u64& vertex_tick,
-                                 bool is_indexed, const std::function<void()>& bind_index);
-    void BindVertexBuffers(const GraphicsPipeline* pipeline);
-    void BindIndexBuffer(u32 index_offset = 0);
+                                 bool is_indexed, const std::function<void()>& bind_index,
+                                 const SotcVertexExtent::Draw* extent = nullptr); // sotc: SOTC_VERTEX_EXTENT
+    /// sotc: extent narrows the sizes to the draw's vertices (SOTC_VERTEX_EXTENT); nullptr keeps the V# sizes.
+    void BindVertexBuffers(const GraphicsPipeline* pipeline,
+                           const SotcVertexExtent::Draw* extent = nullptr);
+    /// sotc: SOTC_INDEX_EXTENT. extent: the indices the draw reads from index_offset (0 = the register window).
+    void BindIndexBuffer(u32 index_offset = 0, u32 extent = 0);
 
     void ResetBindings(bool is_compute);
     void CaptureTextures();

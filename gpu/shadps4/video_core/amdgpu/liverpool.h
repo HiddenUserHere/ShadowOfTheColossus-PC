@@ -770,8 +770,14 @@ private:
     void ApplyBackWd(const BackWd& wd);
     void WaitBackWritesSlow();
     void SubmitDraw(bool is_indexed, u32 index_offset);
+    /// sotc: prepass_mark >= 0: the SOTC_NO_PREPASS=3 mark of the op, already decided (SubmitIndirectRun).
     void SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u32 stride, u32 max_count,
-                            VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
+                            VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset,
+                            int prepass_mark = -1);
+    /// sotc: SOTC_DRAW_COALESCE. A run of DRAW_INDEX_INDIRECT packets with nothing between them (one state): each
+    /// stretch of consecutive records (offset step 0x14, one SOTC_NO_PREPASS=3 mark) is one op of max_count draws.
+    void SubmitIndirectRun(VAddr address, std::span<const u32> offsets, u16 vertex_sgpr_offset,
+                           u16 instance_sgpr_offset);
     void SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 size);
     /// sotc: SOTC_ASYNC_COMPUTE_XLATE: when the current dispatch's compute shader is new,
     /// queues the new compute shaders of the next dispatches in rest (the packets after it)

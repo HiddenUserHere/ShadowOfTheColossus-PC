@@ -61,6 +61,7 @@ uint64_t runtime_det_now_ns(void);          /* guest monotonic time since proces
 uint64_t runtime_det_realtime_ns(void);     /* guest wall clock (unix ns); advances */
 uint64_t runtime_det_from_unix_ns(uint64_t unix_ns); /* guest wall clock to virtual time, no advance */
 void runtime_det_advance_ns(uint64_t ns);   /* a sleep of ns: advances virtual time, clamped */
+int runtime_det_tsc_virtual(void); /* sotc: SOTC_DET_CLOCK with SOTC_DET_CLOCK_TSC=1 */
 uint64_t runtime_det_tsc(void);             /* rdtsc replacement (Win64 callable), in ns */
 uint64_t runtime_det_tsc_frequency(void);   /* 1000000000 */
 void runtime_det_report(void);

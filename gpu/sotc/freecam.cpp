@@ -294,9 +294,15 @@ float MaxSpeed() {
 }
 
 bool EngineFrameLine(float dt, std::string* line) {
+    // sotc: SOTC_DET_ROUTE: a fixed step per call, the same on every run. The engine calls this once per
+    // tick at SOTC_DET_ROUTE_TICK_HZ (default 60, twice per 30 FPS frame): 1/30 s per call ran the route twice as
+    // fast, and the game's own dt ran it faster still.
     if (SotcDetRoute::Enabled()) {
-        // sotc: SOTC_DET_ROUTE: every frame advances by the same step, not the game's wall-clock dt.
-        dt = 1.0f / static_cast<float>(SotcDetRoute::Fps());
+        static const float tick_hz = [] {
+            const float hz = EnvFloat("SOTC_DET_ROUTE_TICK_HZ", 60.0f);
+            return hz >= 1.0f ? hz : 60.0f;
+        }();
+        dt = 1.0f / tick_hz;
     }
     if (!(dt > 0.0f) || !std::isfinite(dt)) {
         dt = kFallbackDt;

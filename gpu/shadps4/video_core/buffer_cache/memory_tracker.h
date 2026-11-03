@@ -13,6 +13,7 @@
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA granule generations
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_trace.h" // sotc: SOTC_TRACE (redirty instants)
+#include "../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG (fresh regions)
 
 namespace VideoCore {
 
@@ -613,6 +614,9 @@ private:
                                  HIGHER_PAGE_SIZE, base_cpu_addr);
         }
         live_managers.push_back(new_manager);
+        // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG: the region is fresh (all CPU-dirty) and, with
+        // predrain, queued for an idle upload (region_predrain.h).
+        SotcRegionPredrain::NoteRegionCreated(page_index);
         return new_manager;
     }
 

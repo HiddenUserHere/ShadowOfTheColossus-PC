@@ -638,15 +638,15 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         }
     }
 
-    // sotc: SOTC_PRESENT_WAIT=1 paces the flips on the display (driver.cpp, vk_presenter.cpp).
-    // VK_KHR_present_wait needs VK_KHR_present_id. Both are enabled only when the switch is on
-    // and the device reports both features, so the default device is unchanged.
+    // sotc: SOTC_PRESENT_WAIT (on by default since 3 Nov 2026, =0 turns it off) paces the flips on the display
+    // (driver.cpp, vk_presenter.cpp). VK_KHR_present_wait needs VK_KHR_present_id. Both are enabled only when the
+    // switch is on and the device reports both features; any other device keeps the software vblank timer.
     const auto has_extension = [this](const char* name) {
         return std::find(available_extensions.begin(), available_extensions.end(), name) !=
                available_extensions.end();
     };
     const char* present_wait_env = std::getenv("SOTC_PRESENT_WAIT");
-    if (present_wait_env && present_wait_env[0] == '1') {
+    if (!present_wait_env || present_wait_env[0] != '0') {
         if (has_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
             has_extension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
             const vk::StructureChain present_chain = physical_device.getFeatures2<
@@ -665,7 +665,7 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
             }
         }
         if (!present_wait_enabled) {
-            LOG_WARNING(Render_Vulkan, "SOTC_PRESENT_WAIT=1 but VK_KHR_present_wait is not "
+            LOG_WARNING(Render_Vulkan, "SOTC_PRESENT_WAIT is on but VK_KHR_present_wait is not "
                                        "supported; the software vblank timer paces the flips");
         }
     }

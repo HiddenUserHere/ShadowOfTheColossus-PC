@@ -235,11 +235,13 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
             }
         }
         if (g_pending.size() >= kMaxPending) {
-            NoteDroppedUpload();
+            // sotc: kept in the overflow (see g_overflow), drained after the queue. Dropping them left the GPU
+            // copies over those bytes stale for good (broken particles in mode 1: 2.3M ranges dropped per route).
+            OverflowAdd(kind, at, at + piece);
             static bool logged = false;
             if (!logged) {
                 logged = true;
-                std::fprintf(stderr, "SOTC NATIVE upload queue full (%zu): announced ranges dropped\n",
+                std::fprintf(stderr, "SOTC NATIVE upload queue full (%zu): announced ranges kept in the overflow\n",
                              kMaxPending);
             }
         } else {

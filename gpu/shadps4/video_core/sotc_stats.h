@@ -731,6 +731,9 @@ inline std::atomic<uint64_t> readback_bytes_changed{0};
 /// sotc: BufferCache::ReleaseMemory's GPU sync (Finish, or Flush with SOTC_UNBIND_GPU_WAIT=1):
 /// calls and time (SOTC_FPS only).
 inline std::atomic<uint64_t> release_finish_count{0}, release_finish_ns{0};
+/// sotc: SOTC_UNBIND_DEFER: unmaps whose unbind was deferred, and deferred unbinds that a bind of their blocks had to
+/// wait for (Scheduler::WaitSubmitted on the draw thread), with that wait.
+inline std::atomic<uint64_t> unbind_deferred{0}, unbind_forced{0}, unbind_forced_ns{0};
 /// sotc: time the guest thread waits in BufferCache::DropGpuModified. The default (SOTC_DROP_ASYNC
 /// unset) waits for the command processor; SOTC_DROP_ASYNC=1 (experimental, off) orders the drop
 /// with the stream instead, and this stays 0. SOTC_FPS only.
@@ -738,6 +741,8 @@ inline std::atomic<uint64_t> drop_gpu_wait_ns{0};
 /// sotc: SOTC_DROP_FAST: unmaps dropped on the guest thread, and those that still waited
 /// (GPU-written pages in the range). Totals.
 inline std::atomic<uint64_t> drop_fast{0};
+/// sotc: SOTC_DROP_NATIVE: unmaps of GPU-written ranges forgotten on the guest thread instead of waited for.
+inline std::atomic<uint64_t> drop_native{0};
 /// sotc: SOTC_ASYNC_UPLOAD, totals: uploads copied by the copy threads and their bytes, the time
 /// submits waited for them, the guest writes / unmaps / frees that waited for a job (the write
 /// fence) and that time, and the large uploads kept on the draw thread (hot pages, no backing).

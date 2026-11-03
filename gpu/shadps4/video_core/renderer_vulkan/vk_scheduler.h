@@ -584,6 +584,10 @@ public:
     /// thread that queues work waiting for tick on the same queue must call this first: a wait
     /// queued before its signal blocks the queue for good. kick: the recording thread only.
     void WaitSubmitted(u64 tick, bool kick = true);
+    /// sotc: true when the submit of tick is queued (what WaitSubmitted waits for), without waiting.
+    [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
+        return !recorder || recorded_submit_tick.load(std::memory_order_acquire) >= tick;
+    }
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.

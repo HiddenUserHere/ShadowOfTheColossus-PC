@@ -140,6 +140,11 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable)) {
             x_pos = usable.x + usable.w - width_ - kMonitorMargin;
             y_pos = usable.y + usable.h - height_ - kMonitorMargin;
+            // sotc: SOTC_MONITOR_SLOT=n (default 0): the n-th window from the right, so parallel runs sit
+            // side by side instead of on top of each other.
+            if (const char* slot = std::getenv("SOTC_MONITOR_SLOT"); slot && *slot) {
+                x_pos -= std::atoi(slot) * (width_ + kMonitorMargin);
+            }
         }
     }
     SDL_PropertiesID props = SDL_CreateProperties();

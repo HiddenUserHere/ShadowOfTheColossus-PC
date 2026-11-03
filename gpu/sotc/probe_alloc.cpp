@@ -550,6 +550,23 @@ void RegisterAlloc() {
     SotcHooks::RegisterHandler("FREE_BLOCK", freed);
 }
 
+// sotc: SOTC_VSIZE_PROBE. The live tracked block holding addr (linear scan of the node table, under the
+// lock; the caller runs it once per buffer pair, not per bind).
+bool FindBlock(uint64_t addr, BlockInfo* out) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (const NodeEntry& e : g_nodes) {
+        if (e.key == 0 || e.base == 0 || addr < e.base || addr - e.base >= e.size) {
+            continue;
+        }
+        out->base = e.base;
+        out->size = e.size;
+        out->kind = g_pools[e.pool].kind;
+        std::snprintf(out->pool, sizeof out->pool, "%s", g_pools[e.pool].name);
+        return true;
+    }
+    return false;
+}
+
 void ReportAlloc(std::string& out, double seconds) {
     if (seconds <= 0.0) {
         seconds = 1.0;

@@ -63,12 +63,18 @@
 #include "video_core/sotc_arch/guest_barrier.h" // sotc: SOTC_BARRIER_GUEST report
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_draw_merge.h" // sotc: SOTC_DRAW_MERGE_STATS report
+#include "video_core/sotc_vertex_extent.h" // sotc: SOTC_VERTEX_EXTENT report
 #include "../../../../sotc/hooks.h"      // sotc: SotcHookStats::Report
 #include "../../../../sotc/write_decl.h" // sotc: SotcWriteDecl::Report
 #include "../../../../sotc/probe_prepass.h" // sotc: SOTC_PREPASS_PROBE report
+#include "../../../../sotc/probe_ops.h"      // sotc: SOTC_OPS_PROBE report (observe only)
 #include "../../../../sotc/probes.h"     // sotc: engine probe report lines
 #include "video_core/sotc_prepass_probe.h" // sotc: SOTC_PREPASS_PROBE depth readers report
 #include "../../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK report (plan step 6)
+#include "../../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG report
+#include "../../../../sotc/probe_xpr_groups.h" // sotc: SOTC_XPR_GROUPS report
+#include "video_core/sotc_draw_runs.h"         // sotc: SOTC_DRAW_RUNS report
+#include "../../../../sotc/probe_vsize.h"     // sotc: SOTC_VSIZE_PROBE report
 #include "../../../../sotc/pc_ring.h"     // sotc: SOTC_PC_RING report
 #include "../../../../sotc/native/native.h" // sotc: SOTC_NATIVE report
 #include "../../../../sotc/native/native_sync.h" // sotc: SOTC_NATIVE frame ticket report
@@ -113,6 +119,7 @@ uint64_t runtime_memory_chunk_opens_locked(void);
 #include "video_core/buffer_cache/buffer_cache.h"     // sotc: VideoCore::ReportReadbackRips (B6)
 #include "video_core/texture_cache/texture_cache.h"   // sotc: ReportImageFrees / ReportUnmapPark (B4/C5)
 #include "video_core/sotc_noprepass.h"                // sotc: SOTC_NO_PREPASS=2 report
+#include "video_core/sotc_shader_extent.h"            // sotc: SOTC_SHADER_EXTENT report
 
 // sotc: SOTC_TINY_ASYNC (vk_pipeline_cache.cpp).
 namespace Vulkan {
@@ -124,8 +131,10 @@ void ReportPipeDirty(std::string& out, double seconds); // sotc: SOTC_PIPE_DIRTY
 void ReportPipeFast(std::string& out, double seconds); // sotc: SOTC_PIPE_FAST
 void ReportOpSet(std::string& out, double seconds); // sotc: SOTC_OPSET_STATS
 void ReportPassStats(std::string& out, double seconds); // sotc: SOTC_PASS_STATS
+void ReportIndexExtent(std::string& out, double seconds); // sotc: SOTC_INDEX_EXTENT
 void ReportSpecMemo(std::string& out, double seconds); // sotc: SOTC_SPEC_MEMO
 void ReportPipeGpl(std::string& out, double seconds); // sotc: SOTC_PIPE_GPL
+void ReportHleCopyExact(std::string& out, double seconds); // sotc: SOTC_HLE_COPY_EXACT (vk_shader_hle.cpp)
 } // namespace Vulkan
 // sotc: src/runtime_kernel.c, SOTC USLEEP line (usleep histogram, SOTC_USLEEP_YIELD).
 extern "C" void runtime_usleep_stats(char* out, size_t size, double seconds);
@@ -1898,6 +1907,13 @@ void VideoOutDriver::Flip(const Request& req) {
                              drop_ns / 1e6, static_cast<unsigned long long>(lock_sleeps),
                              freeze_ns / 1e6);
             }
+            // sotc: SOTC_UNBIND_DEFER: unbinds deferred instead of waited for, and the ones a rebind had to wait for.
+            if (const uint64_t deferred = SotcStats::unbind_deferred.exchange(0, std::memory_order_relaxed)) {
+                ReportPrintf(report, "SOTC unbind defer: %llu deferred, %llu forced by a rebind (%.2f ms waited)\n",
+                             static_cast<unsigned long long>(deferred),
+                             static_cast<unsigned long long>(SotcStats::unbind_forced.exchange(0)),
+                             SotcStats::unbind_forced_ns.exchange(0) / 1e6);
+            }
             // sotc: async readbacks whose data went stale and were read back again synchronously.
             {
                 const u64 replaced = SotcStats::shader_cache_replaced.exchange(0);
@@ -2099,6 +2115,11 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::drop_fast_late_ibs.load(std::memory_order_relaxed)));
             }
+            // sotc: SOTC_DROP_NATIVE: unmaps of GPU-written ranges that did not wait for the draw thread.
+            if (const uint64_t native = SotcStats::drop_native.load(std::memory_order_relaxed)) {
+                ReportPrintf(report, "SOTC drop native %llu (GPU-written ranges forgotten without a wait)\n",
+                             static_cast<unsigned long long>(native));
+            }
             {
                 // sotc: SOTC_EOP_TICK labels: written, mean/max time from queue to write, flushes.
                 const uint64_t n = AmdGpu::g_eop_written.exchange(0);
@@ -2235,6 +2256,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcHookStats::Report(report, seconds);
             SotcNoPrepass::Report(report, seconds); // sotc: SOTC_NO_PREPASS=2 (measurement only)
             SotcProbes::ReportPrepassProbe(report, seconds); // sotc: SOTC_PREPASS_PROBE (observe only)
+            SotcProbes::ReportOpsProbe(report, seconds);     // sotc: SOTC_OPS_PROBE (observe only)
             SotcPrepassProbe::ReportReaders(report);         // sotc: SOTC_PREPASS_PROBE (depth readers)
             SotcPrepassProbe::ReportArgs(report);            // sotc: SOTC_PREPASS_PROBE (XPR records)
             SotcPrepassProbe::ReportSkip(report);            // sotc: SOTC_NO_PREPASS=1
@@ -2276,6 +2298,11 @@ void VideoOutDriver::Flip(const Request& req) {
             if (Vulkan::DescriptorHeapActive()) { // sotc: SOTC_DESCRIPTOR_HEAP (phase 1 counters)
                 char heap_line[256];
                 if (Vulkan::DescriptorHeapReport(heap_line, sizeof heap_line) != 0) {
+                    report += heap_line;
+                    report += '\n';
+                }
+                // sotc: the ring waits by cause (wrap onto the open tick, host time), per second.
+                if (Vulkan::DescriptorHeapWaitReport(heap_line, sizeof heap_line, seconds) != 0) {
                     report += heap_line;
                     report += '\n';
                 }
@@ -2356,6 +2383,12 @@ void VideoOutDriver::Flip(const Request& req) {
                 }
             }
             SotcMemClasses::Report(report, seconds);
+            SotcRegionPredrain::Report(report, seconds); // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG
+            SotcXprGroups::Report(report, seconds);      // sotc: SOTC_XPR_GROUPS (XPR draw groups, 5 s)
+            SotcDrawRuns::Report(report, seconds);       // sotc: SOTC_DRAW_RUNS (indirect draw runs, 5 s)
+            SotcVsizeProbe::Report(report, seconds);     // sotc: SOTC_VSIZE_PROBE (unbounded binds, 5 s)
+            SotcVertexExtent::Report(report, seconds);   // sotc: SOTC_VERTEX_EXTENT (only while it is on)
+            SotcShaderExtent::Report(report, seconds);   // sotc: SOTC_SHADER_EXTENT (limited binds, 5 s)
             SotcPcPlaceGlue::Global().Report(report, seconds); // sotc: SOTC_PC_PLACE / SOTC_PC_RECYCLE
             // sotc: Wave C optimizations, each prints only while its switch is on.
             SotcAreaPrewarm::ReportAreaPrewarm(report, seconds); // SOTC_AREA_PREWARM >= 2
@@ -2364,9 +2397,11 @@ void VideoOutDriver::Flip(const Request& req) {
             Vulkan::ReportPipeFast(report, seconds); // SOTC_PIPE_FAST
             Vulkan::ReportOpSet(report, seconds);    // sotc: SOTC_OPSET_STATS
             Vulkan::ReportPassStats(report, seconds); // sotc: SOTC_PASS_STATS
+            Vulkan::ReportIndexExtent(report, seconds); // sotc: SOTC_INDEX_EXTENT (prints only when on)
             Vulkan::ReportSpecMemo(report, seconds); // SOTC_SPEC_MEMO
             Shader::ReportBindlessCache(report, seconds); // SOTC_BINDLESS_CACHE_VERIFY
             Vulkan::ReportPipeGpl(report, seconds); // SOTC_PIPE_GPL
+            Vulkan::ReportHleCopyExact(report, seconds); // sotc: SOTC_HLE_COPY_EXACT (prints only when on)
             AmdGpu::ReportCpLabelSkip(report, seconds);           // SOTC_CP_LABEL_SKIP
             SotcLabels::ReportLabels(report, seconds);            // SOTC_LABELS_HONEST
             // sotc: Wave D probes and optimizations (docs/re-stutters/reports2/00-PLAN.md); each
@@ -3067,7 +3102,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     u64 last_flip_vblank = 0;
     bool flipped = false;
 
-    // sotc: SOTC_PRESENT_WAIT=1 locks the flips to the display (vk_presenter.cpp tags each present
+    // sotc: SOTC_PRESENT_WAIT (on by default) locks the flips to the display (vk_presenter.cpp tags each present
     // with an id, vk_swapchain.cpp forces FIFO). The timer above still sets the cadence; the
     // display gate only holds a flip until an earlier present is on screen:
     //   - after presenting id N, the next flip waits for id N - k + 1, where k is the number of
@@ -3077,11 +3112,15 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     //     60 / (flip rate + 1). Until 4 intervals are known, k is 1;
     //   - the gate waits at most 100 ms, then the flip goes out on the timer (the fallback);
     //   - each tick waits at most one vblank for it, so this thread keeps counting vblanks.
-    // Off by default: nothing below runs. Async present (FSR 3 frame generation) has no gate,
-    // since its present id is taken after Flip returns.
+    // On by default since 3 Nov 2026 (SOTC_PRESENT_WAIT=0 turns it off): the software vblank timer is not in step
+    // with the display (a 59 Hz monitor against the 120 Hz timer), and a 30 FPS flip near the edge of a display
+    // vblank stayed one refresh more on screen now and then (a repeated frame, uneven animation). Late frames
+    // were 0.4% with it against 1.6-4.4% without it in the Lab sessions of 2-3 Nov. A device without
+    // VK_KHR_present_wait keeps the timer (vk_instance.cpp: no present is tagged, the gate stays open). Async
+    // present (FSR 3 frame generation) has no gate, since its present id is taken after Flip returns.
     static const bool present_wait = [] {
         const char* v = std::getenv("SOTC_PRESENT_WAIT");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     constexpr u64 present_wait_timeout_ns = 100'000'000;
     u64 gate_id = 0;       // the present the next flip waits for, 0 for none

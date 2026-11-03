@@ -428,13 +428,13 @@ public:
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
-    /// sotc: VK_KHR_present_id and VK_KHR_present_wait are enabled by SOTC_PRESENT_WAIT=1. The
+    /// sotc: VK_KHR_present_id and VK_KHR_present_wait are enabled by SOTC_PRESENT_WAIT (on by default). The
     /// presenter tags each present with an id and can wait on them.
     bool IsPresentWaitEnabled() const {
         return present_wait_enabled;
     }
 
-    /// sotc: SOTC_PRESENT_WAIT=1 itself: FIFO is forced and the vblank thread paces the flips on
+    /// sotc: SOTC_PRESENT_WAIT itself: FIFO is forced and the vblank thread paces the flips on
     /// the presents.
     bool IsPresentWaitPacingEnabled() const {
         return present_wait_pacing;

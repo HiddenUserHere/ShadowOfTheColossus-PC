@@ -96,6 +96,51 @@ constexpr std::string GetBlobFileExtension(BlobType type) {
     }
 }
 
+void DataBase::SetVariant(std::string key) {
+    variant_key = std::move(key);
+}
+
+// sotc: the folder of a shader variant. `base/variant.key` names the variant a folder holds. A folder without it
+// (new, or written before the variants) takes the current one; another variant goes to `base_v<hash>`.
+static std::filesystem::path VariantFolder(const std::filesystem::path& base, const std::string& key) {
+    const auto held_key = [](const std::filesystem::path& dir) {
+        std::string held;
+        if (std::FILE* f = std::fopen((dir / "variant.key").string().c_str(), "rb")) {
+            char buf[512];
+            const size_t n = std::fread(buf, 1, sizeof buf, f);
+            std::fclose(f);
+            held.assign(buf, n);
+        }
+        return held;
+    };
+    const auto claim = [&key](const std::filesystem::path& dir) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (std::FILE* f = std::fopen((dir / "variant.key").string().c_str(), "wb")) {
+            std::fwrite(key.data(), 1, key.size(), f);
+            std::fclose(f);
+        }
+    };
+    const std::string held = held_key(base);
+    if (held == key) {
+        return base;
+    }
+    if (held.empty()) {
+        claim(base);
+        return base;
+    }
+    u64 hash = 0xcbf29ce484222325ull; // FNV-1a
+    for (const char c : key) {
+        hash = (hash ^ static_cast<u8>(c)) * 0x100000001b3ull;
+    }
+    auto path = base;
+    path += fmt::format("_v{:08x}", static_cast<u32>(hash ^ (hash >> 32)));
+    if (held_key(path) != key) {
+        claim(path);
+    }
+    return path;
+}
+
 void DataBase::Open() {
     if (opened) {
         return;
@@ -127,6 +172,9 @@ void DataBase::Open() {
                       (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "" : "_nodma") +
                       (EmulatorSettings.IsNoInt64() ? "_noi64" : "") +
                       (Libraries::Kernel::sceKernelIsNeoMode() ? "_neo" : ""));
+        if (!variant_key.empty()) {
+            cache_path = VariantFolder(cache_path, variant_key);
+        }
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }

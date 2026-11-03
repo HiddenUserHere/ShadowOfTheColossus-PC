@@ -20,6 +20,7 @@
 //                     cp10_setAreaLoaderState user, entry), switch SOTC_AREA_PREWARM
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace SotcProbes {
@@ -27,6 +28,14 @@ namespace SotcProbes {
 void RegisterXpr();
 void RegisterLoader();
 void RegisterAlloc();
+// sotc: SOTC_VSIZE_PROBE. The live block (ALLOC_BLOCK feed) that holds an address.
+struct BlockInfo {
+    uint64_t base = 0;
+    uint64_t size = 0;
+    int32_t kind = 0;   // 1 CPU, 2 GPU
+    char pool[48] = {}; // allocator name
+};
+bool FindBlock(uint64_t addr, BlockInfo* out); // probe_alloc.cpp; false when no tracked block holds addr
 void RegisterCvars();
 void RegisterArea();
 // sotc: PC memory model, wave B (docs/re-stutters/PC-MEMORY-REWRITE.md section 5).

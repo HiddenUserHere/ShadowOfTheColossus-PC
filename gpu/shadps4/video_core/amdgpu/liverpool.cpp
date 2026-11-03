@@ -25,6 +25,7 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/sotc_draw_runs.h" // sotc: SOTC_DRAW_RUNS (indirect draw run ceiling)
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "shader_recompiler/info.h"
@@ -47,6 +48,7 @@
 #include "video_core/amdgpu/draw_prep.h"
 #include "video_core/amdgpu/op_footprint.h" // sotc: SOTC_CULL_EXPRESS
 #include "../../../sotc/load_warm.h"     // sotc: SOTC_LOAD_WARM
+#include "../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN (idle upload of fresh regions)
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include <xmmintrin.h>
 
@@ -773,6 +775,30 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                                w->self->num_commands.load(std::memory_order_acquire) != 0;
                     },
                     &sctx);
+                if (calls != 0) {
+                    continue;
+                }
+            }
+            // sotc: SOTC_REGION_PREDRAIN: idle upload of the fresh 16 MiB regions (region_predrain.h).
+            if (SotcRegionPredrain::Enabled() && rasterizer && SotcRegionPredrain::HasWork()) {
+                struct PredrainCtx {
+                    Liverpool* self;
+                    u64 tail;
+                } pctx{this, tail};
+                const unsigned calls = SotcRegionPredrain::Idle(
+                    1'000'000, // 1 ms
+                    SotcStats::flip_count.load(std::memory_order_relaxed),
+                    [](void* c, std::uint64_t addr, std::uint64_t size) -> std::uint64_t {
+                        return static_cast<PredrainCtx*>(c)
+                            ->self->rasterizer->GetBufferCache()
+                            .PredrainRange(addr, size);
+                    },
+                    [](void* c) {
+                        auto* w = static_cast<PredrainCtx*>(c);
+                        return w->self->back_head.load(std::memory_order_acquire) != w->tail ||
+                               w->self->num_commands.load(std::memory_order_acquire) != 0;
+                    },
+                    &pctx);
                 if (calls != 0) {
                     continue;
                 }
@@ -1910,9 +1936,57 @@ void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
     BackPublish(back_strict && pipe_writes, pipe_writes);
 }
 
+void Liverpool::SubmitIndirectRun(VAddr address, std::span<const u32> offsets, u16 vertex_sgpr_offset,
+                                  u16 instance_sgpr_offset) {
+    constexpr u32 stride = sizeof(DrawIndexedIndirectArgs);
+    SotcDrawRuns::g_coalesce.runs.fetch_add(1, std::memory_order_relaxed);
+    SotcDrawRuns::g_coalesce.draws.fetch_add(offsets.size(), std::memory_order_relaxed);
+    if (offsets.size() == 1) {
+        SotcDrawRuns::g_coalesce.ops.fetch_add(1, std::memory_order_relaxed);
+        SubmitDrawIndirect(true, address, offsets[0], stride, 1, 0, vertex_sgpr_offset, instance_sgpr_offset);
+        return;
+    }
+    // The SOTC_NO_PREPASS=3 mark of every draw, in stream order (CpClassify keeps per-draw records): the run has one
+    // state, so one pipeline decides the discard test for all of them.
+    thread_local std::vector<u8> marks;
+    marks.assign(offsets.size(), 0);
+    if (SotcPrepassProbe::CpSkipMode()) {
+        const bool looks_up = !rasterizer->IsDrawFilteredOut();
+        const auto* pipeline = LookupAfterWrites(looks_up, [&] {
+            return rasterizer->LookupGraphicsPipeline(vertex_sgpr_offset, instance_sgpr_offset);
+        });
+        bool discard = false;
+        if (pipeline) {
+            for (const auto* st : pipeline->GetStages()) {
+                discard |= st && st->sw_stage == Shader::SwStage::Fragment && st->has_discard;
+            }
+        }
+        for (size_t i = 0; i < offsets.size(); ++i) {
+            marks[i] = SotcPrepassProbe::CpClassify(regs, address + offsets[i], pipeline != nullptr, discard);
+        }
+    }
+    // Stretches of consecutive records with one mark. A dropped draw (mark 1) is not submitted: its op would only be
+    // skipped by the draw thread.
+    for (size_t i = 0; i < offsets.size();) {
+        if (marks[i] == 1) {
+            SotcDrawRuns::g_coalesce.dropped.fetch_add(1, std::memory_order_relaxed);
+            ++i;
+            continue;
+        }
+        size_t end = i + 1;
+        while (end < offsets.size() && marks[end] == marks[i] && offsets[end] == offsets[end - 1] + stride) {
+            ++end;
+        }
+        SotcDrawRuns::g_coalesce.ops.fetch_add(1, std::memory_order_relaxed);
+        SubmitDrawIndirect(true, address, offsets[i], stride, static_cast<u32>(end - i), 0, vertex_sgpr_offset,
+                           instance_sgpr_offset, marks[i]);
+        i = end;
+    }
+}
+
 void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u32 stride,
                                    u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
-                                   u16 instance_sgpr_offset) {
+                                   u16 instance_sgpr_offset, int prepass_mark) {
     const OpCostScope op_cost{SotcArch::OpCost::Thread::CommandProcessor,
                               SotcArch::OpCost::Op::DrawIndirect}; // sotc: SOTC_OPCOST
     if (!back_threaded) {
@@ -1943,7 +2017,9 @@ void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u
     op.instance_sgpr_offset = instance_sgpr_offset;
     CaptureBackOp(op, pipeline);
     op.prepass_mark = 0;
-    if (SotcPrepassProbe::CpSkipMode() && max_count == 1 && count_address == 0) { // sotc: SOTC_NO_PREPASS=3
+    if (prepass_mark >= 0) { // sotc: SOTC_DRAW_COALESCE: decided per draw by SubmitIndirectRun
+        op.prepass_mark = static_cast<u8>(prepass_mark);
+    } else if (SotcPrepassProbe::CpSkipMode() && max_count == 1 && count_address == 0) { // sotc: SOTC_NO_PREPASS=3
         bool discard = false;
         if (pipeline) {
             for (const auto* st : pipeline->GetStages()) {
@@ -4065,7 +4141,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // sotc: mode 8 also runs OnSubmitStart (import and ring at the submit start, PcHostSubmitStart).
     // sotc: mode 8 always runs it (PcHostSubmitStart counts the draw-side submits: the dedupe key).
     // sotc: SOTC_NATIVE timing audit: the announce count at the pickup of this submit rides along (native.h).
-    if (pc_ring_top && rasterizer && (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8)) {
+    // sotc: SOTC_NATIVE drains its announced uploads there too (NativeDrain): with the ring off nothing drained, the
+    // queue filled and every later announce was lost (stale particle and mask data in mode 1).
+    if (pc_ring_top && rasterizer &&
+        (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8 || SotcNative::On())) {
         NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (host ring copy)
         BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); });
     }
@@ -4086,8 +4165,25 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    // sotc: SOTC_DRAW_COALESCE (sotc_draw_runs.h). DRAW_INDEX_INDIRECT packets that follow each other with nothing
+    // between them share every register, so they wait here and go out as one run (SubmitIndirectRun). Any other
+    // packet, an ordered command from a guest thread (queued at this point of the stream, so the run goes first),
+    // a nested command buffer or the end of this one sends the run before it is handled. Draw thread only.
+    const bool coalesce = SotcDrawRuns::kCoalesce && back_threaded && rasterizer;
+    std::vector<u32> coalesce_offsets;
+    VAddr coalesce_base = 0;
+    u16 coalesce_vtx = 0, coalesce_inst = 0;
+    const auto flush_run = [&] {
+        if (!coalesce_offsets.empty()) {
+            SubmitIndirectRun(coalesce_base, coalesce_offsets, coalesce_vtx, coalesce_inst);
+            coalesce_offsets.clear();
+        }
+    };
     while (!dcb.empty()) {
         func_kind_hint = 3; // sotc: SOTC_FPS accounting (ordered commands queued below)
+        if (!coalesce_offsets.empty() && num_ordered.load(std::memory_order_relaxed) != 0) {
+            flush_run(); // sotc: SOTC_DRAW_COALESCE, the run precedes the ordered commands queued now
+        }
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
@@ -4118,9 +4214,25 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 opcode == PM4ItOpcode::EventWriteEos)
                                  ? 1
                                  : 3;
+            // sotc: SOTC_DRAW_COALESCE, before this packet changes anything. A NOP does not end the run (the game
+            // puts debug markers and empty NOPs between its indirect draws; they change no state), except the patched
+            // flip.
+            if (!coalesce_offsets.empty() && opcode != PM4ItOpcode::DrawIndexIndirect) {
+                bool transparent = false;
+                if (opcode == PM4ItOpcode::Nop) {
+                    const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+                    transparent = nop->header.count.Value() == 0 ||
+                                  nop->data_block[0] != PM4CmdNop::PayloadType::PatchedFlip;
+                }
+                if (!transparent) {
+                    flush_run();
+                }
+            }
             if (wd_pending.num_segs && !FuseTransparent(header, opcode)) {
                 FlushWd();
             }
+            // sotc: SOTC_DRAW_RUNS (sotc_draw_runs.h): any packet but an indirect draw or a NOP ends a run.
+            SotcDrawRuns::NotePacket(opcode == PM4ItOpcode::DrawIndexIndirect, opcode == PM4ItOpcode::Nop);
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -4426,6 +4538,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     reinterpret_cast<const PM4CmdDrawIndexIndirect*>(header);
                 const auto offset = draw_index_indirect->data_offset;
                 const auto stride = sizeof(DrawIndexedIndirectArgs);
+                SotcDrawRuns::NoteIndirect(indirect_args_addr, offset); // sotc: SOTC_DRAW_RUNS
+                if (coalesce) { // sotc: SOTC_DRAW_COALESCE: held for the run (flush_run above)
+                    const u16 vtx = draw_index_indirect->base_vtx_loc, inst = draw_index_indirect->start_inst_loc;
+                    constexpr size_t kMaxRun = 4096;
+                    if (!coalesce_offsets.empty() &&
+                        (coalesce_base != indirect_args_addr || coalesce_vtx != vtx || coalesce_inst != inst ||
+                         coalesce_offsets.size() >= kMaxRun)) {
+                        flush_run();
+                    }
+                    if (coalesce_offsets.empty()) {
+                        coalesce_base = indirect_args_addr;
+                        coalesce_vtx = vtx;
+                        coalesce_inst = inst;
+                    }
+                    coalesce_offsets.push_back(offset);
+                    break;
+                }
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -5189,6 +5318,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         }
     }
 
+    flush_run(); // sotc: SOTC_DRAW_COALESCE: a run never spans two command buffers
     FlushWd(); // sotc: SOTC_WD_FUSE: nothing stays held back past the command buffer
 
     if (ce_task.handle) {
@@ -5224,7 +5354,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         PcRingAscDepth() : top(pc_ring_asc_depth++ == 0) {}
         ~PcRingAscDepth() { --pc_ring_asc_depth; }
     } const pc_ring_asc;
-    if (pc_ring_asc.top && rasterizer && (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8)) {
+    if (pc_ring_asc.top && rasterizer &&
+        (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8 || SotcNative::On())) { // sotc: as above
         NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (host ring copy)
         BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); });
     }
