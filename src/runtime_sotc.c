@@ -250,8 +250,16 @@ static ABI int32_t audio3d_object_reserve(uint32_t port, uint32_t *object) {
     *object=next++;
     return 0;
 }
+int runtime_audio_null(void);
+uint64_t runtime_audio_null_slot(uint64_t *next_ns, uint64_t period_ns);
+void runtime_audio_wait(uint64_t deadline_ns);
 static ABI int32_t audio3d_port_push(uint32_t port, int blocking) {
     (void)port;
+    if (runtime_audio_null()) { /* SOTC_NULL_AUDIO: each push is one 256-sample grain on the sink cadence */
+        static uint64_t next_grain_ns;
+        runtime_audio_wait(runtime_audio_null_slot(&next_grain_ns, 256u*1000000000u/48000u));
+        return 0;
+    }
     if (blocking) { /* one 256-sample grain at 48 kHz */
 #ifdef _WIN32
         Sleep(5);
@@ -400,12 +408,8 @@ static int32_t evf_wait_common(EventFlag *f, uint64_t bits, int mode, uint64_t *
     EventWaiter **tail=&f->waiters;
     while (*tail) tail=&(*tail)->next;
     *tail=&w;
-    struct timespec deadline;
-    if (timeout) {
-        clock_gettime(CLOCK_REALTIME,&deadline);
-        uint64_t ns=(uint64_t)deadline.tv_nsec+(uint64_t)*timeout*1000u;
-        deadline.tv_sec+=(time_t)(ns/1000000000u); deadline.tv_nsec=(long)(ns%1000000000u);
-    }
+    RuntimeWait wait={0}; /* sotc: SOTC_DET_CLOCK: the timeout follows the virtual clock */
+    if (timeout) runtime_wait_relative(&wait,CLOCK_REALTIME,*timeout);
     int timed_out=0, reported=0;
     while (!w.ready && !w.canceled && !w.deleted) {
         if (!timeout) {
@@ -418,7 +422,7 @@ static int32_t evf_wait_common(EventFlag *f, uint64_t bits, int mode, uint64_t *
                         reported*5,(unsigned long long)bits,mode,(unsigned long long)f->bits);
             }
         }
-        else if (pthread_cond_timedwait(&w.cv,&f->lock,&deadline)==ETIMEDOUT && !w.ready && !w.canceled && !w.deleted) {
+        else if (runtime_wait_cond(&wait,&w.cv,&f->lock)==ETIMEDOUT && !w.ready && !w.canceled && !w.deleted) {
             timed_out=1; break;
         }
     }
@@ -431,12 +435,22 @@ static int32_t evf_wait_common(EventFlag *f, uint64_t bits, int mode, uint64_t *
     if (w.deleted) return KERNEL_ERROR(E_ACCES);
     return 0;
 }
+/* sotc: SOTC_FRAME_METRICS (gpu/shim/sotc_frame_metrics.cpp): the time of every event flag wait,
+ * from any guest thread. Weak, like trace.h: builds without the GPU library record nothing. */
+int bbgpu_frame_metrics_enabled(void) __attribute__((weak));
+void bbgpu_frame_metrics_game_wait(uint64_t ns) __attribute__((weak));
+static uint64_t fm_mono_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec;
+}
 static ABI int32_t evf_wait(EventFlag *f, uint64_t bits, uint32_t mode, uint64_t *result, uint32_t *timeout) {
     if (f && f->traced) fprintf(stderr,"EVF wait %p 0x%llx mode 0x%x (bits 0x%llx) from %p thread %lu\n",(void *)f,
                                 (unsigned long long)bits,mode,(unsigned long long)f->bits,(void *)(uintptr_t)GUEST_CALLER(),
                                 (unsigned long)get_thread_id());
     const uint64_t t0=trace_now(); /* sotc: SOTC_TRACE */
+    const uint64_t fm0=(bbgpu_frame_metrics_enabled && bbgpu_frame_metrics_enabled()) ? fm_mono_ns() : 0;
     int32_t r=evf_wait_common(f,bits,(int)mode,result,timeout,0);
+    if (fm0) bbgpu_frame_metrics_game_wait(fm_mono_ns()-fm0);
     trace_span("evf wait",t0,bits,(uint64_t)GUEST_CALLER());
     if (f && f->traced) fprintf(stderr,"EVF woke %p -> 0x%x thread %lu\n",(void *)f,(unsigned)r,(unsigned long)get_thread_id());
     return r;

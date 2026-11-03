@@ -53,4 +53,14 @@ private:
     WindowSystemInfo window_info{};
 };
 
+/// sotc: SOTC_HEADLESS=1 (read once): the game window is created hidden and never takes the focus
+/// or the mouse; rendering and presentation go on as usual (see window.cpp). SOTC_HEADLESS=2
+/// (monitor) is headless too, but the window is shown in a corner, still without the focus.
+bool IsHeadless();
+/// sotc: SOTC_HEADLESS=2 (read once): the game window is a small visible monitor window, and the
+/// performance overlay is always on. It takes no keys and no mouse (bbport_overlay.cpp).
+bool IsMonitor();
+/// sotc: the HWND of the headless window under SOTC_HEADLESS (Windows), nullptr otherwise.
+void* HeadlessWindowHwnd();
+
 } // namespace Frontend

@@ -63,6 +63,7 @@ static void from_tick(uint64_t tick, DateTime *t) {
     t->microsecond=(uint32_t)(us%1000000u);
 }
 static uint64_t now_utc(void) {
+    if (runtime_det_clock_on()) return UNIX_EPOCH_TICKS+runtime_det_realtime_ns()/1000u; /* sotc: SOTC_DET_CLOCK */
     struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
     return UNIX_EPOCH_TICKS+(uint64_t)ts.tv_sec*1000000u+(uint64_t)ts.tv_nsec/1000u;
 }

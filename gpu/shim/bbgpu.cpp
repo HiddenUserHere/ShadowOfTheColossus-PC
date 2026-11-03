@@ -1,3 +1,5 @@
+#include "video_core/renderer_vulkan/sotc_frame_hash.h" // sotc: flushed before _Exit
+#include "video_core/sotc_frame_metrics.h" // sotc: flushed before _Exit
 #include "bbport_write_log.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
@@ -475,6 +477,9 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         }
         // sotc: write the pipelines still queued for the cache before leaving.
         Storage::DataBase::Instance().Close();
+        // sotc: offline runs (SOTC_FRAME_HASH, SOTC_FRAME_METRICS): their files end at the last frame.
+        Vulkan::SotcFrameHash::DrainActive(500);
+        SotcFrameMetrics::FlushAll();
         std::fflush(stdout);
         std::_Exit(0);
     });

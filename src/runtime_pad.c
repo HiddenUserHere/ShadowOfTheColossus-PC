@@ -63,7 +63,9 @@ static SDL_Gamepad *gamepad;
 static size_t reads;
 static uint8_t connected_count;
 
-static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
+static uint64_t now_us(void) {
+    if (runtime_det_clock_on()) return runtime_det_now_ns()/1000; /* sotc: SOTC_DET_CLOCK */
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
 static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
 static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
 static uint16_t touch_axis(float v, int max) {
@@ -371,6 +373,14 @@ static void sample_host(PadData *d) {
     SDL_Gamepad *g=current_gamepad();
     if (!bindings_ready) { load_bindings(); bindings_ready=1; }
     if (bbgpu_overlay_captures_input()) return; /* settings menu open: neutral input */
+    /* sotc: SOTC_DET_ROUTE (deterministic Lab route): hardware pad, keyboard and mouse stay out of the
+     * unattended run. Lab injection (sample(): read_inject, replay) still applies after this. */
+    static int det_route=-1;
+    if (det_route<0) {
+        const char *dv=getenv("SOTC_DET_ROUTE");
+        det_route=dv && *dv && strcmp(dv,"0")!=0;
+    }
+    if (det_route) return;
     if (bbgpu_freecam_captures_input()) {
         /* sotc: SotC Lab free-cam flying: neutral input for the game; the gamepad drives the camera.
          * Mouse motion is read by the free-cam from SDL events, so drain it here (no jump later). */

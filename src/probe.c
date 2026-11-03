@@ -1363,6 +1363,11 @@ void runtime_call_on_host_stack(void (*fn)(void *), void *arg) { fn(arg); }
  * check. */
 static void *tsc_clock;
 static void choose_tsc(void) {
+    if (runtime_det_clock_on() && getenv("SOTC_DET_CLOCK_TSC")) { /* sotc: SOTC_DET_CLOCK_TSC=1: rdtsc reads the virtual clock too (off: the game crashed in a HUD formatter at the route start, 3 Nov) */
+        puts("Runtime: SOTC_DET_CLOCK: the game's rdtsc reads the virtual clock");
+        tsc_clock=(void *)runtime_det_tsc;
+        return;
+    }
     const char *mode=getenv("SOTC_TSC");
     if (mode && !strcmp(mode,"native")) return;
     if (!mode || strcmp(mode,"qpc")) {

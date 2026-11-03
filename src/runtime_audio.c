@@ -61,7 +61,71 @@ static void sleep_until(uint64_t deadline) {
     while (clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&t,NULL)) {}
 #endif
 }
+/* SOTC_NULL_AUDIO=1: no sound device. The game's buffers are accepted and dropped, but the
+ * blocking calls keep the cadence of a real sink. With SOTC_DET_CLOCK=1 as well, that cadence
+ * runs on the deterministic clock det_now_ns() (provided by the virtual-clock module; weak, so
+ * the real clock is used when it is not linked). Both switches are read once. Off: unused. */
+extern uint64_t det_now_ns(void) __attribute__((weak));
+static int null_sink(void) {
+    static int on=-1;
+    if (on<0) { const char *e=getenv("SOTC_NULL_AUDIO"); on = e && e[0]=='1'; }
+    return on;
+}
+static int virtual_sink(void) {
+    static int on=-1;
+    if (on<0) {
+        const char *e=getenv("SOTC_DET_CLOCK");
+        on = null_sink() && e && e[0]=='1' && (const void *)det_now_ns!=NULL;
+    }
+    return on;
+}
+static uint64_t run_now_ns(void) { return virtual_sink() ? det_now_ns() : now_ns(); }
+static void nap_1ms(void) {
+#ifdef _WIN32
+    compat_sleep_ns(1000000);
+#else
+    struct timespec t={0,1000000};
+    nanosleep(&t,NULL);
+#endif
+}
+/* Virtual clock: nap in 1 ms steps until det time reaches the deadline. The clock moves per
+ * frame, so a wait with no movement for 10 s of real time gives up (counted in
+ * runtime_audio_report) instead of holding the audio thread behind a frame that cannot come. */
+static unsigned long virtual_stalls;
+static void wait_virtual(uint64_t deadline) {
+    uint64_t last=det_now_ns(), last_real=now_ns();
+    for (;;) {
+        uint64_t t=det_now_ns();
+        if (t>=deadline) return;
+        if (t!=last) { last=t; last_real=now_ns(); }
+        else if (now_ns()-last_real>10000000000u) { ++virtual_stalls; return; }
+        nap_1ms();
+    }
+}
+int runtime_audio_null(void) { return null_sink(); }
+/* Null sink cadence (also used by the Audio3d grains in runtime_sotc.c): returns the deadline of
+ * the next period and advances *next_ns. A caller that falls a long way behind restarts the
+ * cadence instead of bursting. The caller waits with runtime_audio_wait, holding no lock. */
+uint64_t runtime_audio_null_slot(uint64_t *next_ns, uint64_t period_ns) {
+    static pthread_mutex_t slot_lock=PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&slot_lock);
+    uint64_t now=run_now_ns();
+    if (!*next_ns || now>*next_ns+8*period_ns) *next_ns=now;
+    uint64_t deadline=*next_ns;
+    *next_ns+=period_ns;
+    pthread_mutex_unlock(&slot_lock);
+    return deadline;
+}
+void runtime_audio_wait(uint64_t deadline_ns) {
+    if (virtual_sink()) wait_virtual(deadline_ns);
+    else sleep_until(deadline_ns);
+}
+
 static int sdl_audio(void) {
+    if (sdl_ready<0 && null_sink()) {
+        sdl_ready=0;
+        printf("Runtime: audio backend silent (SOTC_NULL_AUDIO%s)\n", virtual_sink() ? ", virtual clock" : "");
+    }
     if (sdl_ready<0) {
         const char *mode=getenv("BB_AUDIO");
         sdl_ready = (!mode || strcmp(mode,"none")) && SDL_InitSubSystem(SDL_INIT_AUDIO);
@@ -191,6 +255,7 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
     pthread_mutex_lock(&p->lock);
     size_t samples=(size_t)p->frames*(size_t)p->channels, bytes=samples*(size_t)p->sample_bytes;
     uint64_t period=(uint64_t)p->frames*1000000000u/48000u;
+    uint64_t wait_deadline=0; /* null sink: waited on after the port lock is released */
     if (data) {
         /* Apply per-channel volume and map PS4 8ch (L R C LFE SL SR BL BR) to SDL 7.1 order. */
         unsigned char converted[2048*8*4];
@@ -230,11 +295,13 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
                 p->stat_start_ns=now; p->stat_max_gap_ns=0; p->stat_starved=0; p->stat_buffers=0; p->stat_min_queued=1<<30;
             }
         }
-        if (pace) {
+        if (pace && !null_sink()) {
             uint64_t now=now_ns();
             if (!p->next_deadline_ns || now>p->next_deadline_ns+8*period) p->next_deadline_ns=now; /* start or stall: restart cadence */
             else sleep_until(p->next_deadline_ns);
             p->next_deadline_ns+=period;
+        } else if (pace) {
+            wait_deadline=runtime_audio_null_slot(&p->next_deadline_ns,period);
         }
         if (p->stream) {
             /* The device drains the queue in quanta (21 ms on PipeWire), so the level
@@ -255,8 +322,9 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
         }
         ++buffers_out;
     }
-    p->last_output_us=now_ns()/1000;
+    p->last_output_us=(wait_deadline ? wait_deadline : run_now_ns())/1000;
     pthread_mutex_unlock(&p->lock);
+    if (wait_deadline) runtime_audio_wait(wait_deadline);
     return data ? (int32_t)samples : 0;
 }
 static ABI int32_t audio_output(int32_t handle, const void *data) { return output_port(handle,data,1); }
@@ -317,4 +385,7 @@ static const RuntimeExport exports[]={
     {"sceAudioOutGetLastOutputTime",audio_last_time},
 };
 uintptr_t runtime_audio_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
-void runtime_audio_report(void) { printf("Runtime: audio ports opened=%zu, buffers output=%zu\n",ports_opened,buffers_out); }
+void runtime_audio_report(void) {
+    printf("Runtime: audio ports opened=%zu, buffers output=%zu\n",ports_opened,buffers_out);
+    if (virtual_stalls) printf("Runtime: audio virtual-clock waits given up (no clock movement for 10 s): %lu\n",virtual_stalls);
+}

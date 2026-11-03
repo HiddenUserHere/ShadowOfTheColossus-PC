@@ -175,6 +175,7 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_TUNING_JSON=<arquivo>` | `out/tuning.json` lido pelo menu do SotC Lab para montar a aba SOTC_* |
 | `SOTC_BOOT_BOSS=N` | abre o jogo direto no colosso N (1 a 16) |
 | `SOTC_LAB_ORCH_CMD=<comando>` | comando que o menu usa para iniciar o orquestrador (padrão `python tools/sotc_matrix.py`) |
+| `SOTC_DETERMINISTIC=1` | modo de teste offline: sem janela, relógio virtual, som nulo e rota do Lab por quadro; comparação de configurações com `tools/offline_matrix.py`. Ver [OFFLINE-TESTS.md](OFFLINE-TESTS.md) |
 
 ### Trace automático (SOTC_TRACE)
 

@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -43,6 +44,9 @@ struct Frame {
     u8 id{};
     /// sotc: this frame without the HUD (Rasterizer::TakeHudless) for frame generation, or null.
     Frame* hudless{};
+    /// sotc: SOTC_FRAME_HASH, the guest flip number this frame is presented as (set by the video
+    /// out driver before the present job; 0 for frames it did not flip).
+    u64 sotc_flip_index{};
 
     ImTextureID imgui_texture;
 };
@@ -54,6 +58,7 @@ enum SchedulerType {
 };
 
 class Rasterizer;
+struct SotcFrameHashRing; // sotc: SOTC_FRAME_HASH, defined in vk_presenter.cpp
 
 class Presenter {
 public:
@@ -201,6 +206,10 @@ private:
 
     void SetExpectedGameSize(s32 width, s32 height);
 
+    /// sotc: SOTC_FRAME_HASH. Records the downscale and readback of the game image of `frame`
+    /// into `cmdbuf` (the present command buffer), right after the blit to the swapchain.
+    void RecordFrameHash(const vk::CommandBuffer& cmdbuf, const Frame* frame);
+
 private:
     float expected_ratio{1920.0 / 1080.0f};
     u32 expected_frame_width{1920};
@@ -243,6 +252,10 @@ private:
     std::atomic<u64> last_present_id{0};         ///< sotc: SOTC_PRESENT_WAIT, see LastPresentId
     mutable std::mutex present_records_mutex;    ///< sotc: guards present_records
     std::array<PresentRecord, 64> present_records{}; ///< sotc: indexed by id % 64
+    /// sotc: SOTC_FRAME_HASH, see SotcFrameHashRing. Created by the first game frame recorded;
+    /// null while off, or when the GPU cannot blit the swapchain format (sotc_frame_hash_tried).
+    std::shared_ptr<SotcFrameHashRing> sotc_frame_hash;
+    bool sotc_frame_hash_tried{};
 };
 
 /// sotc: SOTC_FPS (B5). Appends one line per window: the draw thread's flip wait split by cause

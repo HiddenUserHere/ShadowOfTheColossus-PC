@@ -43,11 +43,6 @@ static void host_check(int e) {
 #else
 #define WAIT_CLOCK CLOCK_MONOTONIC
 #endif
-static uint64_t now_ns(void) {
-    struct timespec t;
-    if (clock_gettime(WAIT_CLOCK,&t)) { perror("clock_gettime"); exit(1); }
-    return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec;
-}
 static ABI int32_t sem_create(uint32_t *out,const char *name,uint32_t attr,
                               int32_t initial,int32_t maximum,const void *options) {
     if (!out || !name || attr>2 || initial<0 || maximum<=0 || initial>maximum) return ERR(22);
@@ -84,10 +79,10 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
         Waiter **tail=&s->first;
         while (*tail) tail=&(*tail)->next;
         *tail=&w; ++s->active;
-        uint64_t deadline=timeout ? now_ns()+(uint64_t)*timeout*1000 : 0;
-        struct timespec end={.tv_sec=(time_t)(deadline/1000000000),.tv_nsec=(long)(deadline%1000000000)};
+        RuntimeWait wait={0};
+        if (timeout) runtime_wait_relative(&wait,WAIT_CLOCK,*timeout);
         while (!w.done) {
-            int e=timeout ? pthread_cond_timedwait(&w.event,&lock,&end) : pthread_cond_wait(&w.event,&lock);
+            int e=timeout ? runtime_wait_cond(&wait,&w.event,&lock) : pthread_cond_wait(&w.event,&lock);
             if (e==ETIMEDOUT && !w.done) {
                 Waiter **p=&s->first;
                 while (*p!=&w) p=&(*p)->next;
@@ -96,10 +91,7 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
         }
         result=w.result;
         if (!result) ++acquired;
-        if (timeout) {
-            uint64_t now=now_ns();
-            *timeout=result ? 0 : (uint32_t)(now>=deadline ? 0 : (deadline-now)/1000);
-        }
+        if (timeout) *timeout=result ? 0 : runtime_wait_remaining_us(&wait);
         host_check(pthread_cond_destroy(&w.event));
         if (!--s->active && s->deleted) free(s);
     }

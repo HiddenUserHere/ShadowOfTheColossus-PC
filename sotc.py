@@ -37,6 +37,13 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       negative keeps it open). The log gets "SOTC LAB ROUTE done: ..." with the stats
     user/lab_pending_env.json  restart-only settings queued by the lab ({"env": {..}, "boss": n});
                       merged into this launch once, then deleted
+    SOTC_DETERMINISTIC  1: the offline test mode (docs/sotc/OFFLINE-TESTS.md). Sets the defaults of
+                      SOTC_DET_CLOCK, SOTC_DET_FLIP, SOTC_HEADLESS (2: a small monitor window that shows
+                      the FPS overlay; 1: no window), SOTC_FPS (1: the FPS overlay and its counters),
+                      SOTC_DET_ROUTE, SOTC_NULL_AUDIO, SOTC_DET_IO and SOTC_LAB (with
+                      SOTC_LAB_ROUTE=user/routes/new-route.json), and turns the 30 FPS cap off
+                      (SOTC_FPS_CAP=off). Each one is a setdefault: an explicit value (environment or
+                      sotc.ini) still wins.
 The image is prepared again only when the game, the modules or the scripts change.
 Extra arguments go to bb-probe.exe. Run from a console, the session is also saved to
 <user>/last_run.log (the 4 before it as last_run.1.log ... last_run.4.log; a crash's log is
@@ -61,6 +68,13 @@ BOSS_PLAN = 'route_bossjump.txt'       # in the game folder while a boss boot ru
 BOSS_CVARS = 'nointro RetailBuild=0 automate_loadfile(route_bossjump.txt) automate_go'
 BOSS_PAD = 'lab_boss_pad.txt'          # the pad file (BB_PAD_FILE) that holds Cross for the boss boot
 GAMEFLOW_MARK = 'st_gameflow() starting game'
+# SOTC_DETERMINISTIC=1 (the offline test mode, docs/sotc/OFFLINE-TESTS.md): defaults only, so an explicit
+# value in the environment or sotc.ini wins.
+DETERMINISTIC_DEFAULTS = {
+    'SOTC_DET_CLOCK': '1', 'SOTC_DET_FLIP': '1', 'SOTC_HEADLESS': '2', 'SOTC_FPS': '1',
+    'SOTC_DET_ROUTE': '1', 'SOTC_NULL_AUDIO': '1', 'SOTC_DET_IO': '1', 'SOTC_LAB': '1',
+    'SOTC_LAB_ROUTE': 'user/routes/new-route.json', 'SOTC_FPS_CAP': 'off',
+}
 
 
 def fail(message):
@@ -223,6 +237,10 @@ def hold_cross(pad, log, stop):
 def main():
     load_ini()
     env = os.environ
+    if env.get('SOTC_DETERMINISTIC', '0') not in ('', '0'):
+        # Before the lab switches below (SOTC_LAB is one of the defaults).
+        for name, value in DETERMINISTIC_DEFAULTS.items():
+            env.setdefault(name, value)
     os.chdir(PORT)
     out = PORT / 'out'
     out.mkdir(exist_ok=True)

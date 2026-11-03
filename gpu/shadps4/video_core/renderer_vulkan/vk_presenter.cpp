@@ -18,9 +18,13 @@
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
+#include "video_core/sotc_det_flip.h" // sotc: SOTC_DET_FLIP (the flip waits for its frame's GPU work)
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/amdgpu/liverpool.h"   // sotc: SOTC_FRAME_METRICS (QueuedOps)
+#include "video_core/sotc_frame_metrics.h" // sotc: SOTC_FRAME_METRICS
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/sotc_frame_hash.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_live.h"
@@ -636,6 +640,195 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     painter.join();
 }
 
+/// sotc: SOTC_FRAME_HASH. The game image of a game frame, downscaled on the GPU to
+/// SotcFrameHash::kWidth x kHeight RGBA8 (a linear vkCmdBlitImage) in the present command buffer,
+/// copied to a host-visible buffer of a ring of kSlots, and handed to the SotcFrameHash::Sink
+/// from the scheduler's deferred-operation thread once that copy is done (the completion point the
+/// screenshots use). A slot still in use when its turn comes skips its frame (written as "skip"),
+/// so the render thread never waits for the GPU or the disk.
+struct SotcFrameHashRing : std::enable_shared_from_this<SotcFrameHashRing> {
+    static constexpr u32 kSlots = 3;
+    static constexpr u32 kWidth = SotcFrameHash::kWidth;
+    static constexpr u32 kHeight = SotcFrameHash::kHeight;
+    static constexpr u64 kBytes = u64{kWidth} * kHeight * 4;
+
+    struct Slot {
+        vk::Image image{};
+        VmaAllocation allocation{};
+        VideoCore::Buffer buffer;
+        /// Set when recorded, cleared by Complete (deferred op, after the GPU is done with it).
+        std::atomic<bool> busy{false};
+
+        explicit Slot(const Instance& instance)
+            : buffer{instance, 0, kBytes, VideoCore::MemoryType::HostCached} {}
+    };
+
+    /// Null when the swapchain format cannot be blitted or an image cannot be created (logged).
+    static std::shared_ptr<SotcFrameHashRing> Create(const Instance& instance,
+                                                     const vk::Format source_format) {
+        const auto physical = instance.GetPhysicalDevice();
+        const auto src_props = physical.getFormatProperties(source_format);
+        const auto dst_props = physical.getFormatProperties(vk::Format::eR8G8B8A8Unorm);
+        if (!(src_props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eBlitSrc) ||
+            !(dst_props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eBlitDst)) {
+            LOG_ERROR(Render_Vulkan, "SOTC_FRAME_HASH: no blit for {} to RGBA8, hashing is off",
+                      vk::to_string(source_format));
+            return nullptr;
+        }
+        auto ring = std::make_shared<SotcFrameHashRing>(instance);
+        for (auto& slot : ring->slots) {
+            const vk::ImageCreateInfo image_info{
+                .imageType = vk::ImageType::e2D,
+                .format = vk::Format::eR8G8B8A8Unorm,
+                .extent = {kWidth, kHeight, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .usage = vk::ImageUsageFlagBits::eTransferDst |
+                         vk::ImageUsageFlagBits::eTransferSrc,
+            };
+            const VmaAllocationCreateInfo alloc_info{
+                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            };
+            VkImage image{};
+            VkImageCreateInfo raw_info = static_cast<VkImageCreateInfo>(image_info);
+            if (vmaCreateImage(instance.GetAllocator(), &raw_info, &alloc_info, &image,
+                               &slot->allocation, nullptr) != VK_SUCCESS) {
+                LOG_ERROR(Render_Vulkan, "SOTC_FRAME_HASH: cannot create the hash image");
+                return nullptr;
+            }
+            slot->image = vk::Image{image};
+        }
+        return ring;
+    }
+
+    explicit SotcFrameHashRing(const Instance& instance_)
+        : instance{instance_}, sink{std::make_unique<SotcFrameHash::Sink>(
+                                   SotcFrameHash::Folder(), SotcFrameHash::PngEvery())} {
+        for (auto& slot : slots) {
+            slot = std::make_unique<Slot>(instance);
+        }
+    }
+
+    ~SotcFrameHashRing() {
+        for (auto& slot : slots) {
+            if (slot && slot->allocation) {
+                vmaDestroyImage(instance.GetAllocator(), slot->image, slot->allocation);
+            }
+        }
+        LOG_INFO(Render_Vulkan, "SOTC_FRAME_HASH: {} frames recorded, {} skipped", recorded,
+                 skipped);
+    }
+
+    /// Present thread, while recording the present command buffer. `source` is left in
+    /// `source_layout` (already a transfer source) and is not changed.
+    void Record(const vk::CommandBuffer& cmdbuf, Scheduler& scheduler, const vk::Image source,
+                const vk::ImageLayout source_layout, const u32 source_width,
+                const u32 source_height, const u64 frame) {
+        const u64 n = recorded++;
+        const u32 index = static_cast<u32>(n % kSlots);
+        Slot& slot = *slots[index];
+        if (slot.busy.load(std::memory_order_acquire)) {
+            ++skipped;
+            scheduler.DeferPriorityOperation([self = shared_from_this(), frame] {
+                self->sink->Skip(frame);
+            });
+            return;
+        }
+
+        const auto color = vk::ImageSubresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        const auto barrier = [&](vk::AccessFlags src_access, vk::AccessFlags dst_access,
+                                 vk::ImageLayout old_layout, vk::ImageLayout new_layout) {
+            return vk::ImageMemoryBarrier{
+                .srcAccessMask = src_access,
+                .dstAccessMask = dst_access,
+                .oldLayout = old_layout,
+                .newLayout = new_layout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = slot.image,
+                .subresourceRange = color,
+            };
+        };
+
+        // The slot's previous copy has finished (busy was cleared after it), so its layout can be
+        // discarded.
+        const auto to_blit = barrier(vk::AccessFlagBits::eTransferRead,
+                                     vk::AccessFlagBits::eTransferWrite,
+                                     vk::ImageLayout::eUndefined,
+                                     SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal));
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_blit);
+
+        const vk::ImageBlit blit{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{static_cast<s32>(source_width),
+                                                  static_cast<s32>(source_height), 1}},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{static_cast<s32>(kWidth),
+                                                  static_cast<s32>(kHeight), 1}},
+        };
+        cmdbuf.blitImage(source, source_layout, slot.image,
+                         SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), blit,
+                         vk::Filter::eLinear);
+
+        const auto to_copy = barrier(vk::AccessFlagBits::eTransferWrite,
+                                     vk::AccessFlagBits::eTransferRead,
+                                     SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
+                                     SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal));
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_copy);
+
+        const vk::BufferImageCopy region{
+            .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .imageExtent = {kWidth, kHeight, 1},
+        };
+        cmdbuf.copyImageToBuffer(slot.image,
+                                 SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
+                                 slot.buffer.Handle(), region);
+
+        const vk::BufferMemoryBarrier to_host{
+            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eHostRead,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = slot.buffer.Handle(),
+            .offset = 0,
+            .size = kBytes,
+        };
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eHost, {}, {}, to_host, {});
+
+        slot.busy.store(true, std::memory_order_release);
+        scheduler.DeferPriorityOperation([self = shared_from_this(), index, frame] {
+            self->Complete(index, frame);
+        });
+    }
+
+    /// Deferred-operation thread, after the copy of slot `index` has finished on the GPU.
+    void Complete(const u32 index, const u64 frame) {
+        Slot& slot = *slots[index];
+        std::vector<u8> pixels(kBytes);
+        std::memcpy(pixels.data(), slot.buffer.mapped_data.data(), kBytes);
+        slot.busy.store(false, std::memory_order_release);
+        sink->Push(frame, std::move(pixels));
+    }
+
+    const Instance& instance;
+    std::array<std::unique_ptr<Slot>, kSlots> slots{};
+    std::unique_ptr<SotcFrameHash::Sink> sink;
+    u64 recorded{};   ///< present thread only
+    u64 skipped{};    ///< present thread only
+};
+
 Presenter::~Presenter() {
     if (cp_pacer == this) {
         cp_pacer = nullptr;
@@ -863,6 +1056,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto& image = texture_cache.GetImage(image_id);
     auto image_view = *image.FindView(view_info).image_view;
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+    // sotc: SOTC_FRAME_METRICS: this flip closes the frame (sotc_frame_metrics.h).
+    SotcFrameMetrics::NoteFlip(liverpool ? liverpool->QueuedOps() : 0);
     // sotc: this frame's depth, motion vectors and camera for DLSS Frame Generation.
     SotcStats::cp_frame.fetch_add(1, std::memory_order_relaxed);
     Dlssg::PrepareInputs(frame->id, cmdbuf, texture_cache, runtime, image_size.width,
@@ -1264,6 +1459,22 @@ u64 Presenter::PresentDoneNs(u64 id) const {
     return record.id == id ? record.done_ns : 0;
 }
 
+void Presenter::RecordFrameHash(const vk::CommandBuffer& cmdbuf, const Frame* frame) {
+    if (!sotc_frame_hash && !sotc_frame_hash_tried) {
+        sotc_frame_hash_tried = true;
+        sotc_frame_hash = SotcFrameHashRing::Create(instance, swapchain.GetSurfaceFormat().format);
+        if (sotc_frame_hash) {
+            LOG_INFO(Render_Vulkan, "SOTC_FRAME_HASH: writing to {}", SotcFrameHash::Folder());
+        }
+    }
+    if (!sotc_frame_hash) {
+        return;
+    }
+    sotc_frame_hash->Record(cmdbuf, present_scheduler, frame->image,
+                            SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal),
+                            frame->width, frame->height, frame->sotc_flip_index);
+}
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
     // sotc: SOTC_FPS: the submits of this present (and of the frame generation before it) are
     // counted under the present role (Scheduler::submit_lock_role_ns).
@@ -1458,6 +1669,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             };
             cmdbuf.blitImage(frame->image, SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), swapchain_image,
                              SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), blit, vk::Filter::eLinear);
+            // sotc: SOTC_FRAME_HASH. The game image (frame->image, still a transfer source here, so
+            // before the overlay and whatever the window size is). Game frames only, not re-presents.
+            if (is_game_frame && !is_reusing_frame && SotcFrameHash::Enabled()) {
+                RecordFrameHash(cmdbuf, frame);
+            }
             const std::array back{
                 vk::ImageMemoryBarrier{
                     .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
@@ -1618,6 +1834,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             // sotc: the recreate waits for the device: submit_mutex is still held here.
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
+    }
+
+    // sotc: SOTC_DET_FLIP, the flip is complete when the frame's GPU work is done. present_done is
+    // signalled by the present submit, after the ready semaphore (the draws). Waited before the
+    // frame goes back to the free queue, so readbacks of this frame are final when the flip ends.
+    if (SotcDetFlip::kOn && !is_reusing_frame) {
+        Check(instance.GetDevice().waitForFences(frame->present_done, false,
+                                                 std::numeric_limits<u64>::max()));
     }
 
     free_frame();

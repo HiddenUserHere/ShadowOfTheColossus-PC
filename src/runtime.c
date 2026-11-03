@@ -75,6 +75,7 @@ void runtime_start(uint64_t flags) {
     stack_canary &= ~UINT64_C(255);
 }
 void runtime_report(void) {
+    runtime_det_report(); /* sotc: SOTC_DET_CLOCK counters (only prints when on) */
     printf("Runtime: _init_env=%zu, atexit=%zu, __cxa_atexit=%zu, registered handlers=%zu\n",
            calls_init, calls_atexit, calls_cxa, handler_count);
     printf("Runtime: static guards acquired=%zu, released=%zu\n", (size_t)guards_acquired, (size_t)guards_released);

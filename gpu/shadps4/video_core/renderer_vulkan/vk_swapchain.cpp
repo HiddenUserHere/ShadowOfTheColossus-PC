@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_det_flip.h" // sotc: SOTC_DET_FLIP (Immediate present, no vsync wait)
 
 namespace Vulkan {
 
@@ -245,11 +246,27 @@ void Swapchain::FindPresentMode() {
         std::ranges::find(modes, vk::PresentModeKHR::eImmediate) != modes.cend()) {
         present_mode = vk::PresentModeKHR::eImmediate;
     }
+    // sotc: SOTC_HEADLESS: a hidden window gets no display refresh, so FIFO could block the
+    // present queue for good. Immediate never waits; the frames are not shown anyway.
+    if (Frontend::IsHeadless() &&
+        std::ranges::find(modes, vk::PresentModeKHR::eImmediate) != modes.cend()) {
+        present_mode = vk::PresentModeKHR::eImmediate;
+    }
     // sotc: SOTC_PRESENT_WAIT paces the flips on the display: FIFO queues each present for the
     // next vblank, in order, which is what vkWaitForPresentKHR reports on. The requested mode
     // is ignored then, Immediate (DLSS Frame Generation above) included.
     if (instance.IsPresentWaitPacingEnabled()) {
         present_mode = vk::PresentModeKHR::eFifo;
+    }
+    // sotc: SOTC_DET_FLIP (sotc_det_flip.h) takes the flips without a vsync wait: Immediate, else
+    // Mailbox, whatever was requested. Set last, so it wins over SOTC_PRESENT_WAIT too.
+    if (SotcDetFlip::kOn) {
+        for (const auto mode : {vk::PresentModeKHR::eImmediate, vk::PresentModeKHR::eMailbox}) {
+            if (std::ranges::find(modes, mode) != modes.cend()) {
+                present_mode = mode;
+                break;
+            }
+        }
     }
 }
 

@@ -2890,6 +2890,7 @@ static void PrepassProbeNoteBind(bool is_draw, const AmdGpu::Regs* regs, const P
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolved,
                       bool use_resolved, const PreparedDraw* prepared) {
     RENDERER_TRACE;
+    SotcStats::total_draws.fetch_add(1, std::memory_order_relaxed); // sotc: Lab route load-end detection
     // sotc: SOTC_TEX_PROTECT_BATCH (no-op unless set): texture Tracks of this draw are deferred to
     // the scope's flush, which runs before the next command (see TexProtectScope).
     const VideoCore::TexProtectScope tex_protect_scope;
@@ -3074,6 +3075,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset, const Pipeline* resolved,
                               bool use_resolved, const PreparedDraw* prepared) {
     RENDERER_TRACE;
+    SotcStats::total_draws.fetch_add(1, std::memory_order_relaxed); // sotc: Lab route load-end detection
     const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDrawIndirect}; // sotc: SOTC_OP_PHASES
 

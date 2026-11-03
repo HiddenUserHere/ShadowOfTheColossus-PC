@@ -36,6 +36,7 @@
 #include "video_core/sotc_prepass_probe.h" // sotc: SOTC_NO_PREPASS=3
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_OPCOST (OpCostScope below)
+#include "video_core/sotc_frame_metrics.h"  // sotc: SOTC_FRAME_METRICS (DrawOpScope below)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (AscRptrMode below)
 #include "../../../sotc/pc_ring.h"                   // sotc: SOTC_PC_RING full ring (mode)
@@ -887,6 +888,8 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         }
         BackOp& op = back_ring[tail % BackRingSize];
         back_exec_seq = tail;
+        // sotc: SOTC_FRAME_METRICS: this op's busy time and count, in the frame it was queued in.
+        const SotcFrameMetrics::DrawOpScope fm_op{tail};
         const u64 xp_t0 = xp_on ? SotcStats::NowNs() : 0;
         if (prep_workers) { // sotc: SOTC_PARALLEL_RECORD: the next prepared draw's first lines
             const char* next = reinterpret_cast<const char*>(&prep_ring[(tail + 1) % BackRingSize]);

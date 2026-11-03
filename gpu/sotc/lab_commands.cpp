@@ -4,6 +4,7 @@
 // live switches. Each piece of state below has its own mutex; no lock is held while another
 // subsystem is called, so Execute can run on any thread (control pipe, F2 menu, SOTC_SET_TRIGGER).
 
+#include "video_core/sotc_stats.h" // sotc: flip count of the route start
 #include "lab_commands.h"
 
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include <vector>
 
 #include "autopilot.h"
+#include "det_route.h"
 #include "engine_cmd.h"
 #include "freecam.h"
 #include "sotc_live.h"
@@ -659,26 +661,48 @@ std::string Execute(std::string_view line) {
 namespace {
 
 // SOTC_LAB_ROUTE=<route file>: plays that route by itself once gameplay begins, then (after
-// SOTC_LAB_ROUTE_EXIT seconds, default 5; negative keeps the game open) closes the game.
+// SOTC_LAB_ROUTE_EXIT seconds, default 1.5; negative keeps the game open) closes the game.
 // SOTC_LAB_ROUTE_DELAY (seconds, default 8) is the wait after the last "starting game" line, so the
 // area has loaded before the free camera takes over. Runs from OnFrame (the flip thread) and only
 // queues work for the update thread through the module APIs.
+// sotc: SOTC_DET_ROUTE (det_route.h): every wait counts guest flips instead of wall time, and the
+// delay starts at the first flip that sees the "starting game" line.
 enum class AutoPhase { Off, WaitGame, StartCam, WaitCam, Playing, Done, Closed };
 
 struct AutoRoute {
     AutoPhase phase = AutoPhase::Off;
     std::string path;
     double delay_s = 8.0;
-    double exit_s = 5.0;
+    double exit_s = 1.5;
     uint64_t starts_seen = 0;
-    int64_t phase_ms = 0;
+    int64_t phase_at = 0;  // when the phase began, in clock units (ms, or flips when det)
     bool was_playing = false;
+    bool det = false;       // SOTC_DET_ROUTE
+    bool game_seen = false; // det: the "starting game" line was seen (delay running)
+    uint64_t draws_last = 0;     // SotcStats::total_draws at the previous tick
+    int gameplay_streak = 0;     // consecutive flips that drew like the game world (load end detection)
+    int64_t gameplay_at = -1;    // clock when the streak completed (-1: not yet)
+    int64_t seen_at = -1;        // clock when the "starting game" line was first seen
+    int64_t route_at = 0;   // det: flip at which the route started (SOTC_DET_EXIT_FRAMES counts from it)
 };
+
+// sotc: guest flips since the process started, counted by OnFrame (one per Flip, flip thread only).
+uint64_t g_det_flips = 0;
 
 int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// The route clock: wall-clock ms, or the flip count when det.
+int64_t Clock(bool det) {
+    return det ? static_cast<int64_t>(g_det_flips) : NowMs();
+}
+
+// A duration in clock units: ms of wall time, or frames at SOTC_DET_ROUTE_FPS when det.
+int64_t Units(bool det, double seconds) {
+    return det ? SotcDetRoute::Frames(seconds) : static_cast<int64_t>(seconds * 1000.0);
 }
 
 double EnvSeconds(const char* name, double def) {
@@ -697,12 +721,20 @@ void AutoRouteTick() {
         const char* v = std::getenv("SOTC_LAB_ROUTE");
         if (v && *v && Enabled()) {
             r.path = v;
-            r.delay_s = EnvSeconds("SOTC_LAB_ROUTE_DELAY", 8.0);
-            r.exit_s = EnvSeconds("SOTC_LAB_ROUTE_EXIT", 5.0);
+            // sotc: the route starts at the end of the load (the first flips that draw the game world, see
+            // WaitGame), plus SOTC_LAB_ROUTE_DELAY seconds (default 0). Without that signal within
+            // SOTC_LAB_ROUTE_LOAD_MAX seconds the old fixed wait applies.
+            r.delay_s = EnvSeconds("SOTC_LAB_ROUTE_DELAY", 0.0);
+            r.exit_s = EnvSeconds("SOTC_LAB_ROUTE_EXIT", 1.5);
+            r.det = SotcDetRoute::Enabled();
             std::string err;
             if (SotcAutopilot::Load(r.path, &err)) {
                 r.phase = AutoPhase::WaitGame;
                 std::fprintf(stderr, "SOTC LAB ROUTE %s: waiting for gameplay\n", r.path.c_str());
+                if (r.det) {
+                    std::fprintf(stderr, "SOTC LAB ROUTE deterministic: waits in guest frames at %.1f fps\n",
+                                 SotcDetRoute::Fps());
+                }
             } else {
                 std::fprintf(stderr, "SOTC LAB ROUTE %s: %s\n", r.path.c_str(), err.c_str());
             }
@@ -712,12 +744,53 @@ void AutoRouteTick() {
     if (a.phase == AutoPhase::Off || a.phase == AutoPhase::Closed) {
         return;
     }
-    const int64_t now = NowMs();
+    const bool det = a.det;
+    const int64_t now = Clock(det);
+    // sotc: SOTC_DET_EXIT_FRAMES: the run ends that many frames after the route started, whatever the
+    // route is doing. Without it the exit below (route end plus SOTC_LAB_ROUTE_EXIT) applies.
+    if (det && SotcDetRoute::ExitFrames() > 0 &&
+        (a.phase == AutoPhase::Playing || a.phase == AutoPhase::Done) &&
+        now - a.route_at >= SotcDetRoute::ExitFrames()) {
+        std::fprintf(stderr, "SOTC LAB ROUTE exit after %lld frames (SOTC_DET_EXIT_FRAMES)\n",
+                     static_cast<long long>(now - a.route_at));
+        std::fflush(stderr);
+        a.phase = AutoPhase::Closed;
+        SDL_Event quit{};
+        quit.type = SDL_EVENT_QUIT;
+        SDL_PushEvent(&quit);
+        return;
+    }
     switch (a.phase) {
     case AutoPhase::WaitGame: {
         const uint64_t starts = SotcEngineCmd::GameStarts();
-        const int64_t last = SotcEngineCmd::LastGameStartMs();
-        if (starts > 0 && now - last >= static_cast<int64_t>(a.delay_s * 1000.0)) {
+        bool ready = false;
+        // sotc: end of the load. After "starting game", the route waits for SOTC_LAB_ROUTE_LOAD_FLIPS (3) flips in a
+        // row that each drew at least SOTC_LAB_ROUTE_GAME_DRAWS (2000) draws: the loading screen draws a few hundred
+        // per frame, the game world thousands. Draws are counted when the draw thread records them, a frame or two
+        // behind the flip; that only delays the start by as much.
+        static const int64_t game_draws = static_cast<int64_t>(EnvSeconds("SOTC_LAB_ROUTE_GAME_DRAWS", 2000.0));
+        static const int load_flips = static_cast<int>(EnvSeconds("SOTC_LAB_ROUTE_LOAD_FLIPS", 3.0));
+        static const double load_max_s = EnvSeconds("SOTC_LAB_ROUTE_LOAD_MAX", 60.0);
+        const uint64_t draws = SotcStats::total_draws.load(std::memory_order_relaxed);
+        const int64_t drawn = static_cast<int64_t>(draws - a.draws_last);
+        a.draws_last = draws;
+        if (starts > 0 && a.seen_at < 0) {
+            a.seen_at = now;
+            a.game_seen = true;
+        }
+        if (a.seen_at >= 0 && a.gameplay_at < 0) {
+            a.gameplay_streak = drawn >= game_draws ? a.gameplay_streak + 1 : 0;
+            if (a.gameplay_streak >= load_flips) {
+                a.gameplay_at = now;
+                std::fprintf(stderr, "SOTC LAB ROUTE load end: %lld draws in the last flip\n",
+                             static_cast<long long>(drawn));
+            } else if (now - a.seen_at >= Units(det, load_max_s)) {
+                a.gameplay_at = now; // no load-end signal: start anyway (the old fixed wait)
+                std::fprintf(stderr, "SOTC LAB ROUTE load end not seen in %.0f s: starting anyway\n", load_max_s);
+            }
+        }
+        ready = a.gameplay_at >= 0 && now - a.gameplay_at >= Units(det, a.delay_s);
+        if (ready) {
             a.phase = AutoPhase::StartCam;
         } else if (starts == 0 && SotcEngineCmd::GameWaitExpired()) {
             // sotc: SOTC_LAB_ROUTE_WAIT expired (engine_cmd.cpp printed why): end the run.
@@ -731,7 +804,7 @@ void AutoRouteTick() {
     case AutoPhase::StartCam:
         if (SotcFreecam::SetActive(true)) {
             a.phase = AutoPhase::WaitCam;
-            a.phase_ms = now;
+            a.phase_at = now;
         }
         break;
     case AutoPhase::WaitCam: {
@@ -741,10 +814,13 @@ void AutoRouteTick() {
             SotcAutopilot::Play();
             Mark(SotcAutopilot::Current().name.empty() ? "route" : SotcAutopilot::Current().name);
             a.phase = AutoPhase::Playing;
-            a.phase_ms = now;
+            a.phase_at = now;
+            a.route_at = now;
             a.was_playing = false;
-            std::fprintf(stderr, "SOTC LAB ROUTE start\n");
-        } else if (!st.active && now - a.phase_ms > 3000) {
+            // sotc: the flip of the route start, so offline runs can align their frames on it (offline_matrix.py)
+            std::fprintf(stderr, "SOTC LAB ROUTE start at flip %llu\n",
+                         static_cast<unsigned long long>(SotcStats::flip_count.load(std::memory_order_relaxed)));
+        } else if (!st.active && now - a.phase_at > Units(det, 3.0)) {
             a.phase = AutoPhase::StartCam; // the start pose was not ready yet: try again
         }
         break;
@@ -753,7 +829,7 @@ void AutoRouteTick() {
         const bool playing = SotcAutopilot::GetProgress().playing;
         if (playing) {
             a.was_playing = true;
-        } else if (a.was_playing || now - a.phase_ms > 5000) {
+        } else if (a.was_playing || now - a.phase_at > Units(det, 5.0)) {
             const Window w = CurrentWindow();
             std::fprintf(stderr,
                          "SOTC LAB ROUTE done: %llu frames, p50 %.1f ms, p99 %.1f ms, max %.1f ms, "
@@ -763,14 +839,17 @@ void AutoRouteTick() {
                          static_cast<unsigned long long>(w.hitch50),
                          static_cast<unsigned long long>(w.hitch100));
             a.phase = AutoPhase::Done;
-            a.phase_ms = now;
+            a.phase_at = now;
         }
         break;
     }
     case AutoPhase::Done:
+        if (det && SotcDetRoute::ExitFrames() > 0) {
+            break; // sotc: SOTC_DET_EXIT_FRAMES decides the end (top of this function), not the route end
+        }
         if (a.exit_s < 0.0) {
             a.phase = AutoPhase::Closed;
-        } else if (now - a.phase_ms >= static_cast<int64_t>(a.exit_s * 1000.0)) {
+        } else if (now - a.phase_at >= Units(det, a.exit_s)) {
             std::fprintf(stderr, "SOTC LAB ROUTE exit\n");
             std::fflush(stderr);
             a.phase = AutoPhase::Closed;
@@ -788,6 +867,7 @@ void AutoRouteTick() {
 } // namespace
 
 void OnFrame(double frame_ms) {
+    ++g_det_flips; // sotc: the route's frame clock (SOTC_DET_ROUTE)
     AutoRouteTick();
     if (!std::isfinite(frame_ms)) {
         return;

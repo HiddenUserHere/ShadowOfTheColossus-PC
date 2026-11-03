@@ -36,6 +36,7 @@ extern "C" void* bb_low_block(void) __attribute__((weak)); // src/probe.c
 #endif
 
 #include "guest_mem.h"
+#include "det_route.h"
 #include "freecam.h"
 #include "hooks.h"
 
@@ -219,6 +220,8 @@ std::atomic<int64_t> g_game_start_ms{0};
 // text never reached stdout; ticks flat means the update thread itself is stuck.
 std::atomic<bool> g_wait_expired{false};
 std::atomic<int64_t> g_wait_first_ms{0};
+// sotc: SOTC_DET_ROUTE: the same bound counted in engine ticks from the first one (update thread only).
+uint64_t g_wait_first_tick = 0;
 
 void CheckGameWait(uint64_t frame) {
     static const double limit_s = [] {
@@ -240,16 +243,27 @@ void CheckGameWait(uint64_t frame) {
         g_game_starts.load(std::memory_order_relaxed) > 0) {
         return;
     }
-    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
-    int64_t first = g_wait_first_ms.load(std::memory_order_relaxed);
-    if (first == 0) {
-        g_wait_first_ms.store(now, std::memory_order_relaxed);
-        return;
-    }
-    if (static_cast<double>(now - first) < limit_s * 1000.0) {
-        return;
+    if (SotcDetRoute::Enabled()) {
+        // sotc: SOTC_DET_ROUTE: counted in engine ticks, so the give-up point is the same frame on every run.
+        if (g_wait_first_tick == 0) {
+            g_wait_first_tick = frame;
+            return;
+        }
+        if (frame - g_wait_first_tick < static_cast<uint64_t>(SotcDetRoute::Frames(limit_s))) {
+            return;
+        }
+    } else {
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+        int64_t first = g_wait_first_ms.load(std::memory_order_relaxed);
+        if (first == 0) {
+            g_wait_first_ms.store(now, std::memory_order_relaxed);
+            return;
+        }
+        if (static_cast<double>(now - first) < limit_s * 1000.0) {
+            return;
+        }
     }
     g_wait_expired.store(true, std::memory_order_relaxed);
     std::fprintf(stderr,

@@ -49,6 +49,7 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_recorder.h" // sotc: SOTC_FUTEX_WAIT report
 #include "video_core/sotc_fps_cap.h"
+#include "video_core/sotc_det_flip.h" // sotc: SOTC_DET_FLIP (flips and vblanks paced by the work)
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND report
 #include "video_core/buffer_cache/sync_events.h" // sotc: SOTC_SYNC_EVENTS report
 #include "video_core/sotc_adaptive.h"
@@ -646,6 +647,10 @@ void VideoOutDriver::PresentJobThread(std::stop_token token) {
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    // sotc: SOTC_FRAME_HASH, the flip number this frame is presented as (the fetch_add below).
+    if (req.frame) {
+        req.frame->sotc_flip_index = SotcStats::flip_count.load(std::memory_order_relaxed) + 1;
+    }
     // Update HDR status before presenting, and present the frame.
     RunPresentJob([frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
@@ -654,6 +659,9 @@ void VideoOutDriver::Flip(const Request& req) {
     const uint64_t sotc_flip = SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (SotcTrace::kOn) { // sotc: SOTC_TRACE, the game's flip on the frames track
         SotcTrace::FlipMark(sotc_flip);
+    }
+    if (SotcDetFlip::kOn) { // sotc: SOTC_DET_FLIP, before the flip events so the clock is first
+        SotcDetFlip::NoteFlipped(sotc_flip);
     }
     UntrackAutoTick(); // sotc: SOTC_UNTRACK_AUTO (every 30 flips)
     {
@@ -2895,6 +2903,9 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     return true;
 }
 
+// sotc: SOTC_DET_FLIP, wakes PresentThreadDet when a flip is queued (the wall-clock path polls).
+static std::condition_variable det_request_cv;
+
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
     Vulkan::Frame* frame;
     if (index == -1) {
@@ -2928,9 +2939,99 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .index = index,
         .eop = is_eop,
     });
+    if (SotcDetFlip::kOn) {
+        det_request_cv.notify_one();
+    }
+}
+
+// sotc: SOTC_DET_FLIP (sotc_det_flip.h). The flips are taken as they are queued, each one is
+// complete when its frame's GPU work is done (Presenter::Present waits for it), and the vblanks
+// follow the flip instead of a timer: the game's flip rate + 1 vblanks per flip at BB_VBLANK_HZ
+// (2 per flip at 60 Hz for the 30 FPS cap), sent at once. The flip rate and vblank count are the
+// capped path's, so the game sees the cadence it expects, while no frame waits for the clock.
+// No vsync wait: the swapchain is Immediate in this mode (vk_swapchain.cpp). If no flip comes for
+// 5 s (a guest thread waits for a vblank no flip will bring), the vblanks are sent by the wall
+// clock instead and logged: the one place where the timing is not deterministic.
+void VideoOutDriver::PresentThreadDet(std::stop_token token) {
+    Common::SetCurrentThreadName("shadPS4:PresentThread");
+    BbThreads::PlaceThread(BbThreads::Role::Present);
+    std::fprintf(stderr, "SOTC DET FLIP: on, flips and vblanks paced by the work (no 30 FPS cap, no vsync wait)\n");
+
+    // Vblanks per flip: the game's rate + 1 at 60 Hz steps, 30 FPS when it asks for none (the
+    // capped path's rule, SotcFpsCap::EffectiveRate without the F7 toggle).
+    const auto vblanks_per_flip = [] {
+        const int rate = SotcFpsCap::game_rate.load(std::memory_order_relaxed);
+        const u64 per_60hz = std::max<u64>(1, EmulatorSettings.GetVblankFrequency() / 60);
+        return (rate > 0 ? u64(rate) + 1 : u64{2}) * per_60hz;
+    };
+
+    const auto emit_vblanks = [this](u64 count) {
+        for (u64 i = 0; i < count; ++i) {
+            // Same order as the timer path: the events carry the count before it is advanced.
+            std::scoped_lock lock{main_port.vo_mutex};
+            auto& vblank_status = main_port.vblank_status;
+            for (auto event : main_port.vblank_events) {
+                auto equeue = Kernel::GetEqueue(event);
+                if (equeue != nullptr) {
+                    equeue->TriggerEvent(
+                        static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
+                        Kernel::OrbisKernelEvent::Filter::VideoOut,
+                        reinterpret_cast<void*>(
+                            static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
+                            (vblank_status.count << 16)));
+                }
+            }
+            vblank_status.count++;
+            vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
+            vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
+            main_port.vblank_cv.notify_all();
+        }
+    };
+
+    auto last_flip = std::chrono::steady_clock::now();
+    while (!token.stop_requested()) {
+        if (presenter) {
+            presenter->RefillReadyFrames(); // sotc: SOTC_FLIP_OFFTHREAD, as in PresentThread
+        }
+        if (DebugState.IsGuestThreadsPaused()) {
+            DrawLastFrame();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        Request request{};
+        {
+            std::unique_lock lk{mutex};
+            if (det_request_cv.wait_for(lk, std::chrono::milliseconds(20),
+                                        [this] { return !requests.empty(); })) {
+                request = requests.front();
+                requests.pop();
+            }
+        }
+        if (!request) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_flip >= std::chrono::seconds(5)) {
+                std::fprintf(stderr, "SOTC DET FLIP: no flip for 5 s, vblanks sent by the wall clock (not deterministic)\n");
+                emit_vblanks(vblanks_per_flip());
+                last_flip = now;
+            }
+            continue;
+        }
+
+        // sotc: SOTC_LOW_LATENCY start of the frame, as in PresentThread.
+        presenter->LowLatencyFrameStart();
+        Flip(request); // present (GPU work done on return), clock notified, flip events
+        last_flip = std::chrono::steady_clock::now();
+        emit_vblanks(vblanks_per_flip());
+        FRAME_END;
+    }
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
+    if (SotcDetFlip::kOn) { // sotc: SOTC_DET_FLIP, the flips and vblanks follow the work
+        PresentThreadDet(token);
+        return;
+    }
     const std::chrono::nanoseconds vblank_period(1000000000 /
                                                  EmulatorSettings.GetVblankFrequency());
 

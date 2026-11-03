@@ -66,6 +66,8 @@ static void prune_locked(Rwlock *r, Holder *h) {
     *link=h->next; free(h);
 }
 enum Operation { READ, WRITE, TRY_READ, TRY_WRITE, TIMED_READ, TIMED_WRITE };
+static int attempt_rdlock(void *lock,const struct timespec *end) { return pthread_rwlock_timedrdlock(lock,end); }
+static int attempt_wrlock(void *lock,const struct timespec *end) { return pthread_rwlock_timedwrlock(lock,end); }
 static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time) {
     if (!handle) return error(EINVAL);
     int writer=op==WRITE || op==TRY_WRITE || op==TIMED_WRITE;
@@ -96,7 +98,9 @@ static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time
         if (!time || time->nanoseconds<0 || time->nanoseconds>=1000000000) e=EINVAL;
         else {
             struct timespec deadline={.tv_sec=(time_t)time->seconds,.tv_nsec=(long)time->nanoseconds};
-            e=writer ? pthread_rwlock_timedwrlock(&r->native,&deadline) : pthread_rwlock_timedrdlock(&r->native,&deadline);
+            RuntimeWait wait; /* sotc: SOTC_DET_CLOCK aware (runtime_detclock.c) */
+            runtime_wait_absolute(&wait,CLOCK_REALTIME,&deadline);
+            e=runtime_wait_timed(&wait,writer ? attempt_wrlock : attempt_rdlock,&r->native);
         }
     }
     pthread_mutex_lock(&registry_lock);

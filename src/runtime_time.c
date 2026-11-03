@@ -20,6 +20,10 @@ static ABI int guest_gettimeofday(GuestTimeval *value,GuestTimezone *zone) {
     }
     if (zone) { zone->minuteswest=z.tz_minuteswest; zone->dsttime=z.tz_dsttime; }
 #endif
+    if (runtime_det_clock_on()) { /* sotc: SOTC_DET_CLOCK: the wall clock is virtual (the zone stays the host's) */
+        const uint64_t ns=runtime_det_realtime_ns();
+        t.tv_sec=(time_t)(ns/1000000000u); t.tv_usec=(long)(ns%1000000000u/1000u);
+    }
     if (value) { value->seconds=t.tv_sec; value->microseconds=t.tv_usec; }
     return 0;
 }

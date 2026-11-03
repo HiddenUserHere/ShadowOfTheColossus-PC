@@ -2,6 +2,8 @@
 #define BB_RUNTIME_H
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
+#include <pthread.h>
 #ifdef _WIN32
 #include "compat_win.h"
 /* No signals on Windows: the exception handler resumes the thread in bb_longjmp
@@ -53,6 +55,25 @@ uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *n
 uintptr_t runtime_kernel_resolve(const char *name);
 /* sceKernelReadTsc/GetTscFrequency read QPC instead of the TSC (cores out of step). */
 void runtime_tsc_use_qpc(void);
+/* sotc: SOTC_DET_CLOCK, the virtual guest clock (runtime_detclock.c). Off: one cached flag test. */
+int runtime_det_clock_on(void);
+uint64_t runtime_det_now_ns(void);          /* guest monotonic time since process start; advances */
+uint64_t runtime_det_realtime_ns(void);     /* guest wall clock (unix ns); advances */
+uint64_t runtime_det_from_unix_ns(uint64_t unix_ns); /* guest wall clock to virtual time, no advance */
+void runtime_det_advance_ns(uint64_t ns);   /* a sleep of ns: advances virtual time, clamped */
+uint64_t runtime_det_tsc(void);             /* rdtsc replacement (Win64 callable), in ns */
+uint64_t runtime_det_tsc_frequency(void);   /* 1000000000 */
+void runtime_det_report(void);
+/* A guest timed wait: the virtual deadline (det) or the host deadline (off). */
+typedef struct RuntimeWait { clockid_t clock; struct timespec real_end; uint64_t vend_ns; int det; } RuntimeWait;
+void runtime_wait_relative(RuntimeWait *w, clockid_t clock, uint64_t timeout_us);
+void runtime_wait_absolute(RuntimeWait *w, clockid_t clock, const struct timespec *guest_abs);
+/* Runs attempt(ctx, end) (a host timed call on the condvar/lock) until it succeeds, fails other than
+ * ETIMEDOUT, or the guest timeout expires (then ETIMEDOUT). Off: a single attempt with real_end. */
+int runtime_wait_timed(RuntimeWait *w, int (*attempt)(void *ctx, const struct timespec *end), void *ctx);
+uint32_t runtime_wait_remaining_us(const RuntimeWait *w);
+int runtime_wait_cond(RuntimeWait *w, pthread_cond_t *cv, pthread_mutex_t *m);
+int runtime_wait_mutex(RuntimeWait *w, pthread_mutex_t *m);
 uintptr_t runtime_file_resolve(const char *name);
 uintptr_t runtime_services_resolve(const char *name);
 void runtime_file_report(void);

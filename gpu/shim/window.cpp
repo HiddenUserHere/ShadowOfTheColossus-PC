@@ -1,4 +1,5 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +28,52 @@
 
 namespace Frontend {
 
+namespace {
+// sotc: SOTC_HEADLESS, read once. 0 off, 1 hidden window, 2 monitor (a small visible window in a
+// corner). 1 and 2 are both "headless" for the other pieces (DLSS foreground patch, immediate
+// present mode, HWND lookup); only 2 shows the window.
+int HeadlessMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_HEADLESS");
+        if (v && v[0] == '2') {
+            return 2;
+        }
+        return v && v[0] == '1' ? 1 : 0;
+    }();
+    return mode;
+}
+
+// sotc: SOTC_MONITOR_SIZE=WxH (default 640x360) for the monitor window, clamped to a sane range.
+void MonitorSize(s32& width, s32& height) {
+    width = 640;
+    height = 360;
+    const char* v = std::getenv("SOTC_MONITOR_SIZE");
+    int w = 0, h = 0;
+    if (v && std::sscanf(v, "%dx%d", &w, &h) == 2) {
+        width = std::clamp(w, 160, 3840);
+        height = std::clamp(h, 90, 2160);
+    }
+}
+
+constexpr int kMonitorMargin = 16; // px between the monitor window and the display's corner
+} // namespace
+
+bool IsHeadless() {
+    return HeadlessMode() != 0;
+}
+
+bool IsMonitor() {
+    return HeadlessMode() == 2;
+}
+
+namespace {
+void* g_headless_hwnd = nullptr; // sotc: SOTC_HEADLESS window (Windows)
+} // namespace
+
+void* HeadlessWindowHwnd() {
+    return g_headless_hwnd;
+}
+
 // sotc: the mouse as a PC camera. A click in the window captures it (relative mode, hidden
 // cursor); Esc or losing focus releases it. runtime_pad.c takes the motion as the right stick
 // and the buttons through its bindings (mouse.<input>=). SOTC_MOUSE=0 leaves the mouse alone.
@@ -36,6 +83,10 @@ std::atomic<u32> g_mouse_buttons{0};
 std::atomic<bool> g_mouse_captured{false};
 void* g_behind_hwnd = nullptr; // sotc: SOTC_WINDOW_BEHIND window (Windows)
 bool MouseEnabled() {
+    // sotc: SOTC_HEADLESS never captures the mouse (the user keeps their own).
+    if (IsHeadless()) {
+        return false;
+    }
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_MOUSE");
         return !v || v[0] != '0';
@@ -70,28 +121,51 @@ void SetWindowIcon(SDL_Window*) {}
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
     // sotc: the click that brings the window to the front also reaches the game (mouse capture).
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
+    // sotc: SOTC_HEADLESS: a hidden window never has the focus, so gamepads keep reporting to it.
+    const bool headless = IsHeadless();
+    if (headless) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    }
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
     }
+    // sotc: SOTC_HEADLESS=2 (monitor): a small window in the bottom-right corner of the primary
+    // display's usable area (the taskbar is left out). It is created hidden and shown below.
+    const bool monitor = IsMonitor();
+    int x_pos = SDL_WINDOWPOS_CENTERED, y_pos = SDL_WINDOWPOS_CENTERED;
+    if (monitor) {
+        MonitorSize(width_, height_);
+        SDL_Rect usable{};
+        if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable)) {
+            x_pos = usable.x + usable.w - width_ - kMonitorMargin;
+            y_pos = usable.y + usable.h - height_ - kMonitorMargin;
+        }
+    }
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, x_pos);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, y_pos);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
     const char* fullscreen = std::getenv("BB_FULLSCREEN");
-    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen && fullscreen[0] == '1');
+    // The monitor window is never fullscreen: it would cover the user's work.
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN,
+                           fullscreen && fullscreen[0] == '1' && !monitor);
     // sotc: SOTC_WINDOW_BEHIND=1 (unattended benchmarks): the window opens without taking the
     // focus and goes behind the other windows, so a test run never interrupts the desktop.
     const char* behind_env = std::getenv("SOTC_WINDOW_BEHIND");
-    const bool behind = behind_env && behind_env[0] == '1';
+    // sotc: SOTC_HEADLESS also takes this path: created hidden, and never shown unless monitor.
+    const bool behind = headless || (behind_env && behind_env[0] == '1');
     if (behind) {
         SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
         SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "0");
         SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIDDEN_BOOLEAN, true);
+    }
+    if (headless) {
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FOCUSABLE_BOOLEAN, false);
     }
     base_title = title;
     window = SDL_CreateWindowWithProperties(props);
@@ -114,15 +188,34 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     if (behind) {
         if (HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(
                 SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr))) {
-            g_behind_hwnd = hwnd;
+            if (headless) {
+                // sotc: never shown, so it cannot cover or flash over the user's windows. The
+                // hidden window still gets a swapchain and renders (its frames are not seen).
+                g_headless_hwnd = hwnd;
+            } else {
+                g_behind_hwnd = hwnd;
+            }
             // A WS_EX_NOACTIVATE window never becomes the foreground window, whoever shows it.
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
                               GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
             SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (monitor) {
+                // sotc: SOTC_HEADLESS=2: shown without the focus and not topmost, so it stays
+                // in view above the other windows without taking the keyboard.
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            } else if (!headless) {
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
         }
+    }
+#else
+    if (monitor) {
+        // sotc: SOTC_HEADLESS=2 off Windows: ACTIVATE_WHEN_SHOWN=0 above keeps the focus away.
+        SDL_ShowWindow(window);
     }
 #endif
 

@@ -112,6 +112,7 @@ private:
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
+    void PresentThreadDet(std::stop_token token); // sotc: SOTC_DET_FLIP (sotc_det_flip.h)
     /// sotc: with DLSS Frame Generation, presenting waits for Streamline's pacing; the frames are
     /// then presented on a thread of their own so that the vblank clock keeps its rate.
     bool AsyncPresent();

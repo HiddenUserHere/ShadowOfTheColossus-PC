@@ -146,6 +146,10 @@ static ABI int32_t http_epoll(int32_t ctx,void **handle) {
 }
 static ABI int32_t http_wait(void *handle,void *events,int32_t max,int64_t timeout) {
     (void)handle; (void)events; (void)max;
+    if (timeout>0 && runtime_det_clock_on()) { /* sotc: SOTC_DET_CLOCK: the wait advances virtual time; the host waits 1 ms at most */
+        runtime_det_advance_ns((uint64_t)timeout*1000);
+        if (timeout>1000) timeout=1000;
+    }
 #ifdef _WIN32
     if (timeout>0) compat_sleep_ns((uint64_t)timeout*1000);
 #else

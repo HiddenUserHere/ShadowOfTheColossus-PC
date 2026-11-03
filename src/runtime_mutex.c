@@ -212,20 +212,13 @@ static ABI int32_t mutex_destroy(GuestMutex **mutex) {
     if (!e) { free(*mutex); *mutex = (GuestMutex *)(uintptr_t)2; }
     return orbis_error(e);
 }
-static int deadline_after(struct timespec *end, uint64_t usec) {
-    if (clock_gettime(CLOCK_REALTIME, end)) return errno;
-    uint64_t ns = (uint64_t)end->tv_nsec + (usec % 1000000) * 1000;
-    end->tv_sec += (time_t)(usec / 1000000 + ns / 1000000000);
-    end->tv_nsec = (long)(ns % 1000000000);
-    return 0;
-}
 static int32_t timed_error(int e) { return e == ETIMEDOUT ? (int32_t)UINT32_C(0x8002003c) : orbis_error(e); }
 static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
-    struct timespec end;
-    if (deadline_after(&end, usec)) return orbis_error(EINVAL);
-    e = timed_error(pthread_mutex_timedlock(&(*mutex)->native, &end));
+    RuntimeWait wait; /* sotc: SOTC_DET_CLOCK aware (runtime_detclock.c) */
+    runtime_wait_relative(&wait, CLOCK_REALTIME, usec);
+    e = timed_error(runtime_wait_mutex(&wait, &(*mutex)->native));
     if (!e) ++locks;
     return e;
 }
@@ -273,20 +266,20 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     return orbis_error(r);
 }
 /* sotc: ra, the guest return address of the import (SOTC_TRACE) */
-static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struct timespec *end, void *ra) {
+static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, RuntimeWait *wait, void *ra) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
+    if (!mutex || (uintptr_t)*mutex < 3 || !wait) return orbis_error(EINVAL);
     ++waits;
     const uint64_t t0 = trace_now(); /* sotc: SOTC_TRACE (the caller is a timed-wait import) */
-    const int r = pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end);
+    const int r = runtime_wait_cond(wait, &(*cond)->native, &(*mutex)->native);
     trace_span("cond timedwait", t0, (uint64_t)(uintptr_t)*cond, (uint64_t)(uintptr_t)ra);
     return timed_error(r);
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {
-    struct timespec end;
-    if (deadline_after(&end, usec)) return orbis_error(EINVAL);
-    return cond_wait_until(cond, mutex, &end, (void *)(uintptr_t)GUEST_CALLER());
+    RuntimeWait wait;
+    runtime_wait_relative(&wait, CLOCK_REALTIME, usec);
+    return cond_wait_until(cond, mutex, &wait, (void *)(uintptr_t)GUEST_CALLER());
 }
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
@@ -303,7 +296,9 @@ typedef struct { int64_t sec, nsec; } GuestTimespec;
 static ABI int32_t cond_abs_timedwait(GuestCond **cond, GuestMutex **mutex, const GuestTimespec *abs) {
     if (!abs || abs->nsec < 0 || abs->nsec >= 1000000000) return orbis_error(EINVAL);
     struct timespec end = {.tv_sec = (time_t)abs->sec, .tv_nsec = (long)abs->nsec};
-    return cond_wait_until(cond, mutex, &end, (void *)(uintptr_t)GUEST_CALLER());
+    RuntimeWait wait;
+    runtime_wait_absolute(&wait, CLOCK_REALTIME, &end);
+    return cond_wait_until(cond, mutex, &wait, (void *)(uintptr_t)GUEST_CALLER());
 }
 /* POSIX pthread APIs return positive guest errno values, unlike scePthread. */
 static int32_t posix_result(int32_t result) { return result ? (int32_t)((uint32_t)result & 0xffff) : 0; }

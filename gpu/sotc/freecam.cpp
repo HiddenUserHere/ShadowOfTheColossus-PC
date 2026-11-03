@@ -26,6 +26,7 @@
 #include <SDL3/SDL.h>
 
 #include "autopilot.h"
+#include "det_route.h"
 #include "engine_cmd.h"
 #include "probe_cam.h"
 #include "../shim/bbport_overlay.h"
@@ -137,10 +138,13 @@ float Boost(const bool* k) {
 
 // Advances g_state.cam by the input of this frame. Called with g_mutex held.
 void Integrate(float dt) {
-    const bool* k = SDL_WasInit(SDL_INIT_VIDEO) && !MenuHasKeyboard() ? SDL_GetKeyboardState(nullptr)
-                                                                         : nullptr;
+    // sotc: SOTC_DET_ROUTE: no live keyboard or pad or mouse input reaches the camera (route only).
+    const bool det = SotcDetRoute::Enabled();
+    const bool* k = !det && SDL_WasInit(SDL_INIT_VIDEO) && !MenuHasKeyboard()
+                        ? SDL_GetKeyboardState(nullptr)
+                        : nullptr;
     Pose& p = g_state.cam;
-    Input in = g_input;
+    Input in = det ? Input{} : g_input;
     g_input.mouse_dx = g_input.mouse_dy = g_input.wheel = 0.0f;
 
     if (in.wheel != 0.0f) {
@@ -290,6 +294,10 @@ float MaxSpeed() {
 }
 
 bool EngineFrameLine(float dt, std::string* line) {
+    if (SotcDetRoute::Enabled()) {
+        // sotc: SOTC_DET_ROUTE: every frame advances by the same step, not the game's wall-clock dt.
+        dt = 1.0f / static_cast<float>(SotcDetRoute::Fps());
+    }
     if (!(dt > 0.0f) || !std::isfinite(dt)) {
         dt = kFallbackDt;
     }

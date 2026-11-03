@@ -41,6 +41,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_frame_metrics.h" // sotc: SOTC_FRAME_METRICS
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (SOTC_PIPE_DIRTY default, N5)
 #include "bbport_threads.h"
 
@@ -1817,6 +1818,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         }
         const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
         SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
+        SotcFrameMetrics::AddCurrent(SotcFrameMetrics::PipelineCompiles, 1); // sotc: SOTC_FRAME_METRICS
         const auto sync_start = std::chrono::steady_clock::now();
 
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
@@ -1899,6 +1901,7 @@ const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
         const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
         SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
+        SotcFrameMetrics::AddCurrent(SotcFrameMetrics::PipelineCompiles, 1); // sotc: SOTC_FRAME_METRICS
 
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
@@ -2906,6 +2909,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
     const SotcStats::ScopedTimer stall_timer{SotcStats::shader_ns};
     SotcStats::shaders_compiled.fetch_add(1, std::memory_order_relaxed);
+    SotcFrameMetrics::AddCurrent(SotcFrameMetrics::ShaderCompiles, 1); // sotc: SOTC_FRAME_METRICS
 
     auto phase_start = std::chrono::steady_clock::now();
     const auto phase = [&](int i) {

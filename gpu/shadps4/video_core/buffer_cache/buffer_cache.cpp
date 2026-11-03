@@ -24,6 +24,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_frame_metrics.h" // sotc: SOTC_FRAME_METRICS
 #include "video_core/sotc_trace.h" // sotc: SOTC_FPS readbacks by guest RIP (B6)
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "../../../sotc/mem_classes.h"  // sotc: SOTC_CLASS_TRACK (plan step 6)
@@ -8592,6 +8593,8 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         if (SotcStats::kFpsLog) {
             SotcStats::frame_copy_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
         }
+        // sotc: SOTC_FRAME_METRICS: the same bytes, in the frame of the op that copied them.
+        SotcFrameMetrics::AddCurrent(SotcFrameMetrics::UploadBytes, total_size_bytes);
         SotcStats::uploads.fetch_add(1, std::memory_order_relaxed);
         if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
             SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);

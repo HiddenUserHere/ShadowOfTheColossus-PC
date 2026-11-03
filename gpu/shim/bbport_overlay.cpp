@@ -128,6 +128,9 @@ float frame_ms_avg = 0.0f;
 // sotc: the settings menu is Bloodborne's; the SotC port shows only the game's dialogs
 // (BB_OVERLAY_MENU=1 opens the menu anyway).
 bool MenuAllowed() {
+    if (Frontend::IsMonitor()) { // sotc: SOTC_HEADLESS=2 never opens the menu (no input)
+        return false;
+    }
     const char* v = std::getenv("BB_OVERLAY_MENU");
     if (v && v[0] == '0') return false;
     return true;
@@ -219,7 +222,8 @@ std::atomic<bool> overlay_on{[] {
     if (const char* v = std::getenv("SOTC_OVERLAY")) {
         return v[0] != '0';
     }
-    return std::getenv("SOTC_FPS") != nullptr;
+    // sotc: a test run (SOTC_RUN_LABEL, the offline matrix runner) always shows the overlay and its run panel.
+    return std::getenv("SOTC_FPS") != nullptr || std::getenv("SOTC_RUN_LABEL") != nullptr;
 }()};
 
 // Frame time the game aims for: 33.3 ms (30 FPS) or 16.7 ms (60 FPS), from the median.
@@ -234,7 +238,8 @@ float TargetMs() {
 }
 
 bool OverlayOn() {
-    return BbSettings::Get().show_fps || overlay_on.load(std::memory_order_relaxed);
+    // sotc: SOTC_HEADLESS=2 (monitor): the overlay is the point of the window, always shown.
+    return Frontend::IsMonitor() || BbSettings::Get().show_fps || overlay_on.load(std::memory_order_relaxed);
 }
 
 void RecordFrame(float ms) {
@@ -1123,6 +1128,177 @@ float FpsCounter() {
     return bottom;
 }
 
+// sotc: the test run panel (top left, under the overlay), shown when SOTC_RUN_LABEL is set: the offline
+// matrix runner (tools/offline_matrix.py) names the configuration and its run, and the panel shows the
+// guest frame, the frame time and the per-frame costs. Nothing here runs when SOTC_RUN_LABEL is unset.
+struct RunPanelData {
+    std::string label, index, flags;
+    uint64_t exit_frames = 0; // SOTC_DET_EXIT_FRAMES: the run ends after this many game flips (0: no bar)
+    // Per-frame costs, published every kRunWindow game flips. The counters are monotonic; each window
+    // takes the difference of two snapshots.
+    struct Snapshot {
+        uint64_t flips = 0, draw_ns = 0, cp_ns = 0, draws = 0, dispatches = 0;
+    };
+    Snapshot base;
+    bool base_set = false, have_costs = false;
+    double draw_ms = 0.0, cp_ms = 0.0, draws_per_frame = 0.0, dispatches_per_frame = 0.0;
+};
+constexpr uint64_t kRunWindow = 30;
+
+RunPanelData& RunPanelState() {
+    static RunPanelData data;
+    return data;
+}
+
+bool RunPanelOn() {
+    static const bool on = [] {
+        const char* label = std::getenv("SOTC_RUN_LABEL");
+        if (!label || !label[0]) {
+            return false;
+        }
+        RunPanelData& d = RunPanelState();
+        d.label = label;
+        if (const char* v = std::getenv("SOTC_RUN_INDEX")) {
+            d.index = v;
+        }
+        if (const char* v = std::getenv("SOTC_RUN_FLAGS")) {
+            d.flags = v;
+        }
+        if (const char* v = std::getenv("SOTC_DET_EXIT_FRAMES")) {
+            d.exit_frames = std::strtoull(v, nullptr, 10);
+        }
+        return true;
+    }();
+    return on;
+}
+
+// The text cut to max_width (current font) with "..." at the end; whole UTF-8 characters only.
+std::string FitText(const std::string& text, float max_width) {
+    if (ImGui::CalcTextSize(text.c_str()).x <= max_width) {
+        return text;
+    }
+    std::string out = text;
+    while (!out.empty()) {
+        out.pop_back();
+        while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80) {
+            out.pop_back(); // a continuation byte: drop the rest of its character too
+        }
+        if (ImGui::CalcTextSize((out + "...").c_str()).x <= max_width) {
+            break;
+        }
+    }
+    return out + "...";
+}
+
+// Reads the costs of the window: the draw and command processor CPU time (SOTC_FPS accounting, through
+// SotcStats::TakeAccount, a snapshot that resets nothing) and the draw thread's ops (SOTC_DRAW_WORK,
+// draw_work_ops, monotonic). Called once per Render, under imgui_mutex.
+void SampleRunCosts(RunPanelData& d) {
+    RunPanelData::Snapshot now;
+    now.flips = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (SotcStats::kFpsLog) {
+        const SotcStats::FrameAccount account = SotcStats::TakeAccount();
+        now.draw_ns = account.cpu_ns[SotcStats::RoleDraw];
+        now.cp_ns = account.cpu_ns[SotcStats::RoleCp];
+    }
+    if (SotcStats::kDrawWork) {
+        now.draws = SotcStats::draw_work_ops[0].load(std::memory_order_relaxed) +
+                    SotcStats::draw_work_ops[1].load(std::memory_order_relaxed);
+        now.dispatches = SotcStats::draw_work_ops[2].load(std::memory_order_relaxed);
+    }
+    if (!d.base_set || now.flips < d.base.flips) { // first call, or the flip count went back
+        d.base = now;
+        d.base_set = true;
+        return;
+    }
+    const uint64_t frames = now.flips - d.base.flips;
+    if (frames < kRunWindow) {
+        return;
+    }
+    const double n = static_cast<double>(frames);
+    d.draw_ms = double(now.draw_ns - d.base.draw_ns) / 1e6 / n;
+    d.cp_ms = double(now.cp_ns - d.base.cp_ns) / 1e6 / n;
+    d.draws_per_frame = double(now.draws - d.base.draws) / n;
+    d.dispatches_per_frame = double(now.dispatches - d.base.dispatches) / n;
+    d.have_costs = true;
+    d.base = now;
+}
+
+void RunPanel() {
+    RunPanelData& d = RunPanelState();
+    SampleRunCosts(d);
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 12.0f * base_scale;
+    const float width = 320.0f * base_scale;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + pad, viewport->WorkPos.y + pad), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0.0f), ImVec2(width, FLT_MAX));
+    ImGui::Begin("##testrun", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    using SotcUi::T;
+    const ImVec4 green(0.45f, 0.9f, 0.45f, 1.0f), yellow(1.0f, 0.82f, 0.3f, 1.0f),
+        red(1.0f, 0.4f, 0.35f, 1.0f), grey(0.7f, 0.7f, 0.7f, 1.0f);
+    const float avail = width - 2.0f * ImGui::GetStyle().WindowPadding.x;
+
+    // Row 1: the configuration label and the run index ("5/18").
+    const std::string index_text = d.index.empty() ? std::string()
+                                                   : std::string(T("Execução ", "Run ")) + d.index;
+    const float index_w = index_text.empty() ? 0.0f : ImGui::CalcTextSize(index_text.c_str()).x + 12.0f * base_scale;
+    ImGui::TextColored(yellow, "%s", FitText(d.label, avail - index_w).c_str());
+    if (!index_text.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(grey, "%s", index_text.c_str());
+    }
+
+    // Row 2: the switches of the run that differ from the defaults, as the runner wrote them.
+    ImGui::TextColored(grey, "%s", FitText(d.flags.empty() ? std::string(T("(padrões)", "(defaults)")) : d.flags,
+                                           avail)
+                                      .c_str());
+
+    // Row 3: the guest frame, and the progress toward the end when the run has one.
+    const uint64_t flips = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (d.exit_frames) {
+        ImGui::Text(T("quadro %llu / %llu", "frame %llu / %llu"), static_cast<unsigned long long>(flips),
+                    static_cast<unsigned long long>(d.exit_frames));
+        const float fraction = std::min(1.0f, float(double(flips) / double(d.exit_frames)));
+        ImGui::ProgressBar(fraction, ImVec2(-FLT_MIN, 8.0f * base_scale), "");
+    } else {
+        ImGui::Text(T("quadro %llu", "frame %llu"), static_cast<unsigned long long>(flips));
+    }
+
+    // Row 4: the frame rate and frame time, as the FPS counter (the same smoothed frame time).
+    const float target = TargetMs();
+    const float now_ms = frame_ms_avg;
+    const ImVec4 rate = now_ms <= target * 1.1f ? green : now_ms <= target * 1.6f ? yellow : red;
+    ImGui::TextColored(rate, "%.0f FPS", now_ms > 0.0f ? 1000.0f / now_ms : 0.0f);
+    ImGui::SameLine();
+    ImGui::TextColored(grey, T("%.1f ms/quadro", "%.1f ms/frame"), now_ms);
+
+    // Row 5: the draw thread and command processor CPU time per frame (SOTC_FPS=1), and the ops per frame
+    // (SOTC_DRAW_WORK=1). Each says what is missing when its switch is off.
+    if (!SotcStats::kFpsLog) {
+        ImGui::TextColored(grey, "%s", T("draw / cp: precisa de SOTC_FPS=1", "draw / cp: needs SOTC_FPS=1"));
+    } else if (d.have_costs) {
+        ImGui::TextColored(grey, T("draw %.1f ms  cp %.1f ms  (por quadro)", "draw %.1f ms  cp %.1f ms  (per frame)"),
+                           d.draw_ms, d.cp_ms);
+    } else {
+        ImGui::TextColored(grey, "%s", T("draw / cp: medindo...", "draw / cp: measuring..."));
+    }
+    // Row 6: the ops of the draw thread per frame (draws, dispatches) from SOTC_DRAW_WORK.
+    if (!SotcStats::kDrawWork) {
+        ImGui::TextColored(grey, "%s", T("ops: precisa de SOTC_DRAW_WORK=1", "ops: needs SOTC_DRAW_WORK=1"));
+    } else if (d.have_costs) {
+        ImGui::TextColored(grey, T("ops %.0f/quadro (draws %.0f, disp %.0f)", "ops %.0f/frame (draws %.0f, disp %.0f)"),
+                           d.draws_per_frame + d.dispatches_per_frame, d.draws_per_frame, d.dispatches_per_frame);
+    } else {
+        ImGui::TextColored(grey, "%s", T("ops: medindo...", "ops: measuring..."));
+    }
+    ImGui::End();
+}
+
 void Toast() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
@@ -1223,6 +1399,23 @@ bool HandleEvent(const SDL_Event& event) {
         return false;
     }
     ImGuiIO& io = ImGui::GetIO();
+    // sotc: SOTC_HEADLESS=2 (monitor): the window takes no keys and no mouse. It is never focused,
+    // but a click or a stray key still reaches it: swallow them, so no hotkey, menu, SotC Lab
+    // window or save list responds to the user. Gamepads are left alone (the game's pad input).
+    if (Frontend::IsMonitor()) {
+        switch (event.type) {
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP:
+        case SDL_EVENT_TEXT_INPUT:
+        case SDL_EVENT_MOUSE_MOTION:
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+        case SDL_EVENT_MOUSE_WHEEL:
+            return true;
+        default:
+            break;
+        }
+    }
     // sotc: F7 switches 30 -> 60 -> unlimited FPS, as the menu's FPS choice (kept for the launcher).
     // The new state is shown at the next frame (Render).
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F7 && !event.key.repeat) {
@@ -1756,6 +1949,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     float fps_bottom = 0.0f;
     if (OverlayOn() && !menu_open) {
         fps_bottom = FpsCounter();
+        if (RunPanelOn()) { // sotc: SOTC_RUN_LABEL, the test run panel (top left)
+            RunPanel();
+        }
     }
     if (ToastShown()) {
         Toast();

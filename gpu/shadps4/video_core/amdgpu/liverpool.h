@@ -120,6 +120,12 @@ public:
     explicit Liverpool();
     ~Liverpool();
 
+    /// sotc: SOTC_FRAME_METRICS: ops the command processor has queued (back_head; the command
+    /// processor's own thread reads it, the sequence numbers the draw loop runs by).
+    [[nodiscard]] u64 QueuedOps() const {
+        return back_head.load(std::memory_order_relaxed);
+    }
+
     void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 

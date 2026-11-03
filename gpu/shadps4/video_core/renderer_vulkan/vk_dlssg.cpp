@@ -4,6 +4,7 @@
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
+#include "sdl_window.h" // sotc: Frontend::IsHeadless, HeadlessWindowHwnd
 
 #include <windows.h>
 
@@ -816,6 +817,11 @@ BOOL CALLBACK FindGameWindow(HWND hwnd, LPARAM) {
 }
 
 HWND WINAPI AssumedForegroundWindow() {
+    // sotc: SOTC_HEADLESS: the hidden window is the game window (it is never visible, so the
+    // search below would not find it).
+    if (HWND headless = static_cast<HWND>(Frontend::HeadlessWindowHwnd())) {
+        return headless;
+    }
     if (!game_window || !IsWindow(game_window)) {
         game_window = nullptr;
         EnumWindows(FindGameWindow, 0);
@@ -972,7 +978,9 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
         return nullptr;
     }
     loaded = true;
-    if (const char* f = std::getenv("SOTC_DLSSG_ASSUME_FOCUS"); f && f[0] == '1') {
+    // sotc: SOTC_HEADLESS also needs the foreground patch (the hidden window never has the focus).
+    const char* assume_focus = std::getenv("SOTC_DLSSG_ASSUME_FOCUS");
+    if ((assume_focus && assume_focus[0] == '1') || Frontend::IsHeadless()) {
         PatchForegroundWindow(L"sl.common.dll");
         PatchForegroundWindow(L"sl.dlss_g.dll");
     }

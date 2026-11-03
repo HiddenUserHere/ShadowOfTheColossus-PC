@@ -27,7 +27,9 @@ namespace SotcStats {
 // own (SotcTrace::kOn checks at the call sites: DrawWait, RoleTimer, liverpool.cpp, vk_recorder.cpp)
 // and the counters stay off unless SOTC_FPS is set. kFpsLog reads no trace state, so the order
 // of the initialisation of sotc_trace.h's kOn does not matter here.
-inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr;
+// sotc: SOTC_FRAME_METRICS (sotc_frame_metrics.h) reads these counters too, so it turns them on.
+inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr ||
+                            std::getenv("SOTC_FRAME_METRICS") != nullptr;
 inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
 /// sotc: SOTC_STALL_DETAIL=1 (off by default): the SOTCSTALL line also shows the flip pacing of the
 /// frame, the guest threads' CPU and the user/kernel CPU of the upload threads (vk_presenter.cpp).
@@ -48,12 +50,20 @@ inline const bool kFpsLean = [] {
 // sotc: read from the environment, not from kFpsLog/kFpsLean: the partial ordering of inline variables
 // did not hold in this build (ThinLTO, static library), and kFpsTimers came out false with SOTC_FPS set
 // ("SOTC FPS switches: log 1 lean 0 timers 0", 1 Nov), so every timer it gates read 0.
+// sotc: SOTC_FRAME_METRICS needs the draw thread's wait times (DrawWait) for its draw_busy column,
+// so it turns kFpsTimers on too. kWriteMarks keeps the SOTC_FPS switch alone (its per-binding
+// marks would add work to the frames being measured).
 inline bool FpsTimersFromEnv() {
+    const char* lean = std::getenv("SOTC_FPS_LEAN");
+    return (std::getenv("SOTC_FPS") != nullptr || std::getenv("SOTC_FRAME_METRICS") != nullptr) &&
+           !(lean && lean[0] == '1');
+}
+inline bool FpsMarksFromEnv() {
     const char* lean = std::getenv("SOTC_FPS_LEAN");
     return std::getenv("SOTC_FPS") != nullptr && !(lean && lean[0] == '1');
 }
 inline const bool kFpsTimers = FpsTimersFromEnv();
-inline const bool kWriteMarks = FpsTimersFromEnv(); // sotc: same switches as kFpsTimers
+inline const bool kWriteMarks = FpsMarksFromEnv(); // sotc: same switches as kFpsTimers, minus the metrics
 /// sotc: skip BindResources on consecutive draws whose pipeline, push data and resource
 /// handles did not change. On by default (SOTC_FAST_BIND=0 turns it off). In 0.60.5 it left black
 /// dots in a grid on sandy ground (new constants at the same address); with the fix (mem_epoch
@@ -542,6 +552,10 @@ inline std::atomic<uint64_t> coalesce_requests{0}, coalesce_calls{0}, coalesce_p
 /// RunGarbageCollector), so stale images over reused texture memory go away (green blocks after
 /// long sessions and many loads, user, 22 Oct). SOTC_LOAD_FLUSH=0 turns it off.
 inline std::atomic<bool> load_flush{false};
+/// sotc: draws recorded since the process started (Rasterizer::Draw / DrawIndirect, one relaxed add each). The Lab
+/// route reads its growth per flip to see the end of a load: the loading screen draws a few hundred per frame, the
+/// game world thousands (gpu/sotc/lab_commands.cpp, AutoRouteTick).
+inline std::atomic<uint64_t> total_draws{0};
 /// sotc: F9 (diagnostic): every cached texture not drawn by the GPU is uploaded again from guest
 /// memory. Garbage that stays was written there by the game; garbage that goes was a stale copy.
 inline std::atomic<bool> reload_all{false};

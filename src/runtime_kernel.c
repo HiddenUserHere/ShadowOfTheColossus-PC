@@ -64,6 +64,13 @@ static int host_clock(uint32_t id,clockid_t *out) {
 static int clock_read(uint32_t id,GuestTimespec *ts) {
     clockid_t host;
     if (!ts || !host_clock(id,&host)) return EINVAL;
+    if (runtime_det_clock_on()) { /* sotc: SOTC_DET_CLOCK: virtual time (runtime_detclock.c) */
+        const int realtime = id==0 || id==9 || id==10 || id==13;
+        const uint64_t ns = realtime ? runtime_det_realtime_ns() : runtime_det_now_ns();
+        ts->sec=(int64_t)(ns/1000000000u); ts->nsec=(int64_t)(ns%1000000000u);
+        if (id==13) ts->nsec=0;
+        return 0;
+    }
     struct timespec t;
     if (clock_gettime(host,&t)) return errno;
     if (id==13) t.tv_nsec=0;
@@ -83,10 +90,12 @@ static ABI int32_t posix_clock_getres(uint32_t id,GuestTimespec *ts) {
     return 0;
 }
 static ABI uint64_t process_time(void) {
+    if (runtime_det_clock_on()) return runtime_det_now_ns()/1000; /* sotc: SOTC_DET_CLOCK */
     struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
     return (uint64_t)(t.tv_sec-process_start.tv_sec)*1000000+(uint64_t)((t.tv_nsec-process_start.tv_nsec)/1000);
 }
 static ABI uint64_t process_time_counter(void) {
+    if (runtime_det_clock_on()) return runtime_det_now_ns(); /* sotc: SOTC_DET_CLOCK */
     struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
     return (uint64_t)(t.tv_sec-process_start.tv_sec)*1000000000+(uint64_t)(t.tv_nsec-process_start.tv_nsec);
 }
@@ -96,6 +105,7 @@ static ABI uint64_t process_time_frequency(void) { return 1000000000; }
 static int tsc_from_qpc;
 void runtime_tsc_use_qpc(void) { tsc_from_qpc=1; }
 static uint64_t host_tsc(void) {
+    if (runtime_det_clock_on()) return runtime_det_tsc(); /* sotc: SOTC_DET_CLOCK, the same clock as the rdtsc patch */
 #ifdef _WIN32
     if (tsc_from_qpc) return compat_qpc_tsc();
 #endif
@@ -104,6 +114,7 @@ static uint64_t host_tsc(void) {
 static ABI uint64_t read_tsc(void) { return host_tsc(); }
 static uint64_t tsc_hz;
 static ABI uint64_t tsc_frequency(void) {
+    if (runtime_det_clock_on()) return runtime_det_tsc_frequency(); /* sotc: SOTC_DET_CLOCK */
 #ifdef _WIN32
     if (tsc_from_qpc) return compat_qpc_tsc_frequency();
 #endif
@@ -129,6 +140,10 @@ uint64_t runtime_read_tsc(void) { return host_tsc(); }
 /* sotc: SOTC_TRACE: ra is the guest return address (the caller of the import). */
 static int sleep_ns_from(uint64_t ns, void *ra) {
     const uint64_t t0=trace_now();
+    if (runtime_det_clock_on()) { /* sotc: SOTC_DET_CLOCK: a sleep advances virtual time by its length; the host waits 1 ms at most */
+        runtime_det_advance_ns(ns);
+        if (ns>1000000) ns=1000000;
+    }
 #ifdef _WIN32
     compat_sleep_ns(ns);
 #else
@@ -206,7 +221,10 @@ static void usleep_guest(uint32_t usec, void *ra) {
     const int yields = mode==1 && would_yield;
     const uint64_t t0 = usleep_now_ns();
     if (would_yield) atomic_fetch_add_explicit(&usleep_stats.yielded,1,memory_order_relaxed);
-    if (yields) usleep_yield_thread(); else sleep_ns_from((uint64_t)usec*1000,ra);
+    if (yields) {
+        if (runtime_det_clock_on()) runtime_det_advance_ns((uint64_t)usec*1000); /* sotc: SOTC_DET_CLOCK */
+        usleep_yield_thread();
+    } else sleep_ns_from((uint64_t)usec*1000,ra);
     const uint64_t actual = usleep_now_ns()-t0;
     const size_t bucket = usec<=10 ? 0 : usec<=100 ? 1 : usec<=1000 ? 2 : 3;
     atomic_fetch_add_explicit(&usleep_stats.calls,1,memory_order_relaxed);
@@ -286,7 +304,10 @@ static ABI int32_t kernel_gettimezone(GuestTimezone *tz) {
 }
 static ABI int32_t posix_gettimeofday(GuestTimeval *tv,GuestTimezone *tz) {
     struct timeval t;
-    gettimeofday(&t,NULL);
+    if (runtime_det_clock_on()) { /* sotc: SOTC_DET_CLOCK */
+        const uint64_t ns=runtime_det_realtime_ns();
+        t.tv_sec=(time_t)(ns/1000000000u); t.tv_usec=(long)(ns%1000000000u/1000u);
+    } else gettimeofday(&t,NULL);
     if (tv) { tv->sec=t.tv_sec; tv->usec=t.tv_usec; }
     if (tz) kernel_gettimezone(tz);
     return 0;
@@ -295,7 +316,11 @@ static ABI int32_t kernel_gettimeofday(GuestTimeval *tv) {
     if (!tv) return ERR(22);
     return posix_gettimeofday(tv,NULL);
 }
-static ABI int64_t posix_time(int64_t *out) { int64_t t=(int64_t)time(NULL); if (out) *out=t; return t; }
+static ABI int64_t posix_time(int64_t *out) {
+    int64_t t=runtime_det_clock_on() ? (int64_t)(runtime_det_realtime_ns()/1000000000u) : (int64_t)time(NULL); /* sotc: SOTC_DET_CLOCK */
+    if (out) *out=t;
+    return t;
+}
 
 /* ---- process ---- */
 static ABI int32_t get_pagesize(void) { return PAGE; }
@@ -342,6 +367,11 @@ typedef struct { GuestTimeval utime, stime; int64_t rest[14]; } GuestRusage;
 static ABI int32_t guest_getrusage(int who,GuestRusage *out) {
     if (!out || (who!=0 && who!=1)) return fail_posix(EINVAL);
     memset(out,0,sizeof(*out));
+    if (runtime_det_clock_on()) { /* sotc: SOTC_DET_CLOCK: CPU time is the virtual clock, no kernel time */
+        const uint64_t us=runtime_det_now_ns()/1000;
+        out->utime=(GuestTimeval){(int64_t)(us/1000000),(int64_t)(us%1000000)};
+        return 0;
+    }
 #ifdef _WIN32
     int64_t user=0,kernel=0;
     compat_cpu_times(who,&user,&kernel);
