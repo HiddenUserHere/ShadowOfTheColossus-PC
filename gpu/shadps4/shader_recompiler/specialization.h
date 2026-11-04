@@ -4,6 +4,7 @@
 #pragma once
 
 #include <bitset>
+#include <cstdlib>
 #include <vector>
 
 #include "common/types.h"
@@ -106,15 +107,40 @@ inline void FillBuffer(BufferSpecialization& spec, const BufferResource& desc,
     }
 }
 
+// sotc: SOTC_IMAGE_SRGB_NORMALIZE (on unless =0). An image's sRGB number format reaches the translation only
+// through a sampler's force_degamma (resource_patching_pass.cpp, the degamma of a non-sRGB image); the sRGB
+// conversion itself is the image view's format. Without force_degamma in the stage the flag was a key difference
+// without a code difference (27% of the game's sampled images), and it cannot be known before the draw: it is keyed
+// false. KeepSrgb is evaluated once per key, before the images are filled.
+inline bool SrgbNormalizeOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_IMAGE_SRGB_NORMALIZE");
+        return !v || v[0] != '0';
+    }();
+    return on;
+}
+
+inline bool KeepSrgb(const Info& info) {
+    if (!SrgbNormalizeOn()) {
+        return true;
+    }
+    for (const auto& desc : info.samplers) {
+        if (const auto sharp = desc.GetSharp(info); sharp && sharp.force_degamma) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline void FillImage(ImageSpecialization& spec, const ImageResource& desc, AmdGpu::Image sharp,
-                      const Info& info) {
+                      const Info& info, bool keep_srgb = true) {
     spec.type = sharp.GetViewType(desc.is_array);
     spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
     spec.is_storage = desc.is_written;
     if (spec.is_storage) {
         spec.dst_select = sharp.DstSelect();
     } else {
-        spec.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
+        spec.is_srgb = keep_srgb && sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
     }
     spec.num_conversion = sharp.GetNumberConversion();
     spec.num_bindings = desc.NumBindings(info);
@@ -214,9 +240,10 @@ struct StageSpecialization {
                      [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                          FillBuffer(spec, desc, sharp);
                      });
+        const bool keep_srgb = info->images.empty() || KeepSrgb(*info); // sotc: SOTC_IMAGE_SRGB_NORMALIZE
         ForEachSharp(binding, images, info->images,
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                         FillImage(spec, desc, sharp, *info);
+                         FillImage(spec, desc, sharp, *info, keep_srgb);
                      });
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
@@ -387,12 +414,13 @@ inline void BuildSpecKey(std::vector<u32>& out, const Info& info,
     }
 
     out.push_back(static_cast<u32>(info.images.size()));
+    const bool keep_srgb = info.images.empty() || KeepSrgb(info); // sotc: SOTC_IMAGE_SRGB_NORMALIZE
     for (const auto& desc : info.images) {
         ImageSpecialization spec{};
         const auto sharp = desc.GetSharp(info);
         out.push_back(sharp ? 1u : 0u);
         if (sharp) {
-            FillImage(spec, desc, sharp, info);
+            FillImage(spec, desc, sharp, info, keep_srgb);
         }
         PackImage(out, spec);
     }

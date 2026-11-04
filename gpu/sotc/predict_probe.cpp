@@ -71,6 +71,11 @@ struct StageCounters {
     // step 2a, pixel: register and input prediction from the shader file, per field.
     uint64_t pred_found{}, pred_user{}, pred_vgprs{}, pred_fp{}, pred_ena{}, pred_addr{}, pred_ninputs{},
         pred_ninterp{}, pred_inputs{}, pred_all{};
+    // step 2b: images, against the default a translation at load assumes without descriptors (Color2D, or
+    // Color2DArray when the instruction declares an array; float; no number conversion; one binding; not sRGB).
+    uint64_t img_bound{}, img_pred_ok{}, img_miss_type{}, img_miss_integer{}, img_miss_conv{}, img_miss_bindings{},
+        img_miss_srgb{}, img_type_3d{}, img_type_cube{}, img_type_array{}, img_type_other{}, img_programs{},
+        img_programs_ok{};
     uint64_t images{}, img_not_2d{}, img_integer{}, img_srgb{}, img_storage{};
     uint64_t buffers{}, buf_formatted{}, buf_other_format{};
 };
@@ -480,6 +485,54 @@ void OnTranslate(const Shader::Info& info, const Shader::StageSpecialization& sp
             c.pred_all += user && vgprs && fp && ena_ok && addr_ok && inputs;
         }
     }
+    {
+        bool program_ok = true;
+        uint32_t bound = 0;
+        for (size_t i = 0; i < spec.images.size() && i < info.images.size(); ++i) {
+            const auto& image = spec.images[i];
+            const auto& desc = info.images[i];
+            if (!spec.bitset[spec.buffers.size() + i]) {
+                continue; // unbound slot (the bitset numbers buffers, then images)
+            }
+            ++bound;
+            ++c.img_bound;
+            const auto predicted_type = desc.is_array ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
+            const bool type_ok = image.type == predicted_type;
+            const bool integer_ok = !image.is_integer;
+            const bool conv_ok = image.num_conversion == AmdGpu::NumberConversion::None;
+            const bool bindings_ok = image.num_bindings == 1;
+            const bool srgb_ok = !image.is_srgb;
+            if (!type_ok) {
+                ++c.img_miss_type;
+                switch (image.type) {
+                case AmdGpu::ImageType::Color3D:
+                    ++c.img_type_3d;
+                    break;
+                case AmdGpu::ImageType::Cube:
+                    ++c.img_type_cube;
+                    break;
+                case AmdGpu::ImageType::Color2DArray:
+                case AmdGpu::ImageType::Color1DArray:
+                    ++c.img_type_array;
+                    break;
+                default:
+                    ++c.img_type_other;
+                    break;
+                }
+            }
+            c.img_miss_integer += !integer_ok;
+            c.img_miss_conv += !conv_ok;
+            c.img_miss_bindings += !bindings_ok;
+            c.img_miss_srgb += !srgb_ok;
+            const bool ok = type_ok && integer_ok && conv_ok && bindings_ok && srgb_ok;
+            c.img_pred_ok += ok;
+            program_ok = program_ok && ok;
+        }
+        if (bound) {
+            ++c.img_programs;
+            c.img_programs_ok += program_ok;
+        }
+    }
     for (const auto& image : spec.images) {
         ++c.images;
         c.img_not_2d += image.type != AmdGpu::ImageType::Color2D;
@@ -543,6 +596,20 @@ void Report(std::string& out, double seconds) {
                       (unsigned long long)c.buffers, (unsigned long long)c.buf_formatted,
                       (unsigned long long)c.buf_other_format, g_loaded.size());
         out += line;
+        if (c.img_bound) {
+            std::snprintf(line, sizeof line,
+                          "SOTC PREDICT %s images (step 2b): bound %llu, default right %llu; misses: type %llu (3D %llu, "
+                          "cube %llu, array %llu, other %llu), integer %llu, conversion %llu, bindings %llu, sRGB "
+                          "%llu; programs all right %llu of %llu\n",
+                          kNames[s], (unsigned long long)c.img_bound, (unsigned long long)c.img_pred_ok,
+                          (unsigned long long)c.img_miss_type, (unsigned long long)c.img_type_3d,
+                          (unsigned long long)c.img_type_cube, (unsigned long long)c.img_type_array,
+                          (unsigned long long)c.img_type_other, (unsigned long long)c.img_miss_integer,
+                          (unsigned long long)c.img_miss_conv, (unsigned long long)c.img_miss_bindings,
+                          (unsigned long long)c.img_miss_srgb, (unsigned long long)c.img_programs_ok,
+                          (unsigned long long)c.img_programs);
+            out += line;
+        }
         if (c.pred_found) {
             std::snprintf(line, sizeof line,
                           "SOTC PREDICT %s registers (step 2a): predicted %llu of %llu; user SGPRs %llu, VGPRs %llu, "
