@@ -14,7 +14,14 @@
 //     once is covered from the next session on. A translation at load would build one module per layout of the set;
 //     the report gives the average set size per translation (the cost of that);
 //   - resources off the default: images that are not Color2D, integer, sRGB or storage; formatted buffers whose
-//     format is not 32-bit float. The default is what a translation at load would assume without the descriptors.
+//     format is not 32-bit float. The default is what a translation at load would assume without the descriptors;
+//   - pixel registers (step 2a): when the loader hands a resource on (RES_LOADED), every pixel program in it gets a
+//     predicted register state from the shader file itself: the program descriptor (dword 0x2DEC0400, then the hash
+//     low 32 bits) holds SPI_SHADER_PGM_RSRC1 at +17 dwords, RSRC2 at +18, SPI_PS_INPUT_ENA at +21, SPI_PS_INPUT_ADDR
+//     at +22 and the interpolant count at +23; the inputs come from the code (v_interp attribute indices: count =
+//     highest + 1, flat = read with v_interp_mov only, param = slot, flat and unread inputs passthrough, as the key
+//     keys them after SOTC_PS_INPUT_NORMALIZE). At the
+//     first translation each field is compared with the draw's real RuntimeInfo.
 // One line per stage every 5 s: "SOTC PREDICT <stage>: ...".
 
 #include "predict_probe.h"
@@ -30,6 +37,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/specialization.h"
 
@@ -60,6 +68,9 @@ struct StageCounters {
     uint64_t translations{}, permutations{}, known{}, in_table{}, lead_ms_sum{}, lead_ms_max{};
     uint64_t layout_hit{}, layout_miss{}, layout_set_sum{};
     uint64_t rule_hit{}, rule_miss{}, rule_cands_sum{}, union_hit{};
+    // step 2a, pixel: register and input prediction from the shader file, per field.
+    uint64_t pred_found{}, pred_user{}, pred_vgprs{}, pred_fp{}, pred_ena{}, pred_addr{}, pred_ninputs{},
+        pred_ninterp{}, pred_inputs{}, pred_all{};
     uint64_t images{}, img_not_2d{}, img_integer{}, img_srgb{}, img_storage{};
     uint64_t buffers{}, buf_formatted{}, buf_other_format{};
 };
@@ -74,6 +85,72 @@ std::FILE* g_layouts_out = nullptr;
 size_t g_layout_count = 0;
 std::array<StageCounters, kStages> g_counters{};
 bool g_table_loaded = false;
+
+// Step 2a: the register state a pixel program declares in its shader file, and its reads from the code.
+struct PsPrediction {
+    uint32_t rsrc1{}, rsrc2{}, ena{}, addr{}, ninterp{};
+    uint64_t read_mask{};     // attributes read by any v_interp
+    uint64_t interp_mask{};   // attributes read by v_interp_p1/p2 (interpolated)
+    std::array<uint8_t, 32> param{}; // the VS export param of each input slot (identity unless the tail says else)
+};
+std::unordered_map<uint64_t, PsPrediction> g_ps_pred;
+
+uint32_t Dword(const unsigned char* p) {
+    uint32_t v;
+    std::memcpy(&v, p, 4);
+    return v;
+}
+
+// The pixel program whose footer is at data + footer: its code (marker 0xBEEB03FF, imm, footer at marker +
+// (imm + 1) * 8) and its descriptor (0x2DEC0400 + hash low 32, nearest before the marker). False when not found.
+bool PredictPixel(const unsigned char* data, size_t footer, uint64_t hash, uint32_t length, PsPrediction& out) {
+    size_t marker = SIZE_MAX;
+    for (size_t m = footer & ~size_t{3}; m >= 8 && footer - m < (size_t{1} << 20);) {
+        m -= 4;
+        if (Dword(data + m) == 0xBEEB03FFu && m + (size_t{Dword(data + m + 4)} + 1) * 8 == footer) {
+            marker = m;
+            break;
+        }
+    }
+    if (marker == SIZE_MAX || marker + length > footer) {
+        return false;
+    }
+    size_t desc = SIZE_MAX;
+    for (size_t d = marker; d >= 4 && marker - d < 64 * 4;) {
+        d -= 4;
+        if (Dword(data + d) == 0x2DEC0400u && d + 4 < marker && Dword(data + d + 4) == static_cast<uint32_t>(hash)) {
+            desc = d;
+            break;
+        }
+    }
+    if (desc == SIZE_MAX || desc + 24 * 4 > marker) {
+        return false;
+    }
+    out.rsrc1 = Dword(data + desc + 17 * 4);
+    out.rsrc2 = Dword(data + desc + 18 * 4);
+    out.ena = Dword(data + desc + 21 * 4);
+    out.addr = Dword(data + desc + 22 * 4);
+    out.ninterp = Dword(data + desc + 23 * 4);
+    for (size_t i = 0; i < out.param.size(); ++i) {
+        out.param[i] = static_cast<uint8_t>(i);
+    }
+    const auto* code = reinterpret_cast<const u32*>(data + marker);
+    Shader::Gcn::GcnCodeSlice slice(code, code + length / 4);
+    Shader::Gcn::GcnDecodeContext decoder;
+    while (!slice.atEnd()) {
+        const auto inst = decoder.decodeInstruction(slice);
+        if (inst.opcode == Shader::Gcn::Opcode::V_INTERP_P1_F32 ||
+            inst.opcode == Shader::Gcn::Opcode::V_INTERP_P2_F32) {
+            out.read_mask |= uint64_t{1} << inst.control.vintrp.attr;
+            out.interp_mask |= uint64_t{1} << inst.control.vintrp.attr;
+        } else if (inst.opcode == Shader::Gcn::Opcode::V_INTERP_MOV_F32) {
+            out.read_mask |= uint64_t{1} << inst.control.vintrp.attr;
+        } else if (inst.opcode == Shader::Gcn::Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return true;
+}
 
 void LoadLayouts();
 
@@ -200,6 +277,76 @@ bool On() noexcept {
     return on;
 }
 
+// The input semantic indices of a single-program pixel file, from the name table after its footer: a 16-byte header,
+// then 16-byte entries (u32 name offset, u32 semantic offset, desc, 0); desc byte 1 = class (0x24 interpolant),
+// byte 2 = semantic index (TEXCOORD n). The VS exports TEXCOORD n at PARAM n, so input slot i (the i-th interpolant
+// record) reads PARAM = its semantic index; a PS that skips a VS output thus reads a later param (distortion_ps,
+// displacement_ps: slot 5 = TEXCOORD 6). The table of a VS+PS file mixes both programs and is not used.
+void ParamsFromTail(const unsigned char* data, size_t n, size_t footer_end, PsPrediction& pred) {
+    size_t entry = footer_end + 16;
+    uint32_t slot = 0;
+    while (entry + 16 <= n && slot < pred.param.size()) {
+        const uint32_t desc = Dword(data + entry + 8);
+        const uint32_t pad = Dword(data + entry + 12);
+        if (pad != 0) {
+            break; // the 8-byte last record (outputs) and the names follow
+        }
+        if (((desc >> 8) & 0xFF) == 0x24) {
+            pred.param[slot++] = static_cast<uint8_t>((desc >> 16) & 0xFF);
+        }
+        entry += 16;
+    }
+}
+
+void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
+    if (!On() || !data || n < 64) {
+        return;
+    }
+    uint32_t programs = 0;
+    uint64_t single_hash = 0;
+    size_t single_footer = 0;
+    static constexpr unsigned char kOrb[7] = {'O', 'r', 'b', 'S', 'h', 'd', 'r'};
+    const unsigned char* p = data;
+    const unsigned char* end = data + n - 32;
+    while (p <= end) {
+        const void* hit = std::memchr(p, 'O', static_cast<size_t>(end - p) + 1);
+        if (!hit) {
+            break;
+        }
+        p = static_cast<const unsigned char*>(hit);
+        if (std::memcmp(p, kOrb, sizeof kOrb) != 0) {
+            ++p;
+            continue;
+        }
+        const uint32_t bits = Dword(p + 8);
+        uint64_t hash = 0;
+        std::memcpy(&hash, p + 16, 8);
+        NoteLoaded(hash);
+        ++programs;
+        single_hash = hash;
+        single_footer = static_cast<size_t>(p - data);
+        if (((bits >> 2) & 0xF) == 0) { // pixel
+            bool known = false;
+            {
+                std::scoped_lock lock{g_mutex};
+                known = g_ps_pred.contains(hash);
+            }
+            PsPrediction pred;
+            if (!known && PredictPixel(data, static_cast<size_t>(p - data), hash, bits >> 8, pred)) {
+                std::scoped_lock lock{g_mutex};
+                g_ps_pred.try_emplace(hash, pred);
+            }
+        }
+        p += 32;
+    }
+    if (programs == 1) {
+        std::scoped_lock lock{g_mutex};
+        if (const auto it = g_ps_pred.find(single_hash); it != g_ps_pred.end()) {
+            ParamsFromTail(data, n, single_footer + 32, it->second);
+        }
+    }
+}
+
 void NoteLoaded(uint64_t program_hash) noexcept {
     if (!On()) {
         return;
@@ -270,6 +417,69 @@ void OnTranslate(const Shader::Info& info, const Shader::StageSpecialization& sp
             AddLayout(entry->second.pass, layout, true);
         }
     }
+    if (info.sw_stage == Shader::SwStage::Fragment) {
+        if (const auto pred = g_ps_pred.find(info.pgm_hash); pred != g_ps_pred.end()) {
+            const PsPrediction& pr = pred->second;
+            const auto& rt = spec.runtime_info;
+            const auto& fs = rt.hw.fs;
+            ++c.pred_found;
+            const bool user = ((pr.rsrc2 >> 1) & 0x1F) == rt.props.num_user_data;
+            const bool vgprs = ((pr.rsrc1 & 0x3F) + 1) * 4 == rt.props.num_allocated_vgprs;
+            const bool fp = ((pr.rsrc1 >> 12) & 3) == static_cast<uint32_t>(rt.props.fp_round_mode32) &&
+                            ((pr.rsrc1 >> 14) & 3) == static_cast<uint32_t>(rt.props.fp_round_mode16_64) &&
+                            ((pr.rsrc1 >> 16) & 3) == static_cast<uint32_t>(rt.props.fp_denorm_mode32) &&
+                            ((pr.rsrc1 >> 18) & 3) == static_cast<uint32_t>(rt.props.fp_denorm_mode16_64);
+            uint32_t ena = 0, addr = 0;
+            std::memcpy(&ena, &fs.en_flags, sizeof ena);
+            std::memcpy(&addr, &fs.addr_flags, sizeof addr);
+            const bool ena_ok = ena == pr.ena;
+            const bool addr_ok = addr == pr.addr;
+            const uint32_t clip = fs.clip_distance_emulation ? 1u : 0u;
+            const uint32_t count = fs.num_inputs > clip ? fs.num_inputs - clip : 0;
+            uint32_t predicted_count = 0;
+            for (uint32_t i = 0; i < 64; ++i) {
+                if (pr.read_mask & (uint64_t{1} << i)) {
+                    predicted_count = i + 1;
+                }
+            }
+            const bool ninputs = predicted_count == count;
+            const bool ninterp = pr.ninterp == count;
+            bool inputs = ninterp;
+            for (uint32_t i = 0; inputs && i < count && i < fs.inputs.size(); ++i) {
+                const auto& in = fs.inputs[i];
+                const bool interpolated = (pr.interp_mask >> i) & 1;
+                inputs = in.param_index == pr.param[i] && in.is_flat == !interpolated &&
+                         in.is_default == !interpolated &&
+                         (interpolated || in.default_value == 0);
+            }
+            if (!inputs && ninterp) {
+                static int shown = 0;
+                if (shown++ < 8) {
+                    std::string slots;
+                    for (uint32_t i = 0; i < count && i < fs.inputs.size(); ++i) {
+                        const auto& in = fs.inputs[i];
+                        char b[48];
+                        std::snprintf(b, sizeof b, " %u:p%u/d%u/f%u/v%u", i, unsigned{in.param_index},
+                                      unsigned{in.is_default}, unsigned{in.is_flat}, unsigned{in.default_value});
+                        slots += b;
+                    }
+                    std::fprintf(stderr, "SOTC PREDICT input miss %#llx: read %#llx interp %#llx;%s\n",
+                                 static_cast<unsigned long long>(info.pgm_hash),
+                                 static_cast<unsigned long long>(pr.read_mask),
+                                 static_cast<unsigned long long>(pr.interp_mask), slots.c_str());
+                }
+            }
+            c.pred_user += user;
+            c.pred_vgprs += vgprs;
+            c.pred_fp += fp;
+            c.pred_ena += ena_ok;
+            c.pred_addr += addr_ok;
+            c.pred_ninputs += ninputs;
+            c.pred_ninterp += ninterp;
+            c.pred_inputs += inputs;
+            c.pred_all += user && vgprs && fp && ena_ok && addr_ok && inputs;
+        }
+    }
     for (const auto& image : spec.images) {
         ++c.images;
         c.img_not_2d += image.type != AmdGpu::ImageType::Color2D;
@@ -333,6 +543,19 @@ void Report(std::string& out, double seconds) {
                       (unsigned long long)c.buffers, (unsigned long long)c.buf_formatted,
                       (unsigned long long)c.buf_other_format, g_loaded.size());
         out += line;
+        if (c.pred_found) {
+            std::snprintf(line, sizeof line,
+                          "SOTC PREDICT %s registers (step 2a): predicted %llu of %llu; user SGPRs %llu, VGPRs %llu, "
+                          "fp modes %llu, PS_INPUT_ENA %llu, PS_INPUT_ADDR %llu, input count from code %llu, from "
+                          "file %llu, inputs %llu; all registers and inputs %llu\n",
+                          kNames[s], (unsigned long long)c.pred_found, (unsigned long long)c.translations,
+                          (unsigned long long)c.pred_user, (unsigned long long)c.pred_vgprs,
+                          (unsigned long long)c.pred_fp, (unsigned long long)c.pred_ena,
+                          (unsigned long long)c.pred_addr, (unsigned long long)c.pred_ninputs,
+                          (unsigned long long)c.pred_ninterp, (unsigned long long)c.pred_inputs,
+                          (unsigned long long)c.pred_all);
+            out += line;
+        }
     }
 }
 

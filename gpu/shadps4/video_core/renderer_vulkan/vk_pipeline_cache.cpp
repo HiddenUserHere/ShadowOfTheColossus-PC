@@ -27,7 +27,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
-#include "shader_recompiler/frontend/decode.h" // sotc: InterpolatedInputs
+#include "shader_recompiler/frontend/decode.h" // sotc: PassthroughSensitiveInputs
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/recompiler.h"
@@ -3208,10 +3208,13 @@ void ReportSpecMemo(std::string& out, double seconds) {
     out += line;
 }
 
-// sotc: SOTC_PS_INPUT_NORMALIZE (on unless =0). The pixel inputs the program reads with v_interp_p1/p2/mov, as a mask
-// of attribute indices, from its GCN code (decoded once per program hash). The translator's own record of the reads
-// (Info::loads) is not in the disk cache, so the code is the one source both a fresh and a restored program share.
-static uint64_t InterpolatedInputs(u64 hash, std::span<const u32> code) {
+// sotc: SOTC_PS_INPUT_NORMALIZE (on unless =0). The pixel inputs whose USE_DEFAULT flag can change the translation,
+// as a mask of attribute indices, from the program's GCN code (decoded once per program hash): those read by
+// v_interp_mov from another vertex than P0 (selector != 2). For a flat input (never IsDefault()) the flag is read
+// only there, by IsPassthrough(), and only on devices with per-vertex attributes (V_INTERP_MOV_F32). The
+// translator's own record of the reads (Info::loads) is not in the disk cache, so the code is the one source a fresh
+// and a restored program share.
+static uint64_t PassthroughSensitiveInputs(u64 hash, std::span<const u32> code) {
     static std::mutex mutex;
     static std::unordered_map<u64, uint64_t> masks;
     {
@@ -3225,9 +3228,7 @@ static uint64_t InterpolatedInputs(u64 hash, std::span<const u32> code) {
     Shader::Gcn::GcnDecodeContext decoder;
     while (!slice.atEnd()) {
         const auto inst = decoder.decodeInstruction(slice);
-        if (inst.opcode == Shader::Gcn::Opcode::V_INTERP_P1_F32 ||
-            inst.opcode == Shader::Gcn::Opcode::V_INTERP_P2_F32 ||
-            inst.opcode == Shader::Gcn::Opcode::V_INTERP_MOV_F32) {
+        if (inst.opcode == Shader::Gcn::Opcode::V_INTERP_MOV_F32 && inst.src[0].code != 2) {
             mask |= uint64_t{1} << inst.control.vintrp.attr;
         } else if (inst.opcode == Shader::Gcn::Opcode::S_ENDPGM) {
             break;
@@ -3238,13 +3239,12 @@ static uint64_t InterpolatedInputs(u64 hash, std::span<const u32> code) {
     return mask;
 }
 
-// sotc: SOTC_PS_INPUT_NORMALIZE. A flat input the program never reads is declared the same way whether the engine
-// set USE_DEFAULT on it or not (both are not IsDefault(); the declaration takes its location and decoration from
-// param_index and the shader's own interpolation), and the passthrough difference is in V_INTERP_MOV, which never
-// runs for it. Yet the flag is in the specialization key, so the same code made two permutations, and the flag
-// cannot be known before the draw (13 such slots, in 4 particle programs, all unread). Such inputs are keyed as
-// passthrough (USE_DEFAULT, value 0), the 99.6% case. Returns the slots changed.
-static u32 NormalizeUnreadFlatInputs(Shader::RuntimeInfo& info, uint64_t read_mask) {
+// sotc: SOTC_PS_INPUT_NORMALIZE. The engine sets USE_DEFAULT on most flat pixel inputs and not on a few (13 slots
+// of 4 particle programs, flat inputs read with v_interp_mov from P0), and it cannot be known before the draw. For a
+// flat input it changes the SPIR-V only through PassthroughSensitiveInputs; elsewhere it was a key difference
+// without a code difference. Such flat inputs are keyed as passthrough (USE_DEFAULT, value 0), the 99.6% case.
+// Returns the slots changed.
+static u32 NormalizeFlatInputs(Shader::RuntimeInfo& info, uint64_t sensitive_mask) {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_PS_INPUT_NORMALIZE");
         return !v || v[0] != '0';
@@ -3257,7 +3257,7 @@ static u32 NormalizeUnreadFlatInputs(Shader::RuntimeInfo& info, uint64_t read_ma
     u32 changed = 0;
     for (u32 i = 0; i < count && i < info.hw.fs.inputs.size(); ++i) {
         auto& input = info.hw.fs.inputs[i];
-        if (input.is_flat && !(read_mask & (uint64_t{1} << i)) && (!input.is_default || input.default_value)) {
+        if (input.is_flat && !(sensitive_mask & (uint64_t{1} << i)) && (!input.is_default || input.default_value)) {
             input.is_default = true;
             input.default_value = 0;
             ++changed;
@@ -3283,10 +3283,10 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (sw_stage == SwStage::Fragment) {
         // sotc: SOTC_PS_INPUT_NORMALIZE, before the key and the translation see the inputs (see above).
         auto& fs_rt = runtime_infos[u32(sw_stage)];
-        if (const u32 changed = NormalizeUnreadFlatInputs(fs_rt, InterpolatedInputs(params.hash, params.code))) {
+        if (const u32 changed = NormalizeFlatInputs(fs_rt, PassthroughSensitiveInputs(params.hash, params.code))) {
             static std::atomic<u32> reported{0};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-                std::fprintf(stderr, "SOTC PS INPUT NORMALIZE: program %#llx, %u unread flat inputs keyed as "
+                std::fprintf(stderr, "SOTC PS INPUT NORMALIZE: program %#llx, %u flat inputs keyed as "
                              "passthrough\n", static_cast<unsigned long long>(params.hash), changed);
             }
         }

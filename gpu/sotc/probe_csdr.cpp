@@ -202,23 +202,7 @@ HookAction Loaded(GuestRegs& regs, void*) {
     if (!data) {
         return HookAction::Continue;
     }
-    const unsigned char* p = data;
-    const unsigned char* end = data + n - 32;
-    while (p <= end) {
-        const void* hit = std::memchr(p, 'O', static_cast<size_t>(end - p) + 1);
-        if (!hit) {
-            break;
-        }
-        p = static_cast<const unsigned char*>(hit);
-        if (std::memcmp(p, kOrb, sizeof kOrb) == 0) {
-            uint64_t hash = 0;
-            std::memcpy(&hash, p + 16, 8);
-            SotcPredict::NoteLoaded(hash);
-            p += 32;
-        } else {
-            ++p;
-        }
-    }
+    SotcPredict::NoteLoadedData(data, n);
     return HookAction::Continue;
 }
 
