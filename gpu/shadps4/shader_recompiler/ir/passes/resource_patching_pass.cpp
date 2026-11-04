@@ -952,6 +952,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         case AmdGpu::ImageType::Color2D:
         case AmdGpu::ImageType::Color2DMsaa:
         case AmdGpu::ImageType::Color2DArray:
+        case AmdGpu::ImageType::Color2DMsaaArray: // sotc: see the coordinate switch below
         case AmdGpu::ImageType::Cube:
             return ir.CompositeConstruct(read(0), read(8));
         case AmdGpu::ImageType::Color3D:
@@ -975,6 +976,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         case AmdGpu::ImageType::Color2D:
         case AmdGpu::ImageType::Color2DMsaa:
         case AmdGpu::ImageType::Color2DArray:
+        case AmdGpu::ImageType::Color2DMsaaArray: // sotc: see the coordinate switch below
         case AmdGpu::ImageType::Cube:
             // (du/dx, dv/dx), (du/dy, dv/dy)
             addr_reg = addr_reg + 4;
@@ -1032,13 +1034,23 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
             addr_reg = addr_reg + 2;
             return ir.CompositeConstruct(get_coord(addr_reg - 2, 0), get_coord(addr_reg - 1, 1));
         case AmdGpu::ImageType::Color2DArray: // x, y, slice
+        case AmdGpu::ImageType::Color2DMsaaArray: // x, y, slice (sotc: was unreachable; colossus 1 arena, 4 Nov 2026)
         case AmdGpu::ImageType::Cube:         // x, y, face
         case AmdGpu::ImageType::Color3D:      // x, y, z
             addr_reg = addr_reg + 3;
             return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
                                          get_coord(addr_reg - 1, 2));
-        default:
-            UNREACHABLE();
+        default: {
+            // sotc: an Invalid view type (a null T# at translation) used to stop the game here. It is read
+            // as a 2D sample (the null image binding is 2D); logged once with the type.
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                LOG_WARNING(Render_Recompiler, "Image sample with view type {} read as 2D",
+                            static_cast<u32>(view_type));
+            }
+            addr_reg = addr_reg + 2;
+            return ir.CompositeConstruct(get_coord(addr_reg - 2, 0), get_coord(addr_reg - 1, 1));
+        }
         }
     }();
 

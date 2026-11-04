@@ -73,6 +73,7 @@ struct PendingPool {
     uint64_t t_ns;
 };
 std::vector<PendingPool> g_pending_pools;
+uint64_t g_bad_pool_bases = 0; // sotc: pools whose resolved base was not mapped guest memory (dropped)
 constexpr uint64_t kPoolMin = uint64_t{1} << 20;
 constexpr uint64_t kPoolResolveNs = 20'000'000; // the creator has returned by then
 constexpr uint64_t kObjBaseOffset = 0x10;
@@ -170,6 +171,16 @@ void ResolvePools(uint64_t now) {
             continue;
         }
         base &= 0xFFFFFFFFFFFFull;
+        // sotc: the pool object can be freed and reused before it is resolved (kPoolResolveNs later): its
+        // +0x10 then holds unrelated data (0x870122068701, 0x6805a8052005 after a colossus jump, which
+        // walked the memory tracker out of bounds). Keep only a base whose first and last bytes are mapped
+        // guest memory inside the tracked 40-bit range.
+        unsigned char probe = 0;
+        if (base >= (uint64_t{1} << 40) || p.size > (uint64_t{1} << 40) - base ||
+            !SotcGuest::Read(base, &probe, 1) || !SotcGuest::Read(base + p.size - 1, &probe, 1)) {
+            ++g_bad_pool_bases;
+            continue;
+        }
         const uint64_t end = base + p.size;
         const uint64_t src = (uint64_t{p.source} << 32) | p.kind;
         auto& k = g_kinds[kPool];
@@ -376,9 +387,10 @@ void Report(std::string& out, double seconds) {
     char line[512];
     std::snprintf(line, sizeof line,
                   "SOTC PRELOAD UPLOAD (%.1f s): bind copies %.1f MiB, of loaded ranges %.1f MiB; idle uploads %.1f "
-                  "MiB in %llu calls, queued %zu; ranges %zu;",
+                  "MiB in %llu calls, queued %zu; ranges %zu; bad pool bases %llu;",
                   seconds, g_bind_copied / mib, g_bind_copied_loaded / mib, g_uploaded / mib,
-                  (unsigned long long)g_drain_calls, g_queue.size(), g_loaded.size());
+                  (unsigned long long)g_drain_calls, g_queue.size(), g_loaded.size(),
+                  (unsigned long long)g_bad_pool_bases);
     out += line;
     std::vector<std::pair<uint32_t, KindStat>> kinds(g_kinds.begin(), g_kinds.end());
     std::sort(kinds.begin(), kinds.end(),

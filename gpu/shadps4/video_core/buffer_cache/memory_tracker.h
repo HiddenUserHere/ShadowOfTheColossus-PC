@@ -16,6 +16,9 @@
 #include "../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG (fresh regions)
 
 namespace VideoCore {
+/// sotc: prints the current thread's return addresses as exe offsets (page_manager.cpp).
+void SotcLogCallerStack(const char* tag);
+
 
 class MemoryTracker {
 public:
@@ -591,6 +594,7 @@ private:
             if (!logged.exchange(true, std::memory_order_relaxed)) {
                 std::fprintf(stderr, "SOTC MEMTRACK address past the tracked range: 0x%llx size 0x%llx (ignored)\n",
                              static_cast<unsigned long long>(cpu_address), static_cast<unsigned long long>(size));
+                SotcLogCallerStack("SOTC MEMTRACK caller stack"); // sotc: who passed it (exe offsets)
             }
             return false;
         }

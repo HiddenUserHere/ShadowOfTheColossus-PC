@@ -84,6 +84,21 @@ static u64 ImageBaseAddress() {
 #endif
 
 namespace VideoCore {
+// sotc: SOTC MEMTRACK diagnostics (memory_tracker.h IteratePages): the caller stack as exe offsets,
+// symbolized with llvm-symbolizer --obj=out/gpu/bb-probe.exe.
+void SotcLogCallerStack(const char* tag) {
+    void* frames[24]{};
+    u32 count = 0;
+#ifdef _WIN64
+    count = CaptureStackBackTrace(1, 24, frames, nullptr);
+#endif
+    std::string where;
+    for (u32 i = 0; i < count; ++i) {
+        where += fmt::format(" {:#x}", reinterpret_cast<u64>(frames[i]) - ImageBaseAddress());
+    }
+    std::fprintf(stderr, "%s:%s\n", tag, where.c_str());
+}
+
 
 namespace {
 // sotc: the guest stack registry lock. SignalImpl::Protect holds it SHARED across the host
