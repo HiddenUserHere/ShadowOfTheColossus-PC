@@ -13,6 +13,7 @@
 #include "probe_frame_rings.h" // sotc: SOTC_FRAME_RINGS (docs/re-backend/10-ring-reuse.md)
 #include "probe_xpr_groups.h"  // sotc: SOTC_XPR_GROUPS (XPR_INDEX_CULL, observe only)
 #include "probe_csdr.h"        // sotc: SOTC_CSDR_PROBE (RES_DECOMPRESS, observe only)
+#include "probe_dump.h"        // sotc: SOTC_RES_DUMP (resource and .cwks body dump, observe only)
 #include "probe_vsize.h"       // sotc: SOTC_VSIZE_PROBE (VSIZE_VIEW_SITE, object map)
 #include "particle_prev.h"
 #include "decommit_budget.h"
@@ -44,6 +45,7 @@ void RegisterAllHandlers() {
     SotcProbes::RegisterArea();
     SotcProbes::RegisterPass(); // sotc: SOTC_PASS_PROBE (probe_pass.cpp), observe only
     SotcProbes::RegisterCalls(); // sotc: SOTC_CALL_PROBE (probe_calls.cpp), observe only
+    SotcProbes::RegisterRe();    // sotc: SOTC_RE_PROBE (probe_re.cpp), observe only
     SotcProbes::RegisterMemtype(); // sotc: PC memory model, wave B
     SotcProbes::RegisterXprMem();
     SotcPcRing::Register(); // sotc: SOTC_PC_RING (PC memory model)
@@ -57,6 +59,7 @@ void RegisterAllHandlers() {
     SotcProbes::RegisterOpsProbe();     // sotc: SOTC_OPS_PROBE (observe only)
     SotcXprGroups::Register();          // sotc: SOTC_XPR_GROUPS (XPR_INDEX_CULL, observe only)
     SotcCsdrProbe::Register();          // sotc: SOTC_CSDR_PROBE (RES_DECOMPRESS, observe only)
+    SotcResDump::Register();            // sotc: SOTC_RES_DUMP (RES_CREATE, CWKS_BODY; observe only)
     SotcVsizeProbe::RegisterVsizeHooks(); // sotc: SOTC_VSIZE_PROBE (VSIZE_VIEW_SITE, observe only)
     SotcFrameRings::Register(); // sotc: SOTC_FRAME_RINGS (RING_INIT hook, observe only)
     SotcProbes::RegisterParticlePrev();

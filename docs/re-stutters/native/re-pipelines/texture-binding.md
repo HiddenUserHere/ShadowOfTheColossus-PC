@@ -1691,3 +1691,116 @@ No draw change. One run with the existing probes, or read-only hooks on the func
 | Stage setters | `0x937c0`, `0x94ab0` | `0009/000937c0.c`, `0009/00094ab0.c` |
 | Pass callers | `0xcaed0`, `0xc4330`, `0xa6640`, `0xe2d70`, `0xcefa0`, `0xd0040`, `0xd04e0` | `000c/000caed0.c` and the others in `000c/`, `000d/`, `000a/`, `000e/` |
 | Atlas creation | `0x10ec60` (from `0x102bb0`) | `0010/0010ec60.c` |
+
+## Run results (RA, 4 Nov 2026)
+
+Source: `user/runGJ/re_probe.log` (one run, `SOTC_RE_PROBE=1`, cold shader cache). Probe: `gpu/sotc/probe_re.cpp`;
+walker log: `LogWalkerRe` in `flatten_extended_userdata_pass.cpp`. Image base of this run: `Image at 0000000018040000`
+(first line of the log), so eboot offset = absolute address - 0x18040000. **Caveat:** every topic stops at 300 distinct
+keys (material at 1500 lines), so counts are the first lines in time order, not the whole run. Hooks that printed no
+`SOTC HOOKS:` rate line never fired: RE_MATERIAL_LOADER (0xf9530) and RE_REFRESH_F8D10 (0xf8d10).
+
+Verdicts: CONFIRMED, REFUTED, PARTIAL (some of the item logged), UNKNOWN (not logged, or the run cannot decide it).
+
+### RA.1 Material blocks (T7.7, T8.9, A.7, T11.6)
+
+- 191 material lines (`src=factory`). For each: S1 = `+0x478 - +0x470` (blob A bytes) and S2 = `+0x4b8 - +0x4b0`
+  (blob B bytes). S1 is 0..560, S2 is 0..64. **S1 % 16 != 0 in 0 of 191; S2 % 16 != 0 in 0 of 191.** `list1 == count1`
+  and `list2 == count2` in 191 of 191. **observed**.
+- Mask `mat+0x468`: 0x35b (143), 0x11b (22), 0x13b (18), 0x37b (5), 0x10b (2), 0x33b (1).
+- **New rule (observed, 191 of 191 materials):** block 2 is present (gate2 > 0) exactly when the mask has bit 0x20 set.
+  0x13b, 0x37b and 0x33b (24 materials) have block 2; 0x35b, 0x11b and 0x10b (167) do not.
+- Blob size is not a function of the mask: 0x35b alone has 24 distinct S1 values.
+- Refresh at 0xf9c40, block 1 (300 of 300 refreshes; all are block 1, the cap was reached on block 1 rows):
+  `A=10/10 B=10/10 C=0/10` (A = data+S+32i, B = data+round16(S)+32i, C = data+round16(S)-32*count+32i).
+  The T# words written are the payload T# words in every row. Because S % 16 == 0 everywhere, A and B are the same
+  address in this run, so this run cannot separate them. C (the aligned-down candidate) never matches.
+- Block 2 refreshes: not logged (cap). 0xf8d10 (notify): never fired.
+
+### RA.2 Item results, T7.7
+
+1. Blob size per program: **UNKNOWN.** The log has no program per material. Size varies within one mask (see above).
+2. Mask per program: **PARTIAL.** The block 2 rule (bit 0x20) is found; the per-program link is not logged.
+3. Gate byte at 0xae150: **CONFIRMED for stage indices 0 and 1.** `srt-chunk layout=0 lay_u16=0x0200 sgpr=0 count=2`
+   in 222 rows (index 0) and 78 rows (index 1); the u16 is 0x0200 in all 300. Index 2 (VS, by the probe's comment) is
+   not in the first 300 keys, so VS is **UNKNOWN**.
+4. Writers of `P+0xb0` / `P+0xb8`: **UNKNOWN** (no write watch in the probe).
+5. Chunk contents at 0x862490: **PARTIAL.** The 8 qwords are logged. `C[3]` was not compared with `material+0x588`
+   (no join between chunk rows and materials).
+6. T# identity: **CONFIRMED for block 1** (refresh rows above: payload T# = block T# in every row). Block 2 not checked.
+7. Shader side (first `s_load` of the SRT): **UNKNOWN** (`DumpSrtProgram` not run). See RA.7 for the walker reads.
+
+### RA.3 Item results, T8.9
+
+1. 0xf5cd0 exit: **UNKNOWN** (no hook at 0xf5cd0).
+2. 0xf6c90 exit with value 1: **PARTIAL.** The material line (factory) gives gates, counts, S1 and S2 for 191 materials.
+3. 0xf8c90 / 0xf8c30 pass slots: **UNKNOWN.** Only the entry of 0xf8c90 is hooked; `pass+0xb0` / `+0xb8` are not read.
+4. 0xf8d10 notify and placement: **UNKNOWN** for 0xf8d10 (never fired). Placement at 0xf9c40: **CONFIRMED for block 1**
+   (RA.1).
+5. Call counts of 0xf9ef0 / 0xf9c40: **PARTIAL.** 0xf9c40 fires about 49,800 times per second (rate line); 0xf9ef0 is
+   not hooked.
+6. 0xf9410 return: **UNKNOWN.**
+7. 0x96680 exit (`.ctxr` path): **UNKNOWN.** The `path` field of the material entries printed `path="?"` in 1297 of
+   1309 lines (the probe's path read failed), so entries cannot be matched to files from this log.
+8. 0x8655d0 exit (V# words): **UNKNOWN** here. The V# writers that were hooked are at 0x85e8e0 / 0x85e9a0 / 0x85e820
+   (see vertex-formats.md, RA section).
+
+### RA.4 Item results, A.7 (blob A)
+
+1. Blob A bytes and count at 0xf5cd0 entry: **PARTIAL.** Count is confirmed (`list1 == count1` in 191 of 191); the
+   bytes were not dumped.
+2. Pass block pointer at 0xf8c90 / 0xf8c30 exit: **UNKNOWN.**
+3. First SGPR writer of the block pointer: **UNKNOWN.** The chunk is logged; the block-base comparison is not.
+4. Draw check at 0x86b040: **UNKNOWN** (not hooked).
+5. Placement check at 0xf9c40: **CONFIRMED for S % 16 == 0** (RA.1). **A.6 (blob size not a multiple of 16) is not
+   settled:** no such material appeared (0 of 191).
+6. Optional shader offsets: **UNKNOWN.**
+
+### RA.5 Item results, T11.6
+
+1. S1 and S2 for the materials: **CONFIRMED for this run**: 0 of 191 with S % 16 != 0.
+2. Shader dump (`*.srtprogram.txt`): **UNKNOWN** (not run).
+3. `SOTC_VSIZE_PROBE`: **UNKNOWN** (not run).
+4. Comparison of the shader offset with S: **UNKNOWN** (needs 2 or 3). S % 16 == 0 everywhere, so the
+   `S + 32*i` versus `round16(S) + 32*i` question does not arise in this run.
+
+### RA.6 Item results, T12.7 (SRT chunk and mask)
+
+1. Draw-time SGPR check: **REFUTED for the expectation `chunk[0] == P[0x90]` in the sampled rows.** `chunk[0]` is
+   `0x1042710110` in 211 of 222 index-0 rows. The srt-mask rows show that value at `P[1]` (`P+0x98`) for mask 0x11b,
+   while `P[0]` varies (3 values) in those rows and is 0 in all 189 rows of mask 0x172. The join is by value, not by
+   call. Evidence: `srt-chunk layout=0 ... q=0x0000001042710110 0x0000001041108090`;
+   `srt-mask mask=0x11b ... slots=[0x104310a2c0 0x1042710110 0x0 ...]`. The user SGPRs at draw time were not read.
+2. Mask per material at 0x95320: **PARTIAL.** Masks passed to 0x95320 are 0x172 (189 rows), 0x11b (75), 0x35b (32),
+   0x3fb (4). The per-material masks 0x10b, 0x12b and 0x13b do not appear at 0x95320 in this run. 0x172 is the constant
+   mask of 0x1051f0 / 0x103ad0 (T7 table).
+3. Which entries a shader reads: **CONFIRMED** (RA.7).
+4. Writers of `P+0x98` / `P+0xd0`, caller of 0x18d6f0: **UNKNOWN.**
+5. Static check on `.csdr`: **UNKNOWN** (not in this run).
+
+### RA.7 Walker reads (port side, `LogWalkerRe`)
+
+- 102 program headers: 38 VS and 64 PS (the first 38 VS and 64 PS programs of the run). 43 distinct program hashes;
+  the same hash can appear more than once. 28 programs have reads: 19 VS and 9 PS. The other 11 VS and 4 PS have none.
+- 1408 reads (VS 824, PS 584). **All 1408 are immediate offsets (valid = 1)**, so each read's offset is fixed for its
+  compiled program. Variation across materials was not tested.
+- Path = `[root SGPR, pointer dword offsets...]`; `src_dw` = dword in the table at the end of the path. The SGPR 0 root
+  table is the stage's chunk; a chunk qword index is dword / 2.
+- VS: direct dwords 0..~8 of the SGPR 0 table (path `[0]`); pointer at dword 0 (`chunk[0]`) read at dwords 0..152
+  (path `[0,0]`, 16 programs); pointer at dword 2 (`chunk[1]`, path `[0,2]`, 17 programs); pointer at dword 4
+  (`chunk[2]`, path `[0,4]`, 8 programs). One VS program reads the SGPR 12 table (dwords 0..7).
+- PS: direct dwords 0..3 (path `[0]`); `[0,0]` dwords 3..11; `[0,2]` dwords 4..7; SGPR 12 table dwords 0..7 in 4
+  programs.
+- **No read at dword 6 or 8 (`chunk[3]`, `chunk[4]`) in any of the 28 programs.** The material block pointers placed at
+  `chunk[3]/[4]` (T7, T12) are not seen in these programs. Programs past the cap are not covered.
+- Answer to item 3: VS and PS both read `chunk[0]` and `chunk[1]`; only VS reads `chunk[2]`.
+
+### RA.8 Verdict summary (texture-binding.md)
+
+| Item | Verdict |
+|---|---|
+| T7.7 items 1-7 | UNKNOWN, PARTIAL, CONFIRMED (stages 0 and 1 only), UNKNOWN, PARTIAL, CONFIRMED (block 1), UNKNOWN |
+| T8.9 items 1-8 | UNKNOWN, PARTIAL, UNKNOWN, CONFIRMED (block 1 at 0xf9c40), PARTIAL, UNKNOWN, UNKNOWN, UNKNOWN |
+| A.7 items 1-6 | PARTIAL, UNKNOWN, UNKNOWN, UNKNOWN, CONFIRMED for S % 16 == 0 (A.6 open), UNKNOWN |
+| T11.6 items 1-4 | CONFIRMED (0 of 191 with S % 16 != 0), UNKNOWN, UNKNOWN, UNKNOWN |
+| T12.7 items 1-5 | REFUTED (`chunk[0] == P[0x90]`) in the sampled rows, PARTIAL, CONFIRMED, UNKNOWN, UNKNOWN |

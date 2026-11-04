@@ -52,6 +52,11 @@ void RegisterPass(); // sotc: SOTC_PASS_PROBE (probe_pass.cpp), observe only; pr
 // sotc: SOTC_CALL_PROBE (probe_calls.cpp), observe only; prints its own 5 s summary. RegisterCalls installs the
 // CALL_<addr> handlers; NoteStepRateWrites is the port-side count of VGT_INSTANCE_STEP_RATE_0/1 writes (liverpool.cpp).
 void RegisterCalls();
+// sotc: SOTC_RE_PROBE (probe_re.cpp), observe only; one group per RE_* hook (scripts/hooks.d/re.py). No report line.
+void RegisterRe();
+// sotc: SOTC_RE_PROBE decal-cb (K6.9 item 6), port side: the draw's CB_COLOR0..7_INFO raw words and the enabled-target
+// mask. Logs only while a decal MRT bind is armed (probe_re.cpp).
+void NoteDecalDraw(const uint32_t info[8], uint32_t bound_mask);
 void NoteStepRateWrites(uint32_t first_reg, const uint32_t* values, uint32_t count);
 // sotc: PC memory model, wave B (docs/re-stutters/PC-MEMORY-REWRITE.md section 5).
 void RegisterMemtype(); // probe_memtype.cpp, switch SOTC_HOOK_MEMTYPE_PROBE

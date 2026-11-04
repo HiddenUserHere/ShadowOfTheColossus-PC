@@ -1466,3 +1466,64 @@ and the mapping needs another source.
 | Port presets and cvars | `af16`, `fps60game` | `scripts/sotc_modes.py:59-74` |
 | Launcher preset text and cascade variants | menu and cvars | `launcher/sotc_launcher_win.py:649-652, 1353-1355` |
 | Neo runtime switch | `runtime_sotc_neo` | `src/runtime_sotc.c:45-55` |
+
+## Run results (RA, 4 Nov 2026)
+
+Source: `user/runGJ/re_probe.log` (same run as texture-binding.md, `SOTC_RE_PROBE=1`, cold cache). Eboot offset =
+absolute address - 0x18040000. Topic `pass-*` is capped at 300 lines per topic; pass-flip (5 lines), pass-mode (0),
+pass-table (1) and pass-view (1) are far below the cap. decal-cb logged 38 arms and 262 draws.
+
+**Key finding for this section:** the probe computes the manager as `M = *(*(image+0x2ed3670)+0x80)`. In this run that
+value is 0 in every line that uses it (`pass-view`, `pass-flip`, all 300 `pass-mrt`). The object the game itself passes
+as the manager is non-null: `pass-table M=0x78322817712` is the `rdi` of 0x9fba0. The decompile agrees (inferred, see
+item 1): `DAT_02ed3670` is the manager object itself, not a pointer to a sub-object. So the `+0x80` dereference in the
+probe (and the `M = *(DAT_02ed3670 + 0x80)` of K6.3 / K6.9 item 1) is wrong, and every "M+..." value logged in this run
+was read at the wrong base.
+
+### RA.P1 Item results, K6.9
+
+1. First `cefa0` call, `V == M`: **REFUTED.** `pass-view first F=0x123c6d4e60 F40=0x123c6baa68 V=0x100dc05700 M=0x0
+   V==M no`. Because M was read at the wrong base, the decision uses the correct manager O = `0x78322817712`
+   (value of `DAT_02ed3670`, from `pass-table`): V != O, and V != `*(O+0x80)` (which is 0 in this run). So V is another
+   object, not the manager. Decompile support (inferred): `0x95a90` stores its allocated object in `DAT_02ed3670`
+   (`00095a90.c` lines 54-61); `0x90860` passes `DAT_02ed3670` itself to `0x95690` (line 200), which passes it to
+   `0xa1cd0` (`000a1cd0.c`, reads `+0x3b70`) and to `0x9fba0`.
+2. `sceKernelIsNeoMode()` result: **CONFIRMED neo = 0** (`pass-table ... neo=0`, `pass-flip first-call neo=0`). The
+   port runs as base PS4, so the derived (Neo) tables are not expected to exist.
+3. `M+0x2288` pointer, count at `+0x1a8`, `M+0x1e80`: **UNKNOWN.** Read at the wrong base (`M2288=0x0 count1a8=0
+   M1e80=0x0`). Needs a re-run with O (`0x78322817712` in this run) as the base.
+4. Derived tables at 0x9fba0 (Neo only): **CONFIRMED that they are empty on base PS4.** At the correct object
+   (`pass-table M=0x78322817712`), all ten sources read `0x0/0x0`, e.g. `[08]=0x0/0x0 [38]=0x0/0x0 ... [380]=0x0/0x0`.
+5. `0x90860` (S, S+0x4b8, S+0x4c0, R) and the mode change at `0xa1cd0`: **PARTIAL.**
+   - R is `0x123c3c5630` in all four logged calls (calls 1, 3, 4 and 176). S4b8 = 0 and S4c0 = 3 in all four.
+     Frequency of R changes: **UNKNOWN** (only four distinct S were logged; R did not change in them).
+   - Mode: no `pass-mode` line. RE_PASS_MODE (0xa1cd0) never fired. Inferred: `0x95690` returns early when the mode is
+     unchanged (`00095690.c` lines 7-8), and `0xa1cd0` is called only from there, so **no mode change happened in this
+     run**. The new value was not observed.
+6. Decal draws, CB_COLORn INFO after the decal MRT bind: **REFUTED as a general statement.** K6 predicted that colour
+   target 0 is unbound for decal draws. Over 38 arms (262 draws logged, the first 8 after each arm):
+   - `bound` (bit 0 = target 0 enabled): `0x00` in 78 draws, `0x01` in 100, `0xff` in 84. So target 0 is enabled in
+     184 draws and unbound in 78.
+   - `cb0` INFO is `0x00000000` in 47 draws (the unbound ones and some others) and non-zero in the rest (for example
+     `0x00042730`, `0x00050410`, `0x0000a028`).
+   - Evidence: `decal-cb draw=1 arm=2 bound=00 cb0=00000000` (unbound); `decal-cb draw=13 arm=4 bound=01 cb0=00042730`
+     (bound).
+   - Caveat: the logged draws are the first eight after each arm; they are not checked to be decal (k = 6) draws. The
+     decal pixel-program hash was not logged: **UNKNOWN** for the 109-program question.
+7. `0x92140` MRT slots against `M+0x60` and `M+0x58`: **UNKNOWN.** The comparison used the wrong M (`eq0=0 eq1=0`
+   everywhere, not evidence). The slot values themselves: slot 0 is pointer-like (200 distinct values in 300 rows;
+   `slot0=0x124bac0280`). Slot 1 is never a pointer in this run: 300 of 300 read as sign-extended values such as
+   `0xffffffff00000000` (173 rows), `0xffff80e000000000` (63), `0xffff90ff00000000` (32), so the hypothesis "slot 1 =
+   Normal" is not supported by what is stored at `P[1]`. The shader export order (MRT0 = Albedo?) was not checked.
+
+### RA.P2 Verdict summary (pass-targets.md, K6.9)
+
+| Item | Verdict |
+|---|---|
+| 1. `V == M` | REFUTED (V is another object; the M formula is wrong) |
+| 2. Neo flag | CONFIRMED neo = 0 |
+| 3. `M+0x2288`, count, `M+0x1e80` | UNKNOWN (wrong base in the probe) |
+| 4. Derived tables (Neo) | CONFIRMED empty on base PS4 |
+| 5. R, S, mode change | PARTIAL: R constant (4 calls), no mode change (inferred), change rate UNKNOWN |
+| 6. Decal CB INFO | REFUTED as stated (cb0 bound in 184 of 262 draws); pixel-program hash UNKNOWN |
+| 7. `0x92140` slots | UNKNOWN (wrong base); P[1] is not a pointer in this run |

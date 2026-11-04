@@ -43,6 +43,7 @@
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (AscRptrMode below)
 #include "../../../sotc/pc_ring.h"                   // sotc: SOTC_PC_RING full ring (mode)
+#include "../../../sotc/cmd_counters.h" // sotc: SOTC_CMD_COUNTERS (DCB hashes, CP time, spins, frame waits)
 #include "../../../sotc/probes.h"                    // sotc: SOTC_CALL_PROBE (NoteStepRateWrites)
 #include "video_core/buffer_cache/pc_ring_copy.h"    // sotc: SOTC_PC_RING full ring (copy)
 #include "video_core/buffer_cache/sync_events.h"  // sotc: SOTC_SYNC_EVENTS (drain at the submit start)
@@ -369,6 +370,8 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
         return v && v[0] == '1';
     }();
     asc_rptr_mode = AscRptrMode();
+    // sotc: SOTC_CMD_COUNTERS, frame-slot wait cause. frames_recorded only moves with the frame tickets.
+    SotcCmdCounters::SetRecordedCounter(frame_tickets ? &frames_recorded : nullptr);
     if (frame_tickets || asc_rptr_mode) {
         LOG_INFO(Render, "SOTC_CP_AHEAD={} SOTC_ASC_RPTR={}", CpAheadMode(), asc_rptr_mode);
     }
@@ -1987,6 +1990,24 @@ const Vulkan::PreparedDraw* Liverpool::TakePrepared(u64 seq, bool dispatch) {
 void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
     const OpCostScope op_cost{SotcArch::OpCost::Thread::CommandProcessor,
                               SotcArch::OpCost::Op::Draw}; // sotc: SOTC_OPCOST
+    // sotc: SOTC_RE_PROBE (read once, observe only): CB_COLORn_INFO of the draws after a decal MRT bind
+    // (probe_re.cpp NoteDecalDraw, topic decal-cb).
+    static const bool kSotcReDecal = [] {
+        const char* v = std::getenv("SOTC_RE_PROBE");
+        return v && v[0] >= '1' && v[0] <= '9';
+    }();
+    if (kSotcReDecal) {
+        const AmdGpu::Regs& dregs = DrawRegs();
+        u32 info[8] = {};
+        u32 bound = 0;
+        for (u32 cb = 0; cb < 8; ++cb) {
+            info[cb] = dregs.color_buffers[cb].info.raw;
+            if (dregs.color_target_mask.GetMask(cb)) {
+                bound |= 1u << cb;
+            }
+        }
+        SotcProbes::NoteDecalDraw(info, bound);
+    }
     if (!back_threaded) {
         rasterizer->Draw(is_indexed, index_offset);
         return;
@@ -4264,6 +4285,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
+        // sotc: SOTC_CMD_COUNTERS: time of this packet by opcode (1 in 64 sampled; observe only).
+        const SotcCmdCounters::PacketTimer pkt_timer{
+            type, type == 3 ? static_cast<u32>(header->type3.opcode.Value()) : 0u,
+            type == 3 && (header->type3.opcode == PM4ItOpcode::IndirectBuffer ||
+                          header->type3.opcode == PM4ItOpcode::IndirectBufferConst)};
 
         switch (type) {
         default:
@@ -5267,6 +5293,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     ++cp_wait_exits; // sotc: progress marker (Process)
                     break;
                 }
+                // sotc: SOTC_CMD_COUNTERS: this wait's rounds and wall time by label (observe only).
+                SotcCmdCounters::SpinScope spin_scope{reinterpret_cast<uint64_t>(wait_addr)};
                 bool ring8_flushed = false; // sotc: SOTC_PC_RING8_LABELS, this wait
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     // sotc: SOTC_PC_RING8_LABELS: a wait on a deferred label that has not landed
@@ -5287,6 +5315,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (SotcStats::kFpsLog) { // sotc: SOTC_FPS CP spin accounting
                         cp_wait_kind = MemWaitKind(*wait_reg_mem, vo_port->IsVoLabel(wait_addr));
                     }
+                    spin_scope.Round(); // sotc: SOTC_CMD_COUNTERS
                     YIELD_GFX();
                 }
                 ++cp_wait_exits; // sotc: progress marker (Process)
@@ -6019,6 +6048,7 @@ void Liverpool::CollectNestedIbs(std::span<const u32> cb, SubmitRanges& out, u32
 }
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+    SotcCmdCounters::NoteDcb(dcb); // sotc: SOTC_CMD_COUNTERS (observe only, before any copy)
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {

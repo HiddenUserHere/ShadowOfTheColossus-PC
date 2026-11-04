@@ -16,10 +16,25 @@
 #include <cstdio>
 
 #include "../hooks.h"
+#include "../cmd_counters.h" // sotc: SOTC_CMD_COUNTERS (frame-slot wait causes)
 #include "native.h"
 
 namespace SotcNativeSync {
 namespace {
+
+// sotc: SOTC_CMD_COUNTERS. The same FrameWait as before, classed by the frame's recording state at its start
+// (cp-behind: not recorded, gpu-behind: recorded) and timed. Off: a plain FrameWait.
+void FrameWaitCounted(uint64_t target) {
+    if (!SotcCmdCounters::kOn) {
+        SotcNative::FrameWait(target);
+        return;
+    }
+    const int state = SotcCmdCounters::RecordedAt(target);
+    const bool done = SotcNative::FrameCompleted() >= target;
+    const uint64_t t0 = SotcCmdCounters::NowNs();
+    SotcNative::FrameWait(target);
+    SotcCmdCounters::NoteFrameWait(state, SotcCmdCounters::NowNs() - t0, done);
+}
 
 std::atomic<uint64_t> g_closed{0};       // ticket of the last frame closed by sceGnmSubmitDone
 std::atomic<uint64_t> c_reuse_calls{0};  // WaitReuse calls
@@ -44,7 +59,7 @@ SotcHooks::HookAction SlotSpinPre(SotcHooks::GuestRegs& regs, void*) {
     const uint64_t target = ReuseTarget();
     if (target != 0) {
         c_slot_spin_wait.fetch_add(1, std::memory_order_relaxed);
-        SotcNative::FrameWait(target);
+        FrameWaitCounted(target);
     }
     const auto* expected =
         reinterpret_cast<const uint64_t*>(regs.r13 + regs.rcx * 8 + 0x780); // engine's CPU copy
@@ -64,7 +79,7 @@ void WaitReuse() {
     const uint64_t target = ReuseTarget();
     if (target != 0) {
         c_reuse_waits.fetch_add(1, std::memory_order_relaxed);
-        SotcNative::FrameWait(target);
+        FrameWaitCounted(target);
     }
 }
 

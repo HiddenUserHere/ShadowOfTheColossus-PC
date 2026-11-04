@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstdio>
 #include <mutex>
+#include <string>
 #include <cstdlib>
 #include <optional>
 #include <unordered_map>
@@ -362,6 +364,14 @@ struct PassInfo {
 static const bool kSotcVsizeRecord = [] {
     const char* v = std::getenv("SOTC_VSIZE_PROBE");
     return v && v[0] == '1';
+}();
+
+// sotc: SOTC_RE_PROBE (read once, observe only): logs the SRT walk of the first 64 VS and 64 PS programs translated
+// in this run (gpu/sotc/probe_re.cpp, topic walker). The provenance is recorded as SOTC_VSIZE_PROBE does; no code
+// changes. Programs restored from the pipeline cache are not walked here, so they are not logged.
+static const bool kSotcReWalk = [] {
+    const char* v = std::getenv("SOTC_RE_PROBE");
+    return v && v[0] >= '1' && v[0] <= '9';
 }();
 
 namespace Shader::Optimization {
@@ -1217,6 +1227,49 @@ void SimplifyReadConstAddressAdd(IR::Inst& inst) {
     }
 }
 
+// sotc: SOTC_RE_PROBE walker log. One line per program (its SRT root SGPRs and read count), then one line per recorded
+// read: the flat-buffer dword it fills, the table-level dword it reads (the immediate offset), the pointer path of the
+// levels above it, and whether the path is exact. A chunk offset is the qword index (dword / 2).
+static void LogWalkerRe(const IR::Program& program, const PassInfo& pass_info) {
+    constexpr int kProgramsPerStage = 64;
+    constexpr int kReadsPerProgram = 48;
+    constexpr int kLineCap = 1500;
+    static std::atomic<int> vs_programs{0};
+    static std::atomic<int> ps_programs{0};
+    static std::atomic<int> lines{0};
+    const HwStage stage = program.info.hw_stage;
+    if (stage != HwStage::Vertex && stage != HwStage::Fragment) {
+        return;
+    }
+    std::atomic<int>& count = stage == HwStage::Vertex ? vs_programs : ps_programs;
+    if (count.fetch_add(1) >= kProgramsPerStage || lines.load() >= kLineCap) {
+        return;
+    }
+    const char* stage_name = stage == HwStage::Vertex ? "VS" : "PS";
+    std::string roots;
+    for (const auto& [ud_reg, root] : pass_info.srt_roots) {
+        roots += " " + std::to_string(static_cast<int>(ud_reg));
+    }
+    const auto& sources = program.info.sotc_srt_sources;
+    std::fprintf(stderr, "SOTC RE walker stage=%s pgm=0x%016llx ud_sgpr=[%s ] reads=%zu\n", stage_name,
+                 static_cast<unsigned long long>(program.info.pgm_hash), roots.c_str(), sources.size());
+    lines.fetch_add(1);
+    int printed = 0;
+    for (const SotcSrtSource& src : sources) {
+        if (printed++ >= kReadsPerProgram || lines.load() >= kLineCap) {
+            break;
+        }
+        std::string path;
+        for (const u32 level : src.path) {
+            path += " " + std::to_string(level);
+        }
+        std::fprintf(stderr, "SOTC RE walker-read stage=%s pgm=0x%016llx dst_dw=%u src_dw=%u valid=%d path=[%s ]\n",
+                     stage_name, static_cast<unsigned long long>(program.info.pgm_hash), src.dst_off_dw,
+                     src.src_off_dw, src.valid ? 1 : 0, path.c_str());
+        lines.fetch_add(1);
+    }
+}
+
 } // Anonymous namespace
 
 void FlattenExtendedUserdataPass(IR::Program& program) {
@@ -1224,7 +1277,8 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
     PassInfo pass_info;
     pass_info.pgm_hash = program.info.pgm_hash;
     // sotc: SOTC_VSIZE_PROBE: the provenance of this program's walker (cleared first, so a re-run starts clean).
-    if (kSotcVsizeRecord) {
+    // SOTC_RE_PROBE records the same provenance for its walker log.
+    if (kSotcVsizeRecord || kSotcReWalk) {
         program.info.sotc_srt_sources.clear();
         pass_info.sotc_sources = &program.info.sotc_srt_sources;
     }
@@ -1329,6 +1383,9 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
     }
 
     GenerateSrtProgram(program.info, pass_info);
+    if (kSotcReWalk) { // sotc: SOTC_RE_PROBE walker log (observe only)
+        LogWalkerRe(program, pass_info);
+    }
 
     // Assign offsets to duplicate readconsts
     for (IR::Inst* readconst : all_readconsts) {

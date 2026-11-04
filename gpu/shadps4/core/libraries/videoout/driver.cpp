@@ -118,6 +118,7 @@ uint64_t runtime_memory_chunk_opens_locked(void);
 #include "../../../../sotc/probe_scopes.h" // sotc: trace v2 engine scopes report
 #include "../../../../sotc/particle_prev.h"
 #include "../../../../sotc/ram_report.h" // sotc: SOTC_RAM_REPORT
+#include "../../../../sotc/cmd_counters.h" // sotc: SOTC_CMD_COUNTERS (5 s report)
 #include "../../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE report
 #include "../../../../sotc/decommit_budget.h"
 #include "../../../../sotc/mip_budget.h"
@@ -2298,6 +2299,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcNative::Report(report, seconds);      // sotc: SOTC_NATIVE
             SotcNativeHooks::Report(report, seconds); // sotc: SOTC_NATIVE write hooks
             SotcNativeSync::Report(report, seconds);  // sotc: SOTC_NATIVE frame ticket
+            SotcCmdCounters::Report(report, seconds); // sotc: SOTC_CMD_COUNTERS (DCB hashes, CP time, spins, waits)
             SotcVerify::Report(report, seconds);      // sotc: SOTC_VERIFY
             SotcN1Verify::Report(report, seconds);    // sotc: SOTC_VERIFY=n1
             SotcNativeResults::Report(report, seconds); // sotc: SOTC_NATIVE GPU-result consumers

@@ -32,6 +32,7 @@
 #include "../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE bind evidence
 #include "../../../sotc/pc_ring.h"      // sotc: SOTC_PC_RING shadow
 #include "../../../sotc/native/native.h"       // sotc: SOTC_NATIVE (windows, announces, frame ticket)
+#include "../../../sotc/cmd_counters.h"        // sotc: SOTC_CMD_COUNTERS (unique-bytes spans, see PcHostRecordBind)
 #include "../../../sotc/native/native_draw.h" // sotc: SOTC_NATIVE draw-thread side
 #include "../../../sotc/native/verify.h"      // sotc: SOTC_VERIFY (NoteGpuConsume)
 #include "../../../sotc/native/n1verify.h"    // sotc: SOTC_VERIFY=n1 (NoteBind)
@@ -7918,8 +7919,10 @@ constexpr size_t kPcHostSpansCompact = 4096; // merge the span list when it grow
 
 void BufferCache::PcHostRecordBind(VAddr addr, u32 size, bool is_written) {
     // sotc: the span records (unique bytes per frame) and samples cost the draw thread on every served bind
-    // (FPS 27 -> 10 in game, 1 Nov): kept only under SOTC_PC_RING8_VERIFY=1.
-    if (!SotcPcRing::Ring8Verify()) {
+    // (FPS 27 -> 10 in game, 1 Nov): kept only under SOTC_PC_RING8_VERIFY=1. SOTC_CMD_COUNTERS=1 also keeps the
+    // spans, because the unique read/written MiB/frame of the host report is computed from them (it printed 0.000
+    // in every run without the verify switch). The hashes below still need the verify switch.
+    if (!SotcPcRing::Ring8Verify() && !SotcCmdCounters::kOn) {
         return;
     }
     auto& spans = is_written ? pc_host_write_spans : pc_host_read_spans;

@@ -31,6 +31,7 @@
 #include "video_core/sotc_stats.h" // sotc: SOTC_DROP_FAST counters (CmdRanges::AddNested)
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH (pass / hazard model)
 #include "../../../sotc/label_honest.h" // sotc: SOTC_LABELS_HONEST (label kinds, counters)
+#include "../../../sotc/cmd_counters.h" // sotc: SOTC_CMD_COUNTERS (frame count at SubmitDone)
 
 namespace Vulkan {
 class Rasterizer;
@@ -131,6 +132,7 @@ public:
 
     void SubmitDone() noexcept {
         std::scoped_lock lk{submit_mutex};
+        SotcCmdCounters::NoteFrame(); // sotc: SOTC_CMD_COUNTERS (frame end: submit index, frame count)
         mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
         mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
         if (frame_tickets) {

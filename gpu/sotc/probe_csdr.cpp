@@ -29,6 +29,7 @@
 #include "hooks.h"
 #include "predict_probe.h"
 #include "pretranslate.h"
+#include "probe_dump.h" // sotc: SOTC_RES_DUMP (RES_LOADED feeds it)
 
 namespace SotcCsdrProbe {
 namespace {
@@ -196,13 +197,19 @@ HookAction Site(GuestRegs& regs, void*) {
 // SOTC_PRETRANSLATE (the programs, translated at load) use it. The data is the loader's stream (CPU heap), freed
 // once the resource is built: the GPU bytes are copied out of it (SOTC_PRELOAD_UPLOAD hooks that copy instead).
 HookAction Loaded(GuestRegs& regs, void*) {
-    if (!SotcPredict::On() && !SotcPretranslate::On()) {
+    const bool dump = SotcResDump::On(); // sotc: SOTC_RES_DUMP (probe_dump.cpp)
+    if (!SotcPredict::On() && !SotcPretranslate::On() && !dump) {
         return HookAction::Continue;
     }
     const size_t n = static_cast<size_t>(regs.rcx);
     const unsigned char* data = n >= 32 && n < (size_t{1} << 30) ? SotcGuest::Backing(regs.rdx, n) : nullptr;
     if (!data) {
         return HookAction::Continue;
+    }
+    if (dump) {
+        uint64_t ret = 0; // sotc: SOTC_RES_DUMP, the return address at [rsp] names the loader's call site
+        std::memcpy(&ret, reinterpret_cast<const void*>(static_cast<uintptr_t>(regs.rsp)), sizeof ret);
+        SotcResDump::NoteResource(ret, data, n);
     }
     SotcPredict::NoteLoadedData(data, n);
     return HookAction::Continue;

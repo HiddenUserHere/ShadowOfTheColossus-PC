@@ -1184,3 +1184,93 @@ address and argument set, one line each.
 - Draw item: `0010/0010c2e0.c` (lines 15-51), `0010/0010c6c0.c`, `0012/00125500.c`, callers `0010/00103ad0.c` and
   `0010/001051f0.c`.
 - Dispatch: `0019/00193810.c`, `0019/00193aa0.c`, `0012/00125520.c`.
+
+## Run results (RA, 4 Nov 2026)
+
+Source: `user/runGJ/re_probe.log` (same run as texture-binding.md, `SOTC_RE_PROBE=1`, cold cache). Eboot offset =
+absolute address - 0x18040000 (`Image at` line of the log). Every topic is capped at 300 distinct keys, so the counts
+are the first lines in time order. skin-palette (216) and skin-queue (178) are not capped. The 0x4938e0 record and the
+0x493bc0 caller were checked with `tools/re/eboot_re.py callers 0x493bc0`.
+
+Hooks that printed no rate line and so never fired: RE_SKIN_STORE (site 0x10c45f). Not hooked at all: 0x1122d0,
+0x116e20/0x116fb0, 0x125520/0x1255d0, 0x193aa0, 0x10c2e0 (only the store site), 0x85e5d0, 0x86b040.
+
+### RA.V1 Item results, T4.10 (SGPR chunk and mask)
+
+1. Item store at 0x1122d0 / 0xdb390 / 0x10b0a0: **UNKNOWN** (not hooked).
+2. Compaction at 0x95320: **PARTIAL.** Mask and `P[0..9]` are logged (300 rows); the returned chunk is not.
+   Masks: 0x172 (189), 0x11b (75), 0x35b (32), 0x3fb (4).
+3. SGPR write at 0x862490: **CONFIRMED for index 0 and 1** (count 2, SGPR 0, in all 300 rows). Index 2 (VS) not in the
+   first 300 keys: **UNKNOWN** for VS. Evidence: `srt-chunk layout=1 lay_u16=0x0200 sgpr=0 count=2`.
+4. Draw side (user SGPRs at the first draw): **UNKNOWN** (not read).
+5. VS fetch shader `s_load` dump: **UNKNOWN** (not run).
+
+### RA.V2 Item results, T5.11 (skin objects, palette, dispatch)
+
+1. Variant and set bits at 0x116e20 / 0x116fb0: **UNKNOWN** (not hooked).
+2. Record count and node count at 0x125520 / 0x1255d0: **UNKNOWN** (not hooked).
+3. Per-record inputs at 0x193810 / 0x193aa0: **PARTIAL.** The input V# writes are logged by the writer hook (table RA.V4,
+   idx 17-21, via 0x1122e0). The per-record stream flags and class (`+0x18`, `+0x1c`) are not logged; 0x193aa0 is not
+   hooked.
+4. Output step at 0x193810: **CONFIRMED** on the formats (table RA.V4). `out_v0` is FLOAT 32_32_32 with stride 12;
+   `out_v1` and `out_v2` are UNORM 2_10_10_10 with stride 4. Parity `p` is 0 in 170 dispatches and 1 in 130.
+5. SAT V# (0x10c2e0 mesh branch): **UNKNOWN.**
+6. Bone palette (0x123330 input and scratch): **PARTIAL, plausible.** The scratch header is `(1, count)` (RA.V3), and
+   node 0 at exit holds plausible 3x4 floats, e.g. `[1 0 0 0 1 0 0 2.98e-08 1 8.583e-06 -0.05656 -0.005073]`. The
+   48-byte input of each node was not logged.
+7. Draw side (VS SGPRs and output-base watch): **UNKNOWN.**
+8. Writers of `obj+0x100` and of the dirty bits, output format of the SAT: **UNKNOWN.**
+
+### RA.V3 Item results, T14.8 (producer, queue, scratch, dispatch)
+
+1. Palette producer at 0x4938e0: **CONFIRMED animated, not identity.** 216 calls, one object, a cycle of 8 record
+   addresses (27 full cycles). For each record, the 12 floats at `rec+0x44` differ in every cycle (27 distinct values
+   per record). Example: `rec44=[0.03496 -0.04218 0.03499 -0.9985 302.8 1.033 -1.972 1.494 0 0 0 0]`. The record at
+   `rec+0x14` also changes (47 distinct values). Floats at `rec+0x10` read as a float near 0.0144 (not a count).
+   `mgr20` is fixed per record (1 or 0).
+2. Queue caller at 0x493bc0: **CONFIRMED caller identity.** 172 of 178 queue calls return to eboot 0x7144f4, the call
+   site 0x7144ef in `sub_714410` (from `eboot_re.py callers`; no decomp file exists for folder 0007). The other 6 are
+   0x493b96 (3 calls, `sub_493ad0`), 0x5751dc (`sub_574f00`), 0x5754dd (`sub_575490`) and 0x716cab (`sub_716bc0`). `sub_714410` is not among the callers named in T14.3 (inferred: a new caller). Arguments: rdi is the same object
+   in all calls (`0x124670fdc0`), rcx = 1 and rdx = 0 in 173 calls, r9 = 0x15c in 172, r8 = 0x158 (94) or 0x1af5a4f0 (78).
+3. Scratch at 0x123330 exit: **CONFIRMED header.** dw0 = 1 in 297 of 297 rows; dw1 equals `head+0x18` (count) in 297 of
+   297. Node 0 varies (205 distinct values in 297). Permutation of T14.2 not checked: **PARTIAL.**
+4. Output V# and palette at 0x193810: **PARTIAL.** The palette V# (`pal_v`) is `98c00000 00100010 00001000 20077fac`:
+   base words, stride 16, 4096 records, FLOAT 32_32_32_32. The count V# and the maximum BONI over the mesh were not
+   read: **UNKNOWN** for "max BONI < NumBones".
+   Probe defect (to fix): in all 300 dispatch lines, `pal_base` (the 8 bytes at `pal`) differs from `pal_v[0..1]`
+   (the 4 dwords at the same `pal`). The two reads are in the same hook, so this needs a probe check before any use of
+   `pal_base`.
+5. Store to `P+0x90` at 0x10c45f: **UNKNOWN** (RE_SKIN_STORE never fired).
+6. First draw of a skinned mesh (VS SGPRs, POS dword offset): **UNKNOWN.**
+7. Calls to 0x85e5d0 between dispatch and draw: **UNKNOWN** (not hooked).
+
+### RA.V4 Skin V# formats (from the writer hooks, `SOTC RE skin-vsharp`)
+
+The probe logs the index (`k + base + i`), the four V# words and the return address. Decoded with: stride = word1
+bits 16-29; base hi = word1 bits 0-15; NUM_FORMAT = word3 bits 12-14; DATA_FORMAT = word3 bits 15-18. Names are
+**inferred** from order and format, not from the shader.
+
+Input writers, return address 0x11235e (inside 0x1122e0, which is called by 0x193810), 2 calls per index:
+
+| idx | inferred name | NUM / DATA format | stride | word3 | base hi16 |
+|---|---|---|---|---|---|
+| 17 | POS0 | FLOAT / 32_32_32 | 12 | 0x2006f3ac | 0x0010 |
+| 18 | NRM0 | UNORM / 2_10_10_10 | 4 | 0x20048fac | 0x0010 |
+| 19 | TAN0 | UNORM / 2_10_10_10 | 4 | 0x20048fac | 0x0010 |
+| 20 | BONI | UINT / 8_8_8_8 | 4 | 0x20054fac | 0x0010 |
+| 21 | BONW | UNORM / 8_8_8_8 | 4 | 0x20050fac | 0x0010 |
+
+Output writers, return address 0x1939c1 (inside 0x193810, direct call), 47 rows per index in the logged part:
+
+| idx | use (dispatch) | NUM / DATA format | stride | word3 | base hi16 |
+|---|---|---|---|---|---|
+| 33 | out+0xe8 + p*0x28 (out_v0) | FLOAT / 32_32_32 | 12 | 0x1806f3ac | 0x7010 |
+| 34 | out+0x138 (out_v1) | UNORM / 2_10_10_10 | 4 | 0x18048fac | 0x7010 |
+| 35 | out+0x160 (out_v2) | UNORM / 2_10_10_10 | 4 | 0x18048fac | 0x7010 |
+
+Extra writers, return address 0x193a23 (inside 0x193810): idx 65 and 66, FLOAT / 32_32_32_32, stride 16, word3
+0x20077fac, the same format as the palette V#. Other callers (0x13792b, 0x137ac5, 0x16eccf, 0x16ec53) write idx 17-23 with
+other formats (for example FLOAT / 32 stride 80); they are not the skin chain and were not used.
+
+Notes: input base hi16 is 0x0010 and output base hi16 is 0x7010 in this run (as logged, not explained). Idx 22 and 23
+are not written in the skin chain (only in the other callers).

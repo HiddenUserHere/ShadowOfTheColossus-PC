@@ -592,7 +592,7 @@ def main():
     # own files and sessions, never shipped).
     def on(name):
         return env.get(name, '0') not in ('', '0')
-    if any(on(n) for n in ('SOTC_CSDR_PROBE', 'SOTC_PREDICT_PROBE', 'SOTC_PRETRANSLATE', 'SOTC_PRETRANSLATE_COMPUTE',
+    if any(on(n) for n in ('SOTC_CSDR_PROBE', 'SOTC_PREDICT_PROBE', 'SOTC_PRETRANSLATE', 'SOTC_PRETRANSLATE_COMPUTE', 'SOTC_RES_DUMP',
                            'SOTC_PRECOMPILE')):
         env.setdefault('SOTC_RES_LOADED', '1')
     if on('SOTC_PRETRANSLATE') or on('SOTC_PRECOMPILE'):

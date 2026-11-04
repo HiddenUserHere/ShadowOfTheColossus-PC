@@ -51,6 +51,7 @@
 // clear) must stay 0; extra bits are the objects the conservative CPU mask keeps that the GPU clears.
 #include "native_masks.h"
 #include "verify.h" // sotc: SOTC_VERIFY (the CPU mask comparison in mode 1)
+#include "../cmd_counters.h" // sotc: SOTC_CMD_COUNTERS (zero-mask counts)
 
 #include <atomic>
 #include <bit>
@@ -720,6 +721,9 @@ uint64_t Serve(uint64_t mask, uint64_t count) {
         }
     }
     if (got == 0 && !last) {
+        if (SotcCmdCounters::kOn) { // sotc: SOTC_CMD_COUNTERS, zero masks per key (count only)
+            SotcCmdCounters::NoteZeroMask(known ? key : 0, !known);
+        }
         std::memset(block, 0, copy_bytes);
     }
     if (SotcNative::Verify()) {
