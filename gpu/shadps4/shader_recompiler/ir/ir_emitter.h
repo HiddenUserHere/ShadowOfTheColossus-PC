@@ -222,6 +222,10 @@ public:
     [[nodiscard]] U32 Pack2_10_10_10(AmdGpu::NumberFormat number_format, const Value& vector);
     [[nodiscard]] Value Unpack2_10_10_10(AmdGpu::NumberFormat number_format, const U32& value);
 
+    /// sotc: SOTC_SPV_FUNCS. The generic formatted buffer decode and its swizzle (see the opcode in opcodes.inc).
+    [[nodiscard]] Value UnpackGenericBufferFormat(const U32& format_code, const Value& dwords,
+                                                  const U32& dst_sel);
+
     [[nodiscard]] F32F64 FPAdd(const F32F64& a, const F32F64& b);
     [[nodiscard]] F32F64 FPSub(const F32F64& a, const F32F64& b);
     [[nodiscard]] F32F64 FPMul(const F32F64& a, const F32F64& b);

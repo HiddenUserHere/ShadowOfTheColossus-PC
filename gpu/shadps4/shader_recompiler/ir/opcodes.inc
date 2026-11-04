@@ -234,6 +234,9 @@ OPCODE(PackUint2_10_10_10,                                  U32,            F32x
 OPCODE(UnpackUint2_10_10_10,                                F32x4,          U32,                                                                            )
 OPCODE(PackSint2_10_10_10,                                  U32,            F32x4,                                                                          )
 OPCODE(UnpackSint2_10_10_10,                                F32x4,          U32,                                                                            )
+// sotc: SOTC_SPV_FUNCS. Generic formatted buffer decode (lower_buffer_format_to_raw.cpp): format code, the four
+// dwords after the byte-offset shift, and dst_sel (V# dword 3). Emitted as one SPIR-V function call.
+OPCODE(UnpackGenericBufferFormat,                           F32x4,          U32,            U32x4,          U32,        )
 
 // Floating-point operations
 OPCODE(FPAbs32,                                             F32,            F32,                                                                            )

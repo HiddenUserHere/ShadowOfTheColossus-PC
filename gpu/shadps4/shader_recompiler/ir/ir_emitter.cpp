@@ -1050,6 +1050,12 @@ Value IREmitter::Unpack2_10_10_10(const AmdGpu::NumberFormat number_format, cons
     }
 }
 
+// sotc: SOTC_SPV_FUNCS. See the opcode in opcodes.inc.
+Value IREmitter::UnpackGenericBufferFormat(const U32& format_code, const Value& dwords,
+                                           const U32& dst_sel) {
+    return Inst(Opcode::UnpackGenericBufferFormat, format_code, dwords, dst_sel);
+}
+
 Value IREmitter::Unpack10_11_11(const AmdGpu::NumberFormat number_format, const U32& value) {
     switch (number_format) {
     case AmdGpu::NumberFormat::Float:

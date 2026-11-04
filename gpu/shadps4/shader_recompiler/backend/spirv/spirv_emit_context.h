@@ -572,8 +572,11 @@ public:
     std::pair<Id, Id> BdaAddress(u32 handle, Id index, u32 elem_size, u32 count);
     /// sotc: SOTC_ADDR_TABLE (table modes): the address of each of the count elements, through the page table (one
     /// entry per element; spirv_emit_context.cpp). Returns valid: the access is in the block and every entry is set.
+    /// With elem_valid (loads): each element is checked on its own (in the block, entry set) and its validity is
+    /// returned there; an invalid element gets the table's own address, which is always readable, instead of its own.
     Id TableAddresses(u32 handle, Id index, u32 elem_size, u32 count,
-                      boost::container::static_vector<Id, 4>& addresses);
+                      boost::container::static_vector<Id, 4>& addresses,
+                      boost::container::static_vector<Id, 4>* elem_valid = nullptr);
     Id BdaLoadTable(u32 handle, Id index, u32 elem_size, Id elem_type, Id zero, Id result_type,
                     u32 count);
     void BdaStoreTable(u32 handle, Id index, u32 elem_size, Id elem_type, Id value, u32 count);
@@ -597,6 +600,17 @@ public:
     /// sotc: SOTC_GCN_BUF. Appends a kMissPage record for the page-aligned guest address `page` (U64), once until the
     /// host drains. Call only inside a branch that runs for a missing page (TableAddresses does).
     void GcnPageMiss(Id page);
+    /// sotc: SOTC_GCN_BUF: the function that runs GcnPageMiss (DefineFunctions; 0 when the shader records no miss).
+    Id gcn_page_miss_func{};
+    /// sotc: SOTC_SPV_FUNCS: gcn_table_addr(guest_base U64, block_size U32, index U32, elem_shift U32, count U32), the
+    /// per-element addresses and validity of a table-mode load (DefineFunctions; 0 when not defined).
+    Id gcn_table_addr_func{};
+    /// sotc: SOTC_SPV_FUNCS: its return type { u64vec4 addresses; u32vec4 ok } and the u64vec4 type of its first member.
+    Id gcn_table_addr_result{};
+    Id gcn_table_u64x4{};
+    /// sotc: SOTC_SPV_FUNCS: generic_buffer_format(format_code U32, dwords U32x4, dst_sel U32) -> F32x4, the generic
+    /// formatted buffer decode (emit_spirv_generic_format.cpp; 0 when not defined).
+    Id generic_format_func{};
 
 private:
     void DefineArithmeticTypes();
@@ -626,6 +640,9 @@ private:
     Id DefineReadConst(bool dynamic);
 
     Id DefineLodFeedback();
+
+    /// sotc: SOTC_SPV_FUNCS: the generic formatted buffer decode function (emit_spirv_generic_format.cpp).
+    Id DefineGenericBufferFormat();
 
     Id GetBufferSize(u32 sharp_idx);
 };

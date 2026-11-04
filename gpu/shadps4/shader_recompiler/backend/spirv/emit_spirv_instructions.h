@@ -236,6 +236,8 @@ Id EmitPackUint2_10_10_10(EmitContext& ctx, Id value);
 Id EmitUnpackUint2_10_10_10(EmitContext& ctx, Id value);
 Id EmitPackSint2_10_10_10(EmitContext& ctx, Id value);
 Id EmitUnpackSint2_10_10_10(EmitContext& ctx, Id value);
+// sotc: SOTC_SPV_FUNCS. One call of the generic buffer format decode function (emit_spirv_generic_format.cpp).
+Id EmitUnpackGenericBufferFormat(EmitContext& ctx, Id format_code, Id dwords, Id dst_sel);
 Id EmitFPAbs32(EmitContext& ctx, Id value);
 Id EmitFPAbs64(EmitContext& ctx, Id value);
 Id EmitFPAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b);

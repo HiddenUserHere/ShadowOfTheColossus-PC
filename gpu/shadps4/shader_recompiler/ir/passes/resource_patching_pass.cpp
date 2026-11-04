@@ -16,6 +16,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/resource.h"
+#include "../../../../sotc/pretranslate.h" // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS (ActiveHint, HintKeyOf)
 
 namespace Shader::Optimization {
 namespace {
@@ -1286,6 +1287,49 @@ static bool SotcIntegerImage(const IR::Inst& inst) {
     return IsImageAtomicInstruction(inst);
 }
 
+// sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS. The raw fields of a binding's hint (pretranslate.h) over its synthetic sharp.
+// The key is the binding's first sharp dword, as the hint file holds it.
+static void SotcApplyBufferHint(AmdGpu::Buffer& buffer, const SotcPretranslate::Hint& hint, uint64_t key) {
+    for (const auto& h : hint.buffers) {
+        if (h.key != key) {
+            continue;
+        }
+        buffer.stride = h.stride;
+        buffer.swizzle_enable = h.swizzle;
+        buffer.index_stride = h.index_stride;
+        buffer.element_size = h.element_size;
+        buffer.num_format = h.num_format;
+        buffer.data_format = h.data_format;
+        buffer.dst_sel_x = h.dst_sel[0];
+        buffer.dst_sel_y = h.dst_sel[1];
+        buffer.dst_sel_z = h.dst_sel[2];
+        buffer.dst_sel_w = h.dst_sel[3];
+        return;
+    }
+}
+
+static void SotcApplyImageHint(AmdGpu::Image& image, const SotcPretranslate::Hint& hint, uint64_t key) {
+    for (const auto& h : hint.images) {
+        if (h.key != key) {
+            continue;
+        }
+        const auto type = static_cast<AmdGpu::ImageType>(h.type);
+        image.type = h.type;
+        image.num_format = h.num_format;
+        image.data_format = h.data_format;
+        image.dst_sel_x = h.dst_sel[0];
+        image.dst_sel_y = h.dst_sel[1];
+        image.dst_sel_z = h.dst_sel[2];
+        image.dst_sel_w = h.dst_sel[3];
+        // The array count the view type needs (as the cube and array branches of SotcFillSyntheticSharps set it).
+        const bool cube = type == AmdGpu::ImageType::Cube;
+        const bool array = type == AmdGpu::ImageType::Color1DArray || type == AmdGpu::ImageType::Color2DArray ||
+                           type == AmdGpu::ImageType::Color2DMsaaArray;
+        image.last_array = cube ? 5 : (array ? 1 : 0);
+        return;
+    }
+}
+
 static void SotcFillSyntheticSharps(Shader::Info& info, const ResourceDiscoveryList& resources) {
     AmdGpu::Buffer buffer{};
     buffer.base_address = 0x100000;
@@ -1298,6 +1342,8 @@ static void SotcFillSyntheticSharps(Shader::Info& info, const ResourceDiscoveryL
     buffer.num_format = u32(AmdGpu::NumberFormat::Float);
     buffer.data_format = u32(AmdGpu::DataFormat::Format32_32_32_32);
     const AmdGpu::Sampler sampler{};
+    // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS: the compute prebuild's hint (null for every other translation).
+    const SotcPretranslate::Hint* hint = SotcPretranslate::ActiveHint();
     // The image rules (step 2b), merged over every instruction that reads the same T#: the instruction's array bit
     // (DA) gives an array view, cube coordinates a cube, integer use an integer format.
     struct ImageUse {
@@ -1356,7 +1402,11 @@ static void SotcFillSyntheticSharps(Shader::Info& info, const ResourceDiscoveryL
     for (const auto& usage : resources) {
         const IR::Inst& inst = *usage.user;
         if (IsBufferInstruction(inst)) {
-            WriteSyntheticSharp(info, usage.sharps[0], buffer);
+            AmdGpu::Buffer hinted = buffer;
+            if (hint) { // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS
+                SotcApplyBufferHint(hinted, *hint, SotcPretranslate::HintKeyOf(ConstructSharpFetch<AmdGpu::Buffer>(usage.sharps[0])));
+            }
+            WriteSyntheticSharp(info, usage.sharps[0], hinted);
         } else if (IsImageInstruction(inst)) {
             const auto it = std::ranges::find(images, image_key(usage.sharps[0]), &ImageUse::key);
             const ImageUse use = it != images.end() ? *it : ImageUse{};
@@ -1381,6 +1431,10 @@ static void SotcFillSyntheticSharps(Shader::Info& info, const ResourceDiscoveryL
                     image.dst_sel_z = u64(AmdGpu::CompSwizzle::Zero);
                     image.dst_sel_w = u64(AmdGpu::CompSwizzle::One);
                 }
+            }
+            if (hint) { // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS
+                SotcApplyImageHint(image, *hint,
+                                   SotcPretranslate::HintKeyOf(ConstructSharpFetch<AmdGpu::Image>(usage.sharps[0])));
             }
             WriteSyntheticSharp(info, usage.sharps[0], image);
             WriteSyntheticSharp(info, usage.sharps[1], sampler);

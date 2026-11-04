@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
@@ -254,7 +255,15 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
         if (!source) {
             continue;
         }
-        ASSERT(IsSharpSource(source));
+        // sotc: a dword computed by another instruction (for example a Phi where the shader selects
+        // between two sharp loads, or an ALU op on a sharp dword) is a valid input here. Only
+        // ReadConstBuffer sources take the flag, so there is nothing to mark. The former ASSERT
+        // logged "Assertion Failed!" on each such dword in every cold translation.
+        if (!IsSharpSource(source)) {
+            LOG_DEBUG(Render_Recompiler, "Sharp dword {} is not a sharp source, not marked",
+                      magic_enum::enum_name(source->GetOpcode()));
+            continue;
+        }
         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {
             auto flags = source->Flags<IR::BufferInstInfo>();
             flags.sharp_source.Assign(1u);

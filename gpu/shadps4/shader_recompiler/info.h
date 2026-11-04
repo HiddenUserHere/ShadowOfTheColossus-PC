@@ -111,6 +111,39 @@ inline bool GenericBufferStride() {
 /// read-only buffer whose V# holds one of the formats below decodes the format at run time, from V# dword 3 (data
 /// and number format, dst_sel), instead of the format of the V# seen at translation; the format, swizzle and number
 /// conversion then leave the specialization key (FillBuffer). Other formats keep the specialized code and key.
+/// sotc: SOTC_SPV_SALT=N (diagnostic, 0 = off): every module carries the string "sotc salt N" and the shader cache
+/// version moves with N, so the port's cache and the driver's own cache both miss: a cold first session on demand,
+/// to measure what a player's first run costs (driver compile times in the SOTC ASYNC COMPUTE line).
+inline uint32_t SpvSalt() {
+    static const uint32_t salt = [] {
+        const char* v = std::getenv("SOTC_SPV_SALT");
+        return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) % 1000u : 0u;
+    }();
+    return salt;
+}
+
+/// sotc: SOTC_GCN_MISS_EMIT=0 (diagnostic): table-mode loads do not emit the S2 page-miss record (gcn_layout.h).
+/// Only to measure the driver compile cost of that code; a page that is not resident then reads zero unrecorded.
+inline bool GcnMissEmit() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_GCN_MISS_EMIT");
+        return !v || v[0] != '0';
+    }();
+    return on;
+}
+
+/// sotc: SOTC_SPV_FUNCS=0 (default on): table-mode buffer loads call one DontInline SPIR-V function (gcn_table_addr,
+/// spirv_emit_context.cpp) for the element addresses, instead of emitting that code at every load. 0 keeps the inline
+/// code: the A/B baseline for the first-run compile cost. Changes the emitted SPIR-V, so the shader cache version
+/// carries it.
+inline bool SpvFuncs() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_SPV_FUNCS");
+        return !v || v[0] != '0';
+    }();
+    return on;
+}
+
 inline bool GenericBufferFormat() {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_GENERIC_BUFFERS");
@@ -252,6 +285,10 @@ struct Info : InfoPersistent {
     bool uses_int64{};
     bool uses_pack_10_11_11{};
     bool uses_unpack_10_11_11{};
+    /// sotc: SOTC_SPV_FUNCS. Set by LowerBufferFormatToRaw when a generic formatted load emits
+    /// UnpackGenericBufferFormat; DefineFunctions then defines the decode function. Not persistent: the emit runs
+    /// right after the translation, with the same Info.
+    bool uses_generic_format_decode{};
     bool uses_buffer_int64_atomics{};
     bool uses_shared_int64_atomics{};
     bool stores_tess_level_outer{};

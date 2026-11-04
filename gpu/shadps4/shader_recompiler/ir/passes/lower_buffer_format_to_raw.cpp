@@ -146,8 +146,22 @@ static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, con
 // byte and half-word aligned 8- and 16-bit formats read right (wider formats are dword aligned, as in
 // BufferAddressShift). Every format of kGenericBufferFormats is decoded the way LoadBufferFormat decodes it, and the
 // one the V# names is selected; a pair outside the table never reaches this code (its key keeps the real format).
+// sotc: SOTC_SPV_FUNCS. The SPIR-V decode function (emit_spirv_generic_format.cpp) applies no number conversion, so
+// it takes the generic path only when every table entry has none. The table is fixed; this keeps the rule explicit.
+static bool GenericDecodeHasNoConversion() {
+    for (const auto& pair : kGenericBufferFormats) {
+        if (AmdGpu::MapNumberConversion(AmdGpu::NumberFormat(pair.num_format),
+                                        AmdGpu::DataFormat(pair.data_format)) !=
+            AmdGpu::NumberConversion::None) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static IR::Value LoadBufferFormatGeneric(IR::IREmitter& ir, const IR::Value handle, const IR::U32 byte_address,
-                                         const IR::BufferInstInfo info, const BufferResource& desc) {
+                                         const IR::BufferInstInfo info, const BufferResource& desc,
+                                         Info& program_info) {
     const IR::U32 dword3 = *SotcSharpDword(ir, desc, 3);
     // num_format (bits 12..14) | data_format (bits 15..18) << 3
     const IR::U32 format_code = ir.BitFieldExtract(dword3, ir.Imm32(12), ir.Imm32(7));
@@ -163,6 +177,15 @@ static IR::Value LoadBufferFormatGeneric(IR::IREmitter& ir, const IR::Value hand
         ir.Select(ir.IEqual(bit_offset, ir.Imm32(0)), ir.Imm32(0),
                   ir.ShiftLeftLogical(d[1], IR::U32{ir.ISub(ir.Imm32(32), bit_offset)}))};
     d[0] = IR::U32{ir.BitwiseOr(IR::U32{ir.ShiftRightLogical(d[0], bit_offset)}, high_part)};
+
+    // sotc: SOTC_SPV_FUNCS=1 (default). The 17-way decode and the swizzle are one SPIR-V function, called here once per
+    // load. The swizzle reads dst_sel from dword 3, so the opcode takes that dword as well as the format code.
+    // SOTC_SPV_FUNCS=0 keeps the decode inline below.
+    if (SpvFuncs() && GenericDecodeHasNoConversion()) {
+        program_info.uses_generic_format_decode = true;
+        return ir.UnpackGenericBufferFormat(format_code, ir.CompositeConstruct(d[0], d[1], d[2], d[3]),
+                                            dword3);
+    }
 
     const auto zero = ir.Imm32(0.f);
     std::array<IR::F32, 4> result{zero, zero, zero, zero};
@@ -332,7 +355,7 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
     // sotc: SOTC_GENERIC_BUFFERS=2, the same decision as PatchBufferArgs (which made the address a byte address).
     if (IsBufferFormatLoad(inst) && !is_inst_typed && SotcGenericFormatLoads(desc, buffer)) {
         inst.ReplaceUsesWithAndRemove(
-            LoadBufferFormatGeneric(ir, inst.Arg(0), IR::U32{inst.Arg(1)}, flags, desc));
+            LoadBufferFormatGeneric(ir, inst.Arg(0), IR::U32{inst.Arg(1)}, flags, desc, info));
         return;
     }
     const auto data_format =

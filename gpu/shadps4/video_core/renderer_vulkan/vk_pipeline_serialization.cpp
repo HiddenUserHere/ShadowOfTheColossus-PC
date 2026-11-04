@@ -54,6 +54,16 @@ static bool AddrVertexRequested() {
     const char* v = std::getenv("SOTC_ADDR_VERTEX");
     return v && (v[0] == '1' || v[0] == '2');
 }
+// sotc: table-mode shader addressing (SOTC_ADDR_TABLE and SOTC_SHADER_ADDR both on, as addr_table.cpp TableAsked)
+// gets +1024000: its loads became valid per element (BdaLoadTable, 4 Nov 2026), so the binaries cached before
+// that read zero for a whole record that ends past its buffer. Other settings keep their caches.
+static bool AddrTableRequested() {
+    const auto on = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && (v[0] == '1' || v[0] == '2'); // SotcArch::SwitchMode != 0
+    };
+    return on("SOTC_ADDR_TABLE") && on("SOTC_SHADER_ADDR");
+}
 // sotc: SOTC_VS_BINDING_BASE (+64000): the vertex shaders' binding numbers start at a fixed base.
 // sotc: SOTC_GENERIC_BUFFERS=1 (+16000) and =2 (+32000 more): the keys of generic buffers hold stride 0 and the generic
 // format marker, so the binaries of another setting would be reused for the wrong buffers.
@@ -61,12 +71,13 @@ static bool AddrVertexRequested() {
 // 40/138: the cache now takes loose files newer than the pack (cache_storage.cpp), which brought
 // back binaries written by older recompiler builds under the same number (wrong vertices, dark
 // trees): everything is translated again once.
+// 42/139 (4 Nov 2026): SOTC_SPV_FUNCS on by default, the generic buffer decode is a DontInline function.
 // 41 (from 40): early fragment tests on the LOD feedback shaders (emit_spirv.cpp, upstream
 // 0.70's 38); the non-feedback binaries are unchanged.
 // sotc: SOTC_PRETRANSLATE / SOTC_PRECOMPILE (+128000): those caches held permutations whose resources differed from
 // their program's Info (a layout variant without the flat buffer, then draws' translations with it, recorded under
 // the variant's Info): the device lost of 4 Nov. Their caches are made again; the others are unchanged.
-static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 41u : 138u) +
+static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 42u : 139u) +
                                        (Shader::StageBindingsEnabled() ? 1000u : 0u) +
                                        (BindlessSamplersRequested() ? 2000u : 0u) +
                                        (SrtPhiDisabled() ? 4000u : 0u) +
@@ -74,12 +85,18 @@ static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 41u : 138
                                        (Shader::GenericBufferStride() ? 16000u : 0u) +
                                        (Shader::GenericBufferFormat() ? 32000u : 0u) +
                                        (Shader::Backend::VsBindingBaseOn() ? 64000u : 0u) +
-                                       (SotcPretranslate::On() ? 128000u : 0u) +
+                                       (SotcPretranslate::PixelVertexOn() ? 128000u : 0u) + // sotc: compute-only keeps the cache
                                        // sotc: ARCH-GCN-NATIVE: the gcn buffer and texture profiles change the SPIR-V
                                        // (profile.h). Zero terms while both stages are off: today's caches stay valid.
                                        // Mode, not ProfileValue: this runs at static init, and ProfileValue may refuse.
                                        (SotcGcn::Mode(SotcGcn::Stage::Buf) != 0 ? 256000u : 0u) +
-                                       (SotcGcn::Mode(SotcGcn::Stage::Tex) != 0 ? 512000u : 0u);
+                                       (SotcGcn::Mode(SotcGcn::Stage::Tex) != 0 ? 512000u : 0u) +
+                                       (AddrTableRequested() ? 1024000u : 0u) +
+                                       // sotc: SOTC_SPV_SALT (info.h) and SOTC_GCN_MISS_EMIT=0: diagnostic caches apart.
+                                       Shader::SpvSalt() * 4096000u + (Shader::GcnMissEmit() ? 0u : 2048000u) +
+                                       // sotc: SOTC_SPV_FUNCS (on by default): the generic buffer decode and the table
+                                       // loads are DontInline functions (first-run compile cost); 0 keeps them inline.
+                                       (Shader::SpvFuncs() ? 0u : 512u);
 // sotc: 22 (from 21): the record ends with the stage variant (SOTC_HEAP). Without it a cached Plain or Heap
 // program came back as Default, so its layout disagreed with its binary (slot-word assert, device lost).
 // 23: a variant's pgm_hash is the game's hash again (Info::CacheHash keys the caches), so 22's variant records differ.

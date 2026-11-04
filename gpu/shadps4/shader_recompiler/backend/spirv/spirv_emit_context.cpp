@@ -165,6 +165,9 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
     }
     String(fmt::format("{:#x}", info.pgm_hash));
+    if (const u32 salt = SpvSalt(); salt != 0) { // sotc: SOTC_SPV_SALT (info.h)
+        String(fmt::format("sotc salt {}", salt));
+    }
 
     AddCapability(spv::Capability::Shader);
     if (UsesShaderAddr(profile, info) || heap) { // sotc: SOTC_SHADER_ADDR: 64-bit pointers (as emit_spirv.cpp does for the block table)
@@ -1496,7 +1499,8 @@ void EmitContext::BdaStore(u32 handle, Id index, u32 elem_size, Id elem_type, Id
 // and the elements are at E0 + 0x3FFC and E1 + 0x0. They need not be contiguous (two backings), which is why each
 // element has its own entry and the loads never add i * elem_size to the first address.
 Id EmitContext::TableAddresses(u32 handle, Id index, u32 elem_size, u32 count,
-                               boost::container::static_vector<Id, 4>& addresses) {
+                               boost::container::static_vector<Id, 4>& addresses,
+                               boost::container::static_vector<Id, 4>* elem_valid) {
     const bool hoisted = handle < bda_blocks.size() && Sirit::ValidId(bda_blocks[handle].first);
     const auto [guest_base, block_size] = hoisted ? bda_blocks[handle] : LoadBdaBlock(handle);
     const u32 elem_shift = static_cast<u32>(std::countr_zero(elem_size));
@@ -1516,30 +1520,98 @@ Id EmitContext::TableAddresses(u32 handle, Id index, u32 elem_size, u32 count,
     const Id table_device{push_word(1)};
 
     addresses.clear();
-    Id all_present{};
-    for (u32 i = 0; i < count; i++) {
-        const Id elem_index = i == 0 ? safe_index : OpIAdd(U32[1], safe_index, ConstU32(i));
-        const Id guest{OpBitwiseAnd(
+    if (elem_valid) {
+        elem_valid->clear();
+    }
+    // sotc: SOTC_GCN_BUF (driver compile cost, first-run measurements of 4 Nov 2026). The elements of one access span
+    // at most 4 * 8 bytes, so they lie on at most two pages: the page of the first element and the page of the last
+    // one. Two table lookups per access (one for a single element) and one page-miss site, instead of one lookup and
+    // one inline miss record per element: the inline records made a cold compute pipeline 2.6 times slower to build.
+    //
+    // Per element (elem_valid, loads): element i is in the block when index + i < num_elements. The first element
+    // decides whether the access touches the block at all; the last lookup is at the last element that is still in
+    // the block (min(index + count - 1, num_elements - 1)), so every valid element is on one of the two pages. The
+    // generic formatted load (lower_buffer_format_to_raw.cpp) always reads 4 dwords, so the last record of a buffer
+    // reads past its end: judged as one access, every component of that record read zero (broken vertices, s2 runs).
+    const Id first_in{elem_valid ? OpULessThan(U1[1], index, num_elements) : valid};
+    const Id first_index{elem_valid ? OpSelect(U32[1], first_in, index, u32_zero_value) : safe_index};
+    Id last_index_used{first_index};
+    if (count > 1) {
+        const Id wanted{OpIAdd(U32[1], first_index, ConstU32(count - 1))};
+        if (elem_valid) {
+            const Id last_in_block{OpISub(U32[1], OpSelect(U32[1], first_in, num_elements, u32_one_value),
+                                          u32_one_value)};
+            last_index_used = OpSelect(U32[1], OpULessThan(U1[1], wanted, last_in_block), wanted, last_in_block);
+        } else {
+            last_index_used = wanted;
+        }
+    }
+    const auto guest_of = [&](Id elem_index) {
+        return OpBitwiseAnd(
             U64,
             OpIAdd(U64, guest_base,
                    OpIMul(U64, OpUConvert(U64, elem_index), Constant(U64, static_cast<u64>(elem_size)))),
-            Constant(U64, ~static_cast<u64>(elem_size - 1)))};
-        // An invalid access uses page 0 (its entry load stays inside the table).
-        const Id rel{OpSelect(U64, valid, OpISub(U64, guest, window_guest), u64_zero_value)};
+            Constant(U64, ~static_cast<u64>(elem_size - 1)));
+    };
+    // An access outside the block uses page 0 (its entry load stays inside the table).
+    const auto entry_of = [&](Id guest) {
+        const Id rel{OpSelect(U64, first_in, OpISub(U64, guest, window_guest), u64_zero_value)};
         const Id page{OpShiftRightLogical(U64, rel, Constant(U64, 14ULL))};
         const Id entry_address{OpIAdd(U64, table_device, OpIMul(U64, page, Constant(U64, 8ULL)))};
-        const Id entry{OpLoad(U64, BdaPointer(entry_address, U64), spv::MemoryAccessMask::Aligned, 8u)};
-        // sotc: SOTC_GCN_BUF. A valid access whose page is not resident appends a page miss (gcn_layout.h). Only
-        // the lanes with a zero entry run the branch; the address below is unused for them (the access is skipped).
-        if (profile.gcn_buf != 0) {
-            const Id miss{OpLogicalAnd(U1[1], valid, OpIEqual(U1[1], entry, u64_zero_value))};
-            const Id miss_merge{BdaBeginIf(miss)};
-            GcnPageMiss(OpBitwiseAnd(U64, guest, Constant(U64, ~((1ULL << 14) - 1))));
-            BdaEndIf(miss_merge);
+        return OpLoad(U64, BdaPointer(entry_address, U64), spv::MemoryAccessMask::Aligned, 8u);
+    };
+    const Id page_mask{Constant(U64, ~((1ULL << 14) - 1))};
+    const Id guest_first{guest_of(first_index)};
+    const Id entry_first{entry_of(guest_first)};
+    const Id guest_last{count > 1 ? guest_of(last_index_used) : guest_first};
+    const Id entry_last{count > 1 ? entry_of(guest_last) : entry_first};
+    const Id page_first{OpBitwiseAnd(U64, guest_first, page_mask)};
+
+    // sotc: SOTC_GCN_BUF. An access in the block with a page that is not resident appends one page miss (the first
+    // missing page; gcn_layout.h). Only the lanes with a zero entry run the branch; the record code is one function.
+    if (profile.gcn_buf != 0 && GcnMissEmit()) { // sotc: SOTC_GCN_MISS_EMIT=0 is a measurement switch (info.h)
+        const Id first_missing{OpIEqual(U1[1], entry_first, u64_zero_value)};
+        const Id any_missing{count > 1 ? OpLogicalOr(U1[1], first_missing,
+                                                     OpIEqual(U1[1], entry_last, u64_zero_value))
+                                       : first_missing};
+        const Id miss{OpLogicalAnd(U1[1], first_in, any_missing)};
+        const Id miss_page{count > 1 ? OpSelect(U64, first_missing, page_first,
+                                                OpBitwiseAnd(U64, guest_last, page_mask))
+                                     : page_first};
+        const Id miss_merge{BdaBeginIf(miss)};
+        if (Sirit::ValidId(gcn_page_miss_func)) {
+            OpFunctionCall(void_id, gcn_page_miss_func, miss_page);
+        } else {
+            GcnPageMiss(miss_page);
         }
-        addresses.push_back(
-            OpIAdd(U64, entry, OpBitwiseAnd(U64, guest, Constant(U64, (1ULL << 14) - 1))));
+        BdaEndIf(miss_merge);
+    }
+
+    Id all_present{};
+    for (u32 i = 0; i < count; i++) {
+        Id elem_in{};
+        Id guest{};
+        if (elem_valid) {
+            elem_in = OpLogicalAnd(U1[1], OpUGreaterThan(U1[1], num_elements, ConstU32(i)),
+                                   OpULessThanEqual(U1[1], index,
+                                                    OpISub(U32[1], num_elements, ConstU32(i + 1))));
+            guest = i == 0 ? guest_first : guest_of(OpSelect(U32[1], elem_in, OpIAdd(U32[1], index, ConstU32(i)),
+                                                             first_index));
+        } else {
+            guest = i == 0 ? guest_first : guest_of(OpIAdd(U32[1], first_index, ConstU32(i)));
+        }
+        const Id entry{i == 0 ? entry_first
+                              : OpSelect(U64, OpIEqual(U1[1], OpBitwiseAnd(U64, guest, page_mask), page_first),
+                                         entry_first, entry_last)};
+        const Id elem_address{OpIAdd(U64, entry, OpBitwiseAnd(U64, guest, Constant(U64, (1ULL << 14) - 1)))};
         const Id present{OpINotEqual(U1[1], entry, u64_zero_value)};
+        if (elem_valid) {
+            const Id ok{OpLogicalAnd(U1[1], elem_in, present)};
+            elem_valid->push_back(ok);
+            addresses.push_back(OpSelect(U64, ok, elem_address, table_device)); // the table: 8-byte aligned, readable
+        } else {
+            addresses.push_back(elem_address);
+        }
         all_present = i == 0 ? present : OpLogicalAnd(U1[1], all_present, present);
     }
     return OpLogicalAnd(U1[1], valid, all_present);
@@ -1616,23 +1688,37 @@ void EmitContext::GcnPageMiss(Id page) {
     BdaEndIf(fresh_merge);
 }
 
-// sotc: SOTC_ADDR_TABLE. BdaLoad with one translated address per element (TableAddresses), same structure as BdaLoad.
+// sotc: SOTC_ADDR_TABLE. BdaLoad with one translated address per element (TableAddresses). Each element is valid on
+// its own, as with a descriptor (robust access per element): an element past the block end or on a page that is not
+// resident reads zero, the others read their bytes. An invalid element's address is the table itself (always
+// readable), so the loads need no branch.
 Id EmitContext::BdaLoadTable(u32 handle, Id index, u32 elem_size, Id elem_type, Id zero,
                              Id result_type, u32 count) {
-    boost::container::static_vector<Id, 4> addresses;
-    const Id valid{TableAddresses(handle, index, elem_size, count, addresses)};
-    const Id header = last_label;
-    const Id merge = BdaBeginIf(valid);
-    boost::container::static_vector<Id, 4> values;
-    for (u32 i = 0; i < count; i++) {
-        values.push_back(OpLoad(elem_type, BdaPointer(addresses[i], elem_type),
-                                spv::MemoryAccessMask::Aligned, elem_size));
-    }
-    const Id then_end = last_label;
-    BdaEndIf(merge);
     boost::container::static_vector<Id, 4> ids;
+    if (Sirit::ValidId(gcn_table_addr_func)) { // sotc: SOTC_SPV_FUNCS: one call per access (gcn_table_addr)
+        const bool hoisted = handle < bda_blocks.size() && Sirit::ValidId(bda_blocks[handle].first);
+        const auto [guest_base, block_size] = hoisted ? bda_blocks[handle] : LoadBdaBlock(handle);
+        const u32 elem_shift = static_cast<u32>(std::countr_zero(elem_size));
+        const Id packed{OpFunctionCall(gcn_table_addr_result, gcn_table_addr_func, guest_base, block_size, index,
+                                       ConstU32(elem_shift), ConstU32(count))};
+        const Id addresses{OpCompositeExtract(gcn_table_u64x4, packed, 0u)};
+        const Id oks{OpCompositeExtract(U32[4], packed, 1u)};
+        for (u32 i = 0; i < count; i++) {
+            const Id address{OpCompositeExtract(U64, addresses, i)};
+            const Id ok{OpINotEqual(U1[1], OpCompositeExtract(U32[1], oks, i), u32_zero_value)};
+            const Id value{OpLoad(elem_type, BdaPointer(address, elem_type), spv::MemoryAccessMask::Aligned,
+                                  elem_size)};
+            ids.push_back(OpSelect(elem_type, ok, value, zero));
+        }
+        return count == 1 ? ids[0] : OpCompositeConstruct(result_type, ids);
+    }
+    boost::container::static_vector<Id, 4> addresses;
+    boost::container::static_vector<Id, 4> elem_valid;
+    TableAddresses(handle, index, elem_size, count, addresses, &elem_valid);
     for (u32 i = 0; i < count; i++) {
-        ids.push_back(OpPhi(elem_type, values[i], then_end, zero, header));
+        const Id value{OpLoad(elem_type, BdaPointer(addresses[i], elem_type), spv::MemoryAccessMask::Aligned,
+                              elem_size)};
+        ids.push_back(OpSelect(elem_type, elem_valid[i], value, zero));
     }
     return count == 1 ? ids[0] : OpCompositeConstruct(result_type, ids);
 }
@@ -2451,6 +2537,116 @@ void EmitContext::DefineFunctions() {
     }
     if (info.uses_lod_feedback) {
         lod_feedback = DefineLodFeedback();
+    }
+    // sotc: SOTC_SPV_FUNCS: the generic formatted buffer decode, one function per shader (set by LowerBufferFormatToRaw).
+    if (info.uses_generic_format_decode) {
+        generic_format_func = DefineGenericBufferFormat();
+    }
+    // sotc: SOTC_GCN_BUF: the page-miss record as one function, called from every table access (TableAddresses).
+    if (profile.gcn_buf != 0 && GcnMissEmit() && ShaderAddrTableMode(profile) && UsesShaderAddr(profile, info)) {
+        const Id func_type{TypeFunction(void_id, U64)};
+        gcn_page_miss_func = OpFunction(void_id, spv::FunctionControlMask::DontInline, func_type);
+        const Id page{OpFunctionParameter(U64)};
+        Name(gcn_page_miss_func, "gcn_page_miss");
+        AddLabel();
+        GcnPageMiss(page);
+        OpReturn();
+        OpFunctionEnd();
+    }
+    // sotc: SOTC_SPV_FUNCS. The element addresses and validity of a table-mode load as one function (BdaLoadTable
+    // calls it). It computes what TableAddresses computes with elem_valid, for count 1..4 and elem_size 1 << elem_shift:
+    // the same first and last page lookups, the same page-miss call, and per element the same address and validity.
+    // Lanes i >= count are invalid (ok 0, address = table_device). count and elem_shift are run-time values, so one
+    // body serves every load: fewer instructions per load site, and no inline copy per site.
+    if (SpvFuncs() && ShaderAddrTableMode(profile) && UsesShaderAddr(profile, info) && Sirit::ValidId(U64)) {
+        gcn_table_u64x4 = TypeVector(U64, 4);
+        gcn_table_addr_result = TypeStruct(gcn_table_u64x4, U32[4]);
+        const Id func_type{TypeFunction(gcn_table_addr_result, U64, U32[1], U32[1], U32[1], U32[1])};
+        gcn_table_addr_func = OpFunction(gcn_table_addr_result, spv::FunctionControlMask::DontInline, func_type);
+        const Id guest_base{OpFunctionParameter(U64)};
+        const Id block_size{OpFunctionParameter(U32[1])};
+        const Id index{OpFunctionParameter(U32[1])};
+        const Id elem_shift{OpFunctionParameter(U32[1])};
+        const Id count{OpFunctionParameter(U32[1])};
+        Name(gcn_table_addr_func, "gcn_table_addr");
+        AddLabel();
+
+        const Id size64{OpShiftLeftLogical(U64, u64_one_value, OpUConvert(U64, elem_shift))};
+        const Id size_mask{OpNot(U64, OpISub(U64, size64, u64_one_value))};
+        const Id num_elements{OpShiftRightLogical(U32[1], block_size, elem_shift)};
+        const Id first_in{OpULessThan(U1[1], index, num_elements)};
+        const Id first_index{OpSelect(U32[1], first_in, index, u32_zero_value)};
+        // The last element that is still in the block, at most count - 1 after the first one (as TableAddresses).
+        const Id last_in_block{
+            OpISub(U32[1], OpSelect(U32[1], first_in, num_elements, u32_one_value), u32_one_value)};
+        const Id wanted{OpIAdd(U32[1], first_index, OpISub(U32[1], count, u32_one_value))};
+        const Id last_index_used{
+            OpSelect(U32[1], OpULessThan(U1[1], wanted, last_in_block), wanted, last_in_block)};
+
+        const auto push_word = [&](u32 member) {
+            return OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64),
+                                             push_data_block, ConstU32(shader_addr_member + member)));
+        };
+        const Id window_guest{push_word(0)};
+        const Id table_device{push_word(1)};
+
+        const auto guest_of = [&](Id elem_index) {
+            return OpBitwiseAnd(
+                U64,
+                OpIAdd(U64, guest_base, OpIMul(U64, OpUConvert(U64, elem_index), size64)),
+                size_mask);
+        };
+        // An access outside the block uses page 0 (its entry load stays inside the table), as TableAddresses.
+        const auto entry_of = [&](Id guest) {
+            const Id rel{OpSelect(U64, first_in, OpISub(U64, guest, window_guest), u64_zero_value)};
+            const Id page{OpShiftRightLogical(U64, rel, Constant(U64, 14ULL))};
+            const Id entry_address{OpIAdd(U64, table_device, OpIMul(U64, page, Constant(U64, 8ULL)))};
+            return OpLoad(U64, BdaPointer(entry_address, U64), spv::MemoryAccessMask::Aligned, 8u);
+        };
+        const Id page_mask{Constant(U64, ~((1ULL << 14) - 1))};
+        const Id guest_first{guest_of(first_index)};
+        const Id entry_first{entry_of(guest_first)};
+        const Id guest_last{guest_of(last_index_used)};
+        const Id entry_last{entry_of(guest_last)};
+        const Id page_first{OpBitwiseAnd(U64, guest_first, page_mask)};
+
+        // sotc: SOTC_GCN_BUF: the same page-miss record as TableAddresses (one call, first missing page).
+        if (profile.gcn_buf != 0 && GcnMissEmit() && Sirit::ValidId(gcn_page_miss_func)) {
+            const Id first_missing{OpIEqual(U1[1], entry_first, u64_zero_value)};
+            const Id any_missing{OpLogicalOr(U1[1], first_missing, OpIEqual(U1[1], entry_last, u64_zero_value))};
+            const Id miss{OpLogicalAnd(U1[1], first_in, any_missing)};
+            const Id miss_page{
+                OpSelect(U64, first_missing, page_first, OpBitwiseAnd(U64, guest_last, page_mask))};
+            const Id miss_merge{BdaBeginIf(miss)};
+            OpFunctionCall(void_id, gcn_page_miss_func, miss_page);
+            BdaEndIf(miss_merge);
+        }
+
+        std::array<Id, 4> addresses{};
+        std::array<Id, 4> oks{};
+        for (u32 i = 0; i < 4; i++) {
+            // Element i is in the block (index + i < num_elements) and inside the access (i < count).
+            const Id active{OpULessThan(U1[1], ConstU32(i), count)};
+            const Id in_block{OpLogicalAnd(U1[1], OpUGreaterThan(U1[1], num_elements, ConstU32(i)),
+                                           OpULessThanEqual(U1[1], index,
+                                                            OpISub(U32[1], num_elements, ConstU32(i + 1))))};
+            const Id elem_in{OpLogicalAnd(U1[1], active, in_block)};
+            const Id guest{i == 0 ? guest_first
+                                  : guest_of(OpSelect(U32[1], elem_in, OpIAdd(U32[1], index, ConstU32(i)),
+                                                      first_index))};
+            const Id entry{i == 0 ? entry_first
+                                  : OpSelect(U64, OpIEqual(U1[1], OpBitwiseAnd(U64, guest, page_mask), page_first),
+                                             entry_first, entry_last)};
+            const Id elem_address{OpIAdd(U64, entry, OpBitwiseAnd(U64, guest, Constant(U64, (1ULL << 14) - 1)))};
+            const Id ok{OpLogicalAnd(U1[1], elem_in, OpINotEqual(U1[1], entry, u64_zero_value))};
+            addresses[i] = OpSelect(U64, ok, elem_address, table_device);
+            oks[i] = OpSelect(U32[1], ok, u32_one_value, u32_zero_value);
+        }
+        const Id addresses_vec{OpCompositeConstruct(gcn_table_u64x4, addresses)};
+        const Id oks_vec{OpCompositeConstruct(U32[4], oks)};
+        const Id result{OpCompositeConstruct(gcn_table_addr_result, std::array<Id, 2>{addresses_vec, oks_vec})};
+        OpReturnValue(result);
+        OpFunctionEnd();
     }
 
     if (True(info.readconst_types & Info::ReadConstType::Immediate)) {
