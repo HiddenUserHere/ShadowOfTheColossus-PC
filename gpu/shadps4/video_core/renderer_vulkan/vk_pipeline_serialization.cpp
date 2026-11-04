@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <filesystem>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
+#include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/info.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/cache_storage.h"
@@ -21,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "../../../sotc/predict_probe.h" // sotc: SOTC_PREDICT_PROBE
+#include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE (ShaderBinaryVersion, profile bytes)
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
@@ -51,17 +54,32 @@ static bool AddrVertexRequested() {
     const char* v = std::getenv("SOTC_ADDR_VERTEX");
     return v && (v[0] == '1' || v[0] == '2');
 }
+// sotc: SOTC_VS_BINDING_BASE (+64000): the vertex shaders' binding numbers start at a fixed base.
+// sotc: SOTC_GENERIC_BUFFERS=1 (+16000) and =2 (+32000 more): the keys of generic buffers hold stride 0 and the generic
+// format marker, so the binaries of another setting would be reused for the wrong buffers.
 // sotc: 39/137 (from 38/136): the SRT walker no longer uses dynamic-window ReadConsts as offsets.
 // 40/138: the cache now takes loose files newer than the pack (cache_storage.cpp), which brought
 // back binaries written by older recompiler builds under the same number (wrong vertices, dark
 // trees): everything is translated again once.
 // 41 (from 40): early fragment tests on the LOD feedback shaders (emit_spirv.cpp, upstream
 // 0.70's 38); the non-feedback binaries are unchanged.
+// sotc: SOTC_PRETRANSLATE / SOTC_PRECOMPILE (+128000): those caches held permutations whose resources differed from
+// their program's Info (a layout variant without the flat buffer, then draws' translations with it, recorded under
+// the variant's Info): the device lost of 4 Nov. Their caches are made again; the others are unchanged.
 static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 41u : 138u) +
                                        (Shader::StageBindingsEnabled() ? 1000u : 0u) +
                                        (BindlessSamplersRequested() ? 2000u : 0u) +
                                        (SrtPhiDisabled() ? 4000u : 0u) +
-                                       (AddrVertexRequested() ? 8000u : 0u);
+                                       (AddrVertexRequested() ? 8000u : 0u) +
+                                       (Shader::GenericBufferStride() ? 16000u : 0u) +
+                                       (Shader::GenericBufferFormat() ? 32000u : 0u) +
+                                       (Shader::Backend::VsBindingBaseOn() ? 64000u : 0u) +
+                                       (SotcPretranslate::On() ? 128000u : 0u) +
+                                       // sotc: ARCH-GCN-NATIVE: the gcn buffer and texture profiles change the SPIR-V
+                                       // (profile.h). Zero terms while both stages are off: today's caches stay valid.
+                                       // Mode, not ProfileValue: this runs at static init, and ProfileValue may refuse.
+                                       (SotcGcn::Mode(SotcGcn::Stage::Buf) != 0 ? 256000u : 0u) +
+                                       (SotcGcn::Mode(SotcGcn::Stage::Tex) != 0 ? 512000u : 0u);
 // sotc: 22 (from 21): the record ends with the stage variant (SOTC_HEAP). Without it a cached Plain or Heap
 // program came back as Default, so its layout disagreed with its binary (slot-word assert, device lost).
 // 23: a variant's pgm_hash is the game's hash again (Info::CacheHash keys the caches), so 22's variant records differ.
@@ -82,8 +100,11 @@ static bool g_variant_folder = false;
 static bool MetaVersionAccepted(u32 version) {
     return version == ShaderMetaVersion || (version == ShaderMetaVersionNoVariants && !g_variant_folder);
 }
+// sotc: SOTC_VS_BINDING_BASE (+4000): the vertex stage's binding numbers start at a fixed base, so the pipelines (and
+// their layouts) of another setting are not the same.
 static const u32 PipelineKeyVersion =
-    3u + (Shader::StageBindingsEnabled() ? 1000u : 0u) + (BindlessSamplersRequested() ? 2000u : 0u);
+    3u + (Shader::StageBindingsEnabled() ? 1000u : 0u) + (BindlessSamplersRequested() ? 2000u : 0u) +
+    (Shader::Backend::VsBindingBaseOn() ? 4000u : 0u);
 } // namespace Serialization
 
 namespace Vulkan {
@@ -256,6 +277,27 @@ bool RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
                                               fmt::format("g_{:#018x}", hash), ar.TakeOff());
 }
 
+// sotc: the shader cache index (PipelineCache::SaveShaderIndex): every program with metas on disk and its permutation
+// count, so a session finds the programs without reading them (PipelineCache::LoadLazyProgram).
+std::mutex g_index_mutex;
+std::unordered_map<u64, u32> g_index;
+bool g_index_dirty = false;
+constexpr const char* kShaderIndexName = "sotc_shader_index";
+
+// sotc: the bytes of a shader meta (RegisterShaderMeta's record; also what the SOTC_PRETRANSLATE pack stores).
+std::vector<u8> SerializeShaderMeta(const Shader::Info& info, const Shader::StageSpecialization& spec, size_t perm_hash,
+                                    size_t perm_idx) {
+    Serialization::Archive ar;
+    Serialization::Writer meta{ar};
+    meta.Write(Serialization::ShaderMetaVersion);
+    meta.Write(Serialization::ShaderBinaryVersion);
+    meta.Write(perm_hash);
+    meta.Write(perm_idx);
+    spec.Serialize(ar);
+    info.Serialize(ar);
+    return ar.TakeOff();
+}
+
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash,
@@ -272,20 +314,16 @@ void RegisterShaderMeta(const Shader::Info& info,
         }
     }
 
-    Serialization::Archive ar;
-    Serialization::Writer meta{ar};
-
-    meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(Serialization::ShaderBinaryVersion);
-
-    meta.Write(perm_hash);
-    meta.Write(perm_idx);
-
-    spec.Serialize(ar);
-    info.Serialize(ar);
-
-    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderMeta,
-                                       fmt::format("{:#018x}", perm_hash), ar.TakeOff());
+    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", perm_hash),
+                                       SerializeShaderMeta(info, spec, perm_hash, perm_idx));
+    {
+        std::scoped_lock lock{g_index_mutex};
+        auto& count = g_index[info.CacheHash()];
+        if (perm_idx + 1 > count) {
+            count = static_cast<u32>(perm_idx + 1);
+            g_index_dirty = true;
+        }
+    }
 }
 
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
@@ -686,6 +724,11 @@ void PipelineCache::WarmUp() {
         if (profile_data.size() == offsetof(Shader::Profile, bindless_images)) {
             profile_data.resize(sizeof(Shader::Profile), 0);
         }
+        // sotc: ARCH-GCN-NATIVE added Profile::gcn_buf and gcn_tex after shader_addr (68 -> 72 bytes): a cache written
+        // before them matches with both off instead of being discarded.
+        if (profile_data.size() == offsetof(Shader::Profile, gcn_buf)) {
+            profile_data.resize(sizeof(Shader::Profile), 0);
+        }
         if (profile_data.size() == sizeof(Shader::Profile)) {
             // sotc: barycentric_via_gs, the last member, sits where older caches have a padding
             // byte (seen 0xe3, 0x36): anything but 1 there is off, so those caches still match.
@@ -708,6 +751,12 @@ void PipelineCache::WarmUp() {
             // sotc: 3 and 4 are the table modes of SOTC_ADDR_TABLE (addr_table.h); without them a saved profile
             // would lose its mode and load the wrong SPIR-V.
             shader_addr = (shader_addr >= 1 && shader_addr <= 4) ? shader_addr : 0;
+            // sotc: ARCH-GCN-NATIVE. gcn_buf and gcn_tex are the bytes 68 and 69 (sizeof is 72 since they were added):
+            // 0 off, 1 on, 2 verify; anything else is off.
+            auto& gcn_buf = profile_data[offsetof(Shader::Profile, gcn_buf)];
+            gcn_buf = gcn_buf <= 2 ? gcn_buf : 0;
+            auto& gcn_tex = profile_data[offsetof(Shader::Profile, gcn_tex)];
+            gcn_tex = gcn_tex <= 2 ? gcn_tex : 0;
             std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
         }
         compatible = profile_data.size() == sizeof(Shader::Profile) && cached_profile == profile;
@@ -841,7 +890,260 @@ void PipelineCache::WarmUp() {
                     num_total_pipelines - num_pipelines);
     }
     CacheDiagReport("warm-up");
+    LoadShaderIndex(); // sotc: the programs on disk that no pipeline loaded (LoadLazyProgram)
+    PrePackLoad();     // sotc: and the SOTC_PRETRANSLATE pack
     Storage::DataBase::Instance().FinishPreload();
+}
+
+void PipelineCache::LoadShaderIndex() {
+    std::vector<u32> data;
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, kShaderIndexName, data);
+    if (data.size() < 2 || data[0] != 1 || data.size() < 2 + size_t{data[1]} * 3) {
+        return;
+    }
+    std::scoped_lock lock{g_index_mutex};
+    for (u32 i = 0; i < data[1]; ++i) {
+        const u64 hash = u64{data[2 + i * 3]} | (u64{data[3 + i * 3]} << 32);
+        const u32 count = data[4 + i * 3];
+        auto& known = g_index[hash];
+        known = std::max(known, count);
+        lazy_programs[hash] = known; // also a program the pipelines loaded: its other permutations
+    }
+    std::fprintf(stderr, "SOTC SHADER INDEX: %u programs on disk\n", data[1]);
+}
+
+void PipelineCache::SaveShaderIndex() {
+    std::vector<u32> data;
+    {
+        std::scoped_lock lock{g_index_mutex};
+        if (!g_index_dirty) {
+            return;
+        }
+        g_index_dirty = false;
+        data.reserve(2 + g_index.size() * 3);
+        data.push_back(1);
+        data.push_back(static_cast<u32>(g_index.size()));
+        for (const auto& [hash, count] : g_index) {
+            data.push_back(static_cast<u32>(hash));
+            data.push_back(static_cast<u32>(hash >> 32));
+            data.push_back(count);
+        }
+    }
+    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary, kShaderIndexName, std::move(data));
+}
+
+namespace {
+// sotc: SOTC_PRETRANSLATE pack. "SOTCPRE1", then records (u64 hash, u32 perm, u32 meta bytes, u32 spv bytes, meta, spv),
+// then the index (u32 count, records of u64 hash, u32 perm, u64 offset, u32 meta bytes, u32 spv bytes), then the
+// index offset (u64) and "SOTCPRE1". Written and read on the command processor thread only.
+constexpr char kPackMagic[8] = {'S', 'O', 'T', 'C', 'P', 'R', 'E', '1'};
+struct PackEntry {
+    u64 hash;
+    u32 perm;
+    u64 offset; // of the meta bytes
+    u32 meta_size;
+    u32 spv_size;
+};
+std::FILE* g_pack_out = nullptr;
+bool g_pack_closed = false; // finished (or failed) this session: no second writer
+std::vector<PackEntry> g_pack_written;
+std::FILE* g_pack_in = nullptr;
+std::unordered_map<u64, std::vector<PackEntry>> g_pack_index;
+
+std::filesystem::path PackPath() {
+    return Storage::DataBase::Instance().CachePath() / "sotc_pretranslate.pack";
+}
+
+bool PackRead(u64 offset, void* out, size_t n) {
+    return g_pack_in && _fseeki64(g_pack_in, static_cast<s64>(offset), SEEK_SET) == 0 &&
+           std::fread(out, 1, n, g_pack_in) == n;
+}
+} // namespace
+
+bool PipelineCache::PrePackAdd(u64 hash, u32 perm_idx, std::vector<u8>&& meta, const std::vector<u32>& spv) {
+    // sotc: SOTC_PRETRANSLATE_PACK=0 writes the hold's variants as loose files instead (diagnostics).
+    static const bool pack_on = [] {
+        const char* v = std::getenv("SOTC_PRETRANSLATE_PACK");
+        return !v || v[0] != '0';
+    }();
+    if (!pack_on || g_pack_closed || !Storage::DataBase::Instance().IsOpened()) {
+        return false;
+    }
+    if (!g_pack_out) {
+        std::error_code ec;
+        std::filesystem::create_directories(PackPath().parent_path(), ec);
+        g_pack_out = std::fopen(PackPath().string().c_str(), "wb");
+        if (!g_pack_out || std::fwrite(kPackMagic, 1, sizeof kPackMagic, g_pack_out) != sizeof kPackMagic) {
+            g_pack_closed = true;
+            return false;
+        }
+    }
+    const u32 meta_size = static_cast<u32>(meta.size());
+    const u32 spv_size = static_cast<u32>(spv.size() * sizeof(u32));
+    std::fwrite(&hash, sizeof hash, 1, g_pack_out);
+    std::fwrite(&perm_idx, sizeof perm_idx, 1, g_pack_out);
+    std::fwrite(&meta_size, sizeof meta_size, 1, g_pack_out);
+    std::fwrite(&spv_size, sizeof spv_size, 1, g_pack_out);
+    const u64 offset = static_cast<u64>(_ftelli64(g_pack_out));
+    std::fwrite(meta.data(), 1, meta_size, g_pack_out);
+    std::fwrite(spv.data(), 1, spv_size, g_pack_out);
+    g_pack_written.push_back({hash, perm_idx, offset, meta_size, spv_size});
+    return true;
+}
+
+void PipelineCache::PrePackFinish() {
+    if (!g_pack_out) {
+        return;
+    }
+    const u64 index_offset = static_cast<u64>(_ftelli64(g_pack_out));
+    const u32 count = static_cast<u32>(g_pack_written.size());
+    std::fwrite(&count, sizeof count, 1, g_pack_out);
+    for (const auto& e : g_pack_written) {
+        std::fwrite(&e.hash, sizeof e.hash, 1, g_pack_out);
+        std::fwrite(&e.perm, sizeof e.perm, 1, g_pack_out);
+        std::fwrite(&e.offset, sizeof e.offset, 1, g_pack_out);
+        std::fwrite(&e.meta_size, sizeof e.meta_size, 1, g_pack_out);
+        std::fwrite(&e.spv_size, sizeof e.spv_size, 1, g_pack_out);
+    }
+    std::fwrite(&index_offset, sizeof index_offset, 1, g_pack_out);
+    std::fwrite(kPackMagic, 1, sizeof kPackMagic, g_pack_out);
+    const bool ok = std::fclose(g_pack_out) == 0;
+    g_pack_out = nullptr;
+    g_pack_closed = true;
+    std::fprintf(stderr, "SOTC PRETRANSLATE pack: %u variants written%s\n", count, ok ? "" : " (write failed)");
+    g_pack_written.clear();
+    if (ok) {
+        PrePackLoad();
+    }
+}
+
+void PipelineCache::PrePackLoad() {
+    if (g_pack_in) {
+        std::fclose(g_pack_in);
+        g_pack_in = nullptr;
+    }
+    g_pack_index.clear();
+    std::FILE* f = std::fopen(PackPath().string().c_str(), "rb");
+    if (!f) {
+        return;
+    }
+    char magic[8]{};
+    u64 index_offset = 0;
+    u32 count = 0;
+    const bool ok = _fseeki64(f, -16, SEEK_END) == 0 && std::fread(&index_offset, sizeof index_offset, 1, f) == 1 &&
+                    std::fread(magic, 1, 8, f) == 8 && std::memcmp(magic, kPackMagic, 8) == 0 &&
+                    _fseeki64(f, static_cast<s64>(index_offset), SEEK_SET) == 0 &&
+                    std::fread(&count, sizeof count, 1, f) == 1;
+    if (!ok) {
+        std::fclose(f);
+        return;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        PackEntry e{};
+        if (std::fread(&e.hash, sizeof e.hash, 1, f) != 1 || std::fread(&e.perm, sizeof e.perm, 1, f) != 1 ||
+            std::fread(&e.offset, sizeof e.offset, 1, f) != 1 ||
+            std::fread(&e.meta_size, sizeof e.meta_size, 1, f) != 1 ||
+            std::fread(&e.spv_size, sizeof e.spv_size, 1, f) != 1) {
+            break;
+        }
+        auto& list = g_pack_index[e.hash];
+        list.push_back(e);
+        auto& known = lazy_programs[e.hash];
+        known = std::max(known, e.perm + 1);
+    }
+    g_pack_in = f;
+    std::fprintf(stderr, "SOTC PRETRANSLATE pack: %zu programs ready on disk\n", g_pack_index.size());
+}
+
+bool PipelineCache::LoadLazyProgram(u64 hash) {
+    const auto entry = lazy_programs.find(hash);
+    if (entry == lazy_programs.end()) {
+        return false;
+    }
+    const u32 count = entry->second;
+    lazy_programs.erase(entry);
+    const auto packed = g_pack_index.find(hash);
+    bool loaded = false;
+    for (u32 idx = 0; idx < count; ++idx) {
+        const auto existing = program_cache.find(hash);
+        if (existing != program_cache.end() && idx < existing.value()->modules.size() &&
+            existing.value()->modules[idx].module) {
+            continue; // a warm-up pipeline loaded it
+        }
+        std::vector<u8> meta_blob;
+        std::vector<u32> packed_spv;
+        if (packed != g_pack_index.end()) {
+            for (const auto& e : packed->second) {
+                if (e.perm != idx) {
+                    continue;
+                }
+                meta_blob.resize(e.meta_size);
+                packed_spv.resize(e.spv_size / sizeof(u32));
+                if (!PackRead(e.offset, meta_blob.data(), e.meta_size) ||
+                    !PackRead(e.offset + e.meta_size, packed_spv.data(), e.spv_size)) {
+                    meta_blob.clear();
+                    packed_spv.clear();
+                }
+                break;
+            }
+            if (!meta_blob.empty()) {
+                // The pipeline warm-up of the next sessions reads loose files: the variant a draw uses gets them now.
+                Storage::DataBase::Instance().Save(Storage::BlobType::ShaderMeta,
+                                                   fmt::format("{:#018x}", HashCombine(hash, u64{idx})),
+                                                   std::vector<u8>(meta_blob));
+                Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
+                                                   fmt::format("{:#018x}_{}", hash, idx), std::vector<u32>(packed_spv));
+            }
+        }
+        if (meta_blob.empty()) {
+            Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
+                                               fmt::format("{:#018x}", HashCombine(hash, u64{idx})), meta_blob);
+        }
+        if (meta_blob.empty()) {
+            continue;
+        }
+        auto program = std::make_unique<Program>();
+        Shader::StageSpecialization spec{};
+        spec.info = &program->info;
+        size_t perm_idx{};
+        try {
+            Serialization::Archive ar{std::move(meta_blob)};
+            if (!LoadShaderMeta(ar, program->info, spec, perm_idx) || perm_idx != idx) {
+                continue;
+            }
+        } catch (...) {
+            continue;
+        }
+        std::vector<u32> spv = std::move(packed_spv);
+        if (spv.empty()) {
+            Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
+                                               fmt::format("{:#018x}_{}", hash, idx), spv);
+        }
+        if (spv.empty()) {
+            continue;
+        }
+        auto [it_pgm, is_new] = program_cache.try_emplace(hash);
+        // sotc: a permutation whose resources differ from the program's would be drawn with descriptors written for
+        // the program's Info (SameBindingLayout): it is not loaded (a draw that needs it translates it again).
+        if (!is_new && !SameBindingLayout(it_pgm.value()->info, program->info)) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr, "SOTC SHADER CACHE: permutation %u of %#llx not loaded, its resources differ from "
+                             "the program's\n", idx, static_cast<unsigned long long>(hash));
+            }
+            continue;
+        }
+        const vk::ShaderModule module = CompileSPV(spv, instance.GetDevice());
+        if (is_new) {
+            it_pgm.value() = std::move(program);
+        } else {
+            Shader::CombineBindlessCache(it_pgm.value()->info.bindless, program->info.bindless);
+        }
+        spec.info = &it_pgm.value()->info;
+        it_pgm.value()->InsertPermut(module, std::move(spec), idx);
+        loaded = true;
+    }
+    return loaded;
 }
 
 void PipelineCache::Sync() {

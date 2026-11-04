@@ -61,6 +61,7 @@
 #include "video_core/sotc_write_extent.h"
 #include "video_core/sotc_write_journal.h" // sotc: SOTC_WRITE_JOURNAL report
 #include "video_core/sotc_arch/guest_barrier.h" // sotc: SOTC_BARRIER_GUEST report
+#include "video_core/sotc_arch/gcn_native.h"    // sotc: ARCH-GCN-NATIVE report
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_draw_merge.h" // sotc: SOTC_DRAW_MERGE_STATS report
 #include "video_core/sotc_vertex_extent.h" // sotc: SOTC_VERTEX_EXTENT report
@@ -74,6 +75,9 @@
 #include "../../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG report
 #include "../../../../sotc/probe_xpr_groups.h" // sotc: SOTC_XPR_GROUPS report
 #include "../../../../sotc/predict_probe.h" // sotc: SOTC_PREDICT_PROBE report
+#include "../../../../sotc/pretranslate.h" // sotc: SOTC_PRETRANSLATE report
+#include "../../../../sotc/preupload.h" // sotc: SOTC_PRELOAD_UPLOAD report
+#include "../../../../sotc/draw_gate.h" // sotc: SOTC_DRAW_GATE
 #include "video_core/sotc_draw_runs.h"         // sotc: SOTC_DRAW_RUNS report
 #include "../../../../sotc/probe_vsize.h"     // sotc: SOTC_VSIZE_PROBE report
 #include "../../../../sotc/pc_ring.h"     // sotc: SOTC_PC_RING report
@@ -2369,6 +2373,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 if (SotcArch::GuestBarrier::Active()) { // sotc: SOTC_BARRIER_GUEST (guest sync points, guest_barrier.h)
                     arch(SotcArch::GuestBarrier::Report);
                 }
+                arch(SotcGcn::Report); // sotc: ARCH-GCN-NATIVE, one line per stage that is on (empty when all are off)
             }
             SotcGen::Report(report, seconds); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
             VideoCore::WriteSetFlat::Report(report, seconds); // sotc: SOTC_WRITE_SCOPE_FLAT (every 5 s)
@@ -2402,6 +2407,9 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcRegionPredrain::Report(report, seconds); // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG
             SotcXprGroups::Report(report, seconds);      // sotc: SOTC_XPR_GROUPS (XPR draw groups, 5 s)
             SotcPredict::Report(report, seconds);        // sotc: SOTC_PREDICT_PROBE (shader translation predictability)
+            SotcPretranslate::Report(report, seconds);
+            SotcPreupload::Report(report, seconds);
+            SotcDrawGate::Report(report, seconds); // sotc: SOTC_DRAW_GATE      // sotc: SOTC_PRELOAD_UPLOAD (loaded ranges, idle uploads)   // sotc: SOTC_PRETRANSLATE (step 2c, keys made at load)
             SotcDrawRuns::Report(report, seconds);       // sotc: SOTC_DRAW_RUNS (indirect draw runs, 5 s)
             SotcVsizeProbe::Report(report, seconds);     // sotc: SOTC_VSIZE_PROBE (unbounded binds, 5 s)
             SotcVertexExtent::Report(report, seconds);   // sotc: SOTC_VERTEX_EXTENT (only while it is on)
@@ -2917,12 +2925,32 @@ void VideoOutDriver::DrawBlankFrame() {
         true);
 }
 
+// sotc: SOTC_PRETRANSLATE boot hold (PipelineCache::MaybeHoldForPretranslate): the command processor holds the game
+// until its shaders are translated, so no flip comes and the window stayed black. A blank frame with the overlay's
+// preparation screen is presented at ~30 fps instead, as the presenter's warm-up painter does. True while it paints.
+bool VideoOutDriver::PaintPrepScreen() {
+    if (!SotcStats::prep_active.load(std::memory_order_acquire) || !presenter) {
+        return false;
+    }
+    static auto last_paint = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_paint >= std::chrono::milliseconds(33)) {
+        last_paint = now;
+        DrawBlankFrame();
+    }
+    return true;
+}
+
 void VideoOutDriver::DrawLastFrame() {
     RunPresentJob(
         [] {
             const auto frame = presenter->PrepareLastFrame();
             if (frame != nullptr) {
                 presenter->Present(frame, true);
+            } else {
+                // sotc: before the game's first frame (after the cache warm-up): a blank frame, so the loading
+                // screen stays on instead of a black window until the game flips.
+                presenter->Present(presenter->PrepareBlankFrame(true), false, false);
             }
         },
         true);
@@ -3045,6 +3073,7 @@ void VideoOutDriver::PresentThreadDet(std::stop_token token) {
         if (presenter) {
             presenter->RefillReadyFrames(); // sotc: SOTC_FLIP_OFFTHREAD, as in PresentThread
         }
+        PaintPrepScreen(); // sotc: the boot shader preparation (no flip comes meanwhile)
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -3211,6 +3240,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             timer.End();
             continue;
         }
+        // sotc: the boot shader preparation: its screen instead of the last frame (the vblanks go on below).
+        const bool prep_painting = PaintPrepScreen();
 
         // Check if it's time to take a request.
         // sotc: the flip rate counts from the last flip instead of fixed vblank phases: at 30 fps
@@ -3259,7 +3290,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
-                    } else if (ImGui::Core::MustKeepDrawing() || BbOverlay::LoadingShown()) {
+                    } else if (!prep_painting && (ImGui::Core::MustKeepDrawing() || BbOverlay::LoadingShown())) {
                         // sotc: also the port's loading screen while the game shows nothing.
                         DrawLastFrame();
                     }

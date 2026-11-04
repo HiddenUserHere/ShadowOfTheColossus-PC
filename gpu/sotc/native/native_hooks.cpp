@@ -6,6 +6,7 @@
 // words they name, then call SotcNative::Announce / Release / NoteDescriptor (native.h). Every handler returns
 // Continue: the displaced instructions or the function body run next, unchanged.
 
+#include "../preupload.h" // sotc: SOTC_PRELOAD_UPLOAD
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -427,8 +428,27 @@ HookAction CcbSubmit(GuestRegs& regs, void*) {
 // Zero-copy creator 0x8be60 (Entry): (rdi = resource, esi = type, edx = elem, ecx = count, r8 = flags,
 // r9 = backing). A zero-copy resource (0x800) uses the caller's backing as its storage; the caller filter
 // keeps the per-frame builders in.
+// The 0x8be60 call in progress on this thread (NATIVE_ZC_CREATE entry): the image offset of its return address and
+// its second argument (the resource kind).
+struct ResCreate {
+    uint32_t caller;
+    uint32_t kind;
+};
+thread_local ResCreate t_res_create{};
+
 HookAction ZeroCopyCreate(GuestRegs& regs, void*) {
     SotcVsizeProbe::NoteBpeEntry(regs); // sotc: SOTC_VSIZE_PROBE (observe only; a no-op when the probe is off)
+    if (SotcPreupload::On()) {
+        // sotc: SOTC_PRELOAD_UPLOAD: who creates the resource whose initial-data memcpy follows (AnnounceWrite).
+        uint64_t caller = 0;
+        CallerOffset(regs, &caller);
+        t_res_create = ResCreate{static_cast<uint32_t>(caller), static_cast<uint32_t>(regs.rsi)};
+        // A buffer without initial data (no source, not zero-copy): a pool the CPU fills later.
+        if (regs.r9 == 0 && (regs.r8 & 0x800) == 0 && static_cast<uint32_t>(regs.rcx) != 0xFFFFFFFFu) {
+            const uint64_t size = uint64_t{static_cast<uint32_t>(regs.rcx)} * static_cast<uint32_t>(regs.rdx);
+            SotcPreupload::NotePool(regs.rdi, size, static_cast<uint32_t>(caller), static_cast<uint32_t>(regs.rsi));
+        }
+    }
     if (!SotcNative::On() || (regs.r8 & 0x800) == 0 || regs.r9 == 0) {
         return HookAction::Continue;
     }
@@ -984,15 +1004,34 @@ HookAction MipRelease(GuestRegs& regs, void*) {
 // route (~130k announces/s, same FPS and p99).
 // The code of the announce a guest copy needs: 0 = none, else 1 + SotcNative::Kind. Lock-free and cheap: it runs
 // on every guest memcpy/memset/memmove.
+// sotc: SOTC_PRELOAD_UPLOAD. The return address of the initial-data memcpy in the resource creator 0x8be60 (call at
+// 0x8bf4b, EU 1.01 / US 1.00): the GPU allocation it just filled from the loader's stream (vertex, index and texel
+// buffers built at load). Flag bit of the code (the kind stays PerFrame).
+constexpr uint64_t kResCopyReturn = 0x8bf50;
+constexpr uint32_t kResCopyFlag = 0x100;
+
 uint32_t GuestWriteCode(uint64_t return_address) {
-    (void)return_address;
-    return SotcNative::On() ? 1u + static_cast<uint32_t>(SotcNative::Kind::PerFrame) : 0u;
+    if (!SotcNative::On()) {
+        return 0u;
+    }
+    uint32_t code = 1u + static_cast<uint32_t>(SotcNative::Kind::PerFrame);
+    if (SotcPreupload::On()) {
+        const uint64_t base = static_cast<uint64_t>(SotcHooks::ImageBase());
+        if (base != 0 && return_address == base + kResCopyReturn) {
+            code |= kResCopyFlag;
+        }
+    }
+    return code;
 }
 
 // Announces [dst, dst + size) for a guest copy that has landed.
 void AnnounceWrite(uint64_t dst, uint64_t size, uint32_t code) {
     if (code == 0 || size == 0 || dst > UINT64_MAX - size) {
         return;
+    }
+    if (code & kResCopyFlag) {
+        code &= ~kResCopyFlag;
+        SotcPreupload::NoteLoaded(dst, size, SotcPreupload::kResCopy, t_res_create.caller, t_res_create.kind);
     }
     AnnounceRange(dst, dst + size, static_cast<SotcNative::Kind>(code - 1), g_window.gmem);
 }

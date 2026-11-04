@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_checkpoints.h" // sotc: SOTC_GPU_CHECKPOINTS
 
 #include <vk_mem_alloc.h>
 
@@ -130,6 +131,8 @@ UniqueBuffer::~UniqueBuffer() {
 }
 
 void UniqueBuffer::Destroy() {
+    SotcCheckpoints::NoteFreed(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer)),
+                               SotcCheckpoints::kBufferRead); // sotc: SOTC_GPU_CHECKPOINTS
     if (borrowed) { // sotc: SOTC_PC_RING=8, the handle belongs to sotc_guest_memory
         buffer = VK_NULL_HANDLE;
         bda_addr = 0;

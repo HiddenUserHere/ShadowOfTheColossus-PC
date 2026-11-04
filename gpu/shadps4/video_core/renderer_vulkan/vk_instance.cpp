@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/sotc_arch/sotc_arch.h"
+#include "video_core/sotc_checkpoints.h" // sotc: SOTC_GPU_CHECKPOINTS
 #include "video_core/sotc_stats.h"
 #include "sotc_gpu_trace.h"
 
@@ -257,6 +258,14 @@ std::string Instance::GetDriverVersionName() {
 
 void Instance::ReportDeviceFault() const {
     LOG_CRITICAL(Render_Vulkan, "Vulkan device lost");
+    // sotc: SOTC_GPU_CHECKPOINTS, the commands in flight (once), when this function returns: with the fault addresses
+    // below when the driver gives them.
+    struct CheckpointReport {
+        std::vector<u64> addrs;
+        ~CheckpointReport() {
+            SotcCheckpoints::Report(addrs.data(), static_cast<u32>(addrs.size()));
+        }
+    } checkpoint_report;
     if (!device_fault) {
         LOG_CRITICAL(Render_Vulkan, "VK_EXT_device_fault unavailable, no fault details");
         return;
@@ -286,6 +295,7 @@ void Instance::ReportDeviceFault() const {
     }
     LOG_CRITICAL(Render_Vulkan, "Device fault: {}", info.description);
     for (const auto& a : addresses) {
+        checkpoint_report.addrs.push_back(a.reportedAddress);
         LOG_CRITICAL(Render_Vulkan, "  address type={} address={:#x} precision={:#x}",
                      vk::to_string(static_cast<vk::DeviceFaultAddressTypeEXT>(a.addressType)),
                      a.reportedAddress, a.addressPrecision);
@@ -514,6 +524,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     }
     // Device fault reporting: lets us print the faulting address/type after a device loss.
     device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    // sotc: SOTC_GPU_CHECKPOINTS=1, the command a device lost stopped at (NVIDIA, sotc_checkpoints.h).
+    SotcCheckpoints::SetAvailable(SotcCheckpoints::Wanted() &&
+                                  add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME));
     if (device_fault) {
         const auto fault_features = feature_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>();
         device_fault = fault_features.deviceFault;
@@ -1416,6 +1429,10 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         LOG_INFO(Render_Vulkan, "Dispatches move to the async compute queue family {} index {} "
                                 "(SOTC_N5_ASYNC_COMPUTE=1)",
                  async_pick.family, async_pick.queue_index);
+    }
+    SotcCheckpoints::RegisterQueue(graphics_queue, "graphics"); // sotc: SOTC_GPU_CHECKPOINTS
+    if (HasAsyncQueue()) {
+        SotcCheckpoints::RegisterQueue(async_queue, "async compute");
     }
     if (HasXferQueue()) {
         xfer_queue = device->getQueue(xfer_queue_family_index, 0);

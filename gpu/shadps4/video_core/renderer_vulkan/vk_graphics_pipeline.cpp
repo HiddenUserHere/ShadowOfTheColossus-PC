@@ -831,6 +831,7 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
         set_bindings;
     u32 num_sets{1};
     u32 binding{};
+    u32 layout_buffers{}; // sotc: the buffer slots of the stages before (SOTC_VS_BINDING_BASE)
     uses_bindless_samplers = false;
     uses_slot_words = false; // sotc: SOTC_HEAP
     packet_range = false;    // sotc: SOTC_PACKET, set by the stages below
@@ -845,6 +846,10 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
             binding = 0;
             num_sets = std::max(num_sets, set + 1);
         }
+        if (stage->sw_stage == Shader::SwStage::Vertex) { // sotc: SOTC_VS_BINDING_BASE, as the bind loop numbers it
+            binding = Shader::Backend::VsStartBindings({binding, layout_buffers}, stage_sets).unified;
+        }
+        layout_buffers += static_cast<u32>(stage->buffers.size());
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
         for (const auto& buffer : stage->buffers) {
             const auto sharp =
@@ -935,8 +940,17 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
             return false;
         }
     }
+    // sotc: maxPushDescriptors bounds the descriptors of the set, not its binding numbers. SOTC_VS_BINDING_BASE leaves a
+    // gap below the vertex stage's first binding (48), so `binding` (the next free number) passed the limit (32 on
+    // NVIDIA) for almost every draw, and they all fell to pool-allocated descriptor sets: the path behind the device
+    // lost of 4 Nov (a draw reading an invalid descriptor, the same one in every crash). The count without the gap is
+    // the one compared; with contiguous bindings it equals `binding`, as before.
+    u32 set0_descriptors = 0;
+    for (const auto& b : set_bindings[0]) {
+        set0_descriptors += b.descriptorCount;
+    }
     uses_push_descriptors =
-        !stage_sets && !descriptor_buffer && binding < instance.MaxPushDescriptors();
+        !stage_sets && !descriptor_buffer && set0_descriptors < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                        : descriptor_buffer

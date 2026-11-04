@@ -63,6 +63,8 @@ OPCODE(SharedAtomicCmpSwap64,                               U64,            U32,
 
 // Context getters/setters
 OPCODE(GetUserData,                                         U32,            ScalarReg,                                                                      )
+// sotc: SOTC_GENERIC_BUFFERS. One dword of the flattened user data buffer at an immediate index (a V# word).
+OPCODE(LoadFlatbufDword,                                    U32,            U32,                                                                            )
 OPCODE(GetScalarRegister,                                   U32,            ScalarReg,                                                                      )
 OPCODE(SetScalarRegister,                                   Void,           ScalarReg,      U32,                                                            )
 OPCODE(GetVectorRegister,                                   U32,            VectorReg,                                                                      )

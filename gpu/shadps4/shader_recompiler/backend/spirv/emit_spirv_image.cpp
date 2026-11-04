@@ -156,6 +156,14 @@ static Id LoadImage(EmitContext& ctx, IR::Inst* inst,
             ctx.TypePointer(spv::StorageClass::UniformConstant, texture.image_type);
         const Id pointer =
             ctx.OpAccessChain(pointer_type, ctx.bindless_image_arrays[texture.bindless_key], index);
+        // sotc: SOTC_GCN_TEX. A probed index differs per invocation (the host tombstones entries): non-uniform.
+        if (texture.heap && ctx.GcnImageProbed(texture.table_entry)) {
+            ctx.Decorate(index, spv::Decoration::NonUniform);
+            ctx.Decorate(pointer, spv::Decoration::NonUniform);
+            const Id image{ctx.OpLoad(texture.image_type, pointer)};
+            ctx.Decorate(image, spv::Decoration::NonUniform);
+            return image;
+        }
         return ctx.OpLoad(texture.image_type, pointer);
     }
     if (texture.array_size == 0) {

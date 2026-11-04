@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "../../../sotc/preupload.h" // sotc: SOTC_PRELOAD_UPLOAD
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -5876,6 +5877,18 @@ u64 BufferCache::DrainRange(VAddr addr, u64 size) {
     return uploaded;
 }
 
+// sotc: SOTC_PRELOAD_UPLOAD=2 (preupload.h Idle).
+u64 BufferCache::PendingUploadBytes(VAddr addr, u64 size) noexcept {
+    return memory_tracker->CountCpuModifiedBytes(addr, size); // sotc: SOTC_DRAW_GATE
+}
+
+u64 BufferCache::PreuploadRange(VAddr addr, u64 size) {
+    if (IsRegionGpuModified(addr, size)) {
+        return 0;
+    }
+    return DrainRange(addr, size);
+}
+
 // sotc: SOTC_REGION_PREDRAIN (region_predrain.h Idle). A CPU-only class range is left to its owner.
 u64 BufferCache::PredrainRange(VAddr addr, u64 size) {
     if (SotcRegionPredrain::InCpuOnlyClass(addr, size)) {
@@ -6050,6 +6063,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (SotcRegionPredrain::TrackOn() && SotcStats::t_draw_thread && tl_early_sync == 0) {
         SotcRegionPredrain::NoteBindSync(device_addr, size, tl_sync_bytes - verify_bytes_before,
                                          tl_fresh_touched);
+    }
+    // sotc: SOTC_PRELOAD_UPLOAD: the bytes this draw-thread bind copied, against the ranges the loader handed on.
+    if (SotcPreupload::On() && SotcStats::t_draw_thread && tl_early_sync == 0) {
+        SotcPreupload::NoteBindCopy(device_addr, size, tl_sync_bytes - verify_bytes_before);
     }
     // sotc: SOTC_VSIZE_PROBE (measurement only): the bytes this draw-thread sync copied, for the bind in progress.
     if (SotcVsizeProbe::On() && SotcStats::t_draw_thread && tl_early_sync == 0) {

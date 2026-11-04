@@ -4,12 +4,14 @@
 #pragma once
 
 #include <array>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <boost/container/static_vector.hpp>
 #include <sirit/sirit.h>
 
 #include "shader_recompiler/backend/bindings.h"
+#include "shader_recompiler/gcn_layout.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/value.h"
 #include "shader_recompiler/profile.h"
@@ -48,7 +50,14 @@ constexpr u32 HeapVerifyFirstMember = 9;
 /// sotc: SOTC_HEAP_VS. The push member of a vertex heap stage's table address (Shader::HeapVsTableOffset, byte 136).
 /// HeapTableMember gives the member of a heap stage: HeapIndexTableMember, or this one for a vertex stage.
 constexpr u32 HeapVsTableMember = 9;
-u32 HeapTableMember(const Info& info);
+/// sotc: SOTC_GCN_TEX (Profile::gcn_tex == 1, emit_spirv_gcn_tex.cpp). The heap push struct then has one more u64
+/// member, the globals address of gcn_layout.h, at byte 88 (Shader::HeapGlobalsOffset = ShaderAddrArenaGuestOffset,
+/// the packet's arena_guest_base word, free in a heap stage). It is member 8, and the members from 8 on move by one
+/// (HeapMemberShift): the debug address is member 9 and 136 is member 10.
+constexpr u32 HeapGcnGlobalsMember = 8;
+constexpr u32 HeapGlobalsOffset = 88;
+u32 HeapMemberShift(const Profile& profile);
+u32 HeapTableMember(const Info& info, const Profile& profile);
 
 struct VectorIds {
     [[nodiscard]] Id& operator[](u32 index) {
@@ -456,6 +465,38 @@ public:
     Id LoadHeapImageIndex(u32 entry, u32 slot);
     /// sotc: SOTC_HEAP: the heap index of sampler `index` (the table entry after the images), as LoadHeapImageIndex.
     Id LoadHeapSamplerIndex(u32 entry, u32 index);
+    /// sotc: SOTC_GCN_TEX (gcn_tex == 1, emit_spirv_gcn_tex.cpp). The heap index of each image and sampler of a heap
+    /// stage, probed once per invocation from the GPU T#/S# table in the globals buffer (HoistGcnTex, called first by
+    /// HoistBdaBlocks in the entry block). Indexed by image index / sampler index; empty unless the probes run.
+    boost::container::small_vector<Id, 16> gcn_image_slots;
+    boost::container::small_vector<Id, 8> gcn_sampler_slots;
+    /// sotc: SOTC_GCN_TEX. True where the slot is a probe result (dynamically non-uniform, so its descriptor access is
+    /// decorated NonUniform); false for the null constant of an invalid sharp and for the index-table fallback.
+    boost::container::small_vector<bool, 16> gcn_image_probed;
+    boost::container::small_vector<bool, 8> gcn_sampler_probed;
+    bool GcnImageProbed(u32 entry) const {
+        return entry < gcn_image_probed.size() && gcn_image_probed[entry];
+    }
+    bool GcnSamplerProbed(u32 index) const {
+        return index < gcn_sampler_probed.size() && gcn_sampler_probed[index];
+    }
+    /// Function variables of the probe loop (u32): the probe number, the outcome (0 searching, 1 hit, 2 empty), the slot.
+    Id gcn_probe_var{};
+    Id gcn_state_var{};
+    Id gcn_result_var{};
+    /// Emits the probes of every image and sampler of a heap stage (no-op unless gcn_tex == 1 on a heap stage). Declares
+    /// the probe variables, so it must run before any other instruction of the entry block.
+    void HoistGcnTex();
+    /// The device address of the globals buffer (the heap push member HeapGcnGlobalsMember).
+    Id GcnGlobalsBase();
+    /// Probes the T#/S# table for `key` (8 or 4 u32 words) and the view class `view_class` (a U32 Id: a constant for
+    /// images, SamplerClass for samplers, bit 7 computed at run time). Returns the heap slot of the hit, or 0 (the null
+    /// slot) on a miss, and appends a miss record for a miss. `sampler` selects kMissSampler over kMissImage.
+    Id GcnTexLookup(std::span<const Id> key, Id view_class, bool sampler);
+    /// Murmur3 of `words` with a run-time seed (Shader::Gcn::Hash with seed = the U32 Id `seed`).
+    Id GcnHashWithSeed(std::span<const Id> words, Id seed);
+    /// Appends one miss record (kind, the key words, view_class) to the miss ring, once per seen bit (hash).
+    void GcnTexRecordMiss(Id globals, u32 kind, std::span<const Id> key, Id view_class, Id hash);
     /// sotc: SOTC_HEAP: the index `raw` clamped to the null slot 0 when it is past `capacity` (counted and recorded).
     Id HeapGuard(Id raw, u32 capacity, u32 entry);
     /// sotc: SOTC_HEAP verify: the 16-bit compact classic slot at bit `shift` (0 or 16) of push member `member`.
@@ -549,6 +590,13 @@ public:
     Id BdaBeginIf(Id valid);
     /// sotc: SOTC_BDA. Closes the block opened by BdaBeginIf.
     void BdaEndIf(Id merge);
+
+    // sotc: SOTC GCN shared helpers (ARCH-GCN-NATIVE, gcn_layout.h). Usable by any stage's emitter code.
+    /// murmur3_32 of `words` (u32 each) with `seed`: the same value as Shader::Gcn::Hash on the host.
+    Id GcnHash(std::span<const Id> words, u32 seed);
+    /// sotc: SOTC_GCN_BUF. Appends a kMissPage record for the page-aligned guest address `page` (U64), once until the
+    /// host drains. Call only inside a branch that runs for a missing page (TableAddresses does).
+    void GcnPageMiss(Id page);
 
 private:
     void DefineArithmeticTypes();

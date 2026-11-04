@@ -11,6 +11,7 @@
 #include "shader_recompiler/ir/operand_helper.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
+#include "shader_recompiler/ir/passes/sotc_generic_buffers.h"
 #include "shader_recompiler/ir/reinterpret.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/resource.h"
@@ -533,6 +534,9 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     }
 
     u32 image_binding = descriptors.Add(image_res);
+    // sotc: SOTC_PREDICT_PROBE step 2b: which instruction uses which image (measurement only).
+    info.sotc_image_uses.push_back({image_binding, static_cast<u32>(inst_info.pc.Value()),
+                                    static_cast<u32>(inst.GetOpcode()), inst_info.raw});
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
 
@@ -767,20 +771,24 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
 }
 
 IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const Info& info,
-                               const AmdGpu::Buffer& buffer, u32 stride) {
+                               const AmdGpu::Buffer& buffer, u32 stride,
+                               std::optional<IR::U32> dynamic_stride = std::nullopt,
+                               bool byte_address = false) {
     const auto inst_info = inst.Flags<IR::BufferInstInfo>();
     const u32 inst_offset = inst_info.inst_offset.Value();
     const auto is_inst_typed = inst_info.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid;
     const auto data_format = is_inst_typed
                                  ? AmdGpu::RemapDataFormat(inst_info.inst_data_fmt.Value())
                                  : buffer.GetDataFmt();
-    const u32 shift = BufferAddressShift(inst, data_format);
+    // sotc: SOTC_GENERIC_BUFFERS=2: a generic formatted load takes a byte address (its element size is a run-time
+    // value); lower_buffer_format_to_raw.cpp splits it.
+    const u32 shift = byte_address ? 0u : BufferAddressShift(inst, data_format);
     const u32 mask = (1 << shift) - 1;
     const IR::U32 soffset = IR::GetBufferSOffsetArg(&inst);
 
     // If address calculation is of the form "index * const_stride + offset" with offset constant
     // and both const_stride and offset are divisible with the element size, apply shift directly.
-    if (inst_info.index_enable && !inst_info.voffset_enable && soffset.IsImmediate() &&
+    if (!dynamic_stride && inst_info.index_enable && !inst_info.voffset_enable && soffset.IsImmediate() &&
         !buffer.swizzle_enable && !buffer.add_tid_enable && (stride & mask) == 0) {
         const u32 total_offset = soffset.U32() + inst_offset;
         if ((total_offset & mask) == 0) {
@@ -819,7 +827,7 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
         const IR::U32 voffset = IR::GetBufferVOffsetArg(&inst);
         offset = ir.IAdd(offset, voffset);
     }
-    const IR::U32 const_stride = ir.Imm32(stride);
+    const IR::U32 const_stride = dynamic_stride ? *dynamic_stride : ir.Imm32(stride); // sotc: SOTC_GENERIC_BUFFERS
     IR::U32 buffer_offset;
     if (buffer.swizzle_enable) {
         const IR::U32 const_index_stride = ir.Imm32(buffer.GetIndexStride());
@@ -862,8 +870,23 @@ void PatchBufferArgs(IR::Inst& inst, Info& info) {
     }
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
+    // sotc: SOTC_GENERIC_BUFFERS. An indexed access to an unswizzled guest buffer takes its stride from the V#
+    // at run time: dword 1 bits 16..29 (AmdGpu::Buffer::stride), where SharpFetch reads it (a flattened user data
+    // dword, or the immediate the code built the V# with).
+    std::optional<IR::U32> dynamic_stride;
+    const auto inst_info = inst.Flags<IR::BufferInstInfo>();
+    if (GenericBufferStride() && !buffer.swizzle_enable && buffer_res.buffer_type == BufferType::Guest &&
+        (inst_info.index_enable || buffer.add_tid_enable)) {
+        if (const auto dword1 = Optimization::SotcSharpDword(ir, buffer_res, 1)) {
+            dynamic_stride = ir.BitFieldExtract(*dword1, ir.Imm32(16), ir.Imm32(14));
+        }
+    }
+    const bool generic_format = inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32 &&
+                                inst_info.inst_data_fmt == AmdGpu::DataFormat::FormatInvalid &&
+                                Optimization::SotcGenericFormatLoads(buffer_res, buffer);
     inst.SetArg(IR::LoadBufferArgs::Address,
-                CalculateBufferAddress(ir, inst, info, buffer, buffer.stride));
+                CalculateBufferAddress(ir, inst, info, buffer, buffer.stride, dynamic_stride,
+                                       generic_format));
 }
 
 void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image_res,
@@ -1155,8 +1178,221 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
     }
 }
 
+// sotc: SOTC_PRETRANSLATE. A translation at resource load has no user data: every loaded dword of each sharp gets
+// the dword of a synthetic sharp in the (zeroed) flat buffer, the state a draw of the game most often has once the
+// key's normalizations apply. Buffers: unswizzled, stride 16, 32_32_32_32 float (a generic format with
+// SOTC_GENERIC_BUFFERS=2, the stride is generic from 1). Images: 1024x1024 2D (the view type follows the
+// instruction's array bit), 8_8_8_8 unorm or 32 float for depth, identity swizzle. Samplers: all zero. Immediate
+// dwords keep their value (the code builds them).
+template <typename T>
+static void WriteSyntheticSharp(Shader::Info& info, const SharpReference& ref, const T& sharp) {
+    if (ref.num_dwords == 0) {
+        return;
+    }
+    const auto fetch = ConstructSharpFetch<T>(ref);
+    if (fetch.summary == SharpFetch<T>::Summary::Invalid) {
+        return;
+    }
+    u32 words[8]{};
+    std::memcpy(words, &sharp, std::min<size_t>(sizeof(sharp), sizeof(words)));
+    auto& flat = info.FlatBuf();
+    for (u32 i = 0; i < ref.num_dwords && i < sizeof(T) / sizeof(u32); ++i) {
+        const bool loaded = fetch.summary == SharpFetch<T>::Summary::SingleLoad || ((fetch.load_mask >> i) & 1);
+        const u32 at = fetch.summary == SharpFetch<T>::Summary::SingleLoad ? u32{fetch.offsets[0]} + i
+                                                                           : u32{fetch.offsets[i]};
+        if (loaded && at < flat.size()) {
+            flat[at] = words[i];
+        }
+    }
+}
+
+// sotc: SOTC_PRETRANSLATE. True when a value of the coordinates reaches back (within a bounded walk) to a v_cube*
+// instruction: the image is sampled as a cube.
+static bool SotcCoordsFromCube(const IR::Inst& inst, u32 first_arg) {
+    boost::container::small_vector<const IR::Inst*, 64> seen;
+    boost::container::small_vector<const IR::Inst*, 64> queue;
+    for (size_t a = first_arg; a < inst.NumArgs(); ++a) {
+        const IR::Value v = inst.Arg(a);
+        if (!v.IsImmediate()) {
+            queue.push_back(v.Inst());
+        }
+    }
+    while (!queue.empty() && seen.size() < 256) {
+        const IR::Inst* cur = queue.back();
+        queue.pop_back();
+        if (std::ranges::find(seen, cur) != seen.end()) {
+            continue;
+        }
+        seen.push_back(cur);
+        switch (cur->GetOpcode()) {
+        case IR::Opcode::CubeFaceIndex:
+        case IR::Opcode::CubeFaceCoordS:
+        case IR::Opcode::CubeFaceCoordT:
+        case IR::Opcode::CubeFaceMajorAxis:
+            return true;
+        default:
+            break;
+        }
+        for (size_t a = 0; a < cur->NumArgs(); ++a) {
+            const IR::Value v = cur->Arg(a);
+            if (!v.IsImmediate()) {
+                queue.push_back(v.Inst());
+            }
+        }
+    }
+    return false;
+}
+
+// sotc: SOTC_PRETRANSLATE. An image read whose texels the code takes as integers (a component goes through an
+// integer bitcast), an image write of integer values, or an atomic: the image has an integer format.
+static bool SotcIntegerImage(const IR::Inst& inst) {
+    const auto opcode = inst.GetOpcode();
+    if (opcode == IR::Opcode::ImageRead) {
+        // Integer texels only when every use of the components is an integer bitcast (a float image's texels are
+        // also bitcast by some code, next to float uses).
+        u32 integer_uses = 0;
+        for (const auto& use : inst.Uses()) {
+            const IR::Inst* user = use.user;
+            if (user->GetOpcode() == IR::Opcode::BitCastU32F32) {
+                ++integer_uses;
+                continue;
+            }
+            if (user->GetOpcode() != IR::Opcode::CompositeExtractF32x4) {
+                return false;
+            }
+            for (const auto& use2 : user->Uses()) {
+                if (use2.user->GetOpcode() != IR::Opcode::BitCastU32F32) {
+                    return false;
+                }
+                ++integer_uses;
+            }
+        }
+        return integer_uses != 0;
+    }
+    if (opcode == IR::Opcode::ImageWrite) {
+        const IR::Value value = inst.Arg(inst.NumArgs() - 1);
+        if (value.IsImmediate()) {
+            return false;
+        }
+        const IR::Inst* composite = value.Inst();
+        for (size_t a = 0; a < composite->NumArgs(); ++a) {
+            const IR::Value c = composite->Arg(a);
+            if (!c.IsImmediate() && c.Inst()->GetOpcode() == IR::Opcode::BitCastF32U32) {
+                return true;
+            }
+        }
+        return composite->GetOpcode() == IR::Opcode::BitCastF32U32;
+    }
+    return IsImageAtomicInstruction(inst);
+}
+
+static void SotcFillSyntheticSharps(Shader::Info& info, const ResourceDiscoveryList& resources) {
+    AmdGpu::Buffer buffer{};
+    buffer.base_address = 0x100000;
+    buffer.stride = 16;
+    buffer.num_records = 0x10000;
+    buffer.dst_sel_x = u32(AmdGpu::CompSwizzle::Red);
+    buffer.dst_sel_y = u32(AmdGpu::CompSwizzle::Green);
+    buffer.dst_sel_z = u32(AmdGpu::CompSwizzle::Blue);
+    buffer.dst_sel_w = u32(AmdGpu::CompSwizzle::Alpha);
+    buffer.num_format = u32(AmdGpu::NumberFormat::Float);
+    buffer.data_format = u32(AmdGpu::DataFormat::Format32_32_32_32);
+    const AmdGpu::Sampler sampler{};
+    // The image rules (step 2b), merged over every instruction that reads the same T#: the instruction's array bit
+    // (DA) gives an array view, cube coordinates a cube, integer use an integer format.
+    struct ImageUse {
+        u32 key;
+        bool is_array, cube, integer, depth, written;
+    };
+    boost::container::small_vector<ImageUse, 16> images;
+    const auto image_key = [](const SharpReference& ref) -> u32 {
+        const auto fetch = ConstructSharpFetch<AmdGpu::Image>(ref);
+        for (u32 i = 0; i < ref.num_dwords; ++i) {
+            if ((fetch.load_mask >> i) & 1) {
+                return u32{fetch.offsets[i]} - i;
+            }
+        }
+        return ~0u;
+    };
+    for (const auto& usage : resources) {
+        const IR::Inst& inst = *usage.user;
+        if (!IsImageInstruction(inst)) {
+            continue;
+        }
+        const auto inst_info = inst.Flags<IR::TextureInstInfo>();
+        const u32 key = image_key(usage.sharps[0]);
+        const bool sampled = inst.GetOpcode() == IR::Opcode::ImageSampleRaw;
+        const bool written = inst.GetOpcode() == IR::Opcode::ImageWrite || IsImageAtomicInstruction(inst);
+        ImageUse use{key, bool(inst_info.is_array), sampled && SotcCoordsFromCube(inst, 2),
+                     !sampled && SotcIntegerImage(inst), bool(inst_info.is_depth), written};
+        const auto it = std::ranges::find(images, key, &ImageUse::key);
+        if (it == images.end()) {
+            images.push_back(use);
+        } else {
+            it->is_array |= use.is_array;
+            it->cube |= use.cube;
+            it->integer |= use.integer;
+            it->depth |= use.depth;
+            it->written |= use.written;
+        }
+    }
+    // An image only read or written (never sampled), whose texel type the code may not show: variant 1 takes the
+    // other verdict.
+    for (auto& use : images) {
+        bool read_only_unsampled = true;
+        for (const auto& usage : resources) {
+            if (IsImageInstruction(*usage.user) && image_key(usage.sharps[0]) == use.key &&
+                usage.user->GetOpcode() == IR::Opcode::ImageSampleRaw) {
+                read_only_unsampled = false;
+            }
+        }
+        if (read_only_unsampled) {
+            info.sotc_synthetic_reads = true;
+            if (info.sotc_synthetic_variant == 1) {
+                use.integer = !use.integer;
+            }
+        }
+    }
+    for (const auto& usage : resources) {
+        const IR::Inst& inst = *usage.user;
+        if (IsBufferInstruction(inst)) {
+            WriteSyntheticSharp(info, usage.sharps[0], buffer);
+        } else if (IsImageInstruction(inst)) {
+            const auto it = std::ranges::find(images, image_key(usage.sharps[0]), &ImageUse::key);
+            const ImageUse use = it != images.end() ? *it : ImageUse{};
+            auto image = AmdGpu::Image::Null(use.depth);
+            image.base_address = 0x1000;
+            image.width = 1023;
+            image.height = 1023;
+            image.pitch = 1023;
+            if (use.cube) {
+                image.type = u64(AmdGpu::ImageType::Cube);
+                image.last_array = 5;
+            } else if (use.is_array) {
+                image.type = u64(AmdGpu::ImageType::Color2DArray);
+                image.last_array = 1;
+            }
+            if (use.integer) {
+                // The game's integer images are single-channel 32-bit; a storage one has the R001 selector.
+                image.num_format = u64(AmdGpu::NumberFormat::Uint);
+                image.data_format = u64(AmdGpu::DataFormat::Format32);
+                if (use.written) {
+                    image.dst_sel_y = u64(AmdGpu::CompSwizzle::Zero);
+                    image.dst_sel_z = u64(AmdGpu::CompSwizzle::Zero);
+                    image.dst_sel_w = u64(AmdGpu::CompSwizzle::One);
+                }
+            }
+            WriteSyntheticSharp(info, usage.sharps[0], image);
+            WriteSyntheticSharp(info, usage.sharps[1], sampler);
+        }
+    }
+}
+
 void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resources,
                           const Profile& profile) {
+    if (info.sotc_synthetic) {
+        SotcFillSyntheticSharps(info, resources);
+    }
     // Iterate over discovered resources and patch them after finding the sharp.
     // Pass 1: Track resource sharps
     Descriptors descriptors{info};

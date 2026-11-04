@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <array>
 #include <span>
 #include <vector>
@@ -93,6 +95,65 @@ struct SotcSrtSource {
     bool valid{};
 };
 
+/// sotc: SOTC_GENERIC_BUFFERS=1 (off by default). An indexed (or thread-id indexed) access to an unswizzled
+/// buffer reads the stride from its V# at run time (dword 1 bits 16..29, from the flattened user data) instead of
+/// the stride of the V# seen at translation, and the stride leaves the specialization key (FillBuffer). The same
+/// code then serves every stride: the key no longer depends on the struct size of each draw's buffers.
+inline bool GenericBufferStride() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_GENERIC_BUFFERS");
+        return v && v[0] >= '1' && v[0] <= '9';
+    }();
+    return on;
+}
+
+/// sotc: SOTC_GENERIC_BUFFERS=2 (implies the generic stride). An untyped formatted load (buffer_load_format_*) of a
+/// read-only buffer whose V# holds one of the formats below decodes the format at run time, from V# dword 3 (data
+/// and number format, dst_sel), instead of the format of the V# seen at translation; the format, swizzle and number
+/// conversion then leave the specialization key (FillBuffer). Other formats keep the specialized code and key.
+inline bool GenericBufferFormat() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_GENERIC_BUFFERS");
+        return v && v[0] >= '2' && v[0] <= '9';
+    }();
+    return on;
+}
+
+/// The (raw V# data format, raw V# number format) pairs the generic decoder handles: the game's formatted buffer
+/// formats (SOTC_PREDICT_BUFFERS_OUT), with no number conversion and no swizzle remap other than the single-channel
+/// alpha-to-red one (AmdGpu::RemapSwizzle).
+struct GenericBufferFormatPair {
+    u8 data_format;
+    u8 num_format;
+};
+inline constexpr std::array<GenericBufferFormatPair, 17> kGenericBufferFormats{{
+    // Float: 32-bit components are raw dwords, 16-bit ones are halves.
+    {4, 7}, {11, 7}, {13, 7}, {14, 7}, {2, 7}, {5, 7}, {12, 7},
+    // Uint.
+    {1, 4}, {2, 4}, {4, 4}, {10, 4}, {11, 4}, {12, 4}, {13, 4}, {14, 4},
+    // Unorm.
+    {9, 0}, {10, 0},
+}};
+/// The key's data format of a generic formatted buffer (6 bits; no real data format uses it).
+inline constexpr u32 kGenericBufferFormatKey = 63u;
+
+inline bool IsGenericBufferFormat(u32 data_format, u32 num_format) {
+    for (const auto& pair : kGenericBufferFormats) {
+        if (pair.data_format == data_format && pair.num_format == num_format) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The decision the key (FillBuffer) and the translation (resource_patching_pass.cpp, lower_buffer_format_to_raw.cpp)
+/// share: it reads only the cached BufferResource and the V# of the draw. A typed load (tbuffer_load_format_*) never
+/// reads the V# format, so it is right with either answer.
+inline bool GenericFormatBuffer(const BufferResource& desc, const AmdGpu::Buffer& sharp) {
+    return GenericBufferFormat() && desc.is_formatted && !desc.is_written && desc.buffer_type == BufferType::Guest &&
+           IsGenericBufferFormat(sharp.data_format, sharp.num_format);
+}
+
 struct Info;
 /// sotc: SOTC_N5_BINDLESS: the push slot of images[index] in the bindless image heap, or
 /// NO_BINDLESS_IMAGE_SLOT when it keeps a classic descriptor (see the declarations at the end).
@@ -142,6 +203,16 @@ struct Info : InfoPersistent {
     /// sotc: SOTC_VSIZE_PROBE provenance of the SRT-flattened dwords (see SotcSrtSource). Empty when the
     /// switch is off or the Info came from the pipeline cache.
     std::vector<SotcSrtSource> sotc_srt_sources;
+    /// sotc: SOTC_PREDICT_PROBE step 2b. One entry per image instruction the resource pass bound: image index in
+    /// images, the GCN pc of the instruction (TextureInstInfo::pc), the IR opcode and the TextureInstInfo bits.
+    /// Not serialized: empty for an Info restored from the pipeline cache.
+    struct SotcImageUse {
+        u32 image;
+        u32 pc;
+        u32 opcode;
+        u32 flags;
+    };
+    std::vector<SotcImageUse> sotc_image_uses;
 
     AttributeFlags loads{};
     AttributeFlags stores{};
@@ -155,6 +226,16 @@ struct Info : InfoPersistent {
     bool has_image_gather{};
     bool has_image_query{};
     bool has_flatbuf{};
+    /// sotc: SOTC_PRETRANSLATE. A translation at resource load, before any draw (gpu/sotc/pretranslate.cpp): there is
+    /// no user data and no guest table, so the flat buffer is zeros (RefreshFlatBuf reads no guest memory) and the
+    /// resource pass writes a synthetic sharp for each resource (SotcFillSyntheticSharps). Cleared when the program is
+    /// installed, so its draws refresh the flat buffer from their own user data. Not serialized.
+    bool sotc_synthetic{};
+    /// sotc: SOTC_PRETRANSLATE: 1 flips the integer verdict of the images the program only reads (a second
+    /// pre-translation of a program whose image reads the code alone cannot tell). Not serialized.
+    u8 sotc_synthetic_variant{};
+    /// sotc: SOTC_PRETRANSLATE: set by the synthetic sharps when an image is only read (the verdict a variant flips).
+    bool sotc_synthetic_reads{};
     /// sotc: implicit-LOD samples report their mip to the LOD feedback buffer (sotc_lod_stats.h)
     bool uses_lod_feedback{};
     bool uses_buffer_atomic_float_min_max{};
@@ -292,6 +373,10 @@ struct Info : InfoPersistent {
         auto& flattened_ud_buf = FlatBuf();
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
+        if (sotc_synthetic) { // sotc: SOTC_PRETRANSLATE, no guest memory to walk
+            std::fill(flattened_ud_buf.begin(), flattened_ud_buf.end(), 0u);
+            return;
+        }
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data(), &SrtCopyWindow,

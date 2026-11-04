@@ -25,6 +25,7 @@
 // One line per stage every 5 s: "SOTC PREDICT <stage>: ...".
 
 #include "predict_probe.h"
+#include "pretranslate.h"
 
 #include <array>
 #include <chrono>
@@ -97,6 +98,13 @@ struct PsPrediction {
     uint64_t read_mask{};     // attributes read by any v_interp
     uint64_t interp_mask{};   // attributes read by v_interp_p1/p2 (interpolated)
     std::array<uint8_t, 32> param{}; // the VS export param of each input slot (identity unless the tail says else)
+    size_t marker{};          // the code's start in the file (SOTC_PRETRANSLATE copies it from there)
+    // SOTC_PRETRANSLATE: the descriptor dwords +16..+31, the stage registers in the Orbis order. Pixel: +17 RSRC1,
+    // +18 RSRC2, +19 SPI_SHADER_Z_FORMAT, +20 SPI_SHADER_COL_FORMAT, +21 SPI_PS_INPUT_ENA, +22 SPI_PS_INPUT_ADDR,
+    // +23 SPI_PS_IN_CONTROL, +24 SPI_BARYC_CNTL, +25 DB_SHADER_CONTROL, +26 CB_SHADER_MASK. Vertex: +17 RSRC1,
+    // +18 RSRC2, +19 SPI_VS_OUT_CONFIG, +20 SPI_SHADER_POS_FORMAT, +21 PA_CL_VS_OUT_CNTL.
+    std::array<uint32_t, 16> regs{};
+    bool swappc{};            // the code calls a fetch shader (s_swappc_b64), whose address only user data gives
 };
 std::unordered_map<uint64_t, PsPrediction> g_ps_pred;
 
@@ -136,6 +144,10 @@ bool PredictPixel(const unsigned char* data, size_t footer, uint64_t hash, uint3
     out.ena = Dword(data + desc + 21 * 4);
     out.addr = Dword(data + desc + 22 * 4);
     out.ninterp = Dword(data + desc + 23 * 4);
+    out.marker = marker;
+    for (size_t i = 0; i < out.regs.size() && desc + (16 + i + 1) * 4 <= marker; ++i) {
+        out.regs[i] = Dword(data + desc + (16 + i) * 4);
+    }
     for (size_t i = 0; i < out.param.size(); ++i) {
         out.param[i] = static_cast<uint8_t>(i);
     }
@@ -150,6 +162,8 @@ bool PredictPixel(const unsigned char* data, size_t footer, uint64_t hash, uint3
             out.interp_mask |= uint64_t{1} << inst.control.vintrp.attr;
         } else if (inst.opcode == Shader::Gcn::Opcode::V_INTERP_MOV_F32) {
             out.read_mask |= uint64_t{1} << inst.control.vintrp.attr;
+        } else if (inst.opcode == Shader::Gcn::Opcode::S_SWAPPC_B64) {
+            out.swappc = true;
         } else if (inst.opcode == Shader::Gcn::Opcode::S_ENDPGM) {
             break;
         }
@@ -304,12 +318,23 @@ void ParamsFromTail(const unsigned char* data, size_t n, size_t footer_end, PsPr
 }
 
 void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
-    if (!On() || !data || n < 64) {
+    const bool probe = On();
+    const bool pre = SotcPretranslate::On();
+    if (!(probe || pre) || !data || n < 64) {
         return;
     }
     uint32_t programs = 0;
     uint64_t single_hash = 0;
     size_t single_footer = 0;
+    // SOTC_PRETRANSLATE: the file's pixel and vertex programs; a vertex program pairs with the file's pixel program
+    // when there is exactly one (its bindings come first in the pipeline).
+    struct Found {
+        uint64_t hash;
+        uint8_t stage;
+        uint32_t length;
+        PsPrediction pred;
+    };
+    std::vector<Found> found;
     static constexpr unsigned char kOrb[7] = {'O', 'r', 'b', 'S', 'h', 'd', 'r'};
     const unsigned char* p = data;
     const unsigned char* end = data + n - 32;
@@ -326,20 +351,27 @@ void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
         const uint32_t bits = Dword(p + 8);
         uint64_t hash = 0;
         std::memcpy(&hash, p + 16, 8);
-        NoteLoaded(hash);
+        if (probe) {
+            NoteLoaded(hash);
+        }
         ++programs;
         single_hash = hash;
         single_footer = static_cast<size_t>(p - data);
-        if (((bits >> 2) & 0xF) == 0) { // pixel
+        const uint32_t type = (bits >> 2) & 0xF;
+        if (type == 0 || (pre && type == 1)) { // pixel; vertex for the pre-translation
             bool known = false;
-            {
+            if (type == 0) {
                 std::scoped_lock lock{g_mutex};
                 known = g_ps_pred.contains(hash);
             }
             PsPrediction pred;
-            if (!known && PredictPixel(data, static_cast<size_t>(p - data), hash, bits >> 8, pred)) {
+            const bool ok = PredictPixel(data, static_cast<size_t>(p - data), hash, bits >> 8, pred);
+            if (ok && type == 0 && !known) {
                 std::scoped_lock lock{g_mutex};
                 g_ps_pred.try_emplace(hash, pred);
+            }
+            if (ok && pre) {
+                found.push_back({hash, static_cast<uint8_t>(type), bits >> 8, pred});
             }
         }
         p += 32;
@@ -348,8 +380,80 @@ void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
         std::scoped_lock lock{g_mutex};
         if (const auto it = g_ps_pred.find(single_hash); it != g_ps_pred.end()) {
             ParamsFromTail(data, n, single_footer + 32, it->second);
+            for (auto& f : found) {
+                if (f.hash == single_hash) {
+                    f.pred.param = it->second.param;
+                }
+            }
         }
     }
+    if (!pre || found.empty()) {
+        return;
+    }
+    uint64_t pair = 0;
+    uint32_t pixel_programs = 0;
+    for (const auto& f : found) {
+        if (f.stage == 0) {
+            pair = f.hash;
+            ++pixel_programs;
+        }
+    }
+    if (pixel_programs != 1) {
+        pair = 0;
+    }
+    for (const auto& f : found) {
+        if (f.stage == 1 && f.pred.swappc) {
+            continue; // the fetch shader is only known from a draw's user data
+        }
+        SotcPretranslate::Request r;
+        r.hash = f.hash;
+        r.stage = f.stage;
+        r.code.resize(f.length / 4);
+        std::memcpy(r.code.data(), data + f.pred.marker, r.code.size() * 4);
+        r.rsrc1 = f.pred.rsrc1;
+        r.rsrc2 = f.pred.rsrc2;
+        r.ena = f.pred.ena;
+        r.addr = f.pred.addr;
+        r.num_inputs = f.pred.ninterp;
+        r.interp_mask = f.pred.interp_mask;
+        r.param = f.pred.param;
+        r.regs = f.pred.regs;
+        r.pair = f.stage == 1 ? pair : 0;
+        SotcPretranslate::Push(std::move(r));
+    }
+}
+
+size_t PixelLayoutCount(uint64_t hash) noexcept {
+    std::scoped_lock lock{g_mutex};
+    if (!g_table_loaded) {
+        LoadTable();
+    }
+    const auto entry = g_table.find(hash);
+    if (entry == g_table.end()) {
+        return 0;
+    }
+    const auto set = g_pass_layouts.find(entry->second.pass);
+    return set == g_pass_layouts.end() ? 0 : set->second.size();
+}
+
+bool PixelLayout(uint64_t hash, Shader::RuntimeInfo& rt, size_t index) noexcept {
+    std::scoped_lock lock{g_mutex};
+    if (!g_table_loaded) {
+        LoadTable();
+    }
+    const auto entry = g_table.find(hash);
+    if (entry == g_table.end()) {
+        return false;
+    }
+    const auto set = g_pass_layouts.find(entry->second.pass);
+    if (set == g_pass_layouts.end() || index >= set->second.size()) {
+        return false;
+    }
+    const FsLayout& layout = set->second[index];
+    rt.hw.fs.color_buffers = layout.color;
+    rt.hw.fs.mrtz_mask = layout.mrtz_mask;
+    rt.hw.fs.num_samples = layout.num_samples;
+    return true;
 }
 
 void NoteLoaded(uint64_t program_hash) noexcept {
@@ -361,8 +465,15 @@ void NoteLoaded(uint64_t program_hash) noexcept {
     g_loaded.try_emplace(program_hash, now);
 }
 
+thread_local bool t_pretranslating = false;
+
+void SetPretranslating(bool on) noexcept {
+    t_pretranslating = on;
+}
+
 void OnTranslate(const Shader::Info& info, const Shader::StageSpecialization& spec, size_t perm_idx) noexcept {
-    if (!On()) {
+    // The layouts a draw uses are learned for the pre-translation as well (SOTC_PREDICT_LAYOUTS).
+    if ((!On() && !SotcPretranslate::On()) || t_pretranslating) {
         return;
     }
     const uint64_t now = NowNs();
@@ -485,6 +596,38 @@ void OnTranslate(const Shader::Info& info, const Shader::StageSpecialization& sp
             c.pred_all += user && vgprs && fp && ena_ok && addr_ok && inputs;
         }
     }
+    // SOTC_PREDICT_IMAGES_OUT: one line per bound image of a fresh translation: program hash, stage, image index,
+    // real type, integer, sRGB, bindings, is_array, is_depth, and its uses (pc:IR opcode:TextureInstInfo bits).
+    if (static std::FILE* images_out = [] {
+            const char* path = std::getenv("SOTC_PREDICT_IMAGES_OUT");
+            std::FILE* f = path && *path ? std::fopen(path, "wb") : nullptr;
+            if (f) {
+                std::fputs("program\tstage\timage\ttype\tinteger\tsrgb\tbindings\tis_array\tis_depth\tuses\n", f);
+            }
+            return f;
+        }();
+        images_out && !info.sotc_image_uses.empty()) {
+        for (size_t i = 0; i < spec.images.size() && i < info.images.size(); ++i) {
+            if (!spec.bitset[spec.buffers.size() + i]) {
+                continue;
+            }
+            const auto& image = spec.images[i];
+            std::string uses;
+            for (const auto& use : info.sotc_image_uses) {
+                if (use.image == i) {
+                    char b[48];
+                    std::snprintf(b, sizeof b, "%s%u:%u:%x", uses.empty() ? "" : ",", use.pc, use.opcode, use.flags);
+                    uses += b;
+                }
+            }
+            std::fprintf(images_out, "%016llx\t%u\t%zu\t%u\t%u\t%u\t%u\t%u\t%u\t%s\n",
+                         static_cast<unsigned long long>(info.pgm_hash), static_cast<unsigned>(info.sw_stage), i,
+                         static_cast<unsigned>(image.type), unsigned{image.is_integer}, unsigned{image.is_srgb},
+                         image.num_bindings, unsigned{info.images[i].is_array}, unsigned{info.images[i].is_depth},
+                         uses.c_str());
+        }
+        std::fflush(images_out);
+    }
     {
         bool program_ok = true;
         uint32_t bound = 0;
@@ -500,7 +643,9 @@ void OnTranslate(const Shader::Info& info, const Shader::StageSpecialization& sp
             const bool type_ok = image.type == predicted_type;
             const bool integer_ok = !image.is_integer;
             const bool conv_ok = image.num_conversion == AmdGpu::NumberConversion::None;
-            const bool bindings_ok = image.num_bindings == 1;
+            // A T# array the resource pass built from a sharp table (array_size) binds array_size + 1 views; that
+            // is decided from the code, not the descriptor.
+            const bool bindings_ok = image.num_bindings == (desc.array_size ? desc.array_size + 1u : 1u);
             const bool srgb_ok = !image.is_srgb;
             if (!type_ok) {
                 ++c.img_miss_type;
@@ -539,6 +684,34 @@ void OnTranslate(const Shader::Info& info, const Shader::StageSpecialization& sp
         c.img_integer += image.is_integer;
         c.img_srgb += image.is_srgb;
         c.img_storage += image.is_storage;
+    }
+    // SOTC_PREDICT_BUFFERS_OUT: one line per bound buffer of a fresh translation: program, stage, index, stride,
+    // formatted, swizzle, data/num format, the BufferResource's type and flags (is_written, is_formatted,
+    // buffer_type), for the step 2b study of the buffer keys.
+    if (static std::FILE* buffers_out = [] {
+            const char* path = std::getenv("SOTC_PREDICT_BUFFERS_OUT");
+            std::FILE* f = path && *path ? std::fopen(path, "wb") : nullptr;
+            if (f) {
+                std::fputs("program\tstage\tbuffer\tstride\tformatted\tswizzle\tdata_format\tnum_format\t"
+                           "buffer_type\tis_written\tsize_dw\n",
+                           f);
+            }
+            return f;
+        }();
+        buffers_out) {
+        for (size_t i = 0; i < spec.buffers.size() && i < info.buffers.size(); ++i) {
+            if (!spec.bitset[i]) {
+                continue;
+            }
+            const auto& b = spec.buffers[i];
+            const auto& desc = info.buffers[i];
+            std::fprintf(buffers_out, "%016llx\t%u\t%zu\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
+                         static_cast<unsigned long long>(info.pgm_hash), static_cast<unsigned>(info.sw_stage), i,
+                         unsigned{b.stride}, unsigned{b.is_formatted}, unsigned{b.swizzle_enable},
+                         unsigned{b.data_format}, unsigned{b.num_format}, static_cast<unsigned>(desc.buffer_type),
+                         unsigned{desc.is_written}, 0u);
+        }
+        std::fflush(buffers_out);
     }
     for (const auto& buffer : spec.buffers) {
         ++c.buffers;

@@ -29,6 +29,7 @@ void Visit(Info& info, const IR::Inst& inst) {
         info.stores.Set(inst.Arg(0).Attribute(), inst.Arg(2).U32());
         break;
     case IR::Opcode::GetUserData:
+    case IR::Opcode::LoadFlatbufDword: // sotc: SOTC_GENERIC_BUFFERS
         AddFlatbuf(info);
         break;
     case IR::Opcode::SetPatch: {

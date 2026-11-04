@@ -235,9 +235,24 @@ def hold_cross(pad, log, stop):
     pad.write_text('')
 
 
+# sotc.py --precompile (the launcher's "Preparar shaders"): the shader preparation run. The game boots without a
+# window or sound, every shader it loads is translated with all its variants into the shader cache, and the port
+# leaves by itself when it is done ("SOTC PRECOMPILE done"). The shader switches come from sotc.ini as for play, so
+# the cache is the one the next sessions use.
+PRECOMPILE_DEFAULTS = {'SOTC_HEADLESS': '1', 'SOTC_NULL_AUDIO': '1', 'SOTC_LAB': '0', 'SOTC_FPS_CAP': 'off'}
+
+
 def main():
     load_ini()
     env = os.environ
+    if '--precompile' in sys.argv:
+        sys.argv.remove('--precompile')
+        env['SOTC_PRECOMPILE'] = '1'
+        for name, value in PRECOMPILE_DEFAULTS.items():
+            env.setdefault(name, value)
+        # A measurement left in sotc.ini (profiler, trace) only slows the preparation down.
+        for name in ('SOTC_PROFILE', 'SOTC_PROFILE_OUT', 'SOTC_TRACE'):
+            env.pop(name, None)
     if env.get('SOTC_DETERMINISTIC', '0') not in ('', '0'):
         # Before the lab switches below (SOTC_LAB is one of the defaults).
         for name, value in DETERMINISTIC_DEFAULTS.items():
@@ -409,6 +424,21 @@ def main():
     user = Path(env.get('SOTC_USER_DIR', PORT / 'user')).resolve()
     user.mkdir(parents=True, exist_ok=True)
     env.setdefault('BB_GPU_USER_DIR', str(user))
+    # The resource loader hook (RES_LOADED) for the predict probe, the extraction probe and the pre-translation; the
+    # pre-translation reads the program table and the pixel layouts of user/shader_predict (written from the game's
+    # own files and sessions, never shipped).
+    def on(name):
+        return env.get(name, '0') not in ('', '0')
+    if any(on(n) for n in ('SOTC_CSDR_PROBE', 'SOTC_PREDICT_PROBE', 'SOTC_PRETRANSLATE', 'SOTC_PRECOMPILE')):
+        env.setdefault('SOTC_RES_LOADED', '1')
+    if on('SOTC_PRETRANSLATE') or on('SOTC_PRECOMPILE'):
+        predict = user / 'shader_predict'
+        predict.mkdir(exist_ok=True)
+        env.setdefault('SOTC_PREDICT_TABLE', str(predict / 'predict_table.tsv'))
+        env.setdefault('SOTC_PREDICT_LAYOUTS', str(predict / 'pass_layouts.txt'))
+        if not Path(env['SOTC_PREDICT_TABLE']).is_file():
+            print(f'sotc: no shader table at {env["SOTC_PREDICT_TABLE"]}: the pixel layouts of the pre-translation '
+                  'are guessed', file=sys.stderr)
     # Controls: key.<input>= / pad.<input>= lines of sotc.ini remap keys and buttons (src/runtime_pad.c).
     env.setdefault('BB_CONFIG', str(PORT / 'sotc.ini'))
     command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
@@ -481,7 +511,16 @@ def keep_crash_log(user, code):
     try:
         crashes.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime('%Y-%m-%d_%H-%M-%S')
-        shutil.copy2(user / 'last_run.log', crashes / f'{stamp}_{code & 0xffffffff:#x}.log')
+        kept = crashes / f'{stamp}_{code & 0xffffffff:#x}.log'
+        shutil.copy2(user / 'last_run.log', kept)
+        # Dev builds: the host stacks of the report, symbolized at the end of the copy (needs llvm-symbolizer).
+        symbolizer = PORT / 'tools' / 'crash_symbolize.py'
+        if symbolizer.is_file() and (PORT / 'out' / 'gpu' / 'bb-probe.exe').is_file():
+            try:
+                subprocess.run([sys.executable, str(symbolizer), str(kept), '--append'], timeout=180,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError):
+                pass
         for old in sorted(crashes.glob('*.log'))[:-CRASH_LOGS_KEPT]:
             old.unlink()
         for old in sorted(crashes.glob('*.dmp'))[:-5]:

@@ -119,6 +119,10 @@ void IREmitter::DeviceMemoryBarrier() {
     Inst(Opcode::DeviceMemoryBarrier);
 }
 
+U32 IREmitter::LoadFlatbufDword(u32 index) {
+    return Inst<U32>(Opcode::LoadFlatbufDword, Imm32(index));
+}
+
 U32 IREmitter::GetUserData(IR::ScalarReg reg) {
     ASSERT(static_cast<u32>(reg) < IR::NumScalarRegs);
     return Inst<U32>(Opcode::GetUserData, reg);

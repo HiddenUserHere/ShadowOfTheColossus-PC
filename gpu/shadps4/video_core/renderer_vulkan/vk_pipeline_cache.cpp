@@ -44,6 +44,9 @@
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_frame_metrics.h" // sotc: SOTC_FRAME_METRICS
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (SOTC_PIPE_DIRTY default, N5)
+#include "../../../sotc/predict_probe.h" // sotc: SOTC_PRETRANSLATE (pixel layouts)
+#include "video_core/sotc_arch/addr_table.h" // sotc: ARCH-GCN-NATIVE (Init before the profile)
+#include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE (Profile::gcn_buf, gcn_tex)
 #include "bbport_threads.h"
 
 // sotc: generation of the runtime memory table (src/runtime_memory.c); odd while a change is in
@@ -526,6 +529,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         LOG_WARNING(Render_Vulkan, "No fragment shader barycentrics: emulated by a geometry shader");
     }
     GraphicsPipeline::SerializationSupport::with_gs = barycentric_via_gs;
+    // sotc: ARCH-GCN-NATIVE. The page table and the globals buffer are created (or their stages refused) before the
+    // profile reads Buf/Tex::ProfileValue: built later, every gcn_tex profile would be refused for a missing globals
+    // buffer, and a later refusal would leave pipelines compiled for a stage that is off. Both Inits are idempotent;
+    // the rasterizer constructor calls them again (no-op) in its own order.
+    SotcArch::AddrTable::Init(instance, scheduler);
+    SotcGcn::Globals::Init(instance);
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
@@ -593,6 +602,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // the profile is the one of today.
         .heap_images = SotcArch::Heap::ProfileValue(),
         .shader_addr = SotcArch::ShaderAddr::Mode(),
+        // sotc: ARCH-GCN-NATIVE S2/S3 (gcn_native.h). Both 0 unless their stage is on (profile.h has the rules).
+        .gcn_buf = SotcGcn::Buf::ProfileValue(),
+        .gcn_tex = SotcGcn::Tex::ProfileValue(),
     };
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
     // the loading screen on meanwhile.
@@ -978,7 +990,9 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             if (job->compute) {
                 --async_compute_queued;
             } else if (job->translate) {
-                --async_translate_queued;
+                if (!job->translate->pretranslate) { // sotc: SOTC_PRETRANSLATE jobs are not counted
+                    --async_translate_queued;
+                }
             } else if (g_tiny_jobs_queued != 0) {
                 // sotc: SOTC_TINY_ASYNC. The tiny run follows the compute and translation jobs, so
                 // with it non-empty the head is one of its jobs.
@@ -1326,9 +1340,12 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
                                       Shader::Pools& worker_pools) {
     if (!t.program) {
         t.new_program = std::make_unique<Program>(t.hw_stage, t.sw_stage, params);
+        t.new_program->info.sotc_synthetic = t.pretranslate; // sotc: SOTC_PRETRANSLATE
+        t.new_program->info.sotc_synthetic_variant = t.synthetic_variant;
         t.module = CompileModule(t.new_program->info, runtime_info, params.code, 0, binding,
                                  &worker_pools, &t.spv);
         t.spec.emplace(t.new_program->info, runtime_info, profile, t.start);
+        t.new_program->info.sotc_synthetic = false;
     } else {
         auto new_info = Shader::Info(t.hw_stage, t.sw_stage, params);
         t.module = CompileModule(new_info, runtime_info, params.code, t.perm_idx, binding,
@@ -1343,6 +1360,101 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
 }
 
 void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
+    if (!t.program && t.pretranslate) {
+        // sotc: SOTC_PRETRANSLATE. A pre-translation that failed says nothing about the draws (their tables were
+        // never read): the program stays unknown, and its first draw translates it as before.
+        if (pre_in_flight > 0) {
+            --pre_in_flight;
+        }
+        struct FeedNext {
+            PipelineCache& cache;
+            ~FeedNext() {
+                cache.FeedPretranslate();
+            }
+        } feed_next{*this};
+        const int stage = t.sw_stage == SwStage::Vertex ? 1 : 0;
+        SotcPretranslate::NoteBuilt(stage, !t.failed);
+        if (!t.failed && t.first_variant && t.synthetic_variant == 0 && t.new_program &&
+            t.new_program->info.sotc_synthetic_reads) {
+            // The program reads images whose texel type the code does not show: the other verdict as one more
+            // variant, queued behind every other job.
+            auto job = std::make_unique<AsyncPipelineJob>();
+            auto& v = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
+            v.hw_stage = t.hw_stage;
+            v.sw_stage = t.sw_stage;
+            v.hash = t.hash;
+            v.owned_code = t.owned_code;
+            v.code = v.owned_code;
+            v.runtime_info = t.runtime_info;
+            v.start = t.start;
+            v.pretranslate = true;
+            v.synthetic_variant = 1;
+            SotcPretranslate::NoteQueued(stage);
+            pre_backlog.push_back(std::move(job));
+        }
+        if (pre_pending.erase(t.hash) != 0) {
+            pending_programs.erase(t.hash);
+        }
+        if (!t.failed && program_cache.contains(t.hash)) {
+            // Another variant of this program (another layout, another draw kind), or a program a draw translated
+            // meanwhile: the variant is one more permutation unless that key is there already.
+            auto& program = *program_cache.find(t.hash).value();
+            if (!SameBindingLayout(program.info, t.new_program->info)) {
+                // sotc: its descriptors would be written for the program's Info (see SameBindingLayout): dropped.
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    std::fprintf(stderr,
+                                 "SOTC PRETRANSLATE: variant of %#llx dropped, its resources differ from the "
+                                 "program's (buffers %zu/%zu, images %zu/%zu, samplers %zu/%zu)\n",
+                                 static_cast<unsigned long long>(t.hash), t.new_program->info.buffers.size(),
+                                 program.info.buffers.size(), t.new_program->info.images.size(),
+                                 program.info.images.size(), t.new_program->info.samplers.size(),
+                                 program.info.samplers.size());
+                }
+                if (t.module) {
+                    instance.GetDevice().destroyShaderModule(t.module);
+                }
+                return;
+            }
+            if (std::ranges::find(program.modules, *t.spec, &Program::Module::spec) == program.modules.end() &&
+                std::ranges::find(program.pending_specs, *t.spec) == program.pending_specs.end()) {
+                const size_t perm_idx = program.modules.size();
+                Shader::CombineBindlessCache(program.info.bindless, t.new_program->info.bindless);
+                if (!((pre_holding || SotcPretranslate::Precompile()) &&
+                      PrePackAdd(t.hash, static_cast<u32>(perm_idx),
+                                 SerializeShaderMeta(program.info, *t.spec, HashCombine(t.hash, perm_idx), perm_idx),
+                                 t.spv))) {
+                    RegisterShaderBinary(std::move(t.spv), t.hash, perm_idx);
+                    SotcPredict::SetPretranslating(true);
+                    RegisterShaderMeta(program.info, t.spec->fetch_shader_data, *t.spec,
+                                       HashCombine(t.hash, perm_idx), perm_idx);
+                    SotcPredict::SetPretranslating(false);
+                }
+                program.AddPermut(t.module, std::move(*t.spec));
+                return;
+            }
+        }
+        if (t.failed || program_cache.contains(t.hash)) {
+            if (t.module) {
+                instance.GetDevice().destroyShaderModule(t.module);
+            }
+            return;
+        }
+        auto [it, is_new] = program_cache.try_emplace(t.hash);
+        it.value() = std::move(t.new_program);
+        auto& program = it.value();
+        program->sotc_pre = true;
+        if (!((pre_holding || SotcPretranslate::Precompile()) &&
+              PrePackAdd(t.hash, 0, SerializeShaderMeta(program->info, *t.spec, HashCombine(t.hash, 0), 0), t.spv))) {
+            RegisterShaderBinary(std::move(t.spv), t.hash, 0);
+            SotcPredict::SetPretranslating(true);
+            RegisterShaderMeta(program->info, t.spec->fetch_shader_data, *t.spec, HashCombine(t.hash, 0), 0);
+            SotcPredict::SetPretranslating(false);
+        }
+        program->AddPermut(t.module, std::move(*t.spec));
+        program->info.UserData() = {};
+        return;
+    }
     if (!t.program) {
         pending_programs.erase(t.hash);
         if (t.failed) {
@@ -2696,6 +2808,9 @@ bool PipelineCache::RefreshGraphicsStages() {
         if (profile.stage_bindings) {
             binding.unified = 0;
         }
+        if (stage_out == SwStage::Vertex) { // sotc: SOTC_VS_BINDING_BASE
+            binding = Shader::Backend::VsStartBindings(binding, profile.stage_bindings);
+        }
         // sotc: the bindings of the later stages follow from this one's: they wait for it.
         if (translation_pending || !regs.stage_enable.IsStageEnabled(stage_in_idx)) {
             key.stage_hashes[stage_out_idx] = 0;
@@ -3266,6 +3381,391 @@ static u32 NormalizeFlatInputs(Shader::RuntimeInfo& info, uint64_t sensitive_mas
     return changed;
 }
 
+// sotc: SOTC_PRETRANSLATE. The key parts in which a draw's key differs from the pre-translated one (pretranslate.h).
+static u32 PretranslateDiff(const Shader::StageSpecialization& a, const Shader::StageSpecialization& b) {
+    using namespace SotcPretranslate;
+    u32 diff = 0;
+    const auto& ra = a.runtime_info;
+    const auto& rb = b.runtime_info;
+    if (!(ra.props == rb.props)) {
+        diff |= DiffProps;
+    }
+    if (ra.sw_stage == SwStage::Fragment && rb.sw_stage == SwStage::Fragment) {
+        const auto& fa = ra.hw.fs;
+        const auto& fb = rb.hw.fs;
+        if (!std::ranges::equal(fa.color_buffers, fb.color_buffers) || fa.mrtz_mask != fb.mrtz_mask ||
+            fa.num_samples != fb.num_samples) {
+            diff |= DiffLayout;
+        }
+        const u32 n = std::min<u32>(fa.num_inputs, 32);
+        if (!(fa.en_flags == fb.en_flags) || !(fa.addr_flags == fb.addr_flags) || fa.num_inputs != fb.num_inputs ||
+            !std::equal(fa.inputs.begin(), fa.inputs.begin() + n, fb.inputs.begin())) {
+            diff |= DiffPsInputs;
+        }
+        const u32 other = (fa.z_export_format != fb.z_export_format ? DiffPsZExport : 0u) |
+                          (fa.front_face_all_bits != fb.front_face_all_bits ? DiffPsFrontFace : 0u) |
+                          (fa.dual_source_blending != fb.dual_source_blending ? DiffPsDualSource : 0u) |
+                          (fa.clip_distance_emulation != fb.clip_distance_emulation ? DiffPsClip : 0u) |
+                          (fa.early_fragment_tests != fb.early_fragment_tests ? DiffPsEarlyZ : 0u);
+        if (other) {
+            diff |= DiffPsOther | other;
+        }
+    } else if (ra.sw_stage == SwStage::Vertex && rb.sw_stage == SwStage::Vertex) {
+        const auto& ha = ra.hw.vs;
+        const auto& hb = rb.hw.vs;
+        if (!(ha == hb)) {
+            diff |= DiffVsHw;
+            diff |= (ha.num_outputs != hb.num_outputs || ha.outputs != hb.outputs ? DiffVsOutputs : 0u) |
+                    (ha.clip_disable != hb.clip_disable ? DiffVsClipDisable : 0u) |
+                    (ha.emulate_depth_negative_one_to_one != hb.emulate_depth_negative_one_to_one
+                         ? DiffVsDepthEmulation
+                         : 0u) |
+                    (ha.user_clip_plane_mask != hb.user_clip_plane_mask ? DiffVsUserClip : 0u);
+        }
+        const auto& sa = ra.sw.vs;
+        const auto& sb = rb.sw.vs;
+        if (!(sa == sb)) {
+            diff |= DiffVsSw;
+            diff |= (sa.step_rate_0 != sb.step_rate_0 || sa.step_rate_1 != sb.step_rate_1 ? DiffVsStepRate : 0u) |
+                    (sa.vertex_sgpr_offset != sb.vertex_sgpr_offset ? DiffVsVertexSgpr : 0u) |
+                    (sa.instance_sgpr_offset != sb.instance_sgpr_offset ? DiffVsInstanceSgpr : 0u) |
+                    (sa.tess_emulated_primitive != sb.tess_emulated_primitive ? DiffVsTessEmulated : 0u);
+        }
+    } else if (!(ra == rb)) {
+        diff |= DiffProps;
+    }
+    if (!(a.fetch_shader_data == b.fetch_shader_data) || a.vs_attribs != b.vs_attribs) {
+        diff |= DiffFetch;
+    }
+    if (a.buffers != b.buffers) {
+        diff |= DiffBuffers;
+    }
+    if (a.images != b.images) {
+        diff |= DiffImages;
+        for (size_t i = 0; i < a.images.size() && i < b.images.size(); ++i) {
+            const auto& ia = a.images[i];
+            const auto& ib = b.images[i];
+            diff |= (ia.type != ib.type ? DiffImgType : 0u) | (ia.is_integer != ib.is_integer ? DiffImgInteger : 0u) |
+                    (ia.is_srgb != ib.is_srgb ? DiffImgSrgb : 0u) |
+                    (!(ia.dst_select == ib.dst_select) ? DiffImgSwizzle : 0u) |
+                    (ia.num_conversion != ib.num_conversion ? DiffImgConversion : 0u) |
+                    (ia.num_bindings != ib.num_bindings ? DiffImgBindings : 0u) |
+                    (ia.is_storage != ib.is_storage ? DiffImgStorage : 0u);
+        }
+    }
+    if (a.samplers != b.samplers) {
+        diff |= DiffSamplers;
+    }
+    if (a.fmasks != b.fmasks) {
+        diff |= DiffFmasks;
+    }
+    if (!(a.buffers.empty() && a.images.empty() && a.samplers.empty()) && a.start != b.start) {
+        diff |= DiffStart;
+    }
+    return diff;
+}
+
+// sotc: SOTC_PRETRANSLATE. The register state a program's file declares: SPI_SHADER_PGM_RSRC1/2 (the layout of
+// AmdGpu::ShaderProgram::settings, RSRC1 in the low word) into the props BuildRuntimeInfo fills from them.
+static void PretranslateProps(Shader::RuntimeInfo& rt, u32 rsrc1, u32 rsrc2) {
+    AmdGpu::ShaderProgram program{};
+    const u64 settings = (u64{rsrc2} << 32) | rsrc1;
+    static_assert(sizeof(program.settings) == sizeof(settings));
+    std::memcpy(&program.settings, &settings, sizeof(settings));
+    rt.props.num_user_data = program.settings.num_user_regs;
+    rt.props.num_input_vgprs = program.settings.vgpr_comp_cnt;
+    rt.props.num_allocated_vgprs = program.NumVgprs();
+    rt.props.fp_denorm_mode32 = program.settings.fp_denorm_mode32;
+    rt.props.fp_denorm_mode16_64 = program.settings.fp_denorm_mode64;
+    rt.props.fp_round_mode32 = program.settings.fp_round_mode32;
+    rt.props.fp_round_mode16_64 = program.settings.fp_round_mode64;
+}
+
+void PipelineCache::PrecompileCheck() {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point last_print{};
+    const auto now = Clock::now();
+    const u64 queued = SotcPretranslate::JobsQueued();
+    const u64 done = SotcPretranslate::JobsDone();
+    if (now - last_print > std::chrono::seconds{2}) {
+        last_print = now;
+        std::fprintf(stderr, "SOTC PRECOMPILE: %llu of %llu shader translations done\n",
+                     static_cast<unsigned long long>(done), static_cast<unsigned long long>(queued));
+        std::fflush(stderr);
+    }
+    const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    const s64 last_request = SotcPretranslate::LastRequestNs();
+    if (queued == 0 || done < queued || SotcPretranslate::Pending() || !pre_deferred.empty() || last_request == 0 ||
+        now_ns - last_request < 5'000'000'000LL) {
+        return;
+    }
+    // Every program the game loaded is translated and in the cache: the pack, the index, the cache files, and out.
+    PrePackFinish();
+    SaveShaderIndex();
+    std::fprintf(stderr, "SOTC PRECOMPILE done: %llu shader translations written to the shader cache\n",
+                 static_cast<unsigned long long>(done));
+    std::fflush(stderr);
+    Storage::DataBase::Instance().Close();
+    std::fflush(stdout);
+    std::_Exit(0);
+}
+
+void PipelineCache::DrainPretranslate() {
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    std::vector<SotcPretranslate::Request> requests;
+    if (SotcPretranslate::Pending()) {
+        requests = SotcPretranslate::Take();
+    }
+    // Waiting vertex requests are looked at again every 100 ms (their pixel program installs meanwhile).
+    if (!pre_deferred.empty() && (now - pre_deferred_since > std::chrono::milliseconds{100} || !requests.empty())) {
+        for (auto& r : pre_deferred) {
+            requests.push_back(std::move(r));
+        }
+        pre_deferred.clear();
+    }
+    if (requests.empty()) {
+        return;
+    }
+    // A program variant (SOTC_SHADER_ADDR) mixes its variant into the hash: those keys are not made here.
+    if (profile.shader_addr != 0) {
+        return;
+    }
+    static const std::array<u32, Shader::ShaderParams::NumShaderUserData> zeros{};
+    // Pixel requests first: a vertex request pairs with a pixel program, often of the same batch.
+    std::stable_partition(requests.begin(), requests.end(), [](const auto& r) { return r.stage == 0; });
+    for (auto& r : requests) {
+        const int stage = r.stage == 1 ? 1 : 0;
+        if (IsProgramKnown(r.hash)) {
+            if (r.deferred_ns == 0) {
+                SotcPretranslate::NoteDropped(stage, 0);
+            }
+            continue;
+        }
+        const HwStage hw = stage == 1 ? HwStage::Vertex : HwStage::Fragment;
+        const SwStage sw = stage == 1 ? SwStage::Vertex : SwStage::Fragment;
+        // The draw state the files do not give (clip settings, the vertex step rates, Z export and early Z of the
+        // pixel stage...) is the last draw's: the game sets most of it the same way for all its draws.
+        Shader::RuntimeInfo rt = runtime_infos[u32(sw)];
+        if (rt.hw_stage != hw || rt.sw_stage != sw) {
+            rt.Initialize(hw, sw);
+        }
+        PretranslateProps(rt, r.rsrc1, r.rsrc2);
+        if (stage == 1) {
+            AmdGpu::VsOutputControl ctl{};
+            std::memcpy(&ctl, &r.regs[21 - 16], sizeof(ctl));
+            rt.hw.vs.num_outputs = MapOutputs(rt.hw.vs.outputs, ctl);
+            // A triangle draw with clipping on (the last draw's state was often a rect list: emulated, clip off).
+            rt.hw.vs.clip_disable = false;
+            rt.hw.vs.user_clip_plane_mask = 0;
+            rt.sw.vs.tess_emulated_primitive = false;
+            // The game's instanced draws are indirect and put the start instance in user SGPR 2 (0x4c + 2,
+            // UdRegFromShOffset); its other draws are direct (no SGPR). A vertex program that loads the instance ID
+            // VGPR (RSRC1.VGPR_COMP_CNT 3) is an instanced one.
+            rt.sw.vs.vertex_sgpr_offset = 0;
+            rt.sw.vs.instance_sgpr_offset = rt.props.num_input_vgprs >= 3 ? 0x4c + 2 : 0;
+        }
+        Shader::Backend::Bindings start{};
+        if (stage == 0) {
+            auto& fs = rt.hw.fs;
+            std::memcpy(&fs.en_flags, &r.ena, sizeof(r.ena));
+            std::memcpy(&fs.addr_flags, &r.addr, sizeof(r.addr));
+            fs.num_inputs = std::min<u32>(r.num_inputs, u32(fs.inputs.size()));
+            fs.inputs = {};
+            for (u32 i = 0; i < fs.num_inputs; ++i) {
+                // As the key holds them after SOTC_PS_INPUT_NORMALIZE: an input read with v_interp_mov only is a
+                // passthrough (flat, default 0).
+                const bool interpolated = (r.interp_mask >> i) & 1;
+                fs.inputs[i] = {.param_index = r.param[i],
+                                .is_default = !interpolated,
+                                .is_flat = !interpolated,
+                                .default_value = 0};
+            }
+            fs.dual_source_blending = false;
+            fs.clip_distance_emulation = false;
+            SotcPredict::PixelLayout(r.hash, rt, 0);
+            AmdGpu::BarycentricControl baryc{};
+            AmdGpu::DepthShaderControl db{};
+            std::memcpy(&baryc, &r.regs[24 - 16], sizeof(baryc));
+            std::memcpy(&db, &r.regs[25 - 16], sizeof(db));
+            fs.z_export_format = static_cast<AmdGpu::ShaderExportFormat>(r.regs[19 - 16] & 0xF);
+            fs.front_face_all_bits = baryc.front_face_all_bits;
+            const u8 stencil_export = db.stencil_op_val_export_enable | db.stencil_test_val_export_enable;
+            fs.mrtz_mask = db.z_export_enable | (stencil_export << 1) | (db.mask_export_enable << 2) |
+                           (db.coverage_to_mask_enable << 3);
+            fs.early_fragment_tests = Common::ElfInfo::Instance().IsSotc() &&
+                                      (db.z_order == AmdGpu::ZOrder::EarlyZLateZ ||
+                                       db.z_order == AmdGpu::ZOrder::EarlyZReZ) &&
+                                      (fs.mrtz_mask & 0b111) == 0;
+        } else if (Shader::Backend::VsBindingBaseOn()) {
+            start = Shader::Backend::VsStartBindings({}, profile.stage_bindings); // SOTC_VS_BINDING_BASE
+        } else if (r.pair != 0) {
+            // The vertex stage's bindings start where its pixel stage's end (the pixel stage is bound first).
+            const auto pair = program_cache.find(r.pair);
+            if (pair == program_cache.end()) {
+                const bool waiting = pending_programs.contains(r.pair);
+                if (waiting && (r.deferred_ns == 0 || now_ns - r.deferred_ns < 10'000'000'000LL)) {
+                    if (r.deferred_ns == 0) {
+                        r.deferred_ns = now_ns;
+                    }
+                    if (pre_deferred.empty()) {
+                        pre_deferred_since = now;
+                    }
+                    pre_deferred.push_back(std::move(r));
+                    continue;
+                }
+                SotcPretranslate::NoteDropped(stage, 1);
+                continue;
+            }
+            const auto& pair_info = pair.value()->info;
+            pair_info.AddBindings(start, Shader::UsesBindlessSamplers(pair_info));
+            if (profile.stage_bindings) {
+                start.unified = 0;
+            }
+        }
+        // The variants of the key the file leaves open: every color layout of the pixel program's pass; both draw
+        // kinds of an instanced vertex program (direct, or indirect with the start instance in user SGPR 2).
+        boost::container::small_vector<Shader::RuntimeInfo, 8> variants{rt};
+        if (stage == 0) {
+            const size_t layouts = std::min<size_t>(SotcPredict::PixelLayoutCount(r.hash), 8);
+            for (size_t l = 1; l < layouts; ++l) {
+                Shader::RuntimeInfo v = rt;
+                SotcPredict::PixelLayout(r.hash, v, l);
+                v.hw.fs.mrtz_mask = rt.hw.fs.mrtz_mask; // the program's own DB_SHADER_CONTROL
+                if (std::ranges::find(variants, v) == variants.end()) {
+                    variants.push_back(v);
+                }
+            }
+        } else if (rt.sw.vs.instance_sgpr_offset != 0) {
+            Shader::RuntimeInfo v = rt;
+            v.sw.vs.instance_sgpr_offset = 0;
+            variants.push_back(v);
+        }
+        for (size_t vi = 0; vi < variants.size(); ++vi) {
+            auto job = std::make_unique<AsyncPipelineJob>();
+            auto& t = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
+            t.hw_stage = hw;
+            t.sw_stage = sw;
+            t.hash = r.hash;
+            t.user_data = zeros;
+            t.owned_code = r.code; // the first variant's job may queue one more with the same code
+            t.code = t.owned_code;
+            t.runtime_info = variants[vi];
+            t.start = start;
+            t.pretranslate = true;
+            t.first_variant = true; // each layout variant gets its integer-verdict twin
+            SotcPretranslate::NoteQueued(stage);
+            pre_backlog.push_back(std::move(job));
+        }
+        pending_programs.insert(r.hash);
+        pre_pending.insert(r.hash);
+    }
+    FeedPretranslate();
+}
+
+void PipelineCache::FeedPretranslate() {
+    const u32 limit = pre_holding || SotcPretranslate::Precompile() ? 64u : 2u;
+    if (pre_backlog.empty() || pre_in_flight >= limit) {
+        return;
+    }
+    {
+        std::scoped_lock lock{async_mutex};
+        while (!pre_backlog.empty() && pre_in_flight < limit) {
+            async_queue.push_back(std::move(pre_backlog.front())); // behind every other job
+            pre_backlog.pop_front();
+            ++pre_in_flight;
+        }
+    }
+    async_cv.notify_all();
+}
+
+void PipelineCache::MaybeHoldForPretranslate() {
+    using Clock = std::chrono::steady_clock;
+    static const Clock::time_point session_start = Clock::now();
+    if (pre_hold_done || SotcPretranslate::Precompile()) {
+        return;
+    }
+    if (Clock::now() - session_start > std::chrono::minutes{2}) {
+        pre_hold_done = true; // past the boot: the backlog is fed slowly, never held for
+        return;
+    }
+    if (pre_backlog.size() + pre_in_flight < 300) {
+        return;
+    }
+    pre_hold_done = true;
+    pre_holding = true;
+    const auto start = Clock::now();
+    std::fprintf(stderr, "SOTC PRETRANSLATE: preparing the game's shaders (%zu translations) before play\n",
+                 pre_backlog.size() + pre_in_flight);
+    last_graphics_pipeline = nullptr; // installs may change the caches under the draw being looked up
+    SotcStats::prep_start_ms.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(start.time_since_epoch()).count(),
+        std::memory_order_relaxed);
+    SotcStats::prep_active.store(true, std::memory_order_release);
+    for (;;) {
+        DrainPretranslate();
+        FeedPretranslate();
+        if (async_done_count.load(std::memory_order_acquire) != 0) {
+            CollectAsyncPipelines();
+        }
+        const u64 queued = SotcPretranslate::JobsQueued();
+        const u64 done = SotcPretranslate::JobsDone();
+        SotcStats::prep_total.store(static_cast<u32>(queued), std::memory_order_relaxed);
+        SotcStats::prep_done.store(static_cast<u32>(done), std::memory_order_relaxed);
+        // The cache files (one meta and one binary per variant, ~38,000 for the game) are written before play: a
+        // write queue left to drain during play slowed every thread by ~40% (file creation, antivirus scans).
+        const u32 writes = Storage::DataBase::Instance().PendingWrites();
+        SotcStats::prep_writes.store(writes, std::memory_order_relaxed);
+        const auto now = Clock::now();
+        const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        const bool idle = pre_backlog.empty() && pre_in_flight == 0 && !SotcPretranslate::Pending() &&
+                          pre_deferred.empty() && now_ns - SotcPretranslate::LastRequestNs() > 3'000'000'000LL &&
+                          writes < 64;
+        if (idle || now - start > std::chrono::minutes{45}) {
+            break;
+        }
+        static bool index_saved = false;
+        if (!index_saved && pre_backlog.empty() && pre_in_flight == 0 && queued == done) {
+            index_saved = true;
+            SaveShaderIndex(); // written with the other files, so the queue the hold waits for holds it too
+        }
+        std::unique_lock lock{async_mutex};
+        translate_done_cv.wait_for(lock, std::chrono::milliseconds{50},
+                                   [this] { return async_done_count.load(std::memory_order_relaxed) != 0; });
+    }
+    pre_holding = false;
+    PrePackFinish(); // the variants of the hold, in one file; read back for their first draws
+    SotcStats::prep_active.store(false, std::memory_order_release); // the screen goes away
+    SaveShaderIndex();
+    // The programs no draw used yet leave memory: their modules are destroyed and they go back to the index on disk,
+    // so this session runs as the next ones (LoadLazyProgram at the first draw). With ~19,000 programs and their
+    // modules resident, every thread of the port ran ~40% slower.
+    {
+        size_t evicted = 0;
+        for (auto it = program_cache.begin(); it != program_cache.end();) {
+            Program& program = *it.value();
+            if (!program.sotc_pre || program.sotc_pre_checked || !program.pending_specs.empty()) {
+                ++it;
+                continue;
+            }
+            for (auto& module : program.modules) {
+                if (module.module) {
+                    instance.GetDevice().destroyShaderModule(module.module);
+                }
+            }
+            lazy_programs[it.key()] = static_cast<u32>(program.modules.size());
+            it = program_cache.erase(it);
+            ++evicted;
+        }
+        std::fprintf(stderr, "SOTC PRETRANSLATE: %zu prepared programs left for their first draw (on disk)\n",
+                     evicted);
+    }
+    std::fprintf(stderr, "SOTC PRETRANSLATE: shaders prepared in %.1f s (%llu translations)\n",
+                 std::chrono::duration<double>(Clock::now() - start).count(),
+                 static_cast<unsigned long long>(SotcPretranslate::JobsDone()));
+}
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding,
@@ -3277,6 +3777,29 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (hw_stage == HwStage::Compute && !async_ok && compute_prefetch &&
         pending_programs.contains(params.hash)) {
         WaitPendingTranslation(params.hash);
+    }
+    if (SotcPretranslate::On() && (SotcPretranslate::Pending() || !pre_deferred.empty())) {
+        DrainPretranslate(); // sotc: SOTC_PRETRANSLATE
+    }
+    if (SotcPretranslate::On() && !pre_hold_done) {
+        MaybeHoldForPretranslate(); // sotc: the first session's shaders, prepared on the loading screen
+    }
+    if (SotcPretranslate::Precompile()) {
+        FeedPretranslate();
+        PrecompileCheck(); // sotc: SOTC_PRECOMPILE (progress, exit when done)
+    }
+    // sotc: a program of the shader cache index that no warm-up pipeline loaded: its permutations from the disk.
+    if (!lazy_programs.empty() && lazy_programs.contains(params.hash)) {
+        LoadLazyProgram(params.hash);
+    }
+    // sotc: the index grows with every translation; it is written every 10 s (and at the end of a precompile run).
+    {
+        static auto last_index_save = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_index_save > std::chrono::seconds{10}) {
+            last_index_save = now;
+            SaveShaderIndex();
+        }
     }
     // sotc: copied only where CompileModule needs a mutable one (it was copied on every call).
     const auto& rt = BuildRuntimeInfo(hw_stage, sw_stage);
@@ -3294,6 +3817,12 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (async_ok && !program_cache.contains(params.hash) &&
         !in_place_programs.contains(params.hash)) {
         if (pending_programs.insert(params.hash).second) {
+            CacheDiagNoteProgram(params.hash);
+            QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, nullptr, nullptr, 0);
+        } else if (pre_pending.erase(params.hash) != 0) {
+            // sotc: SOTC_PRETRANSLATE. The pre-translation waits behind every other job: the draw's own translation
+            // goes ahead of it (whichever installs first is kept).
+            SotcPretranslate::NoteSuperseded(sw_stage == SwStage::Vertex ? 1 : 0);
             CacheDiagNoteProgram(params.hash);
             QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, nullptr, nullptr, 0);
         }
@@ -3464,6 +3993,66 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     vk::ShaderModule module{};
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+    if (program->sotc_pre && !program->sotc_pre_checked && !program->modules.empty()) {
+        // sotc: SOTC_PRETRANSLATE: the first draw of a pre-translated program, against the key it was made for.
+        program->sotc_pre_checked = true;
+        const bool hit = it != program->modules.end();
+        if (!hit && sw_stage == SwStage::Fragment) {
+            // sotc: the first pixel image misses: each image's key at the draw against the pre-translated one.
+            static std::atomic<u32> logged_ps{0};
+            const auto& made = program->modules[0].spec;
+            if (spec.images != made.images && logged_ps.fetch_add(1, std::memory_order_relaxed) < 32) {
+                std::string line;
+                for (size_t i = 0; i < spec.images.size() && i < made.images.size(); ++i) {
+                    const auto& a = spec.images[i];
+                    const auto& b = made.images[i];
+                    if (a == b) {
+                        continue;
+                    }
+                    const auto& d = program->info.images[i];
+                    char buf[200];
+                    std::snprintf(buf, sizeof buf,
+                                  " [%zu %s%s%s draw t%u i%d s%d sw%d%d%d%d c%u n%u | made t%u i%d s%d sw%d%d%d%d c%u n%u]", i,
+                                  d.is_written ? "W" : "R", d.is_array ? "A" : "", d.is_depth ? "D" : "", u32(a.type),
+                                  a.is_integer, a.is_storage, int(a.dst_select.r), int(a.dst_select.g),
+                                  int(a.dst_select.b), int(a.dst_select.a), u32(a.num_conversion), a.num_bindings,
+                                  u32(b.type), b.is_integer, b.is_storage, int(b.dst_select.r), int(b.dst_select.g),
+                                  int(b.dst_select.b), int(b.dst_select.a), u32(b.num_conversion), b.num_bindings);
+                    line += buf;
+                }
+                std::fprintf(stderr, "SOTC PRETRANSLATE ps image miss %#llx:%s\n",
+                             static_cast<unsigned long long>(params.hash), line.c_str());
+            }
+        }
+        if (!hit && sw_stage == SwStage::Vertex && spec.start != program->modules[0].spec.start) {
+            static std::atomic<u32> logged_start{0};
+            if (logged_start.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr, "SOTC PRETRANSLATE vs start miss %#llx: draw %u/%u made %u/%u\n",
+                             static_cast<unsigned long long>(params.hash), spec.start.unified, spec.start.buffer,
+                             program->modules[0].spec.start.unified, program->modules[0].spec.start.buffer);
+            }
+        }
+        if (!hit && sw_stage == SwStage::Vertex) {
+            // sotc: the first vertex misses, with the draw's software state against the pre-translated one.
+            static std::atomic<u32> logged{0};
+            const auto& sa = spec.runtime_info.sw.vs;
+            const auto& sb = program->modules[0].spec.runtime_info.sw.vs;
+            const auto& ha = spec.runtime_info.hw.vs;
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+                std::fprintf(stderr,
+                             "SOTC PRETRANSLATE vs miss %#llx: draw step %u/%u vsgpr %u isgpr %u tess %d clipoff %d "
+                             "outputs %u; made step %u/%u vsgpr %u isgpr %u tess %d clipoff %d outputs %u\n",
+                             static_cast<unsigned long long>(params.hash), sa.step_rate_0, sa.step_rate_1,
+                             sa.vertex_sgpr_offset, sa.instance_sgpr_offset, sa.tess_emulated_primitive,
+                             ha.clip_disable, ha.num_outputs, sb.step_rate_0, sb.step_rate_1, sb.vertex_sgpr_offset,
+                             sb.instance_sgpr_offset, sb.tess_emulated_primitive,
+                             program->modules[0].spec.runtime_info.hw.vs.clip_disable,
+                             program->modules[0].spec.runtime_info.hw.vs.num_outputs);
+            }
+        }
+        SotcPretranslate::NoteFirstUse(sw_stage == SwStage::Vertex ? 1 : 0, hit,
+                                       hit ? 0u : PretranslateDiff(spec, program->modules[0].spec));
+    }
     if (it == program->modules.end() && async_ok && !program->translate_in_place) {
         if (std::ranges::find(program->pending_specs, spec) == program->pending_specs.end()) {
             CacheDiagNotePerm(true);
@@ -3481,7 +4070,33 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         CacheDiagNotePerm(false);
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         auto runtime_info = rt;
+        const auto binding_before = binding;
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        // sotc: the program's Info came from a translation with other resources (a SOTC_PRETRANSLATE layout variant
+        // whose color outputs, and the flat buffer reads behind them, were eliminated). The rasterizer writes a
+        // draw's descriptors from the program's Info, so this draw's own translation replaces it: the permutations
+        // made with the old one keep their specialization lists, which no draw specialized from the new Info matches
+        // (StageSpecialization ==, list lengths), and the pipelines of the stage are looked up again.
+        if (!SameBindingLayout(info, new_info)) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr,
+                             "SOTC SHADER: program %#llx takes a draw's resources (buffers %zu -> %zu, images %zu -> "
+                             "%zu, samplers %zu -> %zu)\n",
+                             static_cast<unsigned long long>(params.hash), info.buffers.size(),
+                             new_info.buffers.size(), info.images.size(), new_info.images.size(),
+                             info.samplers.size(), new_info.samplers.size());
+            }
+            info = std::move(new_info);
+            info.PgmBase() = params.Base();
+            info.UserData() = params.user_data;
+            info.RefreshFlatBuf();
+            spec = Shader::StageSpecialization(info, rt, profile, binding_before);
+            program->translate_in_place = false;
+            last_graphics_pipeline = nullptr;
+            last_compute_pipeline = nullptr;
+            new_info = Shader::Info(hw_stage, sw_stage, params); // moved from: the combine below is a no-op
+        }
         // sotc: the new permutation's bindless answers must agree with the program's (CombineBindlessCache).
         Shader::CombineBindlessCache(info.bindless, new_info.bindless);
 

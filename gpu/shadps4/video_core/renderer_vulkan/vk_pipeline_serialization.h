@@ -18,5 +18,8 @@ void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
+/// sotc: the bytes of a shader meta, as RegisterShaderMeta writes them (the SOTC_PRETRANSLATE pack stores these).
+std::vector<u8> SerializeShaderMeta(const Shader::Info& info, const Shader::StageSpecialization& spec, size_t perm_hash,
+                                    size_t perm_idx);
 
 } // namespace Vulkan

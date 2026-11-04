@@ -36,6 +36,12 @@ public:
     void SetVariant(std::string key);
     void Open();
     void Close();
+    /// sotc: the writes queued for the IO worker and not done yet (the boot hold waits for them).
+    [[nodiscard]] u32 PendingWrites() const noexcept;
+    /// sotc: the folder of this variant's files (SOTC_PRETRANSLATE keeps its pack there).
+    [[nodiscard]] const std::filesystem::path& CachePath() const noexcept {
+        return cache_path;
+    }
     void Clear();
     [[nodiscard]] bool IsOpened() const {
         return opened;

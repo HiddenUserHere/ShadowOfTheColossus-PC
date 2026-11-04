@@ -1309,6 +1309,52 @@ bool RequestDump(const char* reason) {
     return true;
 }
 
+bool FatalDump(const char* reason, uint64_t window_ms, uint64_t wait_ms) {
+    static std::atomic<bool> done{false};
+    if (!kOn || done.exchange(true)) {
+        return false;
+    }
+    State& s = S();
+    const std::string text = std::string("fatal: ") + (reason ? reason : "");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+    if (kMode == 2) {
+        Mark(("dump: " + text).c_str());
+        s.flush_now.store(true);
+        s.job_cv.notify_one();
+        while (s.flush_now.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        // The writer took the request; give its drain a moment to reach the file.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        return !s.flush_now.load();
+    }
+    const uint64_t serial_before = LastDump().serial;
+    const uint64_t now = Now();
+    const uint64_t window_ns = window_ms * 1'000'000ULL;
+    Job job;
+    job.frame = s.frame_now.load(std::memory_order_relaxed);
+    // The writer keeps pre_ns before job.start: start is moved back so the window is window_ms in all.
+    const uint64_t back = window_ns > s.pre_ns ? window_ns - s.pre_ns : 0;
+    job.start = now > back ? now - back : 0;
+    job.end = now;
+    job.manual = true;
+    job.manual_index = s.manual_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+    job.reason = text;
+    {
+        std::scoped_lock lk{s.job_mutex};
+        s.dumps.fetch_add(1, std::memory_order_relaxed);
+        s.jobs.push_back(std::move(job));
+    }
+    s.job_cv.notify_one();
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (LastDump().serial != serial_before) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
 void SetThresholdMs(uint64_t ms) {
     S().threshold_ns.store(ms * 1'000'000ULL, std::memory_order_relaxed);
 }

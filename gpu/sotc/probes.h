@@ -36,6 +36,15 @@ struct BlockInfo {
     char pool[48] = {}; // allocator name
 };
 bool FindBlock(uint64_t addr, BlockInfo* out); // probe_alloc.cpp; false when no tracked block holds addr
+
+/// sotc: SOTC_BLOCK_EXTENT=1 (off by default). An unbounded read-only binding (V# num_records ~4 G) is bound up to
+/// the end of the live allocator block (ALLOC_BLOCK / FREE_BLOCK feed, SOTC_HOOK_ALLOC_PROBE) its base lies in:
+/// a game object never crosses its block, and the port bound (and copied) a window of up to 64 MiB around objects of
+/// a few hundred bytes (BucketAllocator, 64 KiB blocks). Read once.
+bool BlockExtentOn() noexcept;
+/// The bytes from addr to the end of the live tracked block holding it (an ordered index, any thread); false when no
+/// tracked block holds addr.
+bool BlockRemaining(uint64_t addr, uint64_t* remaining) noexcept;
 void RegisterCvars();
 void RegisterArea();
 // sotc: PC memory model, wave B (docs/re-stutters/PC-MEMORY-REWRITE.md section 5).

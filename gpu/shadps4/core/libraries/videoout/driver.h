@@ -117,6 +117,7 @@ private:
     /// then presented on a thread of their own so that the vblank clock keeps its rate.
     bool AsyncPresent();
     void RunPresentJob(std::function<void()> job, bool droppable = false);
+    bool PaintPrepScreen(); // sotc: the boot shader preparation screen (SOTC_PRETRANSLATE hold)
     void PresentJobThread(std::stop_token token);
 
     std::mutex mutex;

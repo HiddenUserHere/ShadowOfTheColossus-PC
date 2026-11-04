@@ -58,6 +58,13 @@ int bbgpu_overlay_captures_input(void);
 int bbgpu_freecam_captures_input(void);
 void bbgpu_freecam_feed_pad(float lx, float ly, float rx, float ry, float l2, float r2,
                             uint32_t buttons);
+/* sotc: crash report. hook runs once when the GPU library stops the port (an assertion: a Vulkan device lost ends
+ * here), after its own stack is printed: the loader passes its every-thread stack dump. NULL removes it. */
+void bbgpu_set_fatal_hook(void (*hook)(void));
+/* sotc: crash report. With SOTC_TRACE=1 or 2: the last window_ms of the recorder go to a file (reason in its META),
+ * waiting up to wait_ms for the writer. Any thread; for the fatal paths (no SOTC_TRACE_MAX limit). Returns 1 when
+ * the file was written. */
+int bbgpu_trace_fatal_dump(const char *reason, unsigned window_ms, unsigned wait_ms);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
 /* sotc: where the engine keeps the pointer to its TargetFramesPerSeconds value (fps60game mode):

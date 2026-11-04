@@ -108,6 +108,7 @@
 
 #include "common/types.h"
 #include "core/memory.h"
+#include "shader_recompiler/gcn_rules.h" // sotc: SOTC_GCN_TEX (Shader::Gcn::TableImage, the table's binding predicate)
 #include "shader_recompiler/info.h"
 #include "video_core/amdgpu/pixel_format.h" // sotc: UiLinear::StageEligible (AmdGpu::IsInteger)
 #include "video_core/buffer_cache/buffer.h"
@@ -116,6 +117,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_arch/bindset_events.h" // sotc: SOTC_BINDSET event API
+#include "video_core/sotc_arch/gcn_native.h" // sotc: SOTC_GCN_TEX (the GPU T#/S# table, fed by the resolutions here)
 #include "video_core/sotc_arch/sotc_arch.h"
 #include "video_core/sotc_lod_stats.h"
 #include "video_core/sotc_stats.h" // sotc: SOTC_PR_KEYS counters (keys used)
@@ -671,6 +673,15 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
         // The heap descriptor is written in GENERAL: the memo makes no layout transition, so SOTC_HEAP needs
         // SOTC_LAYOUT_UNIFIED (every texture-cache image in GENERAL).
         out[index] = Heap::IndexOf(view, key, vk::ImageLayout::eGeneral);
+        // sotc: SOTC_GCN_TEX, the CPU's first sight of this T# feeds the GPU table (a real slot only). Only the bindings
+        // the table can express (the same predicate the recompiler uses: a binding it refuses keeps the index table): the
+        // shader keys the table on the raw T#, and tsharp here is GetSharp's (r128 pitch, cube-to-array).
+        if (SotcGcn::Tex::On() && Shader::Gcn::TableImage(image_desc) && out[index] != Heap::NullImageIndex(key)) {
+            u32 words[8];
+            static_assert(sizeof(words) == sizeof(tsharp));
+            std::memcpy(words, &tsharp, sizeof(words));
+            SotcGcn::Tex::NoteResolved(words, SotcGcn::Tex::ViewClassOf(stage, image_desc), out[index], r.bound);
+        }
         // The view IndexOf wrote (the slot holds it in eGeneral): SlotsMiss checks the slot still holds it.
         r.view = view.image_view ? *view.image_view : vk::ImageView{};
         r.range = desc.view_info.range; // the classic bind's transition range
@@ -703,6 +714,19 @@ void ResolveFresh(VideoCore::TextureCache& tc, const Shader::Info& stage,
         u32 slot = Heap::NullSamplerIndex();
         (void)tc.GetSampler(ssharp, border_color, sampler.is_depth, &slot); // the bindless sampler slot
         out[num_images + j] = slot;
+        // sotc: SOTC_GCN_TEX. The raw S# (the words the shader reads, before the post op) and its class, which carries the
+        // post op and the single-lod fact of DisableAnisoIfSingleLod (read from the paired T#, as GetSharp does).
+        if (SotcGcn::Tex::On()) {
+            AmdGpu::Sampler raw{};
+            sampler.sharp_fetch.Fetch(stage.FlatBuf().data(), &raw);
+            u32 words[4];
+            static_assert(sizeof(words) == sizeof(raw));
+            std::memcpy(words, &raw, sizeof(words));
+            const bool single_lod =
+                sampler.post_op == Shader::SharpFetchPostOp::DisableAnisoIfSingleLod &&
+                ((stage.FlatBuf()[sampler.post_op_tsharp_dw3_off] >> 12) & 0xff) == 0;
+            SotcGcn::Tex::NoteResolvedSampler(words, SotcGcn::Tex::SamplerClassOf(sampler, single_lod), slot);
+        }
     }
     rec.num_bindings = num_images + static_cast<u32>(stage.samplers.size());
     rec.sampler_generation = tc.SamplerGeneration();
@@ -1650,6 +1674,10 @@ bool Armed() noexcept {
 }
 
 void PostImage(u32 image_index, Cause cause) {
+    // sotc: SOTC_GCN_TEX. The table's entries of this image die first, whether or not SOTC_BINDSET is armed.
+    if (SotcGcn::Tex::On()) {
+        SotcGcn::Tex::OnImageEvent(image_index, static_cast<u8>(cause));
+    }
     TableMemo::PostImageGated(image_index, static_cast<u8>(cause));
 }
 

@@ -61,6 +61,8 @@
 #include "video_core/renderer_vulkan/vk_frame_graph.h" // sotc: SOTC_N5_GRAPH (barrier events)
 #include "video_core/sotc_arch/passes.h" // sotc: SOTC_PASSES (pass rule, ARCH-DRAW.md section 5)
 #include "video_core/sotc_arch/guest_barrier.h" // sotc: SOTC_BARRIER_GUEST (guest sync points, safety net)
+#include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE (SOTC_GCN_MEM/BUF/TEX/SYNC/BARRIER)
+#include "shader_recompiler/gcn_rules.h" // sotc: SOTC_GCN_TEX_SKIP_RESOLVE (TableStage)
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h" // sotc: SOTC_HEAP (UsesHeapImages)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -73,7 +75,11 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM (texture records)
 #include "../../../sotc/region_predrain.h" // sotc: SOTC_BIG_BIND_LOG (bind context)
+#include "../../../sotc/probes.h"           // sotc: SOTC_BLOCK_EXTENT
 #include "../../../sotc/probe_vsize.h"      // sotc: SOTC_VSIZE_PROBE (unbounded read-only binds)
+#include "video_core/sotc_checkpoints.h"    // sotc: SOTC_GPU_CHECKPOINTS
+#include "../../../sotc/draw_gate.h"            // sotc: SOTC_DRAW_GATE
+#include "../../../sotc/gcn_census.h"           // sotc: SOTC_GCN_CENSUS
 
 // sotc: SOTC_PR_RESOLVE. Generation of the runtime memory table (src/runtime_memory.c); odd while
 // a change is in progress. Same declaration as sotc_bininfo.cpp.
@@ -84,6 +90,43 @@ namespace BarrierStatic = SotcArch::Passes::BarrierStatic; // sotc: SOTC_BARRIER
 
 namespace Vulkan {
 
+// sotc: SOTC_GPU_CHECKPOINTS (sotc_checkpoints.h): the ring entry of the next command (its kind, the program hashes of
+// the pipeline's stages, a/b/c) and its checkpoint, recorded right before it. One load when off.
+// The pipeline of the command GpuCheckpoint marked last (CheckpointResources records its handle).
+static thread_local const Pipeline* t_checkpoint_pipeline = nullptr;
+
+static u64 GpuCheckpoint(vk::CommandBuffer cmdbuf, const Pipeline* pipeline, SotcCheckpoints::Kind kind, u64 a,
+                         u64 b, u64 c) {
+    if (!SotcCheckpoints::On()) {
+        return 0;
+    }
+    t_checkpoint_pipeline = pipeline;
+    u64 hashes[Shader::MaxStageTypes]{};
+    u16 perms[Shader::MaxStageTypes];
+    std::fill(std::begin(perms), std::end(perms), u16{0xFFFF});
+    if (pipeline) {
+        const auto stages = pipeline->GetStages();
+        const u32 first = pipeline->IsCompute() ? u32(Shader::SwStage::Compute) : 0;
+        const GraphicsPipelineKey* key =
+            pipeline->IsCompute() ? nullptr : &static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey();
+        for (u32 i = 0; i < stages.size() && first + i < Shader::MaxStageTypes; ++i) {
+            if (stages[i]) {
+                hashes[first + i] = stages[i]->pgm_hash;
+                // The module's permutation: the key's stage hash is HashCombine(program hash, permutation).
+                for (u32 p = 0; key && i < key->stage_hashes.size() && p < 64; ++p) {
+                    if (HashCombine(stages[i]->pgm_hash, u64{p}) == key->stage_hashes[i]) {
+                        perms[first + i] = static_cast<u16>(p);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    const u64 seq = SotcCheckpoints::Note(kind, hashes, Shader::MaxStageTypes, a, b, c, perms);
+    cmdbuf.setCheckpointNV(reinterpret_cast<const void*>(seq));
+    return seq;
+}
+
 // sotc: SOTC_BARRIER_STATIC. True when a stage of the pipeline writes memory (Shader::Info::writes_memory, a static bit).
 static bool StagesWriteMemory(const Pipeline& pipeline) {
     for (const auto* stage : pipeline.GetStages()) {
@@ -92,6 +135,52 @@ static bool StagesWriteMemory(const Pipeline& pipeline) {
         }
     }
     return false;
+}
+
+// sotc: ARCH-GCN-NATIVE S5. An op whose shaders write memory: a written buffer or a storage image (the global barrier
+// after the op covers both).
+static bool GcnOpWrites(const Pipeline& pipeline) {
+    for (const auto* stage : pipeline.GetStages()) {
+        if (stage && (stage->writes_memory || stage->has_storage_images)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// sotc: ARCH-GCN-NATIVE S5. A render pass end. The pass boundary barrier is recorded inside Scheduler::EndRendering
+// (only when a pass was open, and for the implicit end in BeginRendering as well).
+static void GcnEndRendering(Vulkan::Scheduler& scheduler) {
+    scheduler.EndRendering();
+}
+
+// sotc: ARCH-GCN-NATIVE S5. Before an op's commands (inside or outside a render pass) and after them.
+static void GcnBeforeOp(Vulkan::Scheduler& scheduler) {
+    if (SotcGcn::Barrier::On()) { // sotc: SOTC_GCN_BARRIER
+        SotcGcn::Barrier::BeforeOp(scheduler, scheduler.IsRendering());
+    }
+}
+static void GcnAfterOp(const Pipeline& pipeline) {
+    if (SotcGcn::Barrier::On()) { // sotc: SOTC_GCN_BARRIER
+        SotcGcn::Barrier::AfterOp(GcnOpWrites(pipeline));
+    }
+}
+
+// sotc: ARCH-GCN-NATIVE S2. The residency call of a shader-addressed range: BindAddressed (placed bits, then Touch)
+// when the buffer stage is on, else AddrTable::Touch as before. Same arguments and answer.
+static bool GcnTouch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size,
+                     bool is_written) {
+    if (SotcGcn::Buf::ProfileValue() != 0) { // sotc: SOTC_GCN_BUF
+        return SotcGcn::Buf::BindAddressed(cache, scheduler, addr, size, is_written);
+    }
+    return SotcArch::AddrTable::Touch(cache, scheduler, addr, size, is_written);
+}
+
+// sotc: ARCH-GCN-NATIVE. Draw thread, at each submit start (see the header).
+void Rasterizer::GcnSubmitStart() {
+    if (SotcGcn::Mem::On() || SotcGcn::Buf::On() || SotcGcn::Tex::On() || SotcGcn::Sync::On()) {
+        SotcGcn::OnSubmitStart(buffer_cache, texture_cache, scheduler);
+    }
 }
 
 namespace {
@@ -183,6 +272,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     SotcArch::ShaderAddr::Init(instance); // sotc: SOTC_SHADER_ADDR=2 debug buffer (no-op otherwise; refuses bad combos)
     SotcArch::TableMemo::Init(instance, scheduler); // sotc: SOTC_HEAP (index table ring; no-op when unset)
     SotcArch::Heap::Init(instance);                 // sotc: SOTC_HEAP (logs the mode; no-op when unset)
+    // sotc: ARCH-GCN-NATIVE. AddrTable::Init above runs for SOTC_GCN_MEM as well (its On() decides). The globals buffer
+    // needs the device; the decisions are logged once every stage has refused what it must.
+    SotcGcn::Globals::Init(instance);
+    SotcGcn::LogDecisions();
     memory->SetRasterizer(this);
     SotcGuestMemory::Init(instance); // sotc: SOTC_PC_MEMORY=1 (docs/sotc/MODELO-MEMORIA-PC.md)
 
@@ -254,7 +347,7 @@ void Rasterizer::SotcLodFeedbackCycle() {
             .pBufferMemoryBarriers = &buffer_barrier,
         });
     };
-    scheduler.EndRendering();
+    GcnEndRendering(scheduler);
     const auto cmdbuf = scheduler.CommandBuffer();
     barrier(vk::PipelineStageFlagBits2::eAllCommands,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
@@ -1539,7 +1632,8 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
         target.height != hudless_vo_height) {
         return false;
     }
-    scheduler.EndRendering();
+    GcnEndRendering(scheduler);
+    GcnBeforeOp(scheduler); // sotc: SOTC_GCN_BARRIER (the composite pass reads what a pending writer wrote)
     const auto cmdbuf = scheduler.CommandBuffer();
     const vk::ImageSubresourceRange color_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
     if (!hudless_clear.image) {
@@ -1639,7 +1733,7 @@ vk::ImageView Rasterizer::TakeHudless(VAddr address, vk::Format format) {
     if (target.read_format != format) {
         return {}; // ponytail: one read format per video out image (its pixel format is fixed)
     }
-    scheduler.EndRendering();
+    GcnEndRendering(scheduler);
     const auto to_read = vk::ImageMemoryBarrier2{
         .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
         .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
@@ -1724,7 +1818,8 @@ bool Rasterizer::BeginUiShadow(const GraphicsPipeline* pipeline, const RenderSta
         ui_shadow_broken = true;
         return false;
     }
-    scheduler.EndRendering();
+    GcnEndRendering(scheduler);
+    GcnBeforeOp(scheduler); // sotc: SOTC_GCN_BARRIER (the composite pass reads what a pending writer wrote)
     // The first draw of a frame starts it (the composite copied the last one); later ones blend
     // over the earlier ones.
     const bool first = ui_shadow_draws++ == 0;
@@ -2571,6 +2666,7 @@ void FlushRun(SotcDrawMerge::Flush why) {
     u64 calls = 0;
     u64 ext_calls = 0;
     size_t i = 0;
+    GpuCheckpoint(cmd, nullptr, SotcCheckpoints::Kind::DrawRun, n, g_run.indexed ? 1 : 0, 0); // sotc
     while (i < n) {
         // Draws i..j-1 share the instance parameters (and the vertex offset when indexed): one multi-draw call.
         const auto same = [&](size_t k) {
@@ -3034,6 +3130,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         SotcStats::Drop(0, regs.color_buffers[0].Address(), regs.stage_enable.raw);
         return;
     }
+    // sotc: SOTC_DRAW_GATE: a draw whose buffers wait for the staged upload is made in a later frame (draw_gate.h).
+    // Before any bind, as a draw whose shaders are still translating.
+    if (SotcDrawGate::On() && DrawGateDefers(pipeline, is_indexed, index_offset)) {
+        return;
+    }
+    if (SotcGcnCensus::On()) { // sotc: SOTC_GCN_CENSUS (measurement only)
+        CensusNote(pipeline, SotcGcnCensus::kDraw);
+    }
     TraceGbufferShaders(regs, pipeline);
     TraceShadowShaders(regs, pipeline);
     PassStats::NoteShader(regs, pipeline); // sotc: SOTC_PASS_STATS
@@ -3124,6 +3228,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDynamicState}; // sotc: SOTC_OP_PHASES
         UpdateDynamicState(pipeline, is_indexed, prepared);
     }
+    GcnBeforeOp(scheduler); // sotc: SOTC_GCN_BARRIER (before the pass: a pending writer barrier goes first)
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -3139,13 +3244,32 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
-    if (is_indexed) {
+    const u64 cp_seq = GpuCheckpoint(cmdbuf, pipeline,
+                                     is_indexed ? SotcCheckpoints::Kind::DrawIndexed : SotcCheckpoints::Kind::Draw,
+                                     regs.num_indices, regs.num_instances.NumInstances(), instance_offset); // sotc
+    CheckpointResources(cp_seq);
+    // sotc: SOTC_SKIP_DRAW_VS=<vertex program hash> (diagnostics): the draws of that vertex program are not recorded.
+    static const u64 skip_vs = [] {
+        const char* v = std::getenv("SOTC_SKIP_DRAW_VS");
+        return v ? std::strtoull(v, nullptr, 16) : 0ull;
+    }();
+    if (skip_vs != 0 && vs_info.pgm_hash == skip_vs) {
+        static std::atomic<u32> skipped{0};
+        if (skipped.fetch_add(1, std::memory_order_relaxed) < 4) {
+            std::fprintf(stderr, "SOTC SKIP DRAW VS: draw of vs %#llx not recorded\n",
+                         static_cast<unsigned long long>(skip_vs));
+        }
+    } else if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
     } else {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    if (cp_seq != 0) { // sotc: SOTC_GPU_CHECKPOINTS: the end of this draw (what follows it is unmarked copies/barriers)
+        cmdbuf.setCheckpointNV(reinterpret_cast<const void*>(cp_seq | SotcCheckpoints::kAfterBit));
+    }
+    GcnAfterOp(*pipeline); // sotc: SOTC_GCN_BARRIER
     // sotc: the composites below record their own pipelines and descriptors: no later draw reuses this bind.
     if ((hudless_ui_info >= 0 && hudless_vo) || ui_shadow_hit) {
         MergeInvalidate();
@@ -3231,6 +3355,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!pipeline) {
         SotcStats::Drop(0, liverpool->DrawRegs().color_buffers[0].Address(), 1);
         return;
+    }
+    if (SotcGcnCensus::On()) { // sotc: SOTC_GCN_CENSUS (measurement only)
+        CensusNote(pipeline, SotcGcnCensus::kDrawIndirect);
     }
     TraceShadowShaders(liverpool->DrawRegs(), pipeline);
     PassStats::NoteShader(liverpool->DrawRegs(), pipeline); // sotc: SOTC_PASS_STATS
@@ -3374,6 +3501,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             const SotcOpPhases::Scope ph{SotcOpPhases::PhDynamicState}; // sotc: SOTC_OP_PHASES
             UpdateDynamicState(pipeline, is_indexed, prepared);
         }
+        GcnBeforeOp(scheduler); // sotc: SOTC_GCN_BARRIER (before the pass)
         scheduler.BeginRendering(state);
         if (SotcDrawMerge::On()) { // sotc: SOTC_DRAW_MERGE_STATS (measurement only)
             DrawMergeNote(state, pipeline, is_indexed, true, arg_address + offset, stride, max_count,
@@ -3383,12 +3511,17 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
         if (is_indexed) {
             const auto& a = args.indexed;
+            CheckpointResources(GpuCheckpoint(cmdbuf, pipeline, SotcCheckpoints::Kind::DrawIndexed, a.indexCount, a.instanceCount,
+                          a.firstInstance)); // sotc
             cmdbuf.drawIndexed(a.indexCount, a.instanceCount, a.firstIndex, a.vertexOffset,
                                a.firstInstance);
         } else {
             const auto& a = args.plain;
+            CheckpointResources(GpuCheckpoint(cmdbuf, pipeline, SotcCheckpoints::Kind::Draw, a.vertexCount, a.instanceCount,
+                          a.firstInstance)); // sotc
             cmdbuf.draw(a.vertexCount, a.instanceCount, a.firstVertex, a.firstInstance);
         }
+        GcnAfterOp(*pipeline); // sotc: SOTC_GCN_BARRIER
         DebugState.IncDrawCall();
         {
             const SotcOpPhases::Scope ph{SotcOpPhases::PhReset}; // sotc: SOTC_OP_PHASES
@@ -3472,6 +3605,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDynamicState}; // sotc: SOTC_OP_PHASES
         UpdateDynamicState(pipeline, is_indexed, prepared);
     }
+    GcnBeforeOp(scheduler); // sotc: SOTC_GCN_BARRIER (before the pass)
     scheduler.BeginRendering(state);
     if (SotcDrawMerge::On()) { // sotc: SOTC_DRAW_MERGE_STATS (measurement only)
         DrawMergeNote(state, pipeline, is_indexed, true, arg_address + offset, stride, max_count,
@@ -3484,6 +3618,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
 
+        CheckpointResources(GpuCheckpoint(cmdbuf, pipeline,
+                      count_address != 0 ? SotcCheckpoints::Kind::DrawIndexedIndirectCount
+                                         : SotcCheckpoints::Kind::DrawIndexedIndirect,
+                      arg_address + offset, max_count, count_address != 0 ? count_address : stride)); // sotc
         if (count_address != 0) {
             cmdbuf.drawIndexedIndirectCount(buffer->Handle(), base, count_buffer->Handle(),
                                             count_offset, max_count, stride);
@@ -3494,6 +3632,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     } else {
         ASSERT(sizeof(VkDrawIndirectCommand) == stride);
 
+        CheckpointResources(GpuCheckpoint(cmdbuf, pipeline,
+                      count_address != 0 ? SotcCheckpoints::Kind::DrawIndirectCount
+                                         : SotcCheckpoints::Kind::DrawIndirect,
+                      arg_address + offset, max_count, count_address != 0 ? count_address : stride)); // sotc
         if (count_address != 0) {
             cmdbuf.drawIndirectCount(buffer->Handle(), base, count_buffer->Handle(), count_offset,
                                      max_count, stride);
@@ -3503,6 +3645,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         DebugState.IncDrawCall();
     }
 
+    GcnAfterOp(*pipeline); // sotc: SOTC_GCN_BARRIER
     // Record the indirect argument reads so a later write to the same range (e.g. a WRITE_DATA
     // packet uploading the next draw's arguments) waits for this draw instead of racing it.
     runtime.AccessBuffer(buffer, base, stride * max_count,
@@ -3642,6 +3785,9 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     if (!pipeline) {
         SotcStats::Drop(2, cs_program.Address<uintptr_t>(), 0);
         return;
+    }
+    if (SotcGcnCensus::On()) { // sotc: SOTC_GCN_CENSUS (measurement only)
+        CensusNote(pipeline, SotcGcnCensus::kDispatch);
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
@@ -3806,7 +3952,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
         runtime.FlushBarriers();
     }
 
-    scheduler.EndRendering();
+    GcnEndRendering(scheduler);
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
         pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
@@ -3814,7 +3960,11 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
+    CheckpointResources(GpuCheckpoint(cmdbuf, pipeline, SotcCheckpoints::Kind::Dispatch, cs_program.dim_x, cs_program.dim_y,
+                  cs_program.dim_z)); // sotc
+    GcnBeforeOp(scheduler); // sotc: SOTC_GCN_BARRIER (outside a pass: the pending global barrier goes first)
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    GcnAfterOp(*pipeline); // sotc: SOTC_GCN_BARRIER
     CopyGpuResults(cmdbuf); // sotc: PC-native GPU result copies (native_copies.h)
     if (async_value != 0) {
         scheduler.AsyncEnd();
@@ -3852,6 +4002,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     if (!pipeline) {
         SotcStats::Drop(2, cs_program.Address<uintptr_t>(), 0);
         return;
+    }
+    if (SotcGcnCensus::On()) { // sotc: SOTC_GCN_CENSUS (measurement only)
+        CensusNote(pipeline, SotcGcnCensus::kDispatchIndirect);
     }
 
     // sotc: SOTC_CS_STATS (measurement only)
@@ -3913,7 +4066,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
         runtime.FlushBarriers();
     }
 
-    scheduler.EndRendering();
+    GcnEndRendering(scheduler);
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
         pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
@@ -3921,7 +4074,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
+    CheckpointResources(GpuCheckpoint(cmdbuf, pipeline, SotcCheckpoints::Kind::DispatchIndirect, address, offset, 0)); // sotc
+    GcnBeforeOp(scheduler); // sotc: SOTC_GCN_BARRIER
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    GcnAfterOp(*pipeline); // sotc: SOTC_GCN_BARRIER
     CopyGpuResults(cmdbuf); // sotc: PC-native GPU result copies (native_copies.h)
     if (async_value != 0) {
         scheduler.AsyncEnd();
@@ -4308,6 +4464,12 @@ static PrBuffer PrResolveBuffer(const Shader::Info& stage, const Shader::BufferR
     if (SotcShaderExtent::kEnabled) {
         size = SotcShaderExtent::Limit(desc.is_written, desc.sotc_read_extent, out.vsize, size);
     }
+    // sotc: SOTC_BLOCK_EXTENT, as BindBuffers.
+    if (!desc.is_written && out.vsize >= 0xFFFF0000ULL && SotcProbes::BlockExtentOn()) {
+        if (u64 remaining = 0; SotcProbes::BlockRemaining(out.base, &remaining) && remaining < size) {
+            size = remaining;
+        }
+    }
     out.size = size;
     out.computed = true;
     return out;
@@ -4571,7 +4733,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             draw_packet.mirror_device_base = windows.empty() ? 0 : windows.front().device_base;
             draw_packet.mirror_size = windows.empty() ? 0 : windows.front().size;
         }
-        draw_packet.arena_guest_base = 0;
+        // sotc: ARCH-GCN-NATIVE (D6). The globals buffer's device address rides in the arena_guest_base word (push
+        // offset 88) of the gcn pipelines; arena_size stays 0 (the arena window is empty, in_arena tests fail). The
+        // packet is pushed whole for every packet pipeline, heap stages included (BindResources). Verify (=2) writes it
+        // too: its pipelines read the globals as well.
+        // sotc: the pipeline's own profile, not the live ProfileValue(): a pipeline compiled with gcn_buf/gcn_tex keeps
+        // reading the globals even after a refusal lowered the stage (its shader would otherwise read address 0).
+        const bool gcn_packet = pipeline->GetProfile().gcn_buf != 0 || pipeline->GetProfile().gcn_tex != 0;
+        draw_packet.arena_guest_base = gcn_packet ? SotcGcn::Globals::Address() : 0;
         draw_packet.arena_device_base = 0;
         draw_packet.arena_size = 0;
     }
@@ -4612,7 +4781,26 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // sotc: the heap resolutions of this op: TableMemo::Resolve of each heap stage, as the op binds them. Made here, or
     // deferred past the frame cache's lookup (SOTC_BIND_CACHE_HEAP: a hit replays the held ones, see below).
     u64 heap_vs_address = 0;
+    // sotc: SOTC_GCN_TEX (S3). A gcn_tex == 1 heap stage finds its slots in the GPU T# table (no index table read).
+    // SOTC_GCN_TEX_SKIP_RESOLVE=1 also skips its per-op Resolve, with the static barriers (S5) on. heap_binds stays empty
+    // then, so BindHeapImages runs neither the transitions nor the classic decline cases (render target of the draw,
+    // stencil image, rebind, composite op): that mode is for measurement until those cases are events (see
+    // GCN-NATIVE-DECISIONS.md). Unset: Resolve runs and prefills the table (NoteResolved), the shader reads the table.
+    static const bool gcn_tex_skip_resolve = [] {
+        const char* v = std::getenv("SOTC_GCN_TEX_SKIP_RESOLVE");
+        return v && v[0] == '1';
+    }();
+    // sotc: only when every image binding of the heap stages is in the table (gcn_rules.h TableStage). A binding the
+    // table cannot express still reads the index table, so its stage keeps Resolve.
+    const bool gcn_tex_skip =
+        gcn_tex_skip_resolve && pipeline->GetProfile().gcn_tex == 1 && SotcGcn::Barrier::On() &&
+        (heap_stage || heap_vs_stage) && (!heap_stage || Shader::Gcn::TableStage(*heap_stage)) &&
+        (!heap_vs_stage || Shader::Gcn::TableStage(*heap_vs_stage));
     const auto resolve_heap_tables = [&]() -> bool {
+        if (gcn_tex_skip) {
+            draw_packet.index_table_address = 0;
+            return true;
+        }
         if (heap_stage) {
             // sotc: SOTC_PR_KEYS: the memo key the prep thread computed for this stage (null: KeyOf here).
             const SotcArch::TableMemo::PreKey* heap_key =
@@ -5194,6 +5382,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         if (staged) {
             binding.unified = 0;
         }
+        if (stage->sw_stage == Shader::SwStage::Vertex) { // sotc: SOTC_VS_BINDING_BASE
+            binding = Shader::Backend::VsStartBindings(binding, staged);
+        }
         // sotc: bindless samplers have no descriptor write (BindTextures sets their push slots).
         const size_t num_sampler_writes =
             IsBindlessStage(instance, *stage) ? 0 : stage->samplers.size();
@@ -5598,7 +5789,7 @@ void Rasterizer::PacketAddrReplay(const std::vector<PacketAddr>& ranges) {
         const bool touch_ok =
             r.size == 0 ||
             (SotcArch::AddrTable::On()
-                 ? SotcArch::AddrTable::Touch(buffer_cache, scheduler, r.addr, r.size, r.written)
+                 ? GcnTouch(buffer_cache, scheduler, r.addr, r.size, r.written)
                  : SotcArch::Mirror::Touch(scheduler, r.addr, r.size));
         if (!touch_ok) {
             static std::atomic<u64> replay_touch_refused{};
@@ -8117,7 +8308,7 @@ void Rasterizer::SotcMirrorAfterOp() {
     // sotc: A2b (aliases). Between the arena and the window there is no copy to order: a write through one alias is
     // read through the other after a memory barrier, recorded here after the op that wrote.
     if (wrote && SotcArch::Mirror::AliasActive()) {
-        scheduler.EndRendering();
+        GcnEndRendering(scheduler);
         SotcArch::Mirror::AliasBarrier(scheduler.CommandBuffer());
     }
 }
@@ -8126,7 +8317,7 @@ void Rasterizer::SotcMirrorFromBuffer(const VideoCore::Buffer& buffer, u64 offse
     if (!SotcArch::Mirror::On() || SotcArch::AddrTable::On() || size == 0) { // sotc: not in table mode (addr_table.h)
         return;
     }
-    scheduler.EndRendering();
+    GcnEndRendering(scheduler);
     // The write of the op (or of the copy) is made visible to the transfer read by the runtime's barriers.
     if (runtime.IsBufferAccessed(&buffer, offset, size)) {
         runtime.FlushBarriers();
@@ -8150,7 +8341,7 @@ void Rasterizer::SotcMirrorToBuffer(VAddr addr, u64 size) {
     }
     // Obtained for writing: the range is GPU-modified from here on, so a CPU read downloads it.
     const auto [buffer, offset] = buffer_cache.ObtainBuffer(addr, static_cast<u32>(size), true);
-    scheduler.EndRendering();
+    GcnEndRendering(scheduler);
     if (runtime.IsBufferAccessed(buffer, offset, size, true)) {
         runtime.FlushBarriers();
     }
@@ -8703,7 +8894,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const bool touch_ok =
                     size == 0 || in_arena ||
                     (SotcArch::AddrTable::On()
-                         ? SotcArch::AddrTable::Touch(buffer_cache, scheduler, vbase, size, desc.is_written)
+                         ? GcnTouch(buffer_cache, scheduler, vbase, size, desc.is_written)
                          : SotcArch::Mirror::Touch(scheduler, vbase, size));
                 if (!touch_ok) {
                     static std::atomic<u64> touch_refused{};
@@ -8823,6 +9014,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // its loads were proven to stay in at translation (sotc_shader_extent.h).
                 if (SotcShaderExtent::kEnabled && !pb) {
                     size = SotcShaderExtent::Limit(desc.is_written, desc.sotc_read_extent, vsize, size);
+                }
+                // sotc: SOTC_BLOCK_EXTENT. An unbounded read-only V# stops at the end of the game's allocator block
+                // its base is in (a game object never crosses its block; sotc/probes.h BlockRemaining).
+                if (!pb && !desc.is_written && vsize >= 0xFFFF0000ULL && SotcProbes::BlockExtentOn()) {
+                    if (u64 remaining = 0; SotcProbes::BlockRemaining(vbase, &remaining) && remaining < size) {
+                        size = remaining;
+                    }
                 }
                 if (size != vsize) {
                     LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
@@ -8990,6 +9188,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     BdaNoteDirect(same ? BdaDirect::Verified : BdaDirect::Mismatch);
                 }
                 const auto [buffer, offset] = obtained;
+                // sotc: ARCH-GCN-NATIVE S1 (SOTC_GCN_MEM=2): the guest page table's answer for this range against the
+                // buffer ObtainBuffer just gave (Mem::VerifyBinding; mode 1 does nothing).
+                if (SotcGcn::Mem::Verify()) {
+                    SotcGcn::Mem::VerifyBinding(vbase, size, buffer, offset, desc.is_written);
+                }
                 // sotc: SOTC_SHADER_ADDR=2: the address the shader computes for this bind, against the one
                 // ObtainBuffer just gave. This run is the old path.
                 if (SotcArch::ShaderAddr::Verify() && shader_addressed(desc)) {
@@ -11864,6 +12067,206 @@ void Rasterizer::WarmTexture(const void* data, size_t size) {
         image_id = depth_image_id;
     }
     (void)texture_cache.FindTexture(image_id, desc);
+}
+
+// sotc: SOTC_GPU_CHECKPOINTS: the buffers and images command `seq` binds (bound_buffers, the vertex/index reads,
+// bound_images), for the device lost report (sotc_checkpoints.h). seq 0: the switch is off.
+void Rasterizer::CheckpointResources(u64 seq) {
+    if (seq == 0) {
+        return;
+    }
+    std::array<SotcCheckpoints::Resource, 64> res{};
+    u32 n = 0;
+    const auto add = [&](u64 addr, u64 size, u64 handle, u8 type, const VideoCore::Buffer* buffer, u64 offset) {
+        if (n < res.size()) {
+            const u64 base = buffer && buffer->HasBufferDeviceAddress() ? buffer->BufferDeviceAddress() : 0;
+            res[n++] = {addr, size, handle, type, base ? base + offset : 0, base ? buffer->SizeBytes() : 0, base};
+        }
+    };
+    for (const auto& b : bound_buffers) {
+        add(b.addr != 0 ? b.addr : (b.buffer ? b.buffer->CpuAddr() + b.offset : 0), b.size,
+            b.buffer ? reinterpret_cast<u64>(static_cast<VkBuffer>(b.buffer->Handle())) : 0,
+            b.is_written ? SotcCheckpoints::kBufferWritten : SotcCheckpoints::kBufferRead, b.buffer, b.offset);
+    }
+    for (const auto& b : fixed_function_reads) {
+        add(b.addr != 0 ? b.addr : (b.buffer ? b.buffer->CpuAddr() + b.offset : 0), b.size,
+            b.buffer ? reinterpret_cast<u64>(static_cast<VkBuffer>(b.buffer->Handle())) : 0,
+            SotcCheckpoints::kVertexIndex, b.buffer, b.offset);
+    }
+    for (const auto id : bound_images) {
+        if (!id) {
+            continue;
+        }
+        const auto& image = texture_cache.GetImage(id);
+        add(image.info.guest_address, image.info.guest_size,
+            reinterpret_cast<u64>(static_cast<VkImage>(image.GetImage())), SotcCheckpoints::kImage, nullptr, 0);
+    }
+    // The pipeline bound for the command (a destroyed one is a use after free on the GPU).
+    if (const Pipeline* bound = t_checkpoint_pipeline) {
+        add(0, 0, reinterpret_cast<u64>(static_cast<VkPipeline>(bound->Handle())), SotcCheckpoints::kPipeline, nullptr,
+            0);
+        // The permutation of each graphics stage (key stage hash = HashCombine(program hash, permutation)): as a
+        // pipeline row, addr = stage << 32 | permutation (0xFFFF: not found in 0..63), size = the program hash.
+        if (!bound->IsCompute()) {
+            const auto& key = static_cast<const GraphicsPipeline*>(bound)->GetGraphicsKey();
+            const auto stages = bound->GetStages();
+            for (u32 s = 0; s < stages.size() && s < key.stage_hashes.size(); ++s) {
+                if (!stages[s]) {
+                    continue;
+                }
+                u32 perm = 0xFFFF;
+                for (u32 p = 0; p < 64; ++p) {
+                    if (HashCombine(stages[s]->pgm_hash, u64{p}) == key.stage_hashes[s]) {
+                        perm = p;
+                        break;
+                    }
+                }
+                add((u64{s} << 32) | perm, stages[s]->pgm_hash, key.stage_hashes[s], SotcCheckpoints::kPipeline, nullptr,
+                    0);
+            }
+        }
+    }
+    // The descriptor writes as they go to the set: a binding of the layout missing here was never written.
+    for (u32 i = 0; i < set_write_index && i < set_writes.size(); ++i) {
+        const auto& w = set_writes[i];
+        const u64 key = u64{w.dstBinding} | (u64{static_cast<u32>(w.descriptorType)} << 32);
+        if (w.pBufferInfo) {
+            add(key, w.pBufferInfo->range, reinterpret_cast<u64>(static_cast<VkBuffer>(w.pBufferInfo->buffer)),
+                SotcCheckpoints::kDescriptor, nullptr, 0);
+            res[n - 1].gpu = w.pBufferInfo->offset;
+        } else if (w.pImageInfo) {
+            // A sampler write has no view: its sampler handle goes in gpu (offset column).
+            add(key, static_cast<u64>(static_cast<VkImageLayout>(w.pImageInfo->imageLayout)),
+                reinterpret_cast<u64>(static_cast<VkImageView>(w.pImageInfo->imageView)),
+                SotcCheckpoints::kDescriptor, nullptr, 0);
+            res[n - 1].gpu = reinterpret_cast<u64>(static_cast<VkSampler>(w.pImageInfo->sampler));
+        } else {
+            add(key, 0, 0, SotcCheckpoints::kDescriptor, nullptr, 0);
+        }
+    }
+    SotcCheckpoints::NoteResources(seq, res.data(), n);
+}
+
+// sotc: SOTC_DRAW_GATE (draw_gate.h). The guest ranges the draw reads (read-only shader buffers, fetch shader vertex
+// buffers, the index buffer), each with the bytes its bind would upload now, and the draw's kind: SotcDrawGate::Decide
+// says whether it waits for the staged upload. Ranges are capped at 64 MiB (an unbounded V#).
+bool Rasterizer::DrawGateDefers(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset) {
+    const auto& regs = liverpool->DrawRegs();
+    std::array<SotcDrawGate::Range, 48> ranges{};
+    size_t n = 0;
+    bool writes = StagesWriteMemory(*pipeline);
+    const auto add = [&](VAddr addr, u64 size) {
+        if (addr == 0 || size == 0 || n >= ranges.size()) {
+            return;
+        }
+        size = std::min<u64>(size, 64_MB);
+        // SOTC_PC_RING=8: a range inside the imported arena is read in host memory (BufferCache::PcHostBind), never
+        // uploaded, though its pages stay CPU-modified (no tracking there): nothing to wait for.
+        const bool host_served = SotcPcRing::Mode() == 8 && SotcPcRing::ArenaRelation(addr, size) == 1;
+        ranges[n++] = {addr, size, host_served ? 0 : buffer_cache.PendingUploadBytes(addr, size)};
+    };
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& desc : stage->buffers) {
+            if (desc.IsSpecial()) {
+                continue;
+            }
+            if (desc.is_written) {
+                writes = true;
+                continue;
+            }
+            // The range BindBuffers will sync: the V# clamped as there (mapping, unbounded window, read and shader
+            // extents, SOTC_BLOCK_EXTENT), so an unbounded V# does not count memory no bind uploads.
+            const PrBuffer b = PrResolveBuffer(*stage, desc, memory, pipeline->GetProfile());
+            if (b.computed && !b.shader_addressed) {
+                add(b.base, b.size);
+            }
+        }
+    }
+    if (const auto* vs = pipeline->GetStages()[static_cast<u32>(Shader::SwStage::Vertex)]) {
+        for (const auto& attrib : pipeline->GetFetchShader().attributes) {
+            const auto sharp = attrib.GetSharp(*vs);
+            add(sharp.base_address, sharp.GetSize());
+        }
+    }
+    if (is_indexed) {
+        const u32 index_size = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+        add(regs.index_base_address.Address<VAddr>() + u64{index_offset} * index_size,
+            u64{regs.num_indices} * index_size);
+    }
+    const bool full_screen = regs.num_indices <= 6;
+    const bool may_follow = !writes && !full_screen;
+    const bool equal_depth =
+        regs.depth_control.depth_enable && regs.depth_control.depth_func == AmdGpu::CompareFunc::Equal;
+    const bool may_defer = may_follow && !equal_depth;
+    return SotcDrawGate::Decide(ranges.data(), n, may_defer, may_follow,
+                                SotcStats::flip_count.load(std::memory_order_relaxed));
+}
+
+// sotc: SOTC_GCN_CENSUS (gcn_census.h, stage S0 of ARCH-GCN-NATIVE.md). What this op binds, from its stages and the
+// sharps as the bind would read them (buffers through PrResolveBuffer, the same clamps as BindBuffers). Measurement only.
+void Rasterizer::CensusNote(const Pipeline* pipeline, u8 kind) {
+    SotcGcnCensus::Op op{};
+    op.kind = kind;
+    op.writes_memory = StagesWriteMemory(*pipeline);
+    std::array<u64, 64> tsharps{};
+    std::array<u64, 32> ssharps{};
+    u32 nt = 0, ns = 0;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        op.storage |= stage->has_storage_images;
+        op.fmask |= !stage->fmasks.empty();
+        op.dma |= stage->uses_dma;
+        for (const auto& desc : stage->buffers) {
+            if (desc.IsSpecial()) {
+                ++op.buf_special;
+                continue;
+            }
+            if (desc.is_written) {
+                ++op.buf_written;
+            } else if (desc.is_formatted) {
+                ++op.buf_formatted;
+            } else {
+                ++op.buf_plain;
+            }
+            const PrBuffer b = PrResolveBuffer(*stage, desc, memory, pipeline->GetProfile());
+            if (!b.computed || b.base == 0 || b.size == 0) {
+                continue;
+            }
+            op.buf_bytes += b.size;
+            const u32 bucket = b.size < 4_KB ? 0 : b.size < 64_KB ? 1 : b.size < 1_MB ? 2 : b.size < 16_MB ? 3 : 4;
+            ++op.size_hist[bucket];
+            if (SotcPcRing::Mode() == 8 && SotcPcRing::ArenaRelation(b.base, b.size) == 1) {
+                ++op.buf_host;
+            }
+        }
+        for (const auto& desc : stage->images) {
+            const AmdGpu::Image tsharp = desc.GetSharp(*stage);
+            (desc.is_written ? op.img_storage : op.img_sampled)++;
+            op.img_array += desc.is_array;
+            op.img_desc_array += desc.array_size != 0;
+            const auto type = tsharp.GetType();
+            op.img_3d += type == AmdGpu::ImageType::Color3D;
+            op.img_cube += type == AmdGpu::ImageType::Cube;
+            op.img_mip += tsharp.base_level != 0;
+            if (nt < tsharps.size()) {
+                tsharps[nt++] = XXH3_64bits(&tsharp, sizeof(tsharp));
+            }
+        }
+        for (const auto& desc : stage->samplers) {
+            const AmdGpu::Sampler ssharp = desc.GetSharp(*stage);
+            ++op.samplers;
+            if (ns < ssharps.size()) {
+                ssharps[ns++] = XXH3_64bits(&ssharp, sizeof(ssharp));
+            }
+        }
+    }
+    SotcGcnCensus::Note(op, tsharps.data(), nt, ssharps.data(), ns,
+                        SotcStats::flip_count.load(std::memory_order_relaxed));
 }
 
 } // namespace Vulkan

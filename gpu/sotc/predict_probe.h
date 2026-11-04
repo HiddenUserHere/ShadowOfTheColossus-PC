@@ -8,6 +8,7 @@
 
 namespace Shader {
 struct Info;
+struct RuntimeInfo;
 struct StageSpecialization;
 } // namespace Shader
 
@@ -30,6 +31,16 @@ void OnTranslate(const Shader::Info& info, const Shader::StageSpecialization& sp
 /// A pixel shader the warm-up restored from the disk cache (vk_pipeline_serialization.cpp LoadPipelineStage): its
 /// color layout joins its pass's set.
 void OnCachedProgram(const Shader::Info& info, const Shader::StageSpecialization& spec) noexcept;
+
+/// SOTC_PRETRANSLATE: the number of color layouts known for the pixel program's pass (SOTC_PREDICT_TABLE,
+/// SOTC_PREDICT_LAYOUTS), and layout `index` of them into rt (color targets, MRTZ mask, samples). False when the
+/// program, its pass or the index has no layout.
+size_t PixelLayoutCount(uint64_t hash) noexcept;
+bool PixelLayout(uint64_t hash, Shader::RuntimeInfo& rt, size_t index) noexcept;
+
+/// SOTC_PRETRANSLATE: the next OnTranslate calls of this thread are pre-translations (not draws): no layout is
+/// learned from them and nothing is counted.
+void SetPretranslating(bool on) noexcept;
 
 /// The 5 s report line (driver.cpp); nothing when the switch is off.
 void Report(std::string& out, double seconds);

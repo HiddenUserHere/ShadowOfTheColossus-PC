@@ -23,6 +23,8 @@
 #include "video_core/texture_cache/image_prefetch.h"
 #include "video_core/texture_cache/tc_fast.h" // sotc: SOTC_TC_FAST_LOOKUP (FindView)
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_checkpoints.h" // sotc: SOTC_GPU_CHECKPOINTS
+#include "video_core/sotc_arch/gcn_native.h" // sotc: SOTC_GCN_BARRIER (S5, GcnDropTransition)
 
 #include <vk_mem_alloc.h>
 
@@ -110,6 +112,8 @@ UniqueImage::~UniqueImage() {
 
 void UniqueImage::Destroy() {
     if (image) {
+        SotcCheckpoints::NoteFreed(reinterpret_cast<uint64_t>(static_cast<VkImage>(image)),
+                                   SotcCheckpoints::kImage); // sotc: SOTC_GPU_CHECKPOINTS
         vmaDestroyImage(allocator, static_cast<VkImage>(image), allocation);
         image = vk::Image{};
         allocation = {};
@@ -652,6 +656,37 @@ static Drop AccountBarrier(const Image::State& prev, vk::AccessFlags2 dst_mask) 
     return drop;
 }
 
+// sotc: SOTC_GCN_BARRIER (S5, D11). A shader-READ transition may be dropped (SotcGcn::Barrier::DropTransition). Its
+// hazards are the ones the global barrier orders: a shader write before it (AfterOp). Kept as they are:
+//  - a shader write (storage image): a read before it (WAR) is not ordered by the global barrier, so the barrier stays;
+//  - a transfer or attachment access on either side: copies are not ops, and a render target's writes are ordered by
+//    the pass end only when the pass ends first; the barrier stays as it was;
+//  - a feedback loop layout.
+static bool GcnDropTransition(vk::ImageLayout from, vk::ImageLayout to, vk::AccessFlags2 prev_mask,
+                              vk::AccessFlags2 dst_mask) {
+    if (!SotcGcn::Barrier::On()) {
+        return false;
+    }
+    constexpr auto shader_read = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderSampledRead |
+                                 vk::AccessFlagBits2::eShaderStorageRead;
+    constexpr auto shader_write = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite;
+    constexpr auto other_access = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite |
+                                  vk::AccessFlagBits2::eColorAttachmentRead |
+                                  vk::AccessFlagBits2::eColorAttachmentWrite |
+                                  vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                  vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                  vk::AccessFlagBits2::eInputAttachmentRead;
+    if ((dst_mask & shader_read) == vk::AccessFlags2{} || (dst_mask & shader_write) != vk::AccessFlags2{} ||
+        (dst_mask & other_access) != vk::AccessFlags2{} || (prev_mask & other_access) != vk::AccessFlags2{} ||
+        // sotc: SOTC_GCN_BARRIER. A read after a shader write keeps its barrier: inside an open render pass the global
+        // barrier of AfterOp waits for the pass end, so only this barrier (which ends the pass) orders the read.
+        (prev_mask & shader_write) != vk::AccessFlags2{} ||
+        to == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT) {
+        return false;
+    }
+    return SotcGcn::Barrier::DropTransition(from, to);
+}
+
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                         vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
@@ -662,6 +697,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     const bool had_subresources = !subresource_states.empty();
     bool subresources_changed = false;
     Drop drop_kind = Drop::None; // sotc: A1, the full-resource barrier's drop (merged below when dropped)
+    bool full_gcn_drop = false;  // sotc: SOTC_GCN_BARRIER, the full-resource barrier's drop (merged below when dropped)
 
     const bool needs_partial_transition =
         subres_range &&
@@ -704,7 +740,9 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                 if (state.layout != dst_layout || state.access_mask != dst_mask ||
                     (is_write && !SkipSameGeneral(*this, state.layout, dst_layout, state.access_mask, dst_mask))) {
                     const Drop drop = AccountBarrier(state, dst_mask); // sotc: A1
-                    if (drop == Drop::None) barriers.emplace_back(vk::ImageMemoryBarrier2{
+                    // sotc: SOTC_GCN_BARRIER. A dropped barrier emits nothing; the state below is set as if recorded.
+                    const bool gcn_drop = drop == Drop::None && GcnDropTransition(state.layout, dst_layout, state.access_mask, dst_mask);
+                    if (drop == Drop::None && !gcn_drop) barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = state.pl_stage,
                         .srcAccessMask = state.access_mask,
                         .dstStageMask = dst_stage,
@@ -726,10 +764,10 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                             state.access_mask != dst_mask ||
                                             state.pl_stage != dst_stage;
                     state.layout = dst_layout;
-                    if (drop == Drop::None) {
+                    if (drop == Drop::None && !gcn_drop) {
                         state.access_mask = dst_mask;
                         state.pl_stage = dst_stage;
-                    } else { // sotc: A1, the reads already tracked still come before a later write
+                    } else { // sotc: A1 and SOTC_GCN_BARRIER drops: the reads already tracked still come before a later write
                         state.access_mask |= dst_mask;
                         state.pl_stage |= dst_stage;
                     }
@@ -750,7 +788,9 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
             return;
         }
         drop_kind = AccountBarrier(last_state, dst_mask); // sotc: A1
-        if (drop_kind == Drop::None) barriers.emplace_back(vk::ImageMemoryBarrier2{
+        // sotc: SOTC_GCN_BARRIER. A dropped barrier emits nothing; the state below is set as if recorded.
+        full_gcn_drop = drop_kind == Drop::None && GcnDropTransition(last_state.layout, dst_layout, last_state.access_mask, dst_mask);
+        if (drop_kind == Drop::None && !full_gcn_drop) barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
             .srcAccessMask = last_state.access_mask,
             .dstStageMask = dst_stage,
@@ -771,7 +811,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     }
 
     last_state.layout = dst_layout;
-    if (drop_kind == Drop::None) {
+    if (drop_kind == Drop::None && !full_gcn_drop) {
         last_state.access_mask = dst_mask;
         last_state.pl_stage = dst_stage;
     } else { // sotc: A1, a dropped read keeps the stages and accesses of the reads before it

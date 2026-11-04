@@ -756,6 +756,10 @@ public:
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
+    /// sotc: SOTC_GCN_SYNC. The per-submit freshness pass (gcn_sync.cpp): under the cache lock, RefreshImage when the
+    /// CPU changed the image's guest memory (CpuDirty). Returns true when a refresh ran. Reentrant with the lock.
+    bool SotcRefreshCpuDirty(Image& image);
+
     /// Retrieves the sampler that matches the provided S# descriptor. With bindless samplers,
     /// `bindless_slot` (when given) receives its heap slot, or 0 (the default sampler) if none.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,

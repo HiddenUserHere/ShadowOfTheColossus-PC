@@ -4,6 +4,7 @@
 // that the placements update, and dirty 4 KiB chunks uploaded on the upload command buffer (it runs before the
 // commands of the submit that uses them).
 #include <atomic>
+#include <bit> // sotc: SOTC_GCN_SYNC (ForEachStalePlaced: countr_zero / countr_one)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_arch/addr_table.h"
+#include "video_core/sotc_arch/gcn_native.h" // sotc: SOTC_GCN_MEM (Mode, Refuse)
 #include "video_core/sotc_arch/shader_addr.h"
 #include "video_core/sotc_arch/sotc_arch.h"
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (TracksGuestPages: the written fast path)
@@ -259,9 +261,30 @@ u32 FindDeviceLocalType(const vk::PhysicalDeviceMemoryProperties& props, u32 typ
 
 } // namespace
 
+namespace {
+
+// sotc: SOTC_GCN_MEM. The table was asked for by its own two switches (the run that always refused by exit). A run that
+// asked for it through SOTC_GCN_MEM alone refuses that stage instead, and goes on without the table.
+bool TableAsked() {
+    static const bool asked = SwitchMode("SOTC_ADDR_TABLE") != 0 && SwitchMode("SOTC_SHADER_ADDR") != 0;
+    return asked;
+}
+
+// sotc: an Init failure. Exits when the table was asked for by its own switches; otherwise refuses SOTC_GCN_MEM only.
+void InitFailed(const char* reason) {
+    // SOTC_SHADER_ADDR with GCN_MEM is mode 3 (the table): without the table the shader would address the mirror window,
+    // which this run does not create. Exit, like the table's own switches.
+    if (TableAsked() || SwitchMode("SOTC_SHADER_ADDR") != 0) {
+        Refuse(reason);
+    }
+    SotcGcn::Refuse(SotcGcn::Stage::Mem, reason);
+}
+
+} // namespace
+
 bool On() {
-    static const bool on = SwitchMode("SOTC_ADDR_TABLE") != 0 && SwitchMode("SOTC_SHADER_ADDR") != 0;
-    return on;
+    static const bool table = TableAsked();
+    return table || SotcGcn::Mode(SotcGcn::Stage::Mem) != 0; // sotc: SOTC_GCN_MEM (read on every call, one load)
 }
 
 void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler) {
@@ -269,7 +292,8 @@ void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler) {
         return;
     }
     if (!instance.SotcBufferDeviceAddress()) {
-        Refuse("the device has no buffer device address");
+        InitFailed("the device has no buffer device address");
+        return;
     }
     const vk::Device device = instance.GetDevice();
     const u64 bytes = NumPages * sizeof(u64);
@@ -279,12 +303,14 @@ void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler) {
         .sharingMode = vk::SharingMode::eExclusive,
     });
     if (created != vk::Result::eSuccess) {
-        Refuse("the table buffer could not be created");
+        InitFailed("the table buffer could not be created");
+        return;
     }
     const vk::MemoryRequirements req = device.getBufferMemoryRequirements(*buffer);
     const u32 type = FindDeviceLocalType(instance.GetMemoryProperties(), req.memoryTypeBits);
     if (type == instance.GetMemoryProperties().memoryTypeCount) {
-        Refuse("no memory type for the table buffer");
+        InitFailed("no memory type for the table buffer");
+        return;
     }
     // A buffer with a device address needs its memory allocated with the device address flag.
     const vk::StructureChain alloc_chain = {
@@ -293,10 +319,12 @@ void Init(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler) {
     };
     auto [alloc, memory] = device.allocateMemoryUnique(alloc_chain.get<vk::MemoryAllocateInfo>());
     if (alloc != vk::Result::eSuccess) {
-        Refuse("the table memory could not be allocated");
+        InitFailed("the table memory could not be allocated");
+        return;
     }
     if (device.bindBufferMemory(*buffer, *memory, 0) != vk::Result::eSuccess) {
-        Refuse("the table memory could not be bound");
+        InitFailed("the table memory could not be bound");
+        return;
     }
 
     auto state = std::make_unique<State>();
@@ -506,9 +534,19 @@ void OnPlace(VAddr addr, u64 size, vk::DeviceAddress device_addr, const VideoCor
     if (!s || size == 0 || addr < WindowBase || addr - WindowBase > WindowSize - size) {
         return;
     }
+    if (device_addr == 0) {
+        // sotc: SOTC_GCN_MEM: no device address (no BDA on the run): an entry of 0 + offset would point at garbage.
+        OnRemove(addr, size);
+        return;
+    }
     ClearClean(addr, size); // before the entries change: a fast read must not see a clean page with the old entry
     std::scoped_lock lock{g_mutex};
     SetRangeLocked(*s, addr, size, device_addr, OwnerIdLocked(*s, owner));
+    // sotc: SOTC_GCN_SYNC. A second clear after the change: a MarkClean whose sequence read came before the first clear
+    // must still see the sequence move, or see the dirty entries under g_mutex (see the proof at Touch, step 1).
+    if (SotcGcn::Sync::On()) {
+        ClearClean(addr, size);
+    }
 }
 
 void OnRemove(VAddr addr, u64 size) {
@@ -524,6 +562,9 @@ void OnRemove(VAddr addr, u64 size) {
     for (u64 page = first; page <= last; ++page) {
         SetEntryLocked(*s, page, 0, 0);
     }
+    if (SotcGcn::Sync::On()) { // sotc: SOTC_GCN_SYNC, the second clear after the change (see OnPlace)
+        ClearClean(addr, size);
+    }
 }
 
 vk::DeviceAddress Translate(VAddr addr) {
@@ -534,6 +575,100 @@ vk::DeviceAddress Translate(VAddr addr) {
     std::scoped_lock lock{g_mutex};
     const u64 entry = s->shadow[(addr - WindowBase) >> PageShift];
     return entry == 0 ? 0 : entry + (addr & (PageSize - 1));
+}
+
+// sotc: SOTC_GCN_MEM / SOTC_GCN_SYNC (addr_table.h). Lock-free: the bit words only.
+
+bool AllPlaced(VAddr addr, u64 size) noexcept {
+    if (size == 0 || addr < WindowBase || addr - WindowBase > WindowSize - size) {
+        return false;
+    }
+    const u64 first = (addr - WindowBase) >> PageShift;
+    const u64 last = (addr - WindowBase + size - 1) >> PageShift;
+    bool all = true;
+    ForWords(first, last, [&](u64 w, u64 mask) {
+        if (all && (g_placed[w].load(std::memory_order_seq_cst) & mask) != mask) {
+            all = false;
+        }
+    });
+    return all;
+}
+
+void ForEachStalePlaced(void (*fn)(void* user, VAddr addr, u64 size), void* user) {
+    if (!fn) {
+        return;
+    }
+    const auto emit = [fn, user](u64 begin, u64 end) {
+        fn(user, WindowBase + (begin << PageShift), (end - begin) << PageShift);
+    };
+    // A run that reaches bit 63 of a word may continue at bit 0 of the next one: it stays open until a word breaks it.
+    bool open = false;
+    u64 begin = 0; // first page of the open or current run
+    for (u64 w = 0; w < kWords; ++w) {
+        const u64 placed = g_placed[w].load(std::memory_order_seq_cst);
+        const u64 stale = placed == 0 ? 0 : placed & ~g_clean[w].load(std::memory_order_seq_cst);
+        if (open && (stale & 1) == 0) {
+            emit(begin, w * 64); // the run ended at the boundary
+            open = false;
+        }
+        if (stale == 0) {
+            continue; // the common case: nothing stale in these 64 pages
+        }
+        u64 bit = 0;
+        while (bit < 64) {
+            const u64 rest = stale >> bit;
+            if (rest == 0) {
+                break;
+            }
+            const u64 start = bit + static_cast<u64>(std::countr_zero(rest));
+            const u64 end = start + static_cast<u64>(std::countr_one(stale >> start)); // <= 64
+            if (!(start == 0 && open)) {
+                begin = w * 64 + start; // a new run (an open one continues at bit 0)
+            }
+            if (end == 64) {
+                open = true;
+            } else {
+                emit(begin, w * 64 + end);
+                open = false;
+            }
+            bit = end;
+        }
+    }
+    if (open) {
+        emit(begin, NumPages);
+    }
+}
+
+u64 CleanSequence() noexcept {
+    return g_dirty_seq.load(std::memory_order_seq_cst);
+}
+
+bool MarkClean(VAddr addr, u64 size, u64 sequence) noexcept {
+    State* s = g_state.get();
+    if (!s || !AllPlaced(addr, size)) {
+        return false;
+    }
+    const u64 first = (addr - WindowBase) >> PageShift;
+    const u64 last = (addr - WindowBase + size - 1) >> PageShift;
+    {
+        // An entry the device does not hold yet (a pending chunk upload): the pages stay stale.
+        std::scoped_lock lock{g_mutex};
+        if (AnyDirtyLocked(*s, first, last)) {
+            return false;
+        }
+    }
+    // The Touch protocol (proof at Touch): set the bits (t), then a sequence change since `sequence` clears them again.
+    ForWords(first, last, [](u64 w, u64 mask) {
+        g_clean[w].fetch_or(mask, std::memory_order_seq_cst);
+    });
+    if (g_dirty_seq.load(std::memory_order_seq_cst) != sequence) {
+        ForWords(first, last, [](u64 w, u64 mask) {
+            g_clean[w].fetch_and(~mask, std::memory_order_seq_cst);
+        });
+        g_reverts.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
 }
 
 // sotc: SOTC_ADDR_VERTEX (see addr_table.h). The mode is read once, like On().

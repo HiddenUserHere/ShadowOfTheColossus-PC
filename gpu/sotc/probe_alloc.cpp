@@ -28,7 +28,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -190,6 +193,9 @@ struct NodeEntry {
 // All of the below is guarded by g_mutex, which is never held while calling into the guest (the
 // hooks run on game threads; the mutex only covers host-side bookkeeping and the OnAlloc feeds).
 std::mutex g_mutex;
+// sotc: SOTC_BLOCK_EXTENT. Every live tracked block by base (base -> size), for BlockRemaining on the draw thread.
+std::shared_mutex g_ext_mutex;
+std::map<uint64_t, uint64_t> g_ext;
 std::array<PoolRow, kMaxPools> g_pools{};
 size_t g_pool_count = 0;
 std::array<OwnerRow, kMaxOwners> g_owners{};
@@ -457,6 +463,10 @@ void AllocPost(GuestRegs& regs, void*) {
         g_dropped_allocs.fetch_add(1, std::memory_order_relaxed);
         return; // do not count an alloc whose matching free we could not track
     }
+    if (base != 0 && size != 0 && BlockExtentOn()) {
+        std::unique_lock ext_lock{g_ext_mutex};
+        g_ext[base] = size;
+    }
     // sotc: step 6. A CPU-only range is a CPUMemory pool (kind 1) that is not a GPU upload pool.
     // "staging-*" are the upload staging pools, which the GPU reads, so they are never CPU-only.
     const bool cpu_only = kind == 1 && std::strncmp(name, "staging", 7) != 0;
@@ -497,6 +507,10 @@ HookAction FreePre(GuestRegs& regs, void*) {
         return HookAction::Continue;
     }
     SotcMemClasses::OnFree(e.base); // sotc: step 6 (no-op for ranges it never tracked)
+    if (e.base != 0 && BlockExtentOn()) {
+        std::unique_lock ext_lock{g_ext_mutex};
+        g_ext.erase(e.base);
+    }
     SotcPcPlaceGlue::Global().OnFreeObserved(e.base, e.size); // sotc: SOTC_PC_PLACE
     SotcPcRing::OnFreeBlock(e.base); // sotc: SOTC_PC_RING
     SotcRbClass::OnFreeBlock(e.base); // sotc: SOTC_RB_CLASS
@@ -548,6 +562,28 @@ void RegisterAlloc() {
     SotcHooks::Handler freed;
     freed.pre = &FreePre;
     SotcHooks::RegisterHandler("FREE_BLOCK", freed);
+}
+
+bool BlockExtentOn() noexcept {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_BLOCK_EXTENT");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+bool BlockRemaining(uint64_t addr, uint64_t* remaining) noexcept {
+    std::shared_lock lock{g_ext_mutex};
+    auto it = g_ext.upper_bound(addr);
+    if (it == g_ext.begin()) {
+        return false;
+    }
+    --it;
+    if (addr - it->first >= it->second) {
+        return false;
+    }
+    *remaining = it->second - (addr - it->first);
+    return true;
 }
 
 // sotc: SOTC_VSIZE_PROBE. The live tracked block holding addr (linear scan of the node table, under the

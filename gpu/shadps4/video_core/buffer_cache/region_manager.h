@@ -948,6 +948,16 @@ public:
         return pages;
     }
 
+    /// sotc: SOTC_DRAW_GATE: CPU-modified pages in the range (the bytes a bind would upload), from an unlocked look
+    /// at the bits. A page that changes meanwhile only moves the estimate by a page.
+    u64 CountCpuModifiedPages(u64 offset, u64 size) noexcept {
+        u64 pages = 0;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            pages += std::popcount(__atomic_load_n(&cpu[index], __ATOMIC_RELAXED) & mask);
+        });
+        return pages;
+    }
+
     /// sotc: SOTC_WRITE_DECL pre-check (MemoryTracker::MaybeWriteProtected). Unlocked look at the
     /// bits of [offset, offset + size): true when a page is CPU-clean (its write watcher protects
     /// it) or, with GPU readbacks Precise (read watchers on GPU-modified pages), GPU-modified. The

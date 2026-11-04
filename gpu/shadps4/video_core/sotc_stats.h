@@ -1402,6 +1402,13 @@ inline std::atomic<uint64_t> frame_ns[FrameCauses]{};
 inline std::atomic<uint64_t> frame_compiles{0}; ///< shader modules and pipelines created
 /// sotc: shader cache preload at boot (loading screen bar): pipelines to load and loaded.
 inline std::atomic<uint32_t> warmup_total{0}, warmup_done{0};
+/// sotc: SOTC_PRETRANSLATE boot hold (PipelineCache::MaybeHoldForPretranslate): the shader preparation screen
+/// (bbport_overlay.cpp PrepScreen). Own counters, so the cache warm-up's bar never mixes with it. total grows while the
+/// game still loads shader files.
+inline std::atomic<bool> prep_active{false};
+inline std::atomic<uint32_t> prep_total{0}, prep_done{0};
+inline std::atomic<int64_t> prep_start_ms{0};
+inline std::atomic<uint32_t> prep_writes{0}; ///< shader cache files still being written (the hold waits for them)
 /// sotc: the boot's shader cache preload is over (the archive read-ahead waits for it: both
 /// on one hard disk made the loading screen last 2 minutes).
 inline std::atomic<bool> warmup_finished{false};

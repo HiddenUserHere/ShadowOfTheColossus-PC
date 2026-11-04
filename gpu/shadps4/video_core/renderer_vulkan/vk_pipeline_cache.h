@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <atomic>
 #include <array>
 #include <condition_variable>
@@ -12,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include "../../../sotc/pretranslate.h" // sotc: SOTC_PRETRANSLATE
 #include <unordered_set>
 #include <variant>
 #include <vector>
@@ -46,6 +48,27 @@ struct Info;
 
 namespace Vulkan {
 
+/// sotc: two translations of one program bind the same descriptors: the same resource kinds and counts. The
+/// rasterizer writes a draw's descriptors from the program's Info, so a permutation whose own Info differs (a
+/// SOTC_PRETRANSLATE variant whose translation found a flat buffer the program has not) must not join the program.
+inline bool SameBindingLayout(const Shader::Info& a, const Shader::Info& b) {
+    if (a.buffers.size() != b.buffers.size() || a.images.size() != b.images.size() ||
+        a.samplers.size() != b.samplers.size() || a.fmasks.size() != b.fmasks.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.buffers.size(); ++i) {
+        if (a.buffers[i].buffer_type != b.buffers[i].buffer_type) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.images.size(); ++i) {
+        if (a.images[i].NumBindings(a) != b.images[i].NumBindings(b) || a.images[i].is_written != b.images[i].is_written) {
+            return false;
+        }
+    }
+    return true;
+}
+
 class Instance;
 class Scheduler;
 class ShaderCache;
@@ -65,6 +88,10 @@ struct Program {
     /// sotc: a worker read other tables than the draw that asked (the game reused them before
     /// the worker ran): this program's later permutations are translated in place.
     bool translate_in_place{};
+    /// sotc: SOTC_PRETRANSLATE: installed by a translation at resource load (gpu/sotc/pretranslate.h); checked set
+    /// once its first draw compared its key with the pre-translated one.
+    bool sotc_pre{};
+    bool sotc_pre_checked{};
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
@@ -206,7 +233,7 @@ public:
     }
     /// sotc: the shader is translated, queued for a worker, or left to the command processor.
     bool IsProgramKnown(u64 hash) const {
-        return program_cache.contains(hash) || pending_programs.contains(hash) ||
+        return program_cache.contains(hash) || lazy_programs.contains(hash) || pending_programs.contains(hash) ||
                in_place_programs.contains(hash);
     }
     /// sotc: queues the translation of cs's shader for a worker when it is new. Returns true
@@ -441,6 +468,12 @@ private:
             bool stale{}; ///< the worker's specialization differs from spec (permutation)
             bool failed{}; ///< translation asserted (tables reused by the game meanwhile)
             Shader::Info::BindlessCache bindless_answers{}; ///< sotc: the permutation's answers (CombineBindlessCache)
+            /// sotc: SOTC_PRETRANSLATE: a translation at resource load (synthetic sharps, the file's registers); the
+            /// code is the job's own copy of the shader file's program. Queued behind every other job.
+            bool pretranslate{};
+            std::vector<u32> owned_code;
+            u8 synthetic_variant{}; ///< Info::sotc_synthetic_variant of the translation
+            bool first_variant{};   ///< the job that may queue the synthetic variant 1
         };
         std::unique_ptr<Translate> translate; ///< a translation job
     };
@@ -460,6 +493,34 @@ private:
                            Shader::Backend::Bindings& binding, Shader::RuntimeInfo& runtime_info,
                            Shader::Pools& worker_pools);
     void InstallTranslation(AsyncPipelineJob::Translate& job);
+    /// sotc: SOTC_PRETRANSLATE: queues the requests of the loaded shader files (command processor thread).
+    void DrainPretranslate();
+    /// sotc: the shader cache index (every program whose metas are on disk, with its permutation count): read at the
+    /// end of the warm-up into lazy_programs, written when it grew (and at the end of the precompile run).
+    void LoadShaderIndex();
+    void SaveShaderIndex();
+    /// sotc: a program of the index that no warm-up pipeline loaded: its permutations are read from the cache and
+    /// their modules created now, at its first draw (command processor). False when it is not indexed.
+    bool LoadLazyProgram(u64 hash);
+    /// sotc: SOTC_PRETRANSLATE pack (sotc_pretranslate.pack in the variant folder). The variants translated by the
+    /// boot hold (or a precompile run) are appended to one file, written sequentially, instead of two loose cache
+    /// files each (~38,000 for the game, whose creation slowed the first session by ~40%). PrePackAdd stores one
+    /// variant (false when no pack is being written); PrePackFinish writes its index and opens it for reading;
+    /// PrePackLoad opens it at the warm-up and adds its programs to lazy_programs. LoadLazyProgram reads it first, and
+    /// a program it loads from there is written to the cache as loose files too (the pipeline warm-up reads those).
+    bool PrePackAdd(u64 hash, u32 perm_idx, std::vector<u8>&& meta, const std::vector<u32>& spv);
+    void PrePackFinish();
+    void PrePackLoad();
+    /// sotc: SOTC_PRECOMPILE: progress line, and the exit once every job is done and the game stopped loading.
+    void PrecompileCheck();
+    /// sotc: SOTC_PRETRANSLATE: moves pre-translation jobs from pre_backlog to the workers, at most 2 at a time
+    /// while the game runs (they never compete with it for the CPU), all of them while the boot hold or a precompile
+    /// run waits for them.
+    void FeedPretranslate();
+    /// sotc: SOTC_PRETRANSLATE: once per session, in its first 2 minutes: when the shader files of the boot leave more
+    /// than 300 translations (the first session, or the first after an update), the command processor holds the game
+    /// on the port's loading screen with a progress bar until they are all in the cache.
+    void MaybeHoldForPretranslate();
     void CollectAsyncPipelines();
     /// sotc: N5 (SOTC_N5_PSO=1). Waits for the graphics pipelines of the boot prebuild (queued by
     /// WarmUp), collecting them as they are built, up to SOTC_N5_PSO_WAIT_S seconds from start.
@@ -531,6 +592,17 @@ private:
     size_t async_priority_queued{}; ///< sotc: shadow graphics jobs right after those, oldest first
     std::unordered_set<u64> pending_programs; ///< new programs being translated (CP only)
     std::unordered_set<u64> in_place_programs; ///< failed on a worker: translated here (CP only)
+    /// sotc: SOTC_PRETRANSLATE (CP only): programs whose pending translation is a pre-translation (a draw that needs
+    /// one queues its own translation), and vertex requests that wait for their pixel program.
+    std::unordered_set<u64> pre_pending;
+    /// sotc: programs of the shader cache index not loaded yet (CP only): hash -> permutations on disk.
+    std::unordered_map<u64, u32> lazy_programs;
+    std::deque<std::unique_ptr<AsyncPipelineJob>> pre_backlog; ///< sotc: pre-translation jobs not given to workers
+    u32 pre_in_flight{};                                       ///< sotc: pre-translation jobs on the workers
+    bool pre_holding{};                                        ///< sotc: the boot hold is waiting for them
+    bool pre_hold_done{};                                      ///< sotc: the hold ran (once per session)
+    std::vector<SotcPretranslate::Request> pre_deferred;
+    std::chrono::steady_clock::time_point pre_deferred_since{};
     /// sotc: SOTC_HEAP. Heap candidates (the variant's hash) that Heap::StageRefused refused, kept in the cache folder
     /// ("heap_refused" blob, loaded by WarmUp). A refused candidate's program is in no saved pipeline, so without
     /// this list it was translated again at every start (~850 shaders per session) only to be refused again.

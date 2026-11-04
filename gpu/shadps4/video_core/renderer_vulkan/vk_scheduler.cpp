@@ -19,6 +19,7 @@
 #include <span>
 #include <boost/container/small_vector.hpp>
 #include <immintrin.h>
+#include "video_core/sotc_arch/gcn_native.h" // sotc: SOTC_GCN_BARRIER
 
 namespace Vulkan {
 
@@ -282,6 +283,11 @@ void Scheduler::EndRendering() {
     }
     is_rendering = false;
     CommandBuffer().endRendering();
+    // sotc: SOTC_GCN_BARRIER (S5). The pass boundary barrier, here so every pass end gets it once: the rasterizer's
+    // ends and the implicit end in BeginRendering. Only a pass that was open reaches this line.
+    if (SotcGcn::Barrier::On()) {
+        SotcGcn::Barrier::OnPassBoundary(*this);
+    }
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {

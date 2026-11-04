@@ -28,6 +28,7 @@
 #include "guest_mem.h"
 #include "hooks.h"
 #include "predict_probe.h"
+#include "pretranslate.h"
 
 namespace SotcCsdrProbe {
 namespace {
@@ -191,10 +192,11 @@ HookAction Site(GuestRegs& regs, void*) {
 }
 
 // RES_LOADED: entry of the memory-stream constructor 0x4d470 that gets every resource the loader 0x147160 reads,
-// stored or decompressed (rdx = data, rcx = size). Only the predict probe uses it: the hashes of the data's OrbShdr
-// footers.
+// stored or decompressed (rdx = data, rcx = size). The predict probe (the hashes of the data's OrbShdr footers) and
+// SOTC_PRETRANSLATE (the programs, translated at load) use it. The data is the loader's stream (CPU heap), freed
+// once the resource is built: the GPU bytes are copied out of it (SOTC_PRELOAD_UPLOAD hooks that copy instead).
 HookAction Loaded(GuestRegs& regs, void*) {
-    if (!SotcPredict::On()) {
+    if (!SotcPredict::On() && !SotcPretranslate::On()) {
         return HookAction::Continue;
     }
     const size_t n = static_cast<size_t>(regs.rcx);
@@ -323,6 +325,9 @@ int ExtractIfRequested(uintptr_t image_base) {
 }
 
 void Register() {
+    // RES_LOADED feeds the predict probe and SOTC_PRETRANSLATE (its handler checks them); a hook that is off never
+    // dispatches to it.
+    SotcHooks::RegisterHandler("RES_LOADED", SotcHooks::Handler{Loaded, nullptr, nullptr});
     if (!On()) {
         return;
     }
@@ -331,7 +336,6 @@ void Register() {
         OpenOut();
     }
     SotcHooks::RegisterHandler("RES_DECOMPRESS_DONE", SotcHooks::Handler{Site, nullptr, nullptr});
-    SotcHooks::RegisterHandler("RES_LOADED", SotcHooks::Handler{Loaded, nullptr, nullptr});
 }
 
 } // namespace SotcCsdrProbe

@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_checkpoints.h" // sotc: SOTC_GPU_CHECKPOINTS
 #include "video_core/sotc_stats.h"
 
 namespace Vulkan {
@@ -173,7 +174,13 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
     // built (a stage reads the DrawPacket when it has a shader-addressed buffer or is the heap stage).
 }
 
-Pipeline::~Pipeline() = default;
+Pipeline::~Pipeline() {
+    // sotc: SOTC_GPU_CHECKPOINTS: a pipeline destroyed while a recorded command still uses it shows in the report.
+    if (pipeline) {
+        SotcCheckpoints::NoteFreed(reinterpret_cast<uint64_t>(static_cast<VkPipeline>(*pipeline)),
+                                   SotcCheckpoints::kPipeline);
+    }
+}
 
 void Pipeline::QueryDescriptorBufferLayout(
     std::span<const vk::DescriptorSetLayoutBinding> bindings) {

@@ -1022,6 +1022,10 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         rbp=frame[0];
     }
     fflush(NULL);
+    /* sotc: crash report: every other thread's stack, then the recorder's last 2 s (SOTC_TRACE). */
+    dump_thread_stacks();
+    if (gpu_enabled && bbgpu_trace_fatal_dump("CPU crash",2000,3000)) fprintf(stderr,"SOTC TRACE: crash window written\n");
+    fflush(NULL);
     minidump_write_now(info);
     fflush(NULL);
     TerminateProcess(GetCurrentProcess(),3);
@@ -1962,6 +1966,9 @@ int main(int argc, char **argv) {
     }
 #ifdef _WIN32
     minidump_prepare(user_dir ? user_dir : "user");
+    /* sotc: crash report: a GPU library stop (an assertion; a Vulkan device lost ends there) also dumps every
+     * thread's stack. */
+    bbgpu_set_fatal_hook(dump_thread_stacks);
 #endif
     if (app0) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");

@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA / SOTC_N5_BDA
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/sotc_arch/addr_table.h" // sotc: SOTC_ADDR_TABLE
+#include "video_core/sotc_arch/gcn_native.h" // sotc: SOTC_GCN_MEM (Mem::OnImport / OnRelease)
 
 extern "C" {
 const unsigned char* runtime_memory_backing_view(uint64_t* size);
@@ -359,6 +360,10 @@ bool ImportRun(uint64_t guest_begin, uint64_t guest_end, const u8* host_begin) {
     SotcArch::AddrTable::OnRemove(guest_begin, guest_end - guest_begin);
     // A stale run for this key is replaced, never destroyed: a submission may still read it.
     if (it != g_runs.end()) {
+        // sotc: SOTC_GCN_MEM: the replaced run is released in the table (its pages are placed again by the new run below).
+        if (SotcGcn::Mem::On()) {
+            SotcGcn::Mem::OnRelease(it->second.guest_begin, it->second.guest_end - it->second.guest_begin);
+        }
         g_retired.push_back(it->second);
         g_runs.erase(it);
     }
@@ -426,6 +431,12 @@ bool ImportRun(uint64_t guest_begin, uint64_t guest_end, const u8* host_begin) {
     run.memory = memory;
     g_runs.emplace(guest_begin, run);
     g_ring_bytes += size;
+    // sotc: SOTC_GCN_MEM: the run's pages are served by its buffer from now on. guest_begin is the byte at
+    // base_offset in the buffer; without a device address (no BDA) the table gets nothing.
+    if (SotcGcn::Mem::On()) {
+        SotcGcn::Mem::OnImport(guest_begin, guest_end - guest_begin,
+                               device_address != 0 ? device_address + run.base_offset : 0, nullptr);
+    }
     return true;
 }
 

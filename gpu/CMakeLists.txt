@@ -401,3 +401,9 @@ endif()
 add_executable(autopilot-test EXCLUDE_FROM_ALL sotc/tests/autopilot_test.cpp sotc/autopilot.cpp)
 target_include_directories(autopilot-test PRIVATE sotc)
 target_compile_options(autopilot-test PRIVATE -UNDEBUG)
+
+# sotc: ARCH-GCN-NATIVE offline test (layouts and hash; no GPU, no game).
+add_executable(gcn-native-test EXCLUDE_FROM_ALL ../tests/test_gcn_native.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(gcn-native-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(gcn-native-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -fPIC)
+target_link_libraries(gcn-native-test PRIVATE bbgpu)

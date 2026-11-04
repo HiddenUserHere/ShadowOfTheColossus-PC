@@ -114,6 +114,10 @@ void SetSegment(const char* segment, uint32_t lap);
 /// Mode 1: queues a dump of the last SOTC_TRACE_PRE_MS up to now (reason in the file's META).
 /// Mode 2: writes a mark and flushes the stream. False when off or SOTC_TRACE_MAX is reached.
 bool RequestDump(const char* reason);
+/// Crash report (gpu/shim/common/assert.cpp, bbgpu_trace_fatal_dump): as RequestDump, but the window is the last
+/// window_ms (what the rings still hold), SOTC_TRACE_MAX does not apply, and it waits up to wait_ms for the writer to
+/// finish the file (mode 1) or flush the stream (mode 2). True when that happened in time. Once per session.
+bool FatalDump(const char* reason, uint64_t window_ms, uint64_t wait_ms);
 /// Live slow-frame threshold in ms (0: no automatic dumps). Any thread.
 void SetThresholdMs(uint64_t ms);
 uint64_t ThresholdMs();

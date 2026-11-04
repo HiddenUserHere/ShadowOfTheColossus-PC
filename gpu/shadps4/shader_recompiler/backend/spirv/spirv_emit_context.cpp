@@ -29,9 +29,16 @@ bool ShaderAddrCandidate(const Info& info, const BufferResource& desc) {
     if (UsesBindlessSamplers(info) || UsesBindlessImages(info)) {
         return false;
     }
-    if (desc.buffer_type != BufferType::Guest || desc.is_formatted ||
+    if (desc.buffer_type != BufferType::Guest ||
         desc.post_op != SharpFetchPostOp::None ||
         desc.sharp_fetch.summary == SharpFetch<AmdGpu::Buffer>::Summary::Invalid) {
+        return false;
+    }
+    // sotc: SOTC_GCN_BUF. A formatted buffer is a candidate only when its loads decode the V# format at run time
+    // (GenericFormatBuffer without the V#: SOTC_GENERIC_BUFFERS=2, read-only). Such loads are lowered to raw loads
+    // on the buffer's handle, as every formatted access is (lower_buffer_format_to_raw.cpp), so the address path is
+    // the same one. Whether the profile takes them is ShaderAddrBuffer's decision (not the cached Info part).
+    if (desc.is_formatted && (!GenericBufferFormat() || desc.is_written)) {
         return false;
     }
     // The decision must depend only on what the compiled shader fixes: the host evaluates it again at every bind
@@ -40,8 +47,17 @@ bool ShaderAddrCandidate(const Info& info, const BufferResource& desc) {
     return true;
 }
 
+// sotc: SOTC_GCN_BUF. The profile's share of the candidate rule: formatted buffers take their address from the shader
+// only in table mode with gcn_buf on. Every other buffer is as before.
+static bool ShaderAddrFormattedAllowed(const Profile& profile, const BufferResource& desc) {
+    return !desc.is_formatted || (profile.gcn_buf != 0 && profile.shader_addr >= 3);
+}
+
 bool ShaderAddrBuffer(const Profile& profile, const Info& info, const BufferResource& desc) {
     if (!profile.shader_addr || !profile.support_int64) {
+        return false;
+    }
+    if (!ShaderAddrFormattedAllowed(profile, desc)) {
         return false;
     }
     return ShaderAddrCandidate(info, desc);
@@ -52,7 +68,10 @@ bool ShaderAddrBufferAt(const Profile& profile, const Info& info, u32 index) {
     if (!profile.shader_addr || !profile.support_int64) {
         return false;
     }
-    if (info.bindless.ready && index < info.buffers.size()) {
+    if (index >= info.buffers.size() || !ShaderAddrFormattedAllowed(profile, info.buffers[index])) {
+        return false;
+    }
+    if (info.bindless.ready) {
         return ((info.bindless.shader_addr_buffers >> index) & 1) != 0;
     }
     return ShaderAddrCandidate(info, info.buffers[index]);
@@ -883,15 +902,20 @@ void EmitContext::DefineHeapPushDataBlock() {
     const bool verify = profile.heap_images == 2;
     // sotc: SOTC_HEAP_VS. A vertex heap stage has its table address at member 9 (byte 136); GPU verify never has one.
     const bool vs_table = !verify && info.sw_stage == Shader::SwStage::Vertex;
+    // sotc: SOTC_GCN_TEX. With gcn_tex the globals address is member 8 (byte 88) and the members after it move by one.
+    const u32 shift = HeapMemberShift(profile);
     std::vector<Id> members{F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]};
     members.push_back(U64); // member 7: the table address
-    members.push_back(U64); // member 8: the debug buffer address
+    if (shift) {
+        members.push_back(U64); // member 8: the globals address (gcn_layout.h)
+    }
+    members.push_back(U64); // member 8 + shift: the debug buffer address
     if (verify) {
         for (u32 word = 0; word < Shader::HeapVerifySamplerWords + Shader::HeapVerifyImageWords; ++word) {
-            members.push_back(U32[1]); // members 9..22
+            members.push_back(U32[1]); // members 9 + shift..: the classic words
         }
     } else if (vs_table) {
-        members.push_back(U64); // member 9: the vertex heap stage's table address
+        members.push_back(U64); // member 9 + shift: the vertex heap stage's table address
     }
     const Id struct_type{Name(TypeStruct(std::span<const Id>(members)), "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
@@ -903,14 +927,17 @@ void EmitContext::DefineHeapPushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
     MemberDecorate(struct_type, HeapIndexTableMember, spv::Decoration::Offset, HeapIndexTableOffset);
-    MemberDecorate(struct_type, HeapDebugMember, spv::Decoration::Offset, Shader::HeapDebugOffset);
+    if (shift) {
+        MemberDecorate(struct_type, HeapGcnGlobalsMember, spv::Decoration::Offset, HeapGlobalsOffset);
+    }
+    MemberDecorate(struct_type, HeapDebugMember + shift, spv::Decoration::Offset, Shader::HeapDebugOffset);
     if (verify) {
         for (u32 word = 0; word < Shader::HeapVerifySamplerWords + Shader::HeapVerifyImageWords; ++word) {
-            MemberDecorate(struct_type, HeapVerifyFirstMember + word, spv::Decoration::Offset,
+            MemberDecorate(struct_type, HeapVerifyFirstMember + shift + word, spv::Decoration::Offset,
                            Shader::HeapVerifyWordsOffset + 4 * word);
         }
     } else if (vs_table) {
-        MemberDecorate(struct_type, HeapVsTableMember, spv::Decoration::Offset, Shader::HeapVsTableOffset);
+        MemberDecorate(struct_type, HeapVsTableMember + shift, spv::Decoration::Offset, Shader::HeapVsTableOffset);
     }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
@@ -1361,6 +1388,9 @@ Id EmitContext::ShaderAddrVerifyLoad(u32 handle, Id index, u32 elem_size, Pointe
 }
 
 void EmitContext::HoistBdaBlocks() {
+    // sotc: SOTC_GCN_TEX. The T# / S# probes of a heap stage run first: they declare the probe variables, which must
+    // lead the entry block (emit_spirv_gcn_tex.cpp). No-op unless gcn_tex == 1 on a heap stage.
+    HoistGcnTex();
     bda_blocks.resize(buffers.size());
     for (size_t handle = 0; handle < buffers.size(); ++handle) {
         if (!buffers[handle].bda || info.buffers[handle].used_types == IR::Type::Void) {
@@ -1499,12 +1529,91 @@ Id EmitContext::TableAddresses(u32 handle, Id index, u32 elem_size, u32 count,
         const Id page{OpShiftRightLogical(U64, rel, Constant(U64, 14ULL))};
         const Id entry_address{OpIAdd(U64, table_device, OpIMul(U64, page, Constant(U64, 8ULL)))};
         const Id entry{OpLoad(U64, BdaPointer(entry_address, U64), spv::MemoryAccessMask::Aligned, 8u)};
+        // sotc: SOTC_GCN_BUF. A valid access whose page is not resident appends a page miss (gcn_layout.h). Only
+        // the lanes with a zero entry run the branch; the address below is unused for them (the access is skipped).
+        if (profile.gcn_buf != 0) {
+            const Id miss{OpLogicalAnd(U1[1], valid, OpIEqual(U1[1], entry, u64_zero_value))};
+            const Id miss_merge{BdaBeginIf(miss)};
+            GcnPageMiss(OpBitwiseAnd(U64, guest, Constant(U64, ~((1ULL << 14) - 1))));
+            BdaEndIf(miss_merge);
+        }
         addresses.push_back(
             OpIAdd(U64, entry, OpBitwiseAnd(U64, guest, Constant(U64, (1ULL << 14) - 1))));
         const Id present{OpINotEqual(U1[1], entry, u64_zero_value)};
         all_present = i == 0 ? present : OpLogicalAnd(U1[1], all_present, present);
     }
     return OpLogicalAnd(U1[1], valid, all_present);
+}
+
+// sotc: SOTC_GCN shared helpers. murmur3_32 over u32 words with a seed: the operations of Shader::Gcn::Hash
+// (gcn_layout.h), in the same order, so a key hashed here and on the host lands in the same slot.
+Id EmitContext::GcnHash(std::span<const Id> words, u32 seed) {
+    const auto rotl = [&](Id x, u32 r) {
+        return OpBitwiseOr(U32[1], OpShiftLeftLogical(U32[1], x, ConstU32(r)),
+                           OpShiftRightLogical(U32[1], x, ConstU32(32u - r)));
+    };
+    Id h{ConstU32(seed ^ 0x9E3779B9u)};
+    for (const Id word : words) {
+        Id k{OpIMul(U32[1], word, ConstU32(0xCC9E2D51u))};
+        k = OpIMul(U32[1], rotl(k, 15), ConstU32(0x1B873593u));
+        h = OpBitwiseXor(U32[1], h, k);
+        h = OpIAdd(U32[1], OpIMul(U32[1], rotl(h, 13), ConstU32(5u)), ConstU32(0xE6546B64u));
+    }
+    h = OpBitwiseXor(U32[1], h, ConstU32(static_cast<u32>(words.size()) * 4u));
+    h = OpBitwiseXor(U32[1], h, OpShiftRightLogical(U32[1], h, ConstU32(16u)));
+    h = OpIMul(U32[1], h, ConstU32(0x85EBCA6Bu));
+    h = OpBitwiseXor(U32[1], h, OpShiftRightLogical(U32[1], h, ConstU32(13u)));
+    h = OpIMul(U32[1], h, ConstU32(0xC2B2AE35u));
+    h = OpBitwiseXor(U32[1], h, OpShiftRightLogical(U32[1], h, ConstU32(16u)));
+    return h;
+}
+
+// sotc: SOTC_GCN_BUF. Records a page miss for the guest page `page` (U64, page aligned). The globals buffer is the
+// push word of ShaderAddrArenaGuestOffset (member 2 of the window words; the host sends it for gcn pipelines). The
+// seen bit of the page is set with an atomic OR; a clear bit means the page is new since the last drain, so one
+// record is appended: index from atomicIAdd on write_index, body first, stamp (index + 1) last (gcn_layout.h).
+// Called inside a branch that runs only for a missing page; the record is dropped when the ring is full (the slot
+// wraps, the host counts the overflow).
+void EmitContext::GcnPageMiss(Id page) {
+    const Id globals{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64),
+                                               push_data_block, ConstU32(shader_addr_member + 2)))};
+    const auto field = [&](u32 offset) { // a u32 field of the globals buffer
+        return BdaPointer(OpIAdd(U64, globals, Constant(U64, static_cast<u64>(offset))), U32[1]);
+    };
+    const Id scope{ConstU32(static_cast<u32>(spv::Scope::Device))};
+
+    const Id lo{OpUConvert(U32[1], page)};
+    const Id hi{OpUConvert(U32[1], OpShiftRightLogical(U64, page, Constant(U64, 32ULL)))};
+    const std::array words{lo, hi};
+    const Id hash{GcnHash(words, static_cast<u32>(Shader::Gcn::kMissPage))};
+    const Id bit{OpBitwiseAnd(U32[1], hash, ConstU32(Shader::Gcn::kSeenBits - 1))};
+    const Id seen_offset{OpIAdd(U32[1], OpShiftLeftLogical(U32[1], OpShiftRightLogical(U32[1], bit, ConstU32(5u)),
+                                                           ConstU32(2u)),
+                                ConstU32(Shader::Gcn::kSeenOffset))};
+    const Id seen_word{BdaPointer(OpIAdd(U64, globals, OpUConvert(U64, seen_offset)), U32[1])};
+    const Id mask{OpShiftLeftLogical(U32[1], ConstU32(1u), OpBitwiseAnd(U32[1], bit, ConstU32(31u)))};
+    const Id old{OpAtomicOr(U32[1], seen_word, scope, u32_zero_value, mask)};
+    const Id fresh{OpIEqual(U1[1], OpBitwiseAnd(U32[1], old, mask), u32_zero_value)};
+
+    const Id fresh_merge{BdaBeginIf(fresh)};
+    const Id idx{OpAtomicIAdd(U32[1], field(Shader::Gcn::kMissRingOffset), scope, u32_zero_value,
+                              ConstU32(1u))};
+    const Id slot{OpBitwiseAnd(U32[1], idx, ConstU32(Shader::Gcn::kMissRingCapacity - 1))};
+    // Record base: the ring header is 16 bytes, then MissRecord (48 bytes) per slot.
+    const Id record_offset{OpIAdd(U32[1], ConstU32(Shader::Gcn::kMissRingOffset + 16),
+                                  OpIMul(U32[1], slot, ConstU32(static_cast<u32>(sizeof(Shader::Gcn::MissRecord)))))};
+    const Id record{OpIAdd(U64, globals, OpUConvert(U64, record_offset))};
+    const auto body = [&](u32 offset, Id value) {
+        OpStore(BdaPointer(OpIAdd(U64, record, Constant(U64, static_cast<u64>(offset))), U32[1]), value,
+                spv::MemoryAccessMask::Aligned, 4u);
+    };
+    body(4, ConstU32(static_cast<u32>(Shader::Gcn::kMissPage))); // kind
+    body(8, u32_zero_value);                                     // view_class
+    body(12, u32_zero_value);                                    // reserved
+    body(16, lo);                                                // words[0]
+    body(20, hi);                                                // words[1]
+    body(0, OpIAdd(U32[1], idx, ConstU32(1u)));                  // stamp, last
+    BdaEndIf(fresh_merge);
 }
 
 // sotc: SOTC_ADDR_TABLE. BdaLoad with one translated address per element (TableAddresses), same structure as BdaLoad.
@@ -1852,9 +1961,15 @@ void EmitContext::DefineImagesAndSamplers() {
     }
 }
 
-u32 HeapTableMember(const Info& info) {
+u32 HeapMemberShift(const Profile& profile) {
+    // sotc: SOTC_GCN_TEX. The globals member exists only with gcn_tex on a heap stage (see HeapGcnGlobalsMember).
+    return profile.gcn_tex == 1 ? 1u : 0u;
+}
+
+u32 HeapTableMember(const Info& info, const Profile& profile) {
     // sotc: SOTC_HEAP_VS. A vertex heap stage reads its table address at byte 136, every other heap stage at byte 64.
-    return info.sw_stage == Shader::SwStage::Vertex ? HeapVsTableMember : HeapIndexTableMember;
+    return info.sw_stage == Shader::SwStage::Vertex ? HeapVsTableMember + HeapMemberShift(profile)
+                                                    : HeapIndexTableMember;
 }
 
 Id EmitContext::LoadTableIndex(u32 entry) {
@@ -1862,7 +1977,7 @@ Id EmitContext::LoadTableIndex(u32 entry) {
     // vertex heap stage); entry i is one u32 at address + 4 * i. The index is the same in every invocation of a draw:
     // it comes from push data and a constant entry, so it is dynamically uniform and needs no NonUniform decoration.
     const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), push_data_block,
-                               ConstU32(HeapTableMember(info)))};
+                               ConstU32(HeapTableMember(info, profile)))};
     const Id table{OpLoad(U64, ptr)};
     const Id address{OpIAdd(U64, table, Constant(U64, static_cast<u64>(entry) * sizeof(u32)))};
     return OpLoad(U32[1], BdaPointer(address, U32[1]), spv::MemoryAccessMask::Aligned, 4U);
@@ -1870,7 +1985,7 @@ Id EmitContext::LoadTableIndex(u32 entry) {
 
 Id EmitContext::HeapDebugBase() {
     return OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), push_data_block,
-                                     ConstU32(HeapDebugMember)));
+                                     ConstU32(HeapDebugMember + HeapMemberShift(profile))));
 }
 
 Id EmitContext::HeapAdd(Id debug_base, u32 offset, Id value) {
@@ -1905,7 +2020,7 @@ void EmitContext::HeapRecord(Id bad, u32 kind, u32 number, Id classic, Id raw, u
     field(0, Constant(U64, info.pgm_hash), U64, 8);
     field(8,
           OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), push_data_block,
-                                    ConstU32(HeapTableMember(info)))),
+                                    ConstU32(HeapTableMember(info, profile)))),
           U64, 8);
     field(16, ConstU32(static_cast<u32>(hw_stage)), U32[1], 4);
     field(20, ConstU32(kind), U32[1], 4);
@@ -1927,6 +2042,11 @@ Id EmitContext::HeapGuard(Id raw, u32 capacity, u32 entry) {
 }
 
 Id EmitContext::LoadHeapImageIndex(u32 entry, u32 slot) {
+    // sotc: SOTC_GCN_TEX: the probed slot of the image (HoistGcnTex), not the index table. A binding without a probed
+    // slot (TableImage false) keeps the index table.
+    if (profile.gcn_tex == 1 && entry < gcn_image_slots.size() && Sirit::ValidId(gcn_image_slots[entry])) {
+        return gcn_image_slots[entry];
+    }
     const Id raw{LoadTableIndex(entry)};
     if (profile.heap_images != 2) {
         return HeapGuard(raw, Shader::HeapImageCapacity, entry);
@@ -1935,7 +2055,8 @@ Id EmitContext::LoadHeapImageIndex(u32 entry, u32 slot) {
     // table value is compared with it, and a difference is recorded (kind 0).
     const u32 rel = slot - Shader::GetBindlessImageRange(info.sw_stage).base;
     ASSERT_MSG(rel < Shader::HeapVerifyImageWords * 2, "heap verify: image slot outside the compact words");
-    const Id classic{LoadHeapClassic(HeapVerifyFirstMember + Shader::HeapVerifySamplerWords + rel / 2,
+    const Id classic{LoadHeapClassic(HeapVerifyFirstMember + HeapMemberShift(profile) +
+                                         Shader::HeapVerifySamplerWords + rel / 2,
                                      (rel & 1) * 16)};
     HeapAdd(HeapDebugBase(), Shader::HeapDebugCompareImage, ConstU32(1u));
     HeapRecord(OpINotEqual(U1[1], classic, raw), 0, entry, classic, raw, entry,
@@ -1944,13 +2065,17 @@ Id EmitContext::LoadHeapImageIndex(u32 entry, u32 slot) {
 }
 
 Id EmitContext::LoadHeapSamplerIndex(u32 entry, u32 index) {
+    // sotc: SOTC_GCN_TEX: the probed slot of the sampler (HoistGcnTex), not the index table.
+    if (profile.gcn_tex == 1 && index < gcn_sampler_slots.size()) {
+        return gcn_sampler_slots[index];
+    }
     const Id raw{LoadTableIndex(entry)};
     if (profile.heap_images != 2) {
         return HeapGuard(raw, Shader::HeapSamplerCapacity, entry);
     }
     // sotc: SOTC_HEAP GPU verify, as LoadHeapImageIndex (kind 1). Sampler s is compact sampler s.
     ASSERT_MSG(index < Shader::HeapVerifySamplerWords * 2, "heap verify: sampler outside the compact words");
-    const Id classic{LoadHeapClassic(HeapVerifyFirstMember + index / 2, (index & 1) * 16)};
+    const Id classic{LoadHeapClassic(HeapVerifyFirstMember + HeapMemberShift(profile) + index / 2, (index & 1) * 16)};
     HeapAdd(HeapDebugBase(), Shader::HeapDebugCompareSampler, ConstU32(1u));
     HeapRecord(OpINotEqual(U1[1], classic, raw), 1, index, classic, raw, entry,
                Shader::HeapDebugMismatchSampler);
@@ -1962,6 +2087,14 @@ Id EmitContext::LoadSampler(u32 index) {
         // sotc: SOTC_HEAP: sampler s is the entry after the images of the stage (UsesHeapImages).
         const Id heap_index{LoadHeapSamplerIndex(static_cast<u32>(info.images.size()) + index, index)};
         const Id sampler_ptr{OpAccessChain(sampler_pointer_type, bindless_sampler_array, heap_index)};
+        // sotc: SOTC_GCN_TEX. A probed index is dynamically non-uniform: decorate the index, the access chain and the load.
+        if (GcnSamplerProbed(index)) {
+            Decorate(heap_index, spv::Decoration::NonUniform);
+            Decorate(sampler_ptr, spv::Decoration::NonUniform);
+            const Id sampler{OpLoad(sampler_type, sampler_ptr)};
+            Decorate(sampler, spv::Decoration::NonUniform);
+            return sampler;
+        }
         return OpLoad(sampler_type, sampler_ptr);
     }
     if (!uses_bindless_samplers) {

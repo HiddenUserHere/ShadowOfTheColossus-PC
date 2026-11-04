@@ -24,6 +24,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
 #include "core/platform.h"
+#include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE submit start
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/sotc_draw_runs.h" // sotc: SOTC_DRAW_RUNS (indirect draw run ceiling)
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -34,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_lod_stats.h"
+#include "../../../sotc/preupload.h" // sotc: SOTC_PRELOAD_UPLOAD
 #include "video_core/sotc_prepass_probe.h" // sotc: SOTC_NO_PREPASS=3
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_OPCOST (OpCostScope below)
@@ -800,6 +802,34 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                     },
                     &pctx);
                 if (calls != 0) {
+                    continue;
+                }
+            }
+            // sotc: SOTC_PRELOAD_UPLOAD=2: idle upload of the ranges the loader handed on (preupload.h).
+            if (SotcPreupload::Mode() == 2 && rasterizer && SotcPreupload::HasWork()) {
+                struct PreuploadCtx {
+                    Liverpool* self;
+                    u64 tail;
+                } uctx{this, tail};
+                const u64 up_t0 = SotcTrace::kOn ? SotcTrace::Now() : 0;
+                const unsigned calls = SotcPreupload::Idle(
+                    1'000'000, // 1 ms
+                    SotcStats::flip_count.load(std::memory_order_relaxed),
+                    [](void* c, std::uint64_t addr, std::uint64_t size) -> std::uint64_t {
+                        return static_cast<PreuploadCtx*>(c)
+                            ->self->rasterizer->GetBufferCache()
+                            .PreuploadRange(addr, size);
+                    },
+                    [](void* c) {
+                        auto* w = static_cast<PreuploadCtx*>(c);
+                        return w->self->back_head.load(std::memory_order_acquire) != w->tail ||
+                               w->self->num_commands.load(std::memory_order_acquire) != 0;
+                    },
+                    &uctx);
+                if (calls != 0) {
+                    if (up_t0) { // sotc: SOTC_TRACE "preload upload" span, a = calls
+                        SotcTrace::PushEvent(SotcTrace::EvSpan, "preload upload", up_t0, SotcTrace::Now(), calls);
+                    }
                     continue;
                 }
             }
@@ -4153,6 +4183,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (pc_ring_top && rasterizer && SotcSyncEvents::On()) {
         BackOrRun([r = rasterizer] { r->GetBufferCache().DrainSyncEvents(); });
     }
+    // sotc: ARCH-GCN-NATIVE (gcn_native.h). The miss drain and the per-submit freshness batch, on the draw thread
+    // before this submit's ops (outermost gfx submit only).
+    if (pc_ring_top && rasterizer && (SotcGcn::Mem::On() || SotcGcn::Tex::On())) {
+        BackOrRun([r = rasterizer] { r->GcnSubmitStart(); });
+    }
 
     // TODO: potentially, ASCs also can depend on CE and in this case the
     // CE task should be moved into more global scope
@@ -5358,6 +5393,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8 || SotcNative::On())) { // sotc: as above
         NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (host ring copy)
         BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); });
+    }
+    // sotc: ARCH-GCN-NATIVE: a compute submit gets the same submit-start batch (outermost call only).
+    if (pc_ring_asc.top && rasterizer && (SotcGcn::Mem::On() || SotcGcn::Tex::On())) {
+        BackOrRun([r = rasterizer] { r->GcnSubmitStart(); });
     }
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());

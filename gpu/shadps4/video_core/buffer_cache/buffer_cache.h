@@ -298,6 +298,12 @@ public:
     /// range in a SOTC_CLASS_TRACK CPU-only class is not uploaded (returns 0). Draw thread only
     /// (region_predrain.h Idle).
     u64 PredrainRange(VAddr addr, u64 size);
+    /// sotc: SOTC_PRELOAD_UPLOAD=2: DrainRange for a piece of a resource the engine built, except a range the GPU
+    /// wrote (without page tracking its guest bytes are stale: they would overwrite the GPU's). Draw thread only.
+    u64 PreuploadRange(VAddr addr, u64 size);
+    /// sotc: SOTC_DRAW_GATE: the bytes a bind of [addr, addr + size) would upload now (MemoryTracker::
+    /// CountCpuModifiedBytes, approximate). Any thread.
+    [[nodiscard]] u64 PendingUploadBytes(VAddr addr, u64 size) noexcept;
 
     // sotc: SOTC_NATIVE (gpu/sotc/native). Draw thread, once per submit (cheap when nothing is queued):
     // performs queued announced uploads (Persistent through DrainRange, PerFrame as CPU-modified) until

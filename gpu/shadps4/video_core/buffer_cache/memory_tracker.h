@@ -225,6 +225,27 @@ public:
         return pages;
     }
 
+    /// sotc: SOTC_DRAW_GATE. The bytes a bind of [cpu_addr, cpu_addr + size) would upload now: its CPU-modified
+    /// pages, and the whole of a range whose tracking region does not exist yet (ForEachUploadRange creates it with
+    /// every page CPU-modified). Lock-free and approximate (unlocked bits).
+    u64 CountCpuModifiedBytes(VAddr cpu_addr, u64 size) noexcept {
+        const u64 limit = u64{1} << MAX_CPU_PAGE_BITS;
+        if (cpu_addr >= limit || size == 0) {
+            return 0;
+        }
+        size = std::min(size, limit - cpu_addr);
+        u64 bytes = 0;
+        u64 page_index = cpu_addr >> HIGHER_PAGE_BITS;
+        u64 offset = cpu_addr & HIGHER_PAGE_MASK;
+        for (u64 remaining = size; remaining > 0; ++page_index, offset = 0) {
+            const u64 len = std::min(HIGHER_PAGE_SIZE - offset, remaining);
+            remaining -= len;
+            RegionManager* region = __atomic_load_n(&top_tier[page_index], __ATOMIC_ACQUIRE);
+            bytes += region ? region->CountCpuModifiedPages(offset, len) * BYTES_PER_PAGE : len;
+        }
+        return std::min(bytes, size);
+    }
+
     /// sotc: SOTC_UNTRACK_AUTO: like UnmarkRegionAsGpuModified(.., false), after a download wrote
     /// the GPU's bytes into guest memory: untracked pages get their CPU bit back (see retrack in
     /// RegionManager::ChangeRegionState).

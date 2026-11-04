@@ -48,6 +48,8 @@ public:
     void DeviceMemoryBarrier();
 
     [[nodiscard]] U32 GetUserData(IR::ScalarReg reg);
+    /// sotc: SOTC_GENERIC_BUFFERS: the dword of the flattened user data buffer at index.
+    [[nodiscard]] U32 LoadFlatbufDword(u32 index);
 
     template <typename T = U32>
     [[nodiscard]] T GetScalarReg(IR::ScalarReg reg);

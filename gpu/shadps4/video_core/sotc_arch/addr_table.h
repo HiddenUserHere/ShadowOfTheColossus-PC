@@ -49,7 +49,9 @@ inline constexpr u64 PageShift = 14;
 inline constexpr u64 PageSize = 1ULL << PageShift;
 inline constexpr u64 NumPages = WindowSize >> PageShift; ///< 4 Mi entries = 32 MiB of device memory
 
-/// SOTC_ADDR_TABLE=1 and SOTC_SHADER_ADDR on. Read once from the environment.
+/// sotc: the table is requested: SOTC_ADDR_TABLE=1 and SOTC_SHADER_ADDR (read once), or SOTC_GCN_MEM not refused
+/// (SotcGcn::Mode(Stage::Mem), read on every call). Init creates the table or refuses the stage; after a refusal
+/// the table is not used, because Mem's mode is 0. Code that needs the table itself checks Translate / Touch.
 bool On();
 
 /// Creates the table (rasterizer constructor, when On()). Refuses the run (exits, like ShaderAddr::Init) when the
@@ -79,6 +81,27 @@ void OnRemove(VAddr addr, u64 size);
 /// The device address of guest byte addr through the table (0 when not resident or outside the window). For the
 /// verify paths (ShaderAddr::Expected).
 vk::DeviceAddress Translate(VAddr addr);
+
+// sotc: SOTC_GCN_MEM / SOTC_GCN_SYNC (gcn_native.h). The bit arrays are read and written with seq_cst, as the
+// Touch fast path does; the scans take no lock.
+
+/// sotc: SOTC_GCN_MEM. True when every table page of [addr, addr + size) is placed (non-zero entry). False for size 0
+/// and for a range that is not wholly inside the window. Any thread, lock-free.
+bool AllPlaced(VAddr addr, u64 size) noexcept;
+/// sotc: SOTC_GCN_SYNC. Calls fn(user, addr, size) for every maximal run of table pages that are placed and not clean
+/// (merged across adjacent pages). Draw thread, once per submit. Lock-free scan of the bit words (64 pages each,
+/// all-zero words skipped); no lock is held while fn runs. A page that changes during the scan is either reported or
+/// not; the caller's MarkClean decides whether the sync it made still stands.
+void ForEachStalePlaced(void (*fn)(void* user, VAddr addr, u64 size), void* user);
+/// sotc: SOTC_GCN_SYNC. The sequence token of a clean-state change, read BEFORE the caller synchronizes a run. Any
+/// thread, lock-free.
+u64 CleanSequence() noexcept;
+/// sotc: SOTC_GCN_SYNC. After the caller synchronized every CPU change of [addr, addr + size) (its copy read the guest
+/// bytes after `sequence` was taken), sets the clean bits of its pages. Sets nothing and returns false when a clean
+/// state change happened since `sequence` (ClearClean bumped the sequence), when an entry of the range is not on the
+/// device yet (a pending chunk upload), or when a page is not placed; the pages then stay stale for the next submit.
+/// Draw thread.
+bool MarkClean(VAddr addr, u64 size, u64 sequence) noexcept;
 
 /// sotc: SOTC_ADDR_VERTEX (1 on, 2 on with verify). Needs On(). The vertex, index and indirect-argument reads of a draw
 /// take their buffer from the table (ObtainRead) instead of ObtainBuffer. Pipelines do not change with it yet.

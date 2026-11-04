@@ -404,6 +404,10 @@ bool DataBase::TakePrefetched(const std::filesystem::path& path, std::vector<u8>
     return true;
 }
 
+u32 DataBase::PendingWrites() const noexcept {
+    return num_requests.load(std::memory_order_relaxed);
+}
+
 void DataBase::Close() {
     if (!IsOpened()) {
         return;

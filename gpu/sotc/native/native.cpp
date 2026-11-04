@@ -3,6 +3,7 @@
 // sotc: the PC-native memory model, the API of native.h. See docs/re-stutters/native/PLAN.md.
 // Announced uploads are queued here and performed by the draw thread (BufferCache::NativeDrain); the frame
 // ticket is a backend supplied by BufferCache.
+#include "../preupload.h" // sotc: SOTC_PRELOAD_UPLOAD
 #include "native.h"
 #include "native_draw.h"
 #include "../pc_ring.h" // sotc: 1a, HostServed (ring 8 imported runs)
@@ -265,6 +266,7 @@ void Release(uint64_t addr, uint64_t size) {
     }
     SotcVerify::NoteAnnounce(addr, size); // sotc: a released range is not an unannounced write
     SotcN1Verify::NoteRelease(addr, size); // sotc: SOTC_VERIFY=n1: its announce records go
+    SotcPreupload::Release(addr, size);    // sotc: SOTC_PRELOAD_UPLOAD: a freed range is not uploaded
     std::scoped_lock lock{g_mutex};
     // Drops the queued parts inside [addr, addr + size); the parts outside it stay queued.
     std::deque<PendingUpload> kept;

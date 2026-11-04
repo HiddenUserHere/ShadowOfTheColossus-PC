@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_bindless.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/sotc_arch/bindset_events.h" // sotc: SOTC_BINDSET (a slot given back ends the replays that hold it)
+#include "video_core/sotc_arch/gcn_native.h" // sotc: SOTC_GCN_TEX (table entries die with their slot)
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace VideoCore {
@@ -125,6 +126,9 @@ u32 BindlessImages::Evict(u32 key) {
         return Shader::NO_BINDLESS_IMAGE_SLOT;
     }
     // The owner of the victim finds it no longer held (Holds) and takes a new one at its next bind.
+    if (SotcGcn::Tex::On()) { // sotc: SOTC_GCN_TEX, the table entries of the slot die before it is reused
+        SotcGcn::Tex::OnSlotReleased(key, victim);
+    }
     slots[key][victim].state = SlotState::Free;
     generation.fetch_add(1, std::memory_order_acq_rel);
     SotcArch::BindSet::PostSlot(key, victim); // sotc: SOTC_BINDSET
@@ -171,6 +175,9 @@ void BindlessImages::Release(u32 key, u32 slot, vk::ImageView view) {
         return;
     }
     ++releases;
+    if (SotcGcn::Tex::On()) { // sotc: SOTC_GCN_TEX, the table entries of the slot die before it is reused
+        SotcGcn::Tex::OnSlotReleased(key, slot);
+    }
     // The GPU may still read the slot through submitted draws: it is cleared and reused only once
     // the tick current now has finished (Reclaim). Until then it is not held by anyone.
     s.state = SlotState::Pending;

@@ -92,10 +92,17 @@ inline void FillVsAttrib(VsAttribSpecialization& spec, const Gcn::VertexAttribut
 
 inline void FillBuffer(BufferSpecialization& spec, const BufferResource& desc,
                        AmdGpu::Buffer sharp) {
-    spec.stride = sharp.GetStride();
+    // sotc: SOTC_GENERIC_BUFFERS: unswizzled buffers read their stride at run time (resource_patching_pass.cpp).
+    spec.stride = GenericBufferStride() && !sharp.swizzle_enable ? 0 : sharp.GetStride();
     spec.is_formatted = desc.is_formatted;
     spec.swizzle_enable = sharp.swizzle_enable;
-    if (spec.is_formatted) {
+    if (spec.is_formatted && GenericFormatBuffer(desc, sharp)) {
+        // sotc: SOTC_GENERIC_BUFFERS=2: the loads decode the V# format at run time (lower_buffer_format_to_raw.cpp).
+        spec.data_format = kGenericBufferFormatKey;
+        spec.num_format = 0;
+        spec.dst_select = AmdGpu::IdentityMapping;
+        spec.num_conversion = AmdGpu::NumberConversion::None;
+    } else if (spec.is_formatted) {
         spec.data_format = static_cast<u32>(sharp.GetDataFmt());
         spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
         spec.dst_select = sharp.DstSelect();
@@ -309,6 +316,16 @@ struct StageSpecialization {
         }
 
         if (fmasks != other.fmasks) {
+            return false;
+        }
+
+        // sotc: the loops below walk this specialization's lists only, so a permutation with more resources than the
+        // draw's (a SOTC_PRETRANSLATE variant whose translation found a flat buffer the program's Info does not have)
+        // compared equal, and its module was drawn with descriptors written for the program's Info: a buffer read
+        // from an image binding and a sampler binding never written, the device lost of 4 Nov
+        // (gbufferbakedambient_motion, PS 0x2df5e183 permutation 1). The lists must have the same lengths.
+        if (buffers.size() != other.buffers.size() || images.size() != other.images.size() ||
+            samplers.size() != other.samplers.size()) {
             return false;
         }
 

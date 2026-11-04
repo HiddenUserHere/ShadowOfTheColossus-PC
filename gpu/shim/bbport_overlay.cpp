@@ -930,69 +930,156 @@ void SaveListBox() {
     ImGui::End();
 }
 
-// sotc: the port's loading screen while the game shows nothing (boot, shader cache, long loads):
-// the title, a turning arc and "Loading…" in the launcher's language, over a dark backdrop.
-void LoadingScreen() {
+// sotc: the port's loading screen, one look for every stretch where the game shows nothing: the boot shader
+// preparation (SOTC_PRETRANSLATE hold, PipelineCache::MaybeHoldForPretranslate), the shader cache warm-up at start,
+// and any second or more without a game frame. It fades in and out (LoadingAlpha), so it never cuts hard to the
+// game's own loading screen or to the first game frame. A dark gradient backdrop, the title, a thin bar (filled with
+// the percentage, count and time left when there is progress to show, a sweeping segment when there is none) and a
+// status line; the preparation adds what it is and what closing the window does.
+enum class LoadingMode { Stall, Cache, Prep };
+
+ImU32 LoadingRgba(int r, int g, int b, float a) {
+    return IM_COL32(r, g, b, static_cast<int>(std::clamp(a, 0.0f, 1.0f) * 255.0f));
+}
+
+// Set by LoadingAlpha: the screen is still on (fading out included), so Visible() keeps the overlay drawn.
+std::atomic<bool> loading_on{false};
+
+void LoadingScreen(float alpha, float backdrop) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
-    // sotc: a hitch of a second or two in play only dims the picture; after 3 s without a game
-    // frame (boot, shader cache, long loads) the backdrop turns opaque within half a second, so the
-    // game's last frame does not show through looking frozen.
-    const long long stall = NowMs() - last_flip_ms.load(std::memory_order_relaxed);
-    ImGui::SetNextWindowBgAlpha(std::clamp(0.55f + float(stall - 3000) / 500.0f * 0.45f, 0.55f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.0f);
     ImGui::Begin("##loading", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
-                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
-                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImDrawList* draw = ImGui::GetWindowDrawList();
     const ImVec2 size = viewport->WorkSize;
     const ImVec2 origin = viewport->WorkPos;
+    const ImVec2 far(origin.x + size.x, origin.y + size.y);
     const float unit = size.y / 1080.0f;
-    const ImU32 dim = IM_COL32(150, 150, 150, 255);
     const float t = float(NowMs() % 1000000) / 1000.0f;
-    // The title breathes slowly (gold, 65-100%).
-    const char* title = "SHADOW OF THE COLOSSUS";
-    const float title_px = 46.0f * unit;
-    const ImVec2 title_size = ImGui::GetFont()->CalcTextSizeA(title_px, FLT_MAX, 0.0f, title);
-    const int glow = int(255.0f * (0.825f + 0.175f * std::sin(t * 2.0f)));
-    const ImU32 gold = IM_COL32(214, 184, 120, glow);
-    const float title_y = origin.y + size.y * 0.40f;
-    draw->AddText(ImGui::GetFont(), title_px,
-                  ImVec2(origin.x + (size.x - title_size.x) * 0.5f, title_y), gold, title);
-    // A turning arc under the title, with a faint full ring behind it.
-    const ImVec2 centre(origin.x + size.x * 0.5f, title_y + title_px + 70.0f * unit);
-    const float radius = 22.0f * unit;
-    draw->AddCircle(centre, radius, IM_COL32(214, 184, 120, 50), 48, 3.0f * unit);
-    draw->PathArcTo(centre, radius, t * 5.0f, t * 5.0f + 1.6f, 32);
-    draw->PathStroke(IM_COL32(214, 184, 120, 255), 0, 3.5f * unit);
-    // "Loading" with moving dots.
-    char text[64];
-    const int dots = int(t * 2.5f) % 4;
-    std::snprintf(text, sizeof(text), "%s%.*s", SotcUi::T("Carregando", "Loading"), dots, "...");
-    const float text_px = 24.0f * unit;
-    const ImVec2 full = ImGui::GetFont()->CalcTextSizeA(
-        text_px, FLT_MAX, 0.0f, SotcUi::T("Carregando...", "Loading..."));
-    draw->AddText(ImGui::GetFont(), text_px,
-                  ImVec2(centre.x - full.x * 0.5f, centre.y + radius + 22.0f * unit), dim, text);
-    // While the shader cache is read at boot: a bar with the percentage.
-    const u32 total = SotcStats::warmup_total.load(std::memory_order_relaxed);
+
+    LoadingMode mode = LoadingMode::Stall;
+    u32 total = 0, done = 0;
+    if (SotcStats::prep_active.load(std::memory_order_acquire)) {
+        mode = LoadingMode::Prep;
+        total = SotcStats::prep_total.load(std::memory_order_relaxed);
+        done = SotcStats::prep_done.load(std::memory_order_relaxed);
+    } else if (const u32 w = SotcStats::warmup_total.load(std::memory_order_relaxed);
+               w > 0 && !SotcStats::warmup_finished.load(std::memory_order_relaxed)) {
+        mode = LoadingMode::Cache;
+        total = w;
+        done = SotcStats::warmup_done.load(std::memory_order_relaxed);
+    }
+    done = std::min(done, total);
+
+    // Backdrop: a vertical gradient, near black, a little warmer at the bottom.
+    const float bg = std::clamp(backdrop, 0.0f, 1.0f) * alpha;
+    draw->AddRectFilledMultiColor(origin, far, LoadingRgba(10, 10, 12, bg), LoadingRgba(10, 10, 12, bg),
+                                  LoadingRgba(24, 20, 15, bg), LoadingRgba(24, 20, 15, bg));
+
+    const auto centred = [&](const char* text, float px, float y, ImU32 colour) {
+        const float w = ImGui::GetFont()->CalcTextSizeA(px, FLT_MAX, 0.0f, text).x;
+        draw->AddText(ImGui::GetFont(), px, ImVec2(origin.x + (size.x - w) * 0.5f, y), colour, text);
+    };
+    const float breathe = 0.82f + 0.18f * std::sin(t * 1.6f);
+    float y = origin.y + size.y * 0.38f;
+    centred("SHADOW OF THE COLOSSUS", 46.0f * unit, y, LoadingRgba(214, 184, 120, alpha * breathe));
+    y += 46.0f * unit + 56.0f * unit;
+
+    // The bar: filled with progress, a segment sweeping back and forth without.
+    const float bar_w = size.x * 0.34f, bar_h = std::max(3.0f, 4.0f * unit);
+    const ImVec2 bar0(origin.x + (size.x - bar_w) * 0.5f, y);
+    const ImVec2 bar1(bar0.x + bar_w, bar0.y + bar_h);
+    draw->AddRectFilled(bar0, bar1, LoadingRgba(255, 255, 255, alpha * 0.10f), bar_h * 0.5f);
     if (total > 0) {
-        const u32 done = std::min(SotcStats::warmup_done.load(std::memory_order_relaxed), total);
         const float frac = float(done) / float(total);
-        const float bar_w = size.x * 0.4f, bar_h = 10.0f * unit;
-        const ImVec2 bar0(origin.x + (size.x - bar_w) * 0.5f, centre.y + radius + 70.0f * unit);
-        draw->AddRectFilled(bar0, ImVec2(bar0.x + bar_w, bar0.y + bar_h), IM_COL32(60, 60, 64, 255), bar_h * 0.5f);
-        draw->AddRectFilled(bar0, ImVec2(bar0.x + bar_w * frac, bar0.y + bar_h), gold, bar_h * 0.5f);
-        char line[128];
-        std::snprintf(line, sizeof(line), "%s %d%%  (%u / %u)", SotcUi::T("Carregando shaders…", "Loading shaders…"),
-                      int(frac * 100.0f + 0.5f), done, total);
-        const float line_px = 22.0f * unit;
-        const ImVec2 line_size = ImGui::GetFont()->CalcTextSizeA(line_px, FLT_MAX, 0.0f, line);
-        draw->AddText(ImGui::GetFont(), line_px,
-                      ImVec2(origin.x + (size.x - line_size.x) * 0.5f, bar0.y + bar_h + 14.0f * unit), dim, line);
+        const float fill = bar_w * frac;
+        draw->AddRectFilled(bar0, ImVec2(bar0.x + fill, bar1.y), LoadingRgba(214, 184, 120, alpha), bar_h * 0.5f);
+        // A soft light running along the filled part, so a long stretch at one percentage still moves.
+        if (fill > 40.0f * unit) {
+            const float sx = bar0.x + fill * std::fmod(t * 0.5f, 1.0f);
+            draw->AddRectFilled(ImVec2(std::max(bar0.x, sx - 36.0f * unit), bar0.y), ImVec2(sx, bar1.y),
+                                LoadingRgba(255, 240, 205, alpha * 0.45f), bar_h * 0.5f);
+        }
+    } else {
+        const float seg = bar_w * 0.22f;
+        const float phase = 0.5f - 0.5f * std::cos(t * 2.2f);
+        const float x0 = bar0.x + (bar_w - seg) * phase;
+        draw->AddRectFilled(ImVec2(x0, bar0.y), ImVec2(x0 + seg, bar1.y), LoadingRgba(214, 184, 120, alpha * 0.9f),
+                            bar_h * 0.5f);
+    }
+    y += bar_h + 24.0f * unit;
+
+    // The status line, then the numbers.
+    char status[160];
+    switch (mode) {
+    case LoadingMode::Prep:
+        std::snprintf(status, sizeof(status), "%s", SotcUi::T("Preparando os shaders do jogo", "Preparing the game's shaders"));
+        break;
+    case LoadingMode::Cache:
+        std::snprintf(status, sizeof(status), "%s", SotcUi::T("Carregando os shaders", "Loading the shaders"));
+        break;
+    case LoadingMode::Stall:
+        std::snprintf(status, sizeof(status), "%s", SotcUi::T("Carregando", "Loading"));
+        break;
+    }
+    centred(status, 24.0f * unit, y, LoadingRgba(225, 225, 225, alpha));
+    y += 24.0f * unit + 12.0f * unit;
+    if (total > 0) {
+        char detail[192];
+        const u32 writes = SotcStats::prep_writes.load(std::memory_order_relaxed);
+        if (mode == LoadingMode::Prep && done >= total && writes > 0) {
+            std::snprintf(detail, sizeof(detail),
+                          SotcUi::T("Gravando no disco…  (%u arquivos)", "Writing to disk…  (%u files)"), writes);
+        } else {
+            // Time left from the rate since the start (the total still grows while the game loads files).
+            char eta[64] = "";
+            const long long elapsed_ms = NowMs() - SotcStats::prep_start_ms.load(std::memory_order_relaxed);
+            if (mode == LoadingMode::Prep && done > 50 && done < total && elapsed_ms > 2000) {
+                const double rate = double(done) / double(elapsed_ms);
+                const long long left_s = static_cast<long long>(double(total - done) / rate / 1000.0);
+                std::snprintf(eta, sizeof(eta),
+                              SotcUi::T("  ·  cerca de %lld:%02lld restantes", "  ·  about %lld:%02lld left"),
+                              left_s / 60, left_s % 60);
+            }
+            std::snprintf(detail, sizeof(detail), "%d%%  ·  %u / %u%s",
+                          int(float(done) / float(total) * 100.0f + 0.5f), done, total, eta);
+        }
+        centred(detail, 19.0f * unit, y, LoadingRgba(150, 150, 150, alpha));
+        y += 19.0f * unit + 10.0f * unit;
+    }
+    if (mode == LoadingMode::Prep) {
+        centred(SotcUi::T("Feito uma vez só: depois disso o jogo não compila mais shaders durante a partida.",
+                          "Done once: after this the game no longer compiles shaders while you play."),
+                18.0f * unit, y + 10.0f * unit, LoadingRgba(130, 130, 130, alpha));
+        centred(SotcUi::T("Fechar a janela agora interrompe o preparo: ele recomeça na próxima abertura.",
+                          "Closing the window now stops the preparation: it starts again next time."),
+                16.0f * unit, far.y - 64.0f * unit, LoadingRgba(100, 100, 100, alpha));
     }
     ImGui::End();
+}
+
+// sotc: the loading screen's opacity, from the render thread (under imgui_mutex): it fades in over 350 ms while it is
+// wanted and out over 300 ms once it is not (the game flips again: its frames show through the fade). backdrop: how
+// much of the game's last frame the screen covers; a hitch in play only dims it, and after 2.5 s without a game frame
+// (or with progress to show) it is opaque, so a frozen picture does not show through.
+float LoadingAlpha(bool wanted, float* backdrop) {
+    static long long last_ms = 0;
+    static float alpha = 0.0f;
+    const long long now = NowMs();
+    const long long gap = now - last_ms;
+    const float dt = float(gap > 100 || gap < 0 ? 16 : gap); // the first frame after a pause steps one frame
+    last_ms = now;
+    alpha = wanted ? std::min(1.0f, alpha + dt / 350.0f) : std::max(0.0f, alpha - dt / 300.0f);
+    loading_on.store(alpha > 0.0f, std::memory_order_relaxed);
+    const bool progress = SotcStats::prep_active.load(std::memory_order_relaxed) ||
+                          SotcStats::flip_count.load(std::memory_order_relaxed) == 0;
+    const long long stall = now - last_flip_ms.load(std::memory_order_relaxed);
+    *backdrop = progress ? 1.0f : std::clamp(0.6f + float(stall - 2500) / 500.0f * 0.4f, 0.6f, 1.0f);
+    return alpha;
 }
 
 std::atomic<const char*> upscaler_label{nullptr};
@@ -1723,16 +1810,21 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool LoadingShown() {
-    // sotc: a second without a game flip. Read from the presenter and the video out threads: the
-    // races only move the moment by a frame.
+    // sotc: a second without a game flip, the boot before the game's first flip, or the boot shader preparation (the
+    // game is held: no flip comes). Read from the presenter and the video out threads: the races only move the moment
+    // by a frame.
     static std::atomic<u64> seen{~u64{0}};
     const u64 flips = SotcStats::flip_count.load(std::memory_order_relaxed);
     const long long now = NowMs();
+    const bool prep = SotcStats::prep_active.load(std::memory_order_acquire);
+    if (flips == 0) {
+        return true;
+    }
     if (seen.exchange(flips, std::memory_order_relaxed) != flips) {
         last_flip_ms.store(now, std::memory_order_relaxed);
-        return false;
+        return prep;
     }
-    return now - last_flip_ms.load(std::memory_order_relaxed) >= 1000;
+    return prep || now - last_flip_ms.load(std::memory_order_relaxed) >= 1000;
 }
 
 // sotc: a SOTC_MENU_TRIGGER / SOTC_SET_TRIGGER file waits (scripted tests): Render handles it.
@@ -1746,7 +1838,8 @@ bool TriggerPending() {
 bool Visible() {
     return initialized && (menu_open || text_entry_active || list_active || OverlayOn() ||
                            SotcLabMenu::Visible() ||
-                           ToastShown() || LoadingShown() || TriggerPending() ||
+                           ToastShown() || LoadingShown() || loading_on.load(std::memory_order_relaxed) ||
+                           TriggerPending() ||
                            upscaler_label.load(std::memory_order_relaxed));
 }
 
@@ -1887,6 +1980,8 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     const bool loading = LoadingShown() && !list_active && !text_entry_active;
+    float loading_backdrop = 1.0f;
+    const float loading_alpha = LoadingAlpha(loading, &loading_backdrop);
     static bool was_loading = false;
     static long long loading_since = 0;
     if (loading != was_loading) { // sotc: one log line when it appears and when it goes away
@@ -1903,8 +1998,8 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
                            double(NowMs() - loading_since) / 1000.0);
         }
     }
-    if (loading) {
-        LoadingScreen();
+    if (loading_alpha > 0.0f) {
+        LoadingScreen(loading_alpha, loading_backdrop);
     }
     // sotc: SOTC_MENU_TRIGGER=<file>: when the file appears it is removed and the menu opens or
     // closes (scripted pictures of the menu: the "menu" event of tools/sotc_play.py).

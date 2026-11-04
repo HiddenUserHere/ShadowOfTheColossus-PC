@@ -26,7 +26,8 @@ HOOKS = [
     ),
     dict(
         name='RES_LOADED',
-        switch='SOTC_CSDR_PROBE',
+        # sotc.py sets it for SOTC_CSDR_PROBE, SOTC_PREDICT_PROBE, SOTC_PRETRANSLATE and SOTC_PRECOMPILE.
+        switch='SOTC_RES_LOADED',
         group='csdr_loaded',
         mode='entry',
         # push rbp; mov rbp,rsp; push rbx; push rax; mov rbx,rdi; call 0x8db10; lea rax,[rip+..]; add rax,0x10;

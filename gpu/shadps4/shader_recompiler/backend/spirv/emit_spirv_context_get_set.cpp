@@ -52,6 +52,11 @@ Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
     return ud_reg;
 }
 
+// sotc: SOTC_GENERIC_BUFFERS (resource_patching_pass.cpp, the runtime buffer stride).
+Id EmitLoadFlatbufDword(EmitContext& ctx, Id index) {
+    return ctx.EmitFlatbufferLoad(index);
+}
+
 Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     const u32 flatbuf_off_dw = inst->Flags<u32>();
     if (flatbuf_off_dw & ReadConstDynamicWindowFlag) {

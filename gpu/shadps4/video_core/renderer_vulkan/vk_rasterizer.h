@@ -61,6 +61,11 @@ public:
         return texture_cache;
     }
 
+    /// sotc: ARCH-GCN-NATIVE. Draw thread, at each submit start: the miss ring drain and the freshness batch
+    /// (SotcGcn::OnSubmitStart). Called by the command processor's submit start (liverpool.cpp); no-op when the GCN
+    /// memory, buffer, texture and sync stages are all off.
+    void GcnSubmitStart();
+
     /// resolved/use_resolved: the pipeline the command processor looked up for this draw
     /// (Liverpool::IsBackThreaded), instead of looking it up here.
     /// sotc: prepared: SOTC_PARALLEL_RECORD's inputs for this draw (draw thread), or null.
@@ -502,6 +507,12 @@ private:
     BdaTable bda_table; ///< sotc: SOTC_BDA, the per-stage block table (vk_bda_table.h)
     /// sotc: hands the dispatch's written binds to the GPU result copies (native_copies.h).
     void CopyGpuResults(vk::CommandBuffer cmdbuf);
+    /// sotc: SOTC_DRAW_GATE: true when this draw waits for the staged upload of its buffers (draw_gate.h).
+    bool DrawGateDefers(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    /// sotc: SOTC_GCN_CENSUS: what this op binds (gcn_census.h). Measurement only.
+    void CensusNote(const Pipeline* pipeline, u8 kind);
+    /// sotc: SOTC_GPU_CHECKPOINTS: the bound resources of command `seq` for the device lost report.
+    void CheckpointResources(u64 seq);
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;

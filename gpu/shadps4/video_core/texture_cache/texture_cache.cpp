@@ -4136,4 +4136,15 @@ void TextureCache::ReportUnmapPark(std::string& out, double seconds) {
     out += line;
 }
 
+// sotc: SOTC_GCN_SYNC (texture_cache.h). The bind path's refresh (UpdateImage) for an image the CPU changed.
+bool TextureCache::SotcRefreshCpuDirty(Image& image) {
+    std::unique_lock lk{mutex, std::defer_lock};
+    LockCounted(lk);
+    if (False(image.flags & ImageFlagBits::CpuDirty)) {
+        return false;
+    }
+    RefreshImage(image);
+    return true;
+}
+
 } // namespace VideoCore

@@ -81,8 +81,16 @@ struct Profile {
     /// descriptor for the value, and its loads compare the shader address with the descriptor (debug buffer).
     /// 3 and 4 (SOTC_ADDR_TABLE, addr_table.h): as 1 and 2, but each access is translated through the guest page
     /// table (the packet's mirror words are the table window) instead of the window words.
-    /// Last member: the cache check pads older profiles. Still one byte (u8 for bool), so sizeof(Profile) holds.
+    /// Followed by gcn_buf and gcn_tex. Still one byte (u8 for bool), so sizeof(Profile) holds.
     u8 shader_addr{};
+    /// sotc: SOTC_GCN_BUF (ARCH-GCN-NATIVE S2, decisions D4-D6): 0 off, 1 on, 2 verify (the same code as 1; the
+    /// verification is on the host). Only with shader_addr 3 or 4. Adds the formatted buffers whose loads decode the
+    /// V# format at run time (SOTC_GENERIC_BUFFERS=2) to the shader-addressed buffers (ShaderAddrBuffer), and every
+    /// table miss of such a shader appends a page record to the globals miss ring (gcn_layout.h).
+    u8 gcn_buf{};
+    /// sotc: SOTC_GCN_TEX (ARCH-GCN-NATIVE S3): 0 off, 1 on, 2 verify. Read by the texture side only (the T# table
+    /// lookup, gcn_layout.h); the buffer side does not use it.
+    u8 gcn_tex{};
 
     bool operator==(const Profile&) const = default;
 };
