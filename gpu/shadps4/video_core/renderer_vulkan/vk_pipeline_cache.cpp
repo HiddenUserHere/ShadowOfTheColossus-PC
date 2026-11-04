@@ -27,6 +27,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/decode.h" // sotc: InterpolatedInputs
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/recompiler.h"
@@ -158,7 +159,11 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
 // from a scanned copy of the registers).
 static void FillComputeRuntimeInfo(Shader::RuntimeInfo& info, const AmdGpu::ComputeProgram& cs_pgm) {
     info.props.num_user_data = cs_pgm.settings.num_user_regs;
-    info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
+    // sotc: COMPUTE_PGM_RSRC1.VGPRS holds granules - 1, as for the graphics stages (ShaderProgram::NumVgprs). It was
+    // num_vgprs * 4, one granule (4 VGPRs) short: 4,222 of the game's 4,260 compute programs use their top granule.
+    // Only v_movrel* bounds and the scratch VGPRs read the count (neither occurs in a compute program of the game),
+    // but it is part of the shader cache key, so the cached compute shaders are translated once again.
+    info.props.num_allocated_vgprs = (cs_pgm.settings.num_vgprs + 1) * 4;
     info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
     info.props.fp_denorm_mode16_64 = cs_pgm.settings.fp_denorm_mode64;
     info.props.fp_round_mode32 = cs_pgm.settings.fp_round_mode32;
@@ -3203,6 +3208,64 @@ void ReportSpecMemo(std::string& out, double seconds) {
     out += line;
 }
 
+// sotc: SOTC_PS_INPUT_NORMALIZE (on unless =0). The pixel inputs the program reads with v_interp_p1/p2/mov, as a mask
+// of attribute indices, from its GCN code (decoded once per program hash). The translator's own record of the reads
+// (Info::loads) is not in the disk cache, so the code is the one source both a fresh and a restored program share.
+static uint64_t InterpolatedInputs(u64 hash, std::span<const u32> code) {
+    static std::mutex mutex;
+    static std::unordered_map<u64, uint64_t> masks;
+    {
+        std::scoped_lock lock{mutex};
+        if (const auto it = masks.find(hash); it != masks.end()) {
+            return it->second;
+        }
+    }
+    uint64_t mask = 0;
+    Shader::Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Shader::Gcn::GcnDecodeContext decoder;
+    while (!slice.atEnd()) {
+        const auto inst = decoder.decodeInstruction(slice);
+        if (inst.opcode == Shader::Gcn::Opcode::V_INTERP_P1_F32 ||
+            inst.opcode == Shader::Gcn::Opcode::V_INTERP_P2_F32 ||
+            inst.opcode == Shader::Gcn::Opcode::V_INTERP_MOV_F32) {
+            mask |= uint64_t{1} << inst.control.vintrp.attr;
+        } else if (inst.opcode == Shader::Gcn::Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    std::scoped_lock lock{mutex};
+    masks.emplace(hash, mask);
+    return mask;
+}
+
+// sotc: SOTC_PS_INPUT_NORMALIZE. A flat input the program never reads is declared the same way whether the engine
+// set USE_DEFAULT on it or not (both are not IsDefault(); the declaration takes its location and decoration from
+// param_index and the shader's own interpolation), and the passthrough difference is in V_INTERP_MOV, which never
+// runs for it. Yet the flag is in the specialization key, so the same code made two permutations, and the flag
+// cannot be known before the draw (13 such slots, in 4 particle programs, all unread). Such inputs are keyed as
+// passthrough (USE_DEFAULT, value 0), the 99.6% case. Returns the slots changed.
+static u32 NormalizeUnreadFlatInputs(Shader::RuntimeInfo& info, uint64_t read_mask) {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_PS_INPUT_NORMALIZE");
+        return !v || v[0] != '0';
+    }();
+    if (!on) {
+        return 0;
+    }
+    const u32 clip = info.hw.fs.clip_distance_emulation ? 1u : 0u;
+    const u32 count = info.hw.fs.num_inputs > clip ? info.hw.fs.num_inputs - clip : 0;
+    u32 changed = 0;
+    for (u32 i = 0; i < count && i < info.hw.fs.inputs.size(); ++i) {
+        auto& input = info.hw.fs.inputs[i];
+        if (input.is_flat && !(read_mask & (uint64_t{1} << i)) && (!input.is_default || input.default_value)) {
+            input.is_default = true;
+            input.default_value = 0;
+            ++changed;
+        }
+    }
+    return changed;
+}
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding,
@@ -3217,6 +3280,17 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     }
     // sotc: copied only where CompileModule needs a mutable one (it was copied on every call).
     const auto& rt = BuildRuntimeInfo(hw_stage, sw_stage);
+    if (sw_stage == SwStage::Fragment) {
+        // sotc: SOTC_PS_INPUT_NORMALIZE, before the key and the translation see the inputs (see above).
+        auto& fs_rt = runtime_infos[u32(sw_stage)];
+        if (const u32 changed = NormalizeUnreadFlatInputs(fs_rt, InterpolatedInputs(params.hash, params.code))) {
+            static std::atomic<u32> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr, "SOTC PS INPUT NORMALIZE: program %#llx, %u unread flat inputs keyed as "
+                             "passthrough\n", static_cast<unsigned long long>(params.hash), changed);
+            }
+        }
+    }
     if (async_ok && !program_cache.contains(params.hash) &&
         !in_place_programs.contains(params.hash)) {
         if (pending_programs.insert(params.hash).second) {

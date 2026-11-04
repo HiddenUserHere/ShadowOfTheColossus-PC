@@ -557,6 +557,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
         return false; // counted by LoadShaderMeta (SOTC CACHE DIAG)
     }
+    SotcPredict::OnCachedProgram(program->info, spec); // sotc: SOTC_PREDICT_PROBE (pixel layouts per pass)
 
     std::vector<u32> spv{};
     {

@@ -23,6 +23,10 @@ void NoteLoaded(uint64_t program_hash) noexcept;
 /// the draw (loaded? pass layout? default resources?).
 void OnTranslate(const Shader::Info& info, const Shader::StageSpecialization& spec, size_t perm_idx) noexcept;
 
+/// A pixel shader the warm-up restored from the disk cache (vk_pipeline_serialization.cpp LoadPipelineStage): its
+/// color layout joins its pass's set.
+void OnCachedProgram(const Shader::Info& info, const Shader::StageSpecialization& spec) noexcept;
+
 /// The 5 s report line (driver.cpp); nothing when the switch is off.
 void Report(std::string& out, double seconds);
 
