@@ -893,3 +893,294 @@ per frame.
 - Corrections to earlier notes: T4.10 item 7 ("the BONI / BONW / SAT_ route ... unknown") is answered for BONI and BONW
   (T5.5) and for SAT_ (T5.8). D1 section 5.3 ("the meaning of the second POS is unknown") still holds: the skin path does
   not write slot 10.
+
+## Skinning palette and draw (T14)
+
+Read-only static analysis (agent T14, closes the two open items of T5: the bone palette and the draw side). Same sources
+as T4/T5: decomp in `out/re/decomp/<hi16>/<addr>.c`, and the saved eboot disassembly `scratchpad/t4_disasm.txt` (from
+`llvm-objdump -d out/re/ghidra/eboot_ghidra.elf`) for the loops the decompile gets wrong or hides (`0x123330`,
+`0x125520`, `0x10c2e0`). Addresses are eboot VAs. Labels: **observed**, **inferred**, **unknown**. No game file read,
+no game run.
+
+### T14.1 Short answer
+
+- **The T5 palette candidate is confirmed in structure.** `obj+0x100` is a palette head (count at `+0x18`, array
+  pointer at `+0x20`). The array holds `NumBones` nodes of `0x30` bytes, each a 3x4 affine matrix. It is created with
+  the skeleton (`TryCreateMesh`, `0x10f760`), initialised to identity, filled each frame from pose records, and copied
+  into the skin scratch by `0x123330` on every skin dispatch. **observed** (layout, init, copy). The matrix values
+  come from an animation producer that is **not** identified (T14.3, open).
+- **Correction to T5.2:** `0x123330` does not walk a linked chain. The nodes are an array at head `+0x20`, indexed by
+  the loop. The "next pointer at node `+0x20`" reading is wrong. **observed** (disassembly).
+- **The palette V# is the scratch V#, extra index 0x41.** The skin inputs (POS0, NRM0, TAN0, BONI, BONW, indices
+  `0x11..0x15`) and outputs (`0x21..0x23`) are as T5.5. The palette and the vertex count go in the extras `0x41` and
+  `0x42`. **observed** (`0x193810`).
+- **The draw side is found.** A skinned draw does not read a new kind of table. Each skinned record has an output
+  object `out` (`rec+0x40`), and `out` holds two 0x68-byte "slot holders", one per frame parity. Slot 1 (POS0) of
+  holder `p` is skin output A of parity `p`, slot 8 (NRM0) is output B, slot 9 (TAN0) is output C. The object mesh draw
+  (`0x10c2e0`, `0x10c6c0`) puts holder `p`'s V# table into item `P+0x90`. So the output addresses reach the VS through
+  the T4 table-pointer path (T4.5-T4.7), with the parity picked at draw time. **observed** (stores, loads, parity
+  expression). The VS reading POS from slot 1 of that table is **inferred** (T4.7 slot rule; no fetch shader read).
+- **Memory model:** the skin outputs are written and read by the GPU, and no CPU read was found. They are a class not
+  in `memory-model.md` (not RESULT, which the CPU reads; not STREAM, which the CPU writes). The palette array is CPU
+  written each frame and reaches the GPU only through the per-frame scratch, so the scratch is STREAM (T14.7).
+
+### T14.2 The palette object `obj+0x100` (layout observed, meaning inferred)
+
+Creation in `TryCreateMesh` (`0x10f760`, decomp `0010/0010f760.c`). `uVar1 = NumBones = *(u32*)(mesh_resource + 0x16c)`
+for the first LOD that has a skeleton (the string at line 120 names it: "LODs have mismatched skeletons: LOD0(NumBones
+= %d, SkelId = %d)"). Lines 176-212 build the palette:
+
+```c
+struct PaletteHead {            // 0x28 bytes, FUN_0016cd90 at 0x10f760 line ~178; stored at obj+0x100
+  u64 pad[3];                   // +0x00..0x17 (zero)
+  u32 count;                    // +0x18  = NumBones
+  u32 pad1;
+  float* nodes;                 // +0x20  -> NumBones * 0x30 bytes
+};
+struct PaletteNode {            // 0x30 bytes, 12 floats; column-major 3x4 (inferred)
+  float w[12];                  // init: w0 = w4 = w8 = 1.0, w1..w3, w5..w7, w9..w11 = 0
+};
+```
+
+- **Identity init (observed):** every node gets `[0] = 1.0f`, `[4] = 1.0f`, `[8] = 1.0f` and zeros elsewhere (the
+  `*puVar13 = 0x3f800000` stores and the `puVar13[2]`/`puVar13[4]` stores of lines 178-212). Read as four columns of
+  three floats, the diagonal is words 0, 4, 8 and the translation is words 9..11. So the initial value is the identity
+  with zero translation. **inferred:** column-major 3x4 (the translation is the fourth column).
+- **Scratch copy (observed, `0x123330`, 198 bytes; disassembly `123330`-`1233f4`).** The loop reads the array base from
+  `head+0x20` each time, then for node `j` (stride `0x30`) it stores twelve dwords with this permutation, source word
+  `w` to destination word `k`:
+
+  | dst k | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | src w | 0 | 3 | 6 | 9 | 1 | 4 | 7 | 10 | 2 | 5 | 8 | 11 |
+
+  So `dst[4c + r] = src[3r + c]`. If `src` is the column-major 3x4 above, `dst` is the same matrix as a row-major 3x4
+  (three rows of four floats). **observed:** the permutation; **inferred:** the layouts it implies.
+- **Scratch header (observed):** `dword[0] = 1`, `dword[1] = count`, nodes from byte `+0x10`. Size `count*0x30 + 0x10`
+  (`0x125520` disassembly `12555a`-`12555d`: `lea (rax,rax,2)`, `shl 4`, `add 0x10`).
+- **Scratch argument (observed):** `0x125520` calls `0x8c0d0(DAT_02ee3ce0+0x520, size)` and passes its return value in
+  `rdx` to `0x123330` (`125568`-`12556e`). The decompile shows one argument, which is why T5 flagged the pointer.
+
+**Verdict on T5.6 candidate A:** `obj+0x100` is an array of `NumBones` 3x4 affine matrices, identity at load, updated
+per frame, and copied into the scratch on every skin dispatch. **Proven:** structure, count source, init, copy. **Not
+checked:** that the skin shader indexes this array with BONI (T14.8, log step 4). Candidate B (`0x123410`, the object
+world matrix at `obj+0x14..0x44`) is a different thing: the world matrix, copied from the pose record (T14.3).
+
+### T14.3 Per-frame writer of the palette (observed up to the producer)
+
+- **Consumer `0x4938e0`** (307 bytes; caller `0x536050` line 162: `FUN_004938e0(DAT_02ef8c08, plVar5)`). `0x536050`
+  (1067 bytes, no static caller; per frame) sets the frame context and calls it. **observed.**
+- Pending records are a singly linked list at `manager+0xa8 + idx*0x20`, where `idx = manager+0x20 - 1` (or 1 when the
+  count is 0). The list is per frame; **inferred** that the manager keeps two slots. Record fields (observed):
+
+  ```c
+  struct PoseRec {                 // one object's pose for one frame (4938e0 view)
+    struct PoseRec* next;          // +0x00
+    u64 obj;                       // +0x08  render object
+    u32 count;                     // +0x10  node count from the producer
+    float world[12];               // +0x14  48 bytes -> obj+0x14..0x44 (0x123db0)
+    float bones[];                 // +0x44  count*0x30 bytes -> palette array
+  };
+  ```
+
+- For each record, `0x4938e0` calls `0x123db0(obj, rec+0x14)` (which writes `obj+0x14..0x44`), then gets the array base
+  with `0x123f10(obj, count)` (returns `*(obj+0x100)+0x20`), then copies `min(count, NumBones) * 0x30` bytes from
+  `rec+0x44` (lines 22-37). **observed.** The test `*(obj+8) != -1` (line 39) only gates a call to `0xd3450`; it does not
+  skip the copy.
+- The second consumer `0x493a20` (136 bytes, no static caller) has the same work with a different layout: the
+  arguments are `(manager, count, rec)`, the world is at `rec+0x00` and the bones at `rec+0x30`. **observed.**
+- **Dirty set (answers T5.11 item 8 in part).** `0x123f10` (line 16) and `0x123db0` (lines 5-9) set bit `obj+0xc` in
+  the bitset at `DAT_02edf140 + 0x208070`. `0x116d80` and `0x118370` copy that bitset to `+0x210070` and `+0x218070`.
+  `0x116e20` walks `+0x218070` (lines 15 and 33) and clears it (line 58, `memset 0x8000`). So T5's "manager+0x218070"
+  is the walker's copy, and the writers set the `+0x208070` bits. **observed.**
+- **Producer (open).** `0x493ad0` (235 bytes; callers `0x58df60` line 73 and `0x5902c0` line 107) calls `0x493bc0`
+  (389 bytes; about twelve callers, e.g. `0x78bc50`, `0x6ffa30`, `0x7fd2b0`). `0x493bc0` builds a reference-counted
+  work item (vtable `PTR_FUN_015bf980`) from its arguments and queues it. **observed.** Whether this item is the pose
+  record, and where the bone matrices are computed (the animation evaluator), is **unknown**. The T5.6 leads
+  `r_enableAnimations` (`0x24db80`) and `CP10-Anim` were not traced.
+
+### T14.4 The skin dispatch: which V# carries the palette (answers T5.3 step 4)
+
+Per object (`0x125520` for variant A, `0x1255d0` for B), in this order (**observed**):
+
+1. Scratch: `0x8c0d0(DAT_02ee3ce0+0x520, count*0x30+0x10)` sets the base words of the 16-byte V# at
+   `DAT_02ee3ce0+0x520` to a new block (`0x8c0d0` writes `param_1[0..1]` only). `0x123330` fills the block (T14.2).
+2. For each skin record `rec` (`obj+0xf0 + 0x58*i`, `i < obj+0xf8`): `0x193810(rec, cmd, ctx, &scratch_V#)`.
+3. In `0x193810`, extras go through `0x85e820` (T5.5): index `0x41` = the scratch V# (`*param_4`, 16 bytes; base = the
+   palette block). Index `0x42` = the V# at `DAT_02ee3ce0+0x548`, whose 4-byte block holds `*(stream+0)`, the **vertex
+   count** (`0x193810` lines 19-26). **observed.**
+4. Palette V# (index `0x41`): base = the scratch block. Node `k` is at `base + 0x10 + 0x30*k`. The bone count is
+   `dword[1]` of the block. Stride and record count (V# words 2-3) come from the template at `DAT_02ee3ce0+0x520`,
+   which was not read (**unknown**). The palette is per object: all records of one object share one block, because the
+   scratch is set once per object before the record loop. **observed** (`0x125520` lines 4-8).
+5. Index and weight streams: BONI (`stream+0x1e8`, input 3) and BONW (`stream+0x210`, input 4). The shader's bone index
+   selects node `k` (**inferred**, T14.8).
+
+Variant B (`0x193aa0`) writes the same palette V# through the stage-array writer `0x8619a0` (T5.3). **observed.**
+
+### T14.5 The draw side: per-parity holder tables (the missing link of T5.7)
+
+**How an object gets its output record (observed, `0x10f760` lines 306-352).** For each LOD record `rec` (`0x58`
+bytes, `lVar9`), the builder chooses by the LOD's NumBones (`uVar1`):
+
+- NumBones == 0 (plain mesh): `rec+0x38 = stream+0x260` (the mesh's 12-pointer slot array, T4.2). `rec+0x40` stays 0
+  (`0x193280` zeroes `rec+0x30..0x4f`).
+- NumBones != 0 (skinned): `out = FUN_0016cd90(...)`, `FUN_00192de0(out)` (constructor, vtable
+  `PTR_FUN_01598930`), `out+0xd8 = mesh handle`, `FUN_00192f20(out)`, then `rec+0x38 = out+8` and `rec+0x40 = out`.
+
+`0x192f20` (862 bytes) builds `out` from the mesh stream `stream = *(mesh+0x70)`:
+
+- **Two holders.** A holder is a 0x68-byte struct: 12 slot pointers at `+0x00..0x5f`, and a table pointer at `+0x60`
+  (set by `0x128a80`, which stores at `obj+0x60`, T4.2). `out` has holder `H0 = out+0x08` and holder `H1 = out+0x70`,
+  with tables `*(out+0x68)` and `*(out+0xd0)`. Each table is `0xc0` bytes (`0x17140(0xc0)`).
+- **Output V# objects inside `out` (observed, `0x8be60` calls at the end of `0x192f20`):**
+  - A[0] at `out+0xe8` and A[1] at `out+0x110`: two separate V# objects, class 2 (`0x8be60(…, 2, 0x8c1d0(2), count, 4, 0, 0)`).
+    Together they are the parity pair of T5.4 (`out+0xe8 + p*0x28`).
+  - B at `out+0x138` and C at `out+0x160`: class `0x12` (`0x8be60(…, 0x12, 0x8c1d0(0x12), count, 4, 0, 0)`).
+  - `count = *(stream+0)`, the vertex count (D1 section 2). The third argument is multiplied by the count
+    (`0x8be60` line `param_1[8] = param_4 * param_3`). It is probably the element stride, but `0x8c1d0` was not read,
+    so the element size is **unknown**.
+  - The entry flags are at `+0x18` of each entry (`out+0x100`, `+0x150`, `+0x178`), as T5.4 says. **observed.**
+- **Pointers that fill the holders (observed, `0x192f20` lines 1-70 and the tail):**
+
+  | holder slot | H0 (`out+0x08`) | H1 (`out+0x70`) |
+  |---|---|---|
+  | 0 | stream slot 0 (copied) | stream slot 0 (copied) |
+  | 1 (POS0) | `out+0x10` = `out+0xe8` (A[0]) | `out+0x78` = `out+0x110` (A[1]) |
+  | 2..7 | stream slots (copied) | stream slots (copied) |
+  | 8 (NRM0) | `out+0x48` = `out+0x138` (B) | `out+0xb0` = `out+0x138` (B) |
+  | 9 (TAN0) | `out+0x50` = `out+0x160` (C) | `out+0xb8` = `out+0x160` (C) |
+  | 10 (POS0 copy, flag 0x400 in D1 5.3) | `out+0x58` = `out+0x110` (A[1]) | `out+0xc0` = `out+0xe8` (A[0]) |
+  | 11 | stream slot (copied) | stream slot (copied) |
+
+  The stream slot pointers are overwritten with the output addresses before the V# copy loop (lines 70-140). That loop
+  dereferences each slot pointer and copies its first two qwords into the table at `holder+0x60`. So it copies the
+  output V#s. **observed** (order and stores).
+- **Holder selection (observed, `0x193560`, 31 bytes):** `FUN_00193560(rec, ctx)` returns `rec+0x38 + 0x68*p`, where
+  `p = *(*(ctx+0x10)+0xd70) & 1` when `rec+0x40 != 0`, else `p = 0`. For a skinned record this is `H0` or `H1`.
+  **observed.** The skin dispatch reads the parity the same way (`0x193810`: `*(*(ctx+0x10)+0xd70) & 1`, and `0x193580`).
+
+**The draw item (observed, `0x10c2e0`, 498 bytes; `0x10c6c0` is the same with `0x1239a0` in place of `0x125500`):**
+
+```c
+// 0x10c2e0(render_ctx, P, ...)   P = draw item; called from 0x103ad0 (and 0x1051f0 for 0x10c6c0)
+// lVar6 = the object's skin instance, found through the 0x198 bitset of the render object; 0 for a plain mesh.
+if (lVar6 == 0) {
+    FUN_001122d0(stream, P, 0x20);           // plain mesh: P+0x90 = stream+0x2c0 (T4.3)
+} else {
+    FUN_00125500(lVar6, ctx, P, lVar6+0x68); // P+0xa8 = 44-bit base of obj+0x68
+    // loop over records (FUN_00123da0(lVar6, i)): keep the record whose mesh == the item's mesh;
+    // if none matches, the last record.
+    rec    = FUN_00123da0(lVar6, i);
+    holder = FUN_00193560(rec, P);           // parity from *(*(P+0x10)+0xd70) & 1
+    P[0x12] = *(holder + 0x60);              // P+0x90 = per-parity V# table (12 entries)
+}
+```
+
+- For a skinned object, `P+0x90` is the per-parity table `*(holder+0x60)`. Its slot 1 (`table + 16*1`) is a copy of
+  A[p] (skin output POS), slot 8 is B (NRM0), slot 9 is C (TAN0). **observed** (copy and stores). **inferred:** the
+  VS reads POS from slot 1 (the T4.7 slot rule) through the SRT chunk of T4.5.
+- **Parity source for the draw (inferred, check at run time):** `0x10c2e0` reads the parity from `*(P+0x10)+0xd70`,
+  whereas `0x193810` reads it from `*(ctx+0x10)+0xd70`. Both are `+0xd70` of a pointer at `+0x10`. They match only if
+  `P+0x10` and the walker's `ctx+0x10` point to the same frame state. The log spec below checks it.
+- **The skin path is taken only when the object has a set bit** in the `0x198` bitset (lines 16-24). The gate at line
+  15 tests a flag of the resource at `+0x60` (`*(*(lVar3+0x60)+0x54) & 2`). Its meaning is **unknown**.
+- **Consequence for T4.6:** the table is reached in one load from the SRT (`chunk[0] = P+0x90`, T4.5). No extra
+  indirection beyond what T4.6 states.
+
+**Answer to the brief's three options for the skinned draw:**
+1. An item builder that copies the output V#s into item slots: **partly.** The builders copy pointers. The V# copy is
+   done once, at construction (`0x192f20`), into the holder tables.
+2. The output written into the mesh table `stream+0x2c0`: **no.** `stream+0x2c0` is untouched. The per-object holder
+   table is what gets the output addresses (at construction, not per frame).
+3. The double-buffer parity applied at draw time: **yes.** `0x193560` picks holder `p` from the frame parity.
+
+### T14.6 Per-frame skinned path, end to end
+
+1. **Load** (`0x10f760`, TryCreateMesh): object `obj` with the identity palette (`obj+0x100`, `NumBones` nodes), `0x58`-byte
+   records (`obj+0xf0`, count `obj+0xf8`). Each skinned LOD gets an output object `out`: two holders, A[0]/A[1], B, C,
+   and the two copied V# tables. **observed.**
+2. **Frame, pose** (`0x493ad0`/`0x493bc0` queue; producer open): the pose record (world plus palette) is queued and then
+   applied by `0x4938e0` (from `0x536050`) to `obj+0x14..0x44` and the palette array; the dirty bit is set. **observed**
+   up to the producer.
+3. **Frame, skin job** (`UpdateSkinningRenderObjects`, `0xcfdb0`, body `0xd06f0` -> `0x116e20` or `0x116fb0`): the
+   dirty bitset is snapshotted (`0x116d80`/`0x118370`) and walked (`0x116e20`). Per object, `0x125520`: scratch and
+   palette copy (`0x123330`). Per record, `0x193810`: program, inputs, outputs A[p]/B/C, extras (palette, count),
+   dispatch of `ceil(vertexCount/64)` groups. **observed.**
+4. **Frame, draw** (`0x103ad0` / `0x1051f0` -> `0x10c2e0` / `0x10c6c0`): item `P+0x90` = holder `p` table. The section
+   draw submits it through the SRT chunk of T4.5 (`0x95320`, `0xae150`, `0x862490`). **observed** up to the SGPR write;
+   the VS side is **inferred**.
+5. **Synchronisation between the skin compute and the draw:** not checked. `0x193810` ends with `0x883870` (dispatch)
+   and calls `0x85e5d0` (flush) only if `*(cmd+0x1adc) != 0` (line 44). **unknown** whether a barrier is issued. The port
+   needs one unless the flush covers it (**inferred**).
+
+### T14.7 Memory-model classes (for `arch-next/memory-model.md`)
+
+| Buffer | Written by | Read by | Lifetime | Class (inferred) |
+|---|---|---|---|---|
+| Palette array `obj+0x100 +0x20` (NumBones x 0x30) | CPU, job (`0x4938e0`) | CPU (`0x123330`) only | persistent, per object | CPU-only guest memory; not a GPU input |
+| Scratch block (palette copy, bump from `DAT_02ee3ce0+0x520`) | CPU (`0x123330`) | GPU, same frame (skin compute) | per frame | STREAM |
+| Count block (`DAT_02ee3ce0+0x548`) | CPU (`0x193810`) | GPU, same frame | per frame | STREAM |
+| Skin outputs A[0]/A[1], B, C (`out+0xe8`, `+0x110`, `+0x138`, `+0x160`) | GPU (skin compute) | GPU (draws this frame; the other parity through slot 10 next frame, **inferred**) | persistent | new class: GPU-written and GPU-read, no CPU read found. Not RESULT, not STREAM. Device-local in the port. |
+
+- The mesh streams (POS0, NRM0, TAN0, BONI, BONW) stay STATIC, as the rest of the mesh (T4.9).
+- A port that imports every GPU-written range as RESULT (memory-model section 2.5) would import A/B/C needlessly, because
+  the CPU never reads them. **inferred.**
+
+### T14.8 Open items and the one-run log spec
+
+Open:
+1. **The producer of the pose matrices.** `0x493bc0` is the queue. Who fills the pose record is unknown.
+2. **The skin shader's use of BONI** as an index into `obj+0x100` (node index = BONI value, no remap). Not read.
+3. **Output V# element size** (`0x8c1d0(2)`, `0x8c1d0(0x12)`, not read) and the format of palette V# words 2-3.
+4. **Whether the VS reads POS from slot 1 of the holder table**, and the use of slot 10 (other parity: motion vectors?).
+5. **Barrier** between the skin dispatch and the draw.
+6. **Parity source** `*(P+0x10)` (draw) versus `*(ctx+0x10)` (walker): same frame state or not.
+7. **Gate** at `0x10c2e0` line 15.
+
+One run, no code change. Add entry logs at the VAs below (add the port load base, as in D1 section 12). Log once per
+address and argument set, one line each.
+
+1. `0x4938e0` entry: `obj`, `*(manager+0x20)`, record count `rec+0x10`, `rec+0x14` (48 bytes), and the first 48 bytes of
+   `rec+0x44`. Expect animated frames to give a palette that changes between frames and is not identity. This identifies
+   the producer's data (open item 1).
+2. `0x493bc0` entry: the argument qwords and the return address. Expect one of the callers listed in T14.3. Names the
+   producer (open item 1).
+3. `0x123330` exit: `*(obj+0x100)+0x18` and scratch dwords `[0..1]` (must be `1, count`), and node 0 (12 floats, row-major
+   after the permutation). Expect node 0 to be the source node 0 with the permutation of T14.2 applied.
+4. `0x193810` after the outputs: the palette V# base (`*param_4`), the count V# value (`*(stream+0)`), and the maximum BONI
+   value over the vertices on the first dispatch (one CPU scan of the mesh buffer `stream+0x1e8`). The maximum must be
+   below `NumBones`. This settles open item 2.
+5. `0x10c2e0` at the store to `P+0x90`: `p` from both sources (`*(P+0x10)+0xd70` and `*(ctx+0x10)+0xd70` at the walker),
+   `holder`, `*(holder+0x60)`, and the 16-byte V# at `table+0x10`. The V# base must equal `out+0xe8` (p = 0) or
+   `out+0x110` (p = 1). This settles the draw mapping and open item 6.
+6. First draw of a skinned mesh: the VS user SGPR pair (from the PM4 stream) and the first `s_load` of the fetch shader.
+   Check that the POS attribute has `dword_offset / 4 == 1` and that the SRT chunk `[0] == P+0x90`. Settles open item 4.
+7. Calls to `0x85e5d0` between the skin dispatch and the draw: record whether a flush or barrier occurs (open item 5).
+
+### T14.9 Corrections to earlier notes
+
+- T5.2: `0x123330` copies an array at `head+0x20`, not a chain (T14.2).
+- T5.2 and T5.11 item 8: the dirty bits are set in `DAT_02edf140+0x208070` by `0x123f10` and `0x123db0`. `+0x218070`
+  is the walker's copy (T14.3).
+- T5.3: the parity is read as `*(*(ctx+0x10)+0xd70) & 1`, not `*(ctx+0xd70)`.
+- T5.4: `out = rec+0x40` is an object built by `0x192de0`/`0x192f20` (vtable `PTR_FUN_01598930`), not a plain stream
+  object. A[0] and A[1] are two objects (T14.5).
+- T5.7: resolved. The draw reads the holder table through `0x10c2e0` (T14.5).
+- T4.6: for a skinned record, `chunk[0] = P+0x90` is the per-parity holder table, not the mesh table.
+- D1 section 5.3 (slot 10): for a skinned object, slot 10 is the other parity's POS (T14.5). Its use is still
+  **inferred**.
+
+### T14.10 Evidence (addresses and files)
+
+- Palette: `out/re/decomp/0010/0010f760.c` (lines 1-20, 120, 150-212), `0012/00123330.c`, `0012/00125520.c`,
+  `0012/001255d0.c`; disassembly `scratchpad/t4_disasm.txt` at `123330`-`1233f4` and `125520`-`1255bd`.
+- Consumers and dirty set: `0049/004938e0.c`, `0049/00493a20.c`, `0053/00536050.c` (line 162), `0012/00123f10.c`,
+  `0012/00123db0.c`, `0011/00116d80.c`, `0011/00118370.c`, `0011/00116e20.c`.
+- Producer candidates: `0049/00493ad0.c`, `0049/00493bc0.c`, `0058/0058df60.c` (line 73), `0059/005902c0.c` (line 107).
+- Skin output object: `0019/00192de0.c`, `0019/00192f20.c`, `0019/00193280.c`, `0019/001932e0.c`, `0019/00193f00.c`
+  (object factory; `0x8be60` call shapes), `0019/00193560.c`, `0019/00193580.c`, `0012/00123da0.c`, `0008/0008be60.c`,
+  `0008/0008c0d0.c`.
+- Draw item: `0010/0010c2e0.c` (lines 15-51), `0010/0010c6c0.c`, `0012/00125500.c`, callers `0010/00103ad0.c` and
+  `0010/001051f0.c`.
+- Dispatch: `0019/00193810.c`, `0019/00193aa0.c`, `0012/00125520.c`.

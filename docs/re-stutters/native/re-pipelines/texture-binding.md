@@ -1456,3 +1456,238 @@ chunk[5] = P+0xd0   bit 8, read by 0x18d6f0 line 372, writer not found in the bu
 | PS reads chunk[3] / chunk[4] | unknown (shader-dependent; 39 % of PS carry the slot) |
 | Writers of `P+0x98`, `P+0xd0`; which writer of `P+0xb0` is live | unknown |
 | The port does not parse the OrbShdr input usage table | observed (grep of `gpu/shadps4`, `gpu/sotc`: no `InputUsage`, `usage_type` or `kPtr*`) |
+
+## Non-material draw paths (T13)
+
+Read-only static analysis (agent T13, follows T7 and T4). Sources: Ghidra pseudocode in `out/re/decomp/<hi16>/<addr>.c`
+(the first line lists the callers), grep counts over the whole decomp folder, and the earlier notes T4, T7, particles-engine,
+particles-data and pass-targets. Addresses are eboot VAs. Labels: **observed** (decomp, address given), **inferred**,
+**unknown**. No game file read, no game run.
+
+### T13.1 Short answer
+
+- **The masks 0x172 and 0x17b are not on the particle render path.** The two functions that use them, `0x1051f0` and
+  `0x103ad0` (both `ParticleRenderer::UpdateSimulation`), are the particle **simulation** (compute dispatches). Their
+  "item" `P` is the particle job context (their `param_2`), not a draw item. Outside the material builders, these two are
+  the only callers of `0x95320`. **observed** (grep: `FUN_00095320` appears twice in `0x103ad0.c` and twice in `0x1051f0.c`,
+  and in no particle render function).
+- **The particle render path is `0x109ca0`** (the `ParticleRenderer::RenderTranslucent` family, 2,140 bytes). It builds its
+  pointer chunk directly from three qwords: `P+0x90`, `P+0x98`, `P+0xd0`. It does not call `0x95320` or `0xf8c90`, and its
+  programs are the particle manager's **engine shader-list entries**, not a `.cmat` material. **observed**
+- **Every non-material path checked has zero references** to `0x95320`, `0xf8c90`, `0xf8c30`, `0x11d3d0`, `0x1a8c60`,
+  `0x1809a0`, `0x10b0a0` and `0xdb390`: the particle render builders, particle lighting, fur (`0x18e3d0`) and the HUD
+  (`0x118470`). **observed** (T13.4).
+- **Skybox, water, decal, debug and the per-probe GBuffer are material paths**, contrary to the brief. They go through the
+  material dispatcher `0x11d3d0` (decal: `0x11d5b0`), which calls `0xf8c90` and `0x95320`. **observed**
+- Port: the particle render programs can be keyed at boot (six render kinds, two or three engine entries each). The particle
+  compute programs need the effect file (`.cprt` names, at effect load). Fur and HUD need their own list entries (open). None
+  of these needs a `.cmat`. **inferred**; the boot-time part also needs the collection name (T13.6).
+
+### T13.2 The compute masks (0x172, 0x17b) on the particle job context
+
+Decode: `0x172` = bits 1, 4, 5, 6, 8. `0x17b` = `0x172` plus bits 0 and 3. Both functions choose the mask the same way: `0x17b`
+when the emitter's typed block C reference (`out+0x140`, non-null after `FUN_0014d7b0`) resolves, `0x172` otherwise
+(`0x1051f0` lines 366-378 for the process stage and 592-595 for the update stage; `0x103ad0` lines 367-378 and 593-596). **observed**
+
+The compaction call is `FUN_00095320(mask, P+0x90, pool)` (`0x1051f0` lines 508 and 603; `0x103ad0` lines 509 and 604), with
+`P` = `param_2` of `UpdateSimulation`. **observed**
+
+| Bit | Slot | In 0x172 | In 0x17b | Writer(s), observed | Meaning (inferred unless noted) |
+|---|---|---|---|---|---|
+| 0 | `P+0x90` | no | yes | `0x10c6c0` (`0010/0010c6c0.c`) and `0x10c2e0` (`0010/0010c2e0.c`); two cases, below | per-stage pointer |
+| 1 | `P+0x98` | yes | yes | **none found** in the particle code (read only: spawn record copy; `0x10db10` line 154; `0x10df30` line 157) | open (T13.7 item 1) |
+| 3 | `P+0xa8` | no | yes | `0x10c6c0` / `0x10c2e0` (case A stores `manager+0x1620`); `0x1239a0` / `0x125500` (case B stores `*(pass+0x68)`; the two 27-byte functions have the same body) | per-particle or per-model base |
+| 4 | `P+0xb0` | yes | yes | process and update stores in `0x1051f0` and `0x103ad0`: `*(P+0xb0) = E+0x50` packed (44-bit base) | emitter constant buffer (particles-engine 4a, inferred) |
+| 5 | `P+0xb8` | yes | yes | same stores: `*(P+0xb8) = E+0xa0` packed. In the enqueue stage the slot holds the spawn-request record instead (`0x8c0d0` ring) | per-emitter 16-byte V# base (particles-data 3d, inferred) |
+| 6 | `P+0xc0` | yes | yes | top of each `UpdateSimulation`: `*(P+0xc0) = manager+0x1530` packed (observed in `0x1051f0`; `0x103ad0` same, inferred) | pool-wide global buffer (inferred) |
+| 8 | `P+0xd0` | yes | yes | **none found** (read only: spawn record; `0x10db10` line 156) | open (T13.7 item 1) |
+
+**The `P+0x90` writers (observed):**
+
+- Case A, `lVar6 == 0` (no live particle pointer, see below): `FUN_001122d0(stream of the out+0x140 object, P, 0x20)` stores
+  `*(P+0x90) = *(mesh+0x70) + 0x2c0`, the **mesh V# table** of T4.2, and `P+0xa8 = manager+0x1620`. So for a mesh-emission
+  emitter, `P+0x90` is the mesh's V# table and the compute program reads the mesh surface. **inferred** (from the mesh branch
+  and the name `MeshEmissionData`, particles-data 3b).
+- Case B, `lVar6 != 0`: `*(P+0x90) = *(FUN_00193560(entry, P) + 0x60)`. `FUN_00193560` (`0019/00193560.c`, 31 bytes) returns
+  `entry+0x38 + 0x68 * (*(*(P+0x10)+0xd70) & 1)`, a 0x68-byte record chosen by frame parity. `entry` =
+  `FUN_00123da0(lVar6, i)` = `lVar6+0xf0 + 0x58*i` (`0012/00123da0.c`). **observed** (code); the buffer role is **inferred**.
+- `lVar6` is the 8-byte value at `sys + 0x178 + 0x74*idx + 0x78 + 0xd8` (the payload of the first live particle, `0x10c6c0`
+  lines 14-22). So it is a **pointer stored in the particle record**. **observed**. Its target looks like a `Model` object
+  (`cmdl`): it has an entry list at `+0xf0`, and fields at `+0x68`, `+0x90`, `+0xb8`. The clear pass "clear per-model-emitter-type
+  model draw counters" (`manager+0x1788`) fits this. **inferred**.
+
+**The compute chunk (what the compute shader sees):**
+
+- Mask `0x172`: 5 qwords `[P+0x98, P+0xb0, P+0xb8, P+0xc0, P+0xd0]`. This is the same tuple that the enqueue spawn record copies
+  (`0x1051f0` lines 246-256: `*puVar24 = P+0x98 ... puVar24[4] = P+0xd0`), so the spawn and update chunks have one shape. **observed**
+- Mask `0x17b`: 7 qwords `[P+0x90, P+0x98, P+0xa8, P+0xb0, P+0xb8, P+0xc0, P+0xd0]`. The index of bit `k` is
+  `popcount(mask & ((1<<k)-1))`.
+- The chunk goes to the stage with usage byte `+0x19 == 2` through `FUN_00862490(cmd+0x2e8, s, &chunk, 2)`, with
+  `s = *(uint*)(param_3[4] + 0x14)` (`0x1051f0` lines 511-514). `param_3[4]` is set at function entry to the table
+  `PTR_DAT_01604428` with key `param_3[3] = 0x20` (**inferred**: compute key). Same two-level form as T7.5. **observed** (writes),
+  **inferred** (compute stage).
+- Per emitter in the update stage: `FUN_0086ad40(cmd, stage, E+0x140 packed)` writes a 16-byte packet (header
+  `0xC0021100 | 2*(stage & 1)`, from `(param_2 & 1)*2 - 0x3ffdef00`), then `FUN_0086ee70`, `FUN_0085f220` and dispatch
+  `FUN_0086bac0` (`0x1051f0` lines 580-616). `E+0x140` is a counter or indirect-args buffer (**inferred**).
+- Job order (observed, labels in the file): `clear ...` counters; per system `0x1013f0` and `0x101720`; then two passes
+  (parent, child) of: `enqueue spawn requests` (ref 1, spawn record); wait; `prep process spawn requests` (`0x10c4e0`, indirect
+  args at `manager+0x1648`); `process spawn requests` (ref 2 binds `out+0x38`, compaction at 508, dispatch); then
+  `prep update preexisting` and `update preexisting` (ref 3 binds `out+0x70`, compaction at 603, dispatch).
+
+### T13.3 The particle render path (`0x109ca0` and its entries)
+
+**Entries and kinds (observed):**
+
+| Entry | `k` (`param_4`) | Caller (observed) | Scope string |
+|---|---|---|---|
+| `0x10a500` (219 B) | 3 | `0xc4330` line 129 (`0xc4330` is called from `0xd04e0`, `PostProcessing::AsyncPreparePostFX`) | `ParticleRenderer::RenderTranslucent` |
+| `0x109ab0` (481 B) | 3 | `0xcaed0` line 387 (main camera) | `ParticleRenderer::RenderTranslucent` (string in the body) |
+| `0x10a5e0` (438 B) | 6 | `0xcaed0` line 466 | `ParticleRenderer::RenderTranslucentUltraLow` |
+| `0x10a7a0` (455 B) | 9 | `0xcaed0` line 366 | `ParticleRenderer::RenderTranslucentUnderwater` |
+| `0x10a970` (177 B) | 0xc | `0xe2d70` line 250 (`0xe2d70` from `0xcefa0` line 342) | `ParticleRenderer::RenderDisplacement` |
+| `0x10aa30` (430 B) | 0xf | `0xcaed0` line 446 | `ParticleRenderer::RenderDistortion` |
+| `0x10abe0` (434 B) | 0x12 | `0xa6640` line 76 (`0xa6640` from `0xc59d0`) | `ParticleRenderer::RenderFog` |
+
+**Gate (observed, first lines of `0x109ca0`):** the pool has systems (`pool+0x10498 != pool+0x104a0`), and the view object
+`P[9]` has `*(view+0x54) != 0` and `*(view+0x55+pass) != 0`, where `pass` = `param_5`.
+
+**The item (observed):** `P+0x90` is set to a **per-draw block** `puVar13` (`FUN_0008c0d0(manager+0x15a8)`, 0x200 bytes). The
+builder stores `plVar14 = FUN_00012820(0x18)` = `[P+0x90, P+0x98, P+0xd0]` (`param_2[0x12]`, `[0x13]`, `[0x1a]`), then calls
+`FUN_00862490(plVar3+0x2e8, s, &plVar14, 2)` for each stage with usage byte 2 (two stages: `*plVar3[4]` and `puVar15[4]`). No
+other chunk shape exists in this builder. `P+0x98` and `P+0xd0` are read here and written nowhere in the particle code
+(open, T13.7 item 1). **observed**
+
+Contents of the per-draw block `puVar13` (qword index; **observed** copies, meaning **inferred**):
+
+- `[0x00..0x07]` = 8 qwords from the caller's `param_6` (a caller-built view or transform block).
+- `[0x08..0x0b]` = width, height, `1/width`, `1/height` of `param_7` (the scene target, via `FUN_00096f50` and `0x96f60`).
+  `param_7` = `view+0x1fb8` when the caller passes 0.
+- `[0x0d]` = `manager+0x1a30`; `+0x6c` = `manager+0x1a34 * obj+0x78`. `[0x0e]` = frame ratio from `FUN_00096f50(lVar18)`.
+  `+0x7c` and `+0x84` = slope terms from `P[2]+0x1190..0x119c`.
+- `+0x74` = flags word `(obj+0x64 << 3) | (bit23 * 3) | ((obj+0x62 > 0xff) << 2)`. **observed**.
+- `[0x11..]` = `memcpy(param_9)` when `param_9` is non-null (only callers that pass it).
+- `[0x1a]` (`+0xd0`) = `pool+0x2e8`; `[0x1b]` = `pool+0x2f0` (`param_3` is the pool).
+- `[0x1c]` (`+0xe0`) = a 16-byte descriptor from `*(FUN_000019f0 + manager)`.
+- `[0x1e]` (`+0xf0`) = `manager+0x18a0`; `[0x1f]` = `manager+0x18a8`. These are the draw-sort records that `PrepForRendering`
+  (`0x106950`, label `sort draw-sort records`) writes (**inferred**).
+- `[0x20]` (`+0x100`) = `FUN_0008c280(manager+0x1990, 4*pass+3)`: the draw argument buffer for this pass (**inferred**).
+- `[0x22..0x25]` = four 16-byte values from `view+0x2378` (`lVar12`) at `+0xc4..0xdc`. `[0x26..0x29]` = the same from `param_7`.
+  `[0x2a..]` = four 16-byte values per entry of the list `manager+0x50..0x58` (lights or probes, **inferred**).
+  `[0x3e..0x3f]` = 16 bytes from `param_8`, or a default at `DAT_02ee3ce0+0x330`.
+
+**Programs (observed mechanism; the names are not read):**
+
+- Stage 1 = `*(*(manager+0x38)+0x68) + 0x10*k` (`0x95580` makes the reference, `0x14d7b0` resolves it, `0x937c0` binds it).
+  Stage 2 = `+0x10*(k + 1 + flag)` with `flag = (uVar17 != 0)` (`0x94ab0`). The collection `manager+0x38` is the one the clear and
+  prep compute programs also use (`0x10bfd0` reads `+0x150`, `0x10c140` reads `+0x170`). **observed**. Its name is probably
+  `particle-shaders.cslt` (string `0xfa8d86`, particles-data section 8; **inferred**).
+- The render key is `plVar3[3] = 0x11` with table `PTR_DAT_01604408` (**inferred**: graphics key); compute uses `0x20` with
+  `PTR_DAT_01604428`.
+- `0x937c0` picks the stage kind from the current stage: kind 2 -> `0x861520`, 4 -> `0x860bb0`, 6 -> `0x861260`
+  (`0009/000937c0.c`). **observed**.
+- **Draw:** `0x10add0` (264 B, `0010/0010add0.c`) writes `0x86ad40(cmd, stage, *(manager+0x1990))` and then
+  `0x86b150(cmd, pass*16, mode, nibbles, 0)`. The mode comes from the state word `cmd+0xc548` (values 0x00, 0xb0, 0x45, 0xad,
+  0x145, 0x1ad). The nibbles come from the stage record byte `+0x19`. So the draw is **indirect**, with arguments at
+  `*(manager+0x1990) + 16*pass` (**inferred**). The fur path uses the same helper with `fur+0x6f0` (T13.4).
+
+**Textures (open):** the particle atlas (`ParticleTextureAtlas`, `0x10ec60`, called from `0x102bb0`) is not referenced by the
+render builder. The atlas T# is either in the bound engine program state or in the 0x200-byte block at a slot not traced
+here. **unknown**. The `.cptx` build (`0x10e9b0`) only returns an atlas handle (particles-data section 4).
+
+### T13.4 Other draw paths: material or not
+
+| Path | Entry (caller) | Chain | Reaches `0x95320` / `0xf8c90`? | Programs and textures | Verdict |
+|---|---|---|---|---|---|
+| Standard, Alpha/Transparent, TransparentDepth, DepthPrePass, Depth | `0xc3600`, `0xc3c70`, `0xc3ec0`, `0xc1860`, `0xc3a50` | runner -> `0x11d3d0` | yes (`0x11d3d0` calls `0xf8c90` and `0x95320`) | material slots | **material** |
+| GBuffer baked, ambient dynamic, per probe | `0xc1ce0`, `0xc1fc0` | runner -> `0x11d3d0` | yes | material slots | **material** (lightprobe draws included) |
+| SkyboxOpaque, SkyboxAlpha | `0xc2fa0`, `0xc3320` | runner -> `0x11d3d0` | yes | material slots | **material** (brief said non-material: wrong) |
+| Water | `0xc3820` | runner -> `0x11d3d0` | yes | material slots | **material** (brief said non-material: wrong) |
+| Debug, DebugCollision, EditorZFail, SpecialScreenFX | `0xc46c0`, `0xc4a50`, `0xc4f80`, `0xc4de0` | runner -> `0x11d3d0` | yes | material slots | **material** |
+| Decal | `0xc28c0` | `0x11d5b0` (`0011/0011d5b0.c`) | yes, directly (`0xf8c90` and `0x95320` in its body) | material slots; four GBuffer binds (K6.6) | **material** |
+| Shadow proxies, rain blockers, XPR cull | `0xcd330`, `0xce850`, `0xcd7a0`, `0xca6d0`, `0xc6f70` | runner -> `0x11d3d0` (`0xce850` also `0xdb390`) | yes | material slots | **material** |
+| Mesh global draw | `0x180ab0` (from `0x1817a0`, `0x181690`, `0x1818e0`) | `0x1809a0` | yes (T4, T7.2) | material slots | **material** |
+| Object-list draws (DepthPrePass, GBuffer, Debug) | `0x10aee0` -> `0x10aef0` -> `0x10b0a0` | item builder | yes (`0x10b0a0` uses `*(material+0x468)`, T7.2) | material | **material** |
+| Fur (RenderFur, RenderStrands, RenderShells) | `0x183d10` (from `0xc59d0`, `0xc46c0`); `0xc2710` is a 1-byte stub (`sub_c2710`) | `0x18e3d0` (`0018/0018e3d0.c`) -> `0x937c0`, `0x94ab0` (list at `+0x60`, source not traced), `0x10add0` (args `fur+0x6f0`, stride 0x70) | **no** (no reference in `0x18e3d0`) | engine shader-list entries; textures not traced | **non-material** |
+| HUD / UI (`R::Hud`, `VBlank`) | `0x118470` (from `0xcefa0` line 480) | `0x937c0`, `0x94ab0`, `0x93960`, `0x92140` (targets), `0x8be60`, font helpers `0x323d0` and `0x32430` | **no** | engine entries; targets `UI_Offscreen_*` (K5); font T# (cfon) not traced | **non-material** |
+| Particle render (6 kinds) | `0x109ca0` via the entries above | `0x109ca0` -> `0x862490` (3-qword chunk), `0x937c0` and `0x94ab0`, `0x10add0` | **no** | engine entries `coll+0x10*k`, scene-target descriptors, draw arguments | **non-material** |
+| Particle simulation (compute) | `0x103ad0`, `0x1051f0` (frame job `0xd0040`, from `0xcefa0` line 336) | compute chunk (mask 0x172 or 0x17b) | **yes**: the only callers outside the material set | emitter programs (`.cprt` names), shared clear and prep (`coll`), buffers | **non-material compute** (not a draw) |
+| Particle lighting (`UpdateLightmaps`) | `0x1070e0`, `0x1072c0` -> `0x10db10`, `0x10df30` | compute; chunk from `P+0x98`, `P+0xd0` | **no** | `ParticleLighting` shader (name not read) | **non-material compute** |
+
+### T13.5 What the port needs for these pipeline keys
+
+- **Particle render (6 kinds).** Program pair per kind: `coll+0x10*k` and `coll+0x10*(k+1+flag)` for `k` in {3, 6, 9, 0xc, 0xf,
+  0x12}. The key needs the two shader objects, the render-target formats of the pass that calls the kind (K1 targets:
+  `view+0x1fb8`, `+0x1fc0`, `+0x2298`), and the blend, depth and raster state of each kind. That state is **unknown** here
+  (not decoded in these builders; the port reads it from the programs' own state setup). It needs **no emitter data**. The
+  scene-target descriptors are copied per draw into the block (T13.3), so they do not enter the key. The atlas T# is open.
+  Boot-time keying holds if the collection is loaded with the particle system (**inferred**; see T13.6).
+- **Particle compute.** The clear and prep programs come from `coll` (boot). Each emitter's three programs are named in the
+  `.cprt` record (`R+0x28`, `+0x2c`, `+0x30`, particles-engine 3b) and resolved at effect load. The buffer V#s use formats 0x1b
+  and 0x1c with flags 0x804 (`0x8be60`, particles-data 3e), so the key needs their formats. Their stride (`R+0x08`, `+0x18`,
+  `+0x1c`) and count come from the effect at load. The chunk shape (5 or 7 qwords) depends only on whether `out+0x140`
+  resolves, so it is a per-emitter key bit known at effect load.
+- **Fur.** Needs the fur object's stage list (`lVar4` in `0x18e3d0`, not traced) and the draw-type nibbles. Open.
+- **HUD / UI.** Needs the engine entries it binds and the `UI_Offscreen` target set (K5). Font T# open.
+- **Material paths.** Unchanged: keys from `.cmat` and the material blocks (T1-T8).
+
+### T13.6 Corrections and conflicts
+
+- The brief's hypothesis that `0x1051f0` and `0x103ad0` are the particle render path is **wrong**. They are the particle
+  simulation (compute). The render builder is `0x109ca0`.
+- T7.7 item 4 (writer of `P+0xb0` and `P+0xb8` on the `0x1051f0` / `0x103ad0` path) is **closed** for `P+0xa8`, `P+0xb0`,
+  `P+0xb8`, `P+0xc0` and `P+0x90` (T13.2). `P+0x98` and `P+0xd0` stay open.
+- The T4.8 row for `0x10c2e0` ("writes `P+0x90` in the no-texture branch") is right. That is case A of T13.2, and it is a compute
+  stage, not a draw.
+- T4.4 calls `P` a draw item. In this section `P` is the particle job context. The same offsets (`P[0x12..0x1b]`) carry different
+  meanings per job: mesh table in draws, render block in `0x109ca0`, emitter buffers in compute. A key must not assume the slot
+  names of T4 or T7.
+- **Conflict (open):** particles-engine 3b puts the mesh emission reference in typed block B (`out+0xe0`, its `+0x28` at
+  `out+0x108`). The code here tests `out+0x140` (record `R+0x3c`, block C in particles-data 3c) for the mesh branch. One of the
+  two is wrong.
+- **Conflict (open):** particles-data 3d puts the V# over the blob at `E+0xa0`; particles-engine 3b puts the blob buffer at
+  `E+0x50`. The code stores `E+0x50` as `P+0xb0` and `E+0xa0` as `P+0xb8`, which fits particles-engine 3b for the blob.
+- **Collection header (open):** `shader-collections.md` 2a says `+0x68` points to a `u64 count` followed by the entries. The
+  particle code addresses entries as `*(coll+0x68) + 0x10*k` with `k` = 3 to 0x1b (`0x10bfd0` uses `+0x150`, `0x10c140` uses
+  `+0x170`). Either `+0x68` points at entry 0, or the count header is not there. T13.7 item 3 settles it.
+
+### T13.7 Open items and one-run log spec
+
+No draw change. One run with the existing probes, or read-only hooks on the functions named.
+
+1. **Writers of `P+0x98` and `P+0xd0`** (job context). Log the eight qwords `P[0x12..0x1b]` at entry of `0x103ad0`, `0x1051f0`,
+   `0x109ca0` and `0x10db10`. Write-watch the two addresses for one frame and log the return address of each store.
+2. **Mask per emitter in compute.** At entry of `0x95320`, log the mask, the emitter index, whether `out+0x140` resolves
+   (non-null after `0x14d7b0`), the resolved object's vtable or name, and `lVar6` (the record pointer at `+0xd8`). Expect `0x172`
+   with `lVar6` unused, and `0x17b` with `lVar6 == 0` (mesh) or `!= 0` (model). This closes T13.2 cases A and B.
+3. **Render program names.** At entry of `0x109ca0`, log `k`, `param_5`, `*(obj+0x62)`, and the names of `coll+0x10*k` and
+   `coll+0x10*(k+1+flag)`. This gives the render program names and settles the collection header question (T13.6).
+4. **Render chunk.** At the `0x862490` call in `0x109ca0`, log the three qwords and the stage index. Expect `[block, P+0x98, P+0xd0]`.
+5. **Atlas T#.** At `0x109ca0` entry, log the 16-byte descriptors at `+0x100` and `+0x1f0`, and the bound stage's T# words.
+   Match them against the atlas table (`DAT_02edf140+0xb8`, `0x10eaa0`).
+6. **Material set by caller.** Count `0x95320` and `0xf8c90` calls per frame by return address. Expected: the `0x95320` callers
+   outside the material set are only `0x1051f0` and `0x103ad0`. Any other caller without `0xf8c90` in the same frame is a new
+   non-material path.
+7. **Fur list.** At entry of `0x18e3d0`, log the list pointer behind `lVar4` and the `k` indices of `0x937c0` and `0x94ab0`.
+8. **Entry kinds.** At entry of each render entry in T13.3, log the caller and `param_5` (pass index). This confirms the caller table.
+
+### T13.8 Evidence list (T13)
+
+| Item | Address | File |
+|---|---|---|
+| Compute masks, compaction, stores | `0x1051f0`, `0x103ad0` | `out/re/decomp/0010/001051f0.c`, `0010/00103ad0.c` |
+| Mesh and model branch of `P+0x90` | `0x10c6c0`, `0x10c2e0` | `0010/0010c6c0.c`, `0010/0010c2e0.c` |
+| Prep indirect (0x50 record, `P+0xb0`) | `0x10c4e0` | `0010/0010c4e0.c` |
+| Parity record and entry list | `0x193560`, `0x123da0` | `0019/00193560.c`, `0012/00123da0.c` |
+| Stores of `P+0xa8` | `0x1239a0`, `0x125500` | `0012/001239a0.c`, `0012/00125500.c` |
+| Mesh V# table write | `0x1122d0` | `0011/001122d0.c` (T4.3) |
+| Compute packet and chunk consumer | `0x86ad40`, `0x862490` | `0086/0086ad40.c`, `0086/00862490.c` |
+| Render builder | `0x109ca0` | `0010/00109ca0.c` |
+| Render entries | `0x109ab0`, `0x10a500`, `0x10a5e0`, `0x10a7a0`, `0x10a970`, `0x10aa30`, `0x10abe0` | `0010/00109ab0.c`, `0010/0010a500.c` and the others in `0010/` |
+| Render draw helper | `0x10add0` | `0010/0010add0.c` |
+| Particle lighting compute | `0x1070e0`, `0x1072c0`, `0x10db10`, `0x10df30` | `0010/001070e0.c` and the others in `0010/` |
+| Fur | `0x183d10`, `0x18e3d0` | `0018/00183d10.c`, `0018/0018e3d0.c` |
+| HUD | `0x118470` | `0011/00118470.c` |
+| Material dispatcher and decal | `0x11d3d0`, `0x11d5b0` | `0011/0011d3d0.c`, `0011/0011d5b0.c` |
+| Stage setters | `0x937c0`, `0x94ab0` | `0009/000937c0.c`, `0009/00094ab0.c` |
+| Pass callers | `0xcaed0`, `0xc4330`, `0xa6640`, `0xe2d70`, `0xcefa0`, `0xd0040`, `0xd04e0` | `000c/000caed0.c` and the others in `000c/`, `000d/`, `000a/`, `000e/` |
+| Atlas creation | `0x10ec60` (from `0x102bb0`) | `0010/0010ec60.c` |
