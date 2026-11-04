@@ -9,6 +9,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/sotc_pipe_feedback.h" // sotc: SOTC_PIPE_FEEDBACK / COMPILE_CHECK
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
 
@@ -208,8 +209,23 @@ void ComputePipeline::CreatePipeline() {
         .stage = shader_ci,
         .layout = heap_mode ? vk::PipelineLayout{} : pipeline_layout, // sotc: heap pipelines have none
     };
-    auto [pipeline_result, pipe] =
-        instance.GetDevice().createComputePipelineUnique(cache, compute_pipeline_ci);
+    // sotc: SOTC_PIPE_FEEDBACK / SOTC_PIPE_COMPILE_CHECK: the build is measured, and with the driver
+    // cache probe on, a success there is the pipeline (no second build). Heap pipelines are not probed.
+    const auto debug_name = [this] { return GetDebugString(); };
+    auto [pipeline_result, pipe] = SotcPipeFeedback::Create(
+        SotcPipeFeedback::Kind::Compute, 1, compute_pipeline_ci.pNext, !heap_mode,
+        [&](const void* next, bool fail_on_compile) {
+            vk::ComputePipelineCreateInfo ci = compute_pipeline_ci;
+            ci.pNext = next;
+            if (fail_on_compile) {
+                ci.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+            }
+            auto [result, handle] = instance.GetDevice().createComputePipelineUnique(cache, ci);
+            return std::pair{result, std::move(handle)};
+        },
+        debug_name);
+    SotcPipeFeedback::NoteBuilt(SotcPipeFeedback::Kind::Compute, &sotc_logged, pipeline_result,
+                                debug_name);
     if (pipeline_result != vk::Result::eSuccess && from_cache) {
         // sotc: as for graphics pipelines, a cached one the driver refuses is dropped.
         LOG_WARNING(Render_Vulkan, "Cached compute pipeline {} failed to build: {}", GetDebugString(),
@@ -235,6 +251,9 @@ void ComputePipeline::WaitBuilt() {
     if (!claimed.load(std::memory_order_acquire)) {
         Build();
     }
+    // sotc: SOTC_PIPE_COMPILE_CHECK: logs the pipeline if it was not ready here.
+    SotcPipeFeedback::NoteWait(SotcPipeFeedback::Kind::Compute, &sotc_logged,
+                               [this] { return GetDebugString(); });
     ready.wait(false, std::memory_order_acquire);
 }
 
@@ -245,6 +264,9 @@ void ComputePipeline::BindWhenReady() const {
     }
     scheduler.RecordDeferred([this](vk::CommandBuffer cmdbuf) {
         if (!ready.load(std::memory_order_acquire)) {
+            // sotc: SOTC_PIPE_COMPILE_CHECK: the recorder waits for this pipeline (logged once).
+            SotcPipeFeedback::NoteWait(SotcPipeFeedback::Kind::Compute, &sotc_logged,
+                                       [this] { return GetDebugString(); });
             const auto start = std::chrono::steady_clock::now();
             if (!claimed.load(std::memory_order_acquire)) {
                 const_cast<ComputePipeline*>(this)->Build();

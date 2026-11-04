@@ -16,6 +16,7 @@ import os
 import platform
 from pathlib import Path
 import queue
+import re
 import runpy
 import shutil
 import subprocess
@@ -798,6 +799,8 @@ def shadps4_saves(serial):
 
 BG, PANEL, CARD, LINE = '#0d0f10', '#14171a', '#1b1f23', '#2a3036'
 TEXT, MUTED, GOLD, ACCENT, ACCENT_HI = '#e6e2da', '#8f9499', '#d7c08a', '#3e5f73', '#4f7790'
+# sotc.py's shader preparation (SOTC_AUTO_PREPARE, --prepare): the progress line of the precompile run.
+PREPARE_PROGRESS = re.compile(r'SOTC PRECOMPILE: (\d+) of (\d+)')
 
 
 class Launcher:
@@ -807,6 +810,7 @@ class Launcher:
         self.app = load_settings()
         self.vars = {}
         self.process = self.job = None
+        self.prepare_window = self.prepare_bar = self.prepare_label = None
         self.stopping = False
         self.output = queue.Queue()
         self.ui_calls = queue.Queue()
@@ -1634,6 +1638,7 @@ class Launcher:
         ttk.Button(holder, text=_('Atalho na área de trabalho', 'Desktop shortcut'), command=self.shortcut).pack(side='left')
         ttk.Button(holder, text=_('Pasta do port', 'Port folder'), command=lambda: self.open_path(PORT_DIR)).pack(side='left', padx=6)
         ttk.Button(holder, text=_('Limpar cache de shaders', 'Clear shader cache'), command=self.clear_cache).pack(side='left')
+        ttk.Button(holder, text=_('Preparar shaders', 'Prepare shaders'), command=self.prepare_shaders).pack(side='left', padx=6)
         self.section(f, _('Diagnóstico', 'Diagnostics'))
         self.check(f, 'show_fps', _('FPS no registro (a cada 5 s)', 'FPS in the log (every 5 s)'))
         self.check(f, 'dlss_compare', _('Comparar DLSS com FSR 1 (F9)', 'Compare DLSS with FSR 1 (F9)'),
@@ -2156,7 +2161,9 @@ class Launcher:
         shutil.copytree(source, target, dirs_exist_ok=True)
 
     # ---- game process ------------------------------------------------------------------------
-    def play(self):
+    def play(self, prepare_only=False):
+        """Starts sotc.py: the game (its shaders are prepared first when they need it), or with prepare_only
+        only the shader preparation (--prepare), which then leaves without a game window."""
         if self.process or self.updating:
             return
         self.collect()
@@ -2173,9 +2180,10 @@ class Launcher:
                           'Could not write the keys to sotc.ini: {}').format(error) + '\n')
         try:
             env = game_environment(self.app)
-            env['SOTC_EVENT_LOG'] = start_event_log(user_dir(self.app), self.app, env)
-            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
-                                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            if not prepare_only:
+                env['SOTC_EVENT_LOG'] = start_event_log(user_dir(self.app), self.app, env)
+            self.process = subprocess.Popen(run_command() + (['--prepare'] if prepare_only else []), cwd=PORT_DIR,
+                                            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         except OSError as error:
             self.append(_('Não foi possível iniciar: {}', 'Could not start: {}').format(error) + '\n')
@@ -2185,10 +2193,18 @@ class Launcher:
         threading.Thread(target=self.read_output, args=(self.process,), daemon=True).start()
         self.play_button.configure(state='disabled')
         self.stop_button.configure(state='normal')
-        self.status.configure(text=_('Preparando o jogo; ele abre na própria janela…',
-                                     'Preparing the game; it opens in its own window…'), fg=GOLD)
-        if self.app.get('close_on_play'):
+        if prepare_only:
+            self.status.configure(text=_('Preparando os shaders; o jogo não abre nesta etapa.',
+                                         'Preparing the shaders; the game does not open in this step.'), fg=GOLD)
+        else:
+            self.status.configure(text=_('Preparando o jogo; ele abre na própria janela…',
+                                         'Preparing the game; it opens in its own window…'), fg=GOLD)
+        if self.app.get('close_on_play') and not prepare_only:
             self.root.after(5000, self.root.destroy)
+
+    def prepare_shaders(self):
+        """The launcher's "Preparar shaders": translates the game's shaders now (sotc.py --prepare)."""
+        self.play(prepare_only=True)
 
     def read_output(self, process):
         # The output also goes to user/last_run.log, so a crash can be looked at afterwards.
@@ -2240,6 +2256,7 @@ class Launcher:
                 if isinstance(item, tuple):
                     self.append(_('\n— o jogo terminou (código {}) —\n', '\n— the game exited (code {}) —\n').format(item[0]))
                     self.process = None
+                    self.close_prepare_window()
                     self.reload_live_settings()
                     if self.job:
                         self.job.close()
@@ -2248,6 +2265,7 @@ class Launcher:
                 else:
                     if 'Entering original x86-64 code' in item:
                         self.status.configure(text=_('O jogo está rodando.', 'The game is running.'), fg=GOLD)
+                    self.track_prepare(item)
                     self.append(item)
         except queue.Empty:
             pass
@@ -2291,6 +2309,46 @@ class Launcher:
         self.messagebox.showinfo('Shadow of the Colossus', _(
             'Cache de shaders limpo. A próxima partida engasga alguns minutos enquanto ele é refeito.',
             'Shader cache cleared. The next start stutters for a few minutes while it is rebuilt.'))
+
+    def track_prepare(self, text):
+        """The shader preparation's window follows sotc.py's markers and the precompile run's progress lines."""
+        if text.startswith('SOTC PREPARE start'):
+            self.open_prepare_window()
+        elif text.startswith('SOTC PREPARE end'):
+            self.close_prepare_window()
+        elif self.prepare_window:
+            match = PREPARE_PROGRESS.search(text)
+            if match:
+                done, queued = int(match.group(1)), int(match.group(2))
+                # The total grows while the game loads, so the bar stays below 100 until the run ends.
+                percent = min(done * 100 // queued, 99) if queued else 0
+                self.prepare_bar.configure(value=percent)
+                self.prepare_label.configure(text=_('Preparando shaders... {}%', 'Preparing shaders... {}%').format(percent))
+
+    def open_prepare_window(self):
+        if self.prepare_window:
+            return
+        ttk = self.ttk
+        win = self.tk.Toplevel(self.root)
+        win.title('Shadow of the Colossus')
+        win.configure(bg=BG)
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.protocol('WM_DELETE_WINDOW', lambda: None)  # it closes itself when the preparation ends
+        self.prepare_label = ttk.Label(win, text=_('Preparando shaders... 0%', 'Preparing shaders... 0%'))
+        self.prepare_label.pack(padx=28, pady=(20, 8))
+        self.prepare_bar = ttk.Progressbar(win, length=self.px(380), mode='determinate', maximum=100)
+        self.prepare_bar.pack(padx=28)
+        ttk.Label(win, text=_('Feito uma vez por versão do port, driver de vídeo e configuração. '
+                              'O jogo abre quando terminar.',
+                              'Done once per port, graphics driver and settings. The game opens when it is done.')
+                  ).pack(padx=28, pady=(8, 20))
+        self.prepare_window = win
+
+    def close_prepare_window(self):
+        if self.prepare_window:
+            self.prepare_window.destroy()
+            self.prepare_window = self.prepare_bar = self.prepare_label = None
 
     def shortcut(self):
         self.collect()

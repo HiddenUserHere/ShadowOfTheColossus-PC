@@ -26,6 +26,7 @@
 #include "video_core/sotc_checkpoints.h" // sotc: SOTC_GPU_CHECKPOINTS
 #include "video_core/sotc_stats.h"
 #include "sotc_gpu_trace.h"
+#include "video_core/renderer_vulkan/sotc_pipe_feedback.h" // sotc: SOTC_PIPE_COMPILE_CHECK
 
 #include <vk_mem_alloc.h>
 
@@ -866,6 +867,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     const int mirror_switch = SotcArch::SwitchMode("SOTC_MIRROR");
     const int shader_addr_switch = SotcArch::SwitchMode("SOTC_SHADER_ADDR");
     const int packet_switch = SotcArch::SwitchMode("SOTC_PACKET");
+    // sotc: SOTC_GCN_MEM / BUF / TEX use the page table and the globals buffer by device address, without the switches above.
+    const int gcn_switch = SotcArch::SwitchMode("SOTC_GCN_MEM") | SotcArch::SwitchMode("SOTC_GCN_BUF") |
+                           SotcArch::SwitchMode("SOTC_GCN_TEX");
     const int passes_switch = SotcArch::SwitchMode("SOTC_PASSES");
     // Everything the block adds sits after this count: a refused device drops exactly these.
     const u32 arch_extension_base = static_cast<u32>(enabled_extensions.size());
@@ -982,9 +986,11 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     // Buffer device address is enabled above (Vulkan 1.2 features). Only reported here.
     const bool bda_present = vk12_features.bufferDeviceAddress;
     sotc_buffer_device_address =
-        bda_present && (mirror_switch != 0 || shader_addr_switch != 0 || packet_switch != 0 || heap_switch != 0);
+        bda_present && (mirror_switch != 0 || shader_addr_switch != 0 || packet_switch != 0 || heap_switch != 0 ||
+                          gcn_switch != 0);
     report_feature("buffer device address",
-                   mirror_switch != 0 || shader_addr_switch != 0 || packet_switch != 0 || heap_switch != 0, bda_present,
+                   mirror_switch != 0 || shader_addr_switch != 0 || packet_switch != 0 || heap_switch != 0 ||
+                       gcn_switch != 0, bda_present,
                    sotc_buffer_device_address);
     // Any of the extensions above that was enabled: the device is created again without them if
     // the driver refuses the device (see the retry after the queue retry).
@@ -1056,6 +1062,10 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     // sotc: SOTC_HEAP needs both heaps (and SOTC_LAYOUT_UNIFIED): with one missing it is refused here, once, instead of
     // building pipelines that misrender (sotc_arch/heap.cpp).
     SotcArch::Heap::CheckRequirements(bindless_images, bindless_samplers);
+    // sotc: SOTC_PIPE_COMPILE_CHECK: the cache-control feature, when the device has it and the switch is on.
+    const bool sotc_compile_control =
+        vk13_features.pipelineCreationCacheControl && SotcPipeFeedback::CompileCheckOn();
+    SotcPipeFeedback::g_compile_control.store(sotc_compile_control, std::memory_order_relaxed);
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = queue_info_count,
@@ -1141,6 +1151,9 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         },
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
+            // sotc: SOTC_PIPE_COMPILE_CHECK=1 (sotc_pipe_feedback.h): the driver-cache probe needs
+            // VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT. Off unless the switch asks for it.
+            .pipelineCreationCacheControl = sotc_compile_control,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,

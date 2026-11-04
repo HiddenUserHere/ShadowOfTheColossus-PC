@@ -18,6 +18,7 @@
 //                     cvar's storage), switch SOTC_HOOK_CVAR_PROBE
 //   probe_area.cpp    AREA_PRECACHE (0x533100, entry), AREA_LOADER_STATE (the
 //                     cp10_setAreaLoaderState user, entry), switch SOTC_AREA_PREWARM
+//   probe_pass.cpp    PASS_RESOLVE (0xf8990, entry), MATERIAL_LOADED (0xf6c90, wrap), switch SOTC_PASS_PROBE
 #pragma once
 
 #include <cstdint>
@@ -47,6 +48,7 @@ bool BlockExtentOn() noexcept;
 bool BlockRemaining(uint64_t addr, uint64_t* remaining) noexcept;
 void RegisterCvars();
 void RegisterArea();
+void RegisterPass(); // sotc: SOTC_PASS_PROBE (probe_pass.cpp), observe only; prints its own 5 s summary
 // sotc: PC memory model, wave B (docs/re-stutters/PC-MEMORY-REWRITE.md section 5).
 void RegisterMemtype(); // probe_memtype.cpp, switch SOTC_HOOK_MEMTYPE_PROBE
 void RegisterXprMem();  // probe_xprmem.cpp, switch SOTC_HOOK_XPRMEM_PROBE

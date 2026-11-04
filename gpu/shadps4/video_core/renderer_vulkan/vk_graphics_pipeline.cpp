@@ -12,6 +12,7 @@
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h" // sotc: SOTC_HEAP (UsesHeapImages)
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/sotc_pipe_feedback.h" // sotc: SOTC_PIPE_FEEDBACK / COMPILE_CHECK
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -632,7 +633,21 @@ GraphicsPipeline::GraphicsPipeline(
                                      const vk::GraphicsPipelineCreateInfo& ci) -> vk::Pipeline {
             bool built = false;
             const vk::Pipeline lib = gpl->GetOrBuild(part, lib_key, built, [&] {
-                auto [result, handle] = device.createGraphicsPipelineUnique(pipeline_cache, ci);
+                // sotc: SOTC_PIPE_FEEDBACK / SOTC_PIPE_COMPILE_CHECK (sotc_pipe_feedback.h)
+                auto [result, handle] = SotcPipeFeedback::Create(
+                    SotcPipeFeedback::Kind::GplLibrary, ci.stageCount, ci.pNext, true,
+                    [&](const void* next, bool fail_on_compile) {
+                        vk::GraphicsPipelineCreateInfo c = ci;
+                        c.pNext = next;
+                        if (fail_on_compile) {
+                            c.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+                        }
+                        auto [r, h] = device.createGraphicsPipelineUnique(pipeline_cache, c);
+                        return std::pair{r, std::move(h)};
+                    },
+                    [&] { return debug_str; });
+                SotcPipeFeedback::NoteBuilt(SotcPipeFeedback::Kind::GplLibrary, nullptr, result,
+                                            [&] { return debug_str; });
                 if (result != vk::Result::eSuccess) {
                     LOG_WARNING(Render_Vulkan, "Pipeline library {} failed to build: {}",
                                 static_cast<u32>(part), vk::to_string(result));
@@ -733,8 +748,21 @@ GraphicsPipeline::GraphicsPipeline(
             .layout = layout,
         };
         const auto link_start = std::chrono::steady_clock::now();
-        auto [link_result, link_pipe] =
-            device.createGraphicsPipelineUnique(pipeline_cache, link_ci);
+        // sotc: SOTC_PIPE_FEEDBACK / SOTC_PIPE_COMPILE_CHECK (sotc_pipe_feedback.h)
+        auto [link_result, link_pipe] = SotcPipeFeedback::Create(
+            SotcPipeFeedback::Kind::GplLink, link_ci.stageCount, link_ci.pNext, true,
+            [&](const void* next, bool fail_on_compile) {
+                vk::GraphicsPipelineCreateInfo c = link_ci;
+                c.pNext = next;
+                if (fail_on_compile) {
+                    c.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+                }
+                auto [r, h] = device.createGraphicsPipelineUnique(pipeline_cache, c);
+                return std::pair{r, std::move(h)};
+            },
+            [&] { return debug_str; });
+        SotcPipeFeedback::NoteBuilt(SotcPipeFeedback::Kind::GplLink, nullptr, link_result,
+                                    [&] { return debug_str; });
         g_gpl_counters.link_ns.fetch_add(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - link_start)
@@ -753,8 +781,22 @@ GraphicsPipeline::GraphicsPipeline(
         return;
     }
 
-    auto [pipeline_result, pipe] =
-        device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    // sotc: SOTC_PIPE_FEEDBACK / SOTC_PIPE_COMPILE_CHECK (sotc_pipe_feedback.h). Heap pipelines are not probed.
+    auto [pipeline_result, pipe] = SotcPipeFeedback::Create(
+        SotcPipeFeedback::Kind::Graphics, pipeline_info.stageCount, pipeline_info.pNext,
+        !heap_mode,
+        [&](const void* next, bool fail_on_compile) {
+            vk::GraphicsPipelineCreateInfo c = pipeline_info;
+            c.pNext = next;
+            if (fail_on_compile) {
+                c.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+            }
+            auto [r, h] = device.createGraphicsPipelineUnique(pipeline_cache, c);
+            return std::pair{r, std::move(h)};
+        },
+        [&] { return debug_str; });
+    SotcPipeFeedback::NoteBuilt(SotcPipeFeedback::Kind::Graphics, nullptr, pipeline_result,
+                                [&] { return debug_str; });
     if (pipeline_result != vk::Result::eSuccess && preloading) {
         // sotc: the driver can refuse a pipeline rebuilt from the cache (ErrorUnknown on AMD).
         // Left without a handle, the preload drops it and the game compiles it when it is drawn.

@@ -6769,9 +6769,14 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
     const VAddr lo = Common::AlignDown(addr, VAddr{4096});
     const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
     bool foreign = false;
-    gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
-        foreign |= start < addr || end > addr + size;
-    });
+    {
+        // sotc: a guest thread reads the set while the command processor and the draw thread change it under the
+        // unique lock: walking the tree unlocked crashed (s5 run, 4 Nov 2026).
+        std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
+            foreign |= start < addr || end > addr + size;
+        });
+    }
     if (foreign) {
         return false;
     }
@@ -6809,9 +6814,14 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
     const VAddr lo = Common::AlignDown(addr, VAddr{4096});
     const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
     bool foreign = false;
-    gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
-        foreign |= start < addr || end > addr + size;
-    });
+    {
+        // sotc: a guest thread reads the set while the command processor and the draw thread change it under the
+        // unique lock: walking the tree unlocked crashed (s5 run, 4 Nov 2026).
+        std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
+            foreign |= start < addr || end > addr + size;
+        });
+    }
     if (foreign) {
         return false;
     }
@@ -6869,9 +6879,14 @@ bool BufferCache::TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, 
     const VAddr lo = Common::AlignDown(addr, VAddr{4096});
     const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
     bool foreign = false;
-    gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
-        foreign |= start < addr || end > addr + size;
-    });
+    {
+        // sotc: a guest thread reads the set while the command processor and the draw thread change it under the
+        // unique lock: walking the tree unlocked crashed (s5 run, 4 Nov 2026).
+        std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
+            foreign |= start < addr || end > addr + size;
+        });
+    }
     if (foreign) {
         return false;
     }

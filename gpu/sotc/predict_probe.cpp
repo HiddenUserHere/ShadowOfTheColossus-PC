@@ -319,8 +319,9 @@ void ParamsFromTail(const unsigned char* data, size_t n, size_t footer_end, PsPr
 
 void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
     const bool probe = On();
-    const bool pre = SotcPretranslate::On();
-    if (!(probe || pre) || !data || n < 64) {
+    const bool pre = SotcPretranslate::PixelVertexOn();
+    const bool cs = SotcPretranslate::ComputeOn(); // sotc: SOTC_PRETRANSLATE_COMPUTE, type 4 programs
+    if (!(probe || pre || cs) || !data || n < 64) {
         return;
     }
     uint32_t programs = 0;
@@ -358,7 +359,7 @@ void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
         single_hash = hash;
         single_footer = static_cast<size_t>(p - data);
         const uint32_t type = (bits >> 2) & 0xF;
-        if (type == 0 || (pre && type == 1)) { // pixel; vertex for the pre-translation
+        if (type == 0 || (pre && type == 1) || (cs && type == 4)) { // pixel; vertex and compute for the pre-translation
             bool known = false;
             if (type == 0) {
                 std::scoped_lock lock{g_mutex};
@@ -370,8 +371,10 @@ void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
                 std::scoped_lock lock{g_mutex};
                 g_ps_pred.try_emplace(hash, pred);
             }
-            if (ok && pre) {
+            if (ok && (pre && type <= 1)) {
                 found.push_back({hash, static_cast<uint8_t>(type), bits >> 8, pred});
+            } else if (ok && cs && type == 4) {
+                found.push_back({hash, 2, bits >> 8, pred}); // compute: stage 2 (pretranslate.h)
             }
         }
         p += 32;
@@ -387,7 +390,7 @@ void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
             }
         }
     }
-    if (!pre || found.empty()) {
+    if (found.empty()) {
         return;
     }
     uint64_t pair = 0;
@@ -402,6 +405,25 @@ void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
         pair = 0;
     }
     for (const auto& f : found) {
+        if (f.stage == 2) {
+            // Compute: the register layout is chosen by the validity test (pretranslate.h); a program without one is not
+            // prebuilt. The raw descriptor dwords go along, the dispatch's registers are checked against them.
+            bool ambiguous = false;
+            const uint8_t layout = SotcPretranslate::ComputeLayoutOf(f.pred.regs, &ambiguous);
+            SotcPretranslate::NoteComputeLayout(layout, ambiguous);
+            if (layout == 0) {
+                continue;
+            }
+            SotcPretranslate::Request r;
+            r.hash = f.hash;
+            r.stage = 2;
+            r.code.resize(f.length / 4);
+            std::memcpy(r.code.data(), data + f.pred.marker, r.code.size() * 4);
+            r.regs = f.pred.regs;
+            r.cs_layout = layout;
+            SotcPretranslate::Push(std::move(r));
+            continue;
+        }
         if (f.stage == 1 && f.pred.swappc) {
             continue; // the fetch shader is only known from a draw's user data
         }

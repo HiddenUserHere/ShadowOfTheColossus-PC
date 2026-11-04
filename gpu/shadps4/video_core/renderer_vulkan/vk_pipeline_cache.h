@@ -428,6 +428,7 @@ private:
     struct AsyncPipelineJob {
         ComputePipeline* compute{}; ///< a compute job: only Build() is run
         bool priority{}; ///< sotc: a depth-only (shadow) graphics job queued ahead of the others
+        bool pre_compute{}; ///< sotc: SOTC_PRETRANSLATE_COMPUTE: a prebuilt compute pipeline (its build counts as done)
         GraphicsPipelineKey key;
         u64 hash{};
         std::array<const Shader::Info*, MaxShaderStages> infos{};
@@ -493,6 +494,16 @@ private:
                            Shader::Backend::Bindings& binding, Shader::RuntimeInfo& runtime_info,
                            Shader::Pools& worker_pools);
     void InstallTranslation(AsyncPipelineJob::Translate& job);
+    /// sotc: SOTC_PRETRANSLATE_COMPUTE (CP only): queues the translation of a predicted compute program, unless it is
+    /// known (warm session: dropped as the other requests are).
+    void QueueComputePrebuild(SotcPretranslate::Request& request);
+    /// sotc: SOTC_PRETRANSLATE_COMPUTE (CP only): installs a translated compute program and queues its pipeline: the
+    /// ComputePipeline is made here (its layouts are CP-only) under the key the first dispatch computes, and a worker
+    /// builds the pipeline (Build, counted as done in JobsDone).
+    void InstallComputePrebuild(AsyncPipelineJob::Translate& translate);
+    /// sotc: SOTC_PRETRANSLATE_COMPUTE (CP only): compares a predicted compute program's registers with the first
+    /// dispatch's ComputeProgram (report: verify match / mismatch, the first mismatches logged).
+    void NoteComputeDispatch(const AmdGpu::ComputeProgram& cs, u64 hash);
     /// sotc: SOTC_PRETRANSLATE: queues the requests of the loaded shader files (command processor thread).
     void DrainPretranslate();
     /// sotc: the shader cache index (every program whose metas are on disk, with its permutation count): read at the
@@ -602,6 +613,16 @@ private:
     bool pre_holding{};                                        ///< sotc: the boot hold is waiting for them
     bool pre_hold_done{};                                      ///< sotc: the hold ran (once per session)
     std::vector<SotcPretranslate::Request> pre_deferred;
+    /// sotc: SOTC_PRETRANSLATE_COMPUTE (CP only): the predicted registers of the prebuilt compute programs, until their
+    /// first dispatch (NoteComputeDispatch) has compared them.
+    struct PreComputePrediction {
+        u32 rsrc1{}, rsrc2{}, nx{}, ny{}, nz{};
+        std::array<u32, 16> raw{};
+        u8 layout{};
+    };
+    std::unordered_map<u64, PreComputePrediction> pre_compute_pred;
+    /// sotc: compute pipeline builds queued by InstallComputePrebuild and not yet built (workers decrement).
+    std::atomic<u32> pre_builds_pending{};
     std::chrono::steady_clock::time_point pre_deferred_since{};
     /// sotc: SOTC_HEAP. Heap candidates (the variant's hash) that Heap::StageRefused refused, kept in the cache folder
     /// ("heap_refused" blob, loaded by WarmUp). A refused candidate's program is in no saved pipeline, so without

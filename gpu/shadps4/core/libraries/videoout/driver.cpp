@@ -139,6 +139,7 @@ void ReportPassStats(std::string& out, double seconds); // sotc: SOTC_PASS_STATS
 void ReportIndexExtent(std::string& out, double seconds); // sotc: SOTC_INDEX_EXTENT
 void ReportSpecMemo(std::string& out, double seconds); // sotc: SOTC_SPEC_MEMO
 void ReportPipeGpl(std::string& out, double seconds); // sotc: SOTC_PIPE_GPL
+void ReportPipeFeedback(std::string& out, double seconds); // sotc: SOTC_PIPE_FEEDBACK / SOTC_PIPE_COMPILE_CHECK
 void ReportHleCopyExact(std::string& out, double seconds); // sotc: SOTC_HLE_COPY_EXACT (vk_shader_hle.cpp)
 } // namespace Vulkan
 // sotc: src/runtime_kernel.c, SOTC USLEEP line (usleep histogram, SOTC_USLEEP_YIELD).
@@ -2408,6 +2409,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcXprGroups::Report(report, seconds);      // sotc: SOTC_XPR_GROUPS (XPR draw groups, 5 s)
             SotcPredict::Report(report, seconds);        // sotc: SOTC_PREDICT_PROBE (shader translation predictability)
             SotcPretranslate::Report(report, seconds);
+            Vulkan::ReportPipeFeedback(report, seconds); // sotc: SOTC_PIPE_FEEDBACK / SOTC_PIPE_COMPILE_CHECK (no-op when both off)
             SotcPreupload::Report(report, seconds);
             SotcDrawGate::Report(report, seconds); // sotc: SOTC_DRAW_GATE      // sotc: SOTC_PRELOAD_UPLOAD (loaded ranges, idle uploads)   // sotc: SOTC_PRETRANSLATE (step 2c, keys made at load)
             SotcDrawRuns::Report(report, seconds);       // sotc: SOTC_DRAW_RUNS (indirect draw runs, 5 s)

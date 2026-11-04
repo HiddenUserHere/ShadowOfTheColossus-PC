@@ -91,6 +91,8 @@ private:
     bool from_cache{}; ///< sotc: preloaded from the cache (a refused one is dropped)
     std::atomic<bool> ready{true};
     std::atomic<bool> claimed{false};
+    /// sotc: SOTC_PIPE_COMPILE_CHECK: set once this pipeline was logged (waited for or built off a worker).
+    mutable std::atomic<bool> sotc_logged{false};
 };
 
 } // namespace Vulkan

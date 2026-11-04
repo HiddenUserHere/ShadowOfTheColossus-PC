@@ -45,6 +45,15 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       SOTC_LAB_ROUTE=user/routes/new-route.json), and turns the 30 FPS cap off
                       (SOTC_FPS_CAP=off). Each one is a setdefault: an explicit value (environment or
                       sotc.ini) still wins.
+    SOTC_AUTO_PREPARE  0 (default): the shaders are prepared inside the game window when it opens (the port's
+                      loading screen, "Preparando os shaders do jogo", SOTC_PRETRANSLATE's boot hold). 1: a
+                      play launch first runs a separate headless preparation (--precompile, below) when the
+                      port binary, the GPU driver, the game image or a shader-relevant setting changed since
+                      the last run that finished; the launcher shows it as "Preparando shaders". Not for
+                      SOTC_DETERMINISTIC runs, boss boots, or runs with neither a console nor the launcher.
+    --precompile      translates every shader the game loads and exits (the launcher's "Preparar shaders"
+                      runs --prepare, the same run with the stamp written)
+    --prepare         prepares the shaders now (SOTC_AUTO_PREPARE's run, forced) and exits
 The image is prepared again only when the game, the modules or the scripts change.
 Extra arguments go to bb-probe.exe. Run from a console, the session is also saved to
 <user>/last_run.log (the 4 before it as last_run.1.log ... last_run.4.log; a crash's log is
@@ -54,6 +63,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import subprocess
@@ -235,17 +245,170 @@ def hold_cross(pad, log, stop):
     pad.write_text('')
 
 
-# sotc.py --precompile (the launcher's "Preparar shaders"): the shader preparation run. The game boots without a
-# window or sound, every shader it loads is translated with all its variants into the shader cache, and the port
-# leaves by itself when it is done ("SOTC PRECOMPILE done"). The shader switches come from sotc.ini as for play, so
-# the cache is the one the next sessions use.
+# sotc.py --precompile (the launcher's "Preparar shaders" runs --prepare): the shader preparation run. The game boots
+# without a window or sound, every shader it loads is translated with all its variants into the shader cache, and the
+# port leaves by itself when it is done ("SOTC PRECOMPILE done"). The shader switches come from sotc.ini as for play,
+# so the cache is the one the next sessions use.
 PRECOMPILE_DEFAULTS = {'SOTC_HEADLESS': '1', 'SOTC_NULL_AUDIO': '1', 'SOTC_LAB': '0', 'SOTC_FPS_CAP': 'off'}
+
+# SOTC_AUTO_PREPARE (see the docstring): before a play launch the shaders are prepared when the fingerprint (prepare_key)
+# differs from the stamp of the game folder in user/cache/prepared.json. The stamp is written only after a run that
+# printed "SOTC PRECOMPILE done" and exited with 0.
+PREPARE_STAMP = 'prepared.json'
+PREPARE_IDLE_S = 300  # a run with no output for this long is stuck: it is stopped and the game starts without it
+# Settings that never change a shader or a pipeline (runtime switches, paths, dumps, the run's own labels): a change
+# to them does not ask for a new preparation. Prefixes of SOTC_* and BB_* names. Every other switch counts.
+PREPARE_IGNORED = (
+    'SOTC_FPS', 'SOTC_LAB', 'SOTC_TRACE', 'SOTC_PROFILE', 'SOTC_EVENT_LOG', 'SOTC_RUN_', 'SOTC_SHOT_', 'SOTC_DET',
+    'SOTC_AUTO_PREPARE', 'SOTC_PRECOMPILE', 'SOTC_NOTE', 'SOTC_WRAP', 'SOTC_WINDOW_', 'SOTC_LAUNCHER_SETTINGS',
+    'SOTC_USER_DIR', 'SOTC_GAME_DIR', 'SOTC_GAME_VERSION', 'SOTC_UPDATE_DIR', 'SOTC_DLC_DIR', 'SOTC_SYS_MODULES',
+    'SOTC_PREDICT_TABLE', 'SOTC_PREDICT_LAYOUTS', 'SOTC_TUNING_TSV', 'SOTC_HEADLESS', 'SOTC_NULL_AUDIO',
+    'SOTC_RDOC_', 'SOTC_DUMP', 'SOTC_TEX_DUMP', 'SOTC_CS_DUMP', 'SOTC_CSDR_', 'SOTC_MINIDUMP', 'SOTC_CTL',
+    'SOTC_ENGINE_CMD', 'SOTC_FREECAM', 'SOTC_VOLUME', 'SOTC_MOUSE', 'SOTC_RUMBLE',
+    'BB_CONFIG', 'BB_GPU_USER_DIR', 'BB_PAD_', 'BB_DUMP_DIR', 'BB_MODS_DIR', 'BB_LANGUAGE', 'BB_USER_NAME',
+    'BB_GAMEPAD', 'BB_FULLSCREEN', 'BB_PRESENT_MODE', 'BB_VBLANK_HZ', 'BB_TOGGLE_FILE', 'BB_RESTART_COMMAND',
+    'BB_WRITE_LOG', 'BB_GPU_LOG', 'BB_MEMORY_LOG', 'BB_TRACE', 'BB_AUDIO', 'BB_FRAME_', 'BB_STACKS_TRIGGER',
+    'BB_FAULT_RING', 'BB_OVERLAY_MENU', 'BB_IME_TEXT', 'BB_MOD_TRACE', 'BB_LIST_IMPORTS', 'BB_STRICT_HANDLES',
+)
+
+
+def display_drivers():
+    """The display adapters and their driver versions, from the registry's display class: a driver update or a
+    change of graphics card changes it. 'unknown' where the registry cannot be read (no winreg, no key)."""
+    try:
+        import winreg
+    except ImportError:
+        return 'unknown'
+    base = r'SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+    found = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as classes:
+            index = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(classes, index)
+                except OSError:
+                    break  # no more subkeys
+                index += 1
+                if not name.isdigit():
+                    continue  # Properties, Configuration...
+                try:
+                    with winreg.OpenKey(classes, name) as adapter:
+                        desc = winreg.QueryValueEx(adapter, 'DriverDesc')[0]
+                        version = winreg.QueryValueEx(adapter, 'DriverVersion')[0]
+                        found.append(f'{desc}|{version}')
+                except OSError:
+                    continue
+    except OSError:
+        return 'unknown'
+    return ';'.join(sorted(found)) or 'unknown'
+
+
+def prepare_key(env, probe, image):
+    """The fingerprint of the shaders a play launch would use: the port binary (size and mtime), the game image
+    (its fingerprint, fingerprint()), the display drivers, and every SOTC_*/BB_* setting not in PREPARE_IGNORED."""
+    digest = hashlib.sha256()
+    stat = probe.stat()
+    digest.update(f'probe {stat.st_size} {stat.st_mtime_ns}\n'.encode())
+    digest.update(f'image {image}\n'.encode())
+    digest.update(f'gpu {display_drivers()}\n'.encode())
+    for name in sorted(env):
+        if name.startswith(('SOTC_', 'BB_')) and not name.startswith(PREPARE_IGNORED):
+            digest.update(f'{name}={env[name]}\n'.encode())
+    return digest.hexdigest()
+
+
+def stamp_matches(stamp, game_name, key):
+    try:
+        data = json.loads(stamp.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get(game_name) == key
+
+
+def write_stamp(stamp, game_name, key):
+    """Records KEY for the game folder GAME_NAME; the other games' entries are kept."""
+    try:
+        data = json.loads(stamp.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[game_name] = key
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(json.dumps(data, indent=1) + '\n', encoding='utf-8')
+
+
+def read_lines(stream, lines):
+    """Reader thread: the child's output, one decoded line at a time, then None."""
+    for raw in iter(stream.readline, b''):
+        lines.put(raw.decode('utf-8', errors='replace'))
+    lines.put(None)
+
+
+def prepare_shaders(env, game, user, image, probe, force=False):
+    """Runs sotc.py --precompile and waits for it, forwarding its output (the launcher reads the progress lines
+    "SOTC PRECOMPILE: N of M" between "SOTC PREPARE start" and "SOTC PREPARE end"). Returns True when the run
+    finished; a run that did not is not stamped, so the next play prepares again. FORCE: run even when the stamp
+    matches (--prepare)."""
+    stamp = user / 'cache' / PREPARE_STAMP
+    key = prepare_key(env, probe, image)
+    if not force and stamp_matches(stamp, game.name, key):
+        return True
+    print('SOTC PREPARE start: preparing the shaders before play (first start, or after a change of the port, '
+          'the GPU driver or the settings)', flush=True)
+    child_env = dict(env)
+    child_env['SOTC_LAB'] = '0'  # the preparation runs no lab (its restart settings stay for the play launch)
+    child_env.pop('SOTC_BOOT_BOSS', None)
+    if getattr(sys, 'frozen', False):
+        command = [sys.executable, '--run', '--precompile']  # the packaged SotC.exe runs sotc.py itself
+    else:
+        command = [sys.executable, str(PORT / 'sotc.py'), '--precompile']
+    try:
+        process = subprocess.Popen(command, cwd=str(PORT), env=child_env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=no_console())
+    except OSError as error:
+        print(f'sotc: the shader preparation did not start: {error}', file=sys.stderr)
+        print('SOTC PREPARE end: not finished', flush=True)
+        return False
+    lines = queue.Queue()
+    threading.Thread(target=read_lines, args=(process.stdout, lines), daemon=True).start()
+    finished = False
+    last_output = time.monotonic()
+    while True:
+        try:
+            line = lines.get(timeout=1.0)
+        except queue.Empty:
+            if time.monotonic() - last_output > PREPARE_IDLE_S:
+                print(f'sotc: the shader preparation printed nothing for {PREPARE_IDLE_S} s: stopped',
+                      file=sys.stderr)
+                process.kill()
+                break
+            continue
+        if line is None:
+            break
+        last_output = time.monotonic()
+        if line.startswith('SOTC PRECOMPILE done'):
+            finished = True
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    code = process.wait()
+    ok = finished and code == 0
+    if ok:
+        write_stamp(stamp, game.name, key)
+    print(f'SOTC PREPARE end: {"done" if ok else "not finished (the game compiles the rest on first use)"}',
+          flush=True)
+    return ok
 
 
 def main():
     load_ini()
     env = os.environ
-    if '--precompile' in sys.argv:
+    prepare_only = '--prepare' in sys.argv
+    if prepare_only:
+        sys.argv.remove('--prepare')
+    precompile_run = '--precompile' in sys.argv
+    if precompile_run:
         sys.argv.remove('--precompile')
         env['SOTC_PRECOMPILE'] = '1'
         for name, value in PRECOMPILE_DEFAULTS.items():
@@ -429,7 +592,8 @@ def main():
     # own files and sessions, never shipped).
     def on(name):
         return env.get(name, '0') not in ('', '0')
-    if any(on(n) for n in ('SOTC_CSDR_PROBE', 'SOTC_PREDICT_PROBE', 'SOTC_PRETRANSLATE', 'SOTC_PRECOMPILE')):
+    if any(on(n) for n in ('SOTC_CSDR_PROBE', 'SOTC_PREDICT_PROBE', 'SOTC_PRETRANSLATE', 'SOTC_PRETRANSLATE_COMPUTE',
+                           'SOTC_PRECOMPILE')):
         env.setdefault('SOTC_RES_LOADED', '1')
     if on('SOTC_PRETRANSLATE') or on('SOTC_PRECOMPILE'):
         predict = user / 'shader_predict'
@@ -441,6 +605,16 @@ def main():
                   'are guessed', file=sys.stderr)
     # Controls: key.<input>= / pad.<input>= lines of sotc.ini remap keys and buttons (src/runtime_pad.c).
     env.setdefault('BB_CONFIG', str(PORT / 'sotc.ini'))
+    # SOTC_AUTO_PREPARE (prepare_shaders): the shaders are prepared before the game starts. Not for the offline test
+    # mode, a boss boot, the preparation run itself, or a run with neither a console nor the launcher (a bench script).
+    deterministic = env.get('SOTC_DETERMINISTIC', '0') not in ('', '0')
+    interactive = bool(env.get('SOTC_LAUNCHER_SETTINGS')) or sys.stdout.isatty()
+    # The default is the in-window preparation (the boot hold of the GPU side), so the separate run is opt-in.
+    auto = env.get('SOTC_AUTO_PREPARE', '0') not in ('', '0') and not (deterministic or boss or precompile_run)
+    if prepare_only or (auto and interactive):
+        ok = prepare_shaders(env, game, user, wanted, probe, force=prepare_only)
+        if prepare_only:
+            return 0 if ok else 1
     command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--patches', str(out / 'patches.bin'),
                *(['--sotc-cmdline', str(out / 'cmdline.bin')] if (out / 'cmdline.bin').is_file() else []),

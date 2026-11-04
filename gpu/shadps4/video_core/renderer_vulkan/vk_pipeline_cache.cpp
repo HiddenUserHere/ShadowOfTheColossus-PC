@@ -787,6 +787,46 @@ struct TinyAsyncStats {
 };
 TinyAsyncStats g_tiny_stats;
 std::atomic<u32> g_tiny_logged{};
+
+// sotc: SOTC_TINY_GPL=1 (off by default; needs SOTC_PIPE_GPL=1 too, which enables the extension). A tiny
+// draw (<= 6 indices) whose pipeline is missing or still queued on a worker is served at once by a
+// fast-linked pipeline: its four libraries are created on the command processor (the stage modules are
+// translated there already, the draw's shaders are not skipped), then linked without optimization. The
+// optimized build is queued on a worker and replaces the linked pipeline when collected, as the GPL
+// path does for geometry draws. Only with async workers and an eligible pipeline; otherwise, or when the
+// fast link is refused, the full build runs on the command processor as before. Takes precedence over
+// SOTC_TINY_ASYNC when both are set. Any other value (or unset): nothing changes.
+bool TinyGplOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_TINY_GPL");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+// sotc: SOTC_TINY_GPL counters, printed by ReportPipeGpl (the 5 s report, with SOTC_PIPE_GPL=1).
+struct TinyGplStats {
+    std::atomic<u64> linked{};   ///< tiny draws served by a fast-linked pipeline
+    std::atomic<u64> queued{};   ///< optimized builds queued behind them
+    std::atomic<u64> lib_ns{};   ///< command processor time of those draws, minus the link time
+    std::atomic<u64> link_ns{};  ///< time of their links (vkCreateGraphicsPipelines with the libraries)
+};
+TinyGplStats g_tiny_gpl;
+
+// sotc: SOTC_PIPE_GPL. A fast-linked pipeline replaced by its optimized build is kept alive until the
+// process ends, never destroyed. A BackOp holds a raw pointer to the pipeline it was captured with
+// (Liverpool::CaptureBackOp) and the back thread records it later, so a delete scheduled for the
+// front thread's tick could free a pipeline that a queued draw still binds (device lost). Each
+// retired pipeline is one VkPipeline; the count is the "optimized replacements" of the GPL report.
+std::mutex g_retired_mutex;
+std::vector<std::unique_ptr<GraphicsPipeline>>& RetiredLinkedPipelines() {
+    static auto* retired = new std::vector<std::unique_ptr<GraphicsPipeline>>; // never freed
+    return *retired;
+}
+void RetireLinkedPipeline(std::unique_ptr<GraphicsPipeline> linked) {
+    std::scoped_lock lock{g_retired_mutex};
+    RetiredLinkedPipelines().push_back(std::move(linked));
+}
 } // namespace
 
 // sotc: SOTC_TINY_ASYNC=1 treats a color target that lies in a display buffer as a presentation
@@ -1013,6 +1053,11 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         if (job->compute) {
             const auto start = std::chrono::steady_clock::now();
             job->compute->Build();
+            if (job->pre_compute) { // sotc: SOTC_PRETRANSLATE_COMPUTE: done when the pipeline is built (or refused)
+                job->compute->WaitBuilt();
+                SotcPretranslate::NoteBuilt(2, job->compute->Handle() != vk::Pipeline{});
+                pre_builds_pending.fetch_sub(1, std::memory_order_relaxed);
+            }
             SotcStats::async_compute_built.fetch_add(1, std::memory_order_relaxed);
             SotcStats::async_compute_build_ns.fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1074,7 +1119,8 @@ void PipelineCache::CollectAsyncPipelines() {
         }
         if (it.value()) {
             // sotc: SOTC_PIPE_GPL: the optimized build replaces the fast-linked pipeline the draws
-            // were using. The linked one is destroyed once the GPU is past the current tick.
+            // were using. The linked one is retired, not destroyed (RetireLinkedPipeline): back-thread
+            // ops may still hold it.
             if (!job->preloaded && job->pipeline && it.value()->IsLinked()) {
                 auto linked = std::move(it.value());
                 it.value() = std::move(job->pipeline);
@@ -1082,7 +1128,7 @@ void PipelineCache::CollectAsyncPipelines() {
                 RegisterPipelineData(job->key, job->hash, job->sdata);
                 ++num_new_pipelines;
                 g_gpl_counters.replaced.fetch_add(1, std::memory_order_relaxed);
-                scheduler.DeferOperation([p = linked.release()] { delete p; });
+                RetireLinkedPipeline(std::move(linked));
                 continue;
             }
             // A full-screen pass built it on the command processor meanwhile (that one may be
@@ -1339,6 +1385,10 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
                                       Shader::RuntimeInfo& runtime_info,
                                       Shader::Pools& worker_pools) {
     if (!t.program) {
+        // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS: a compute prebuild takes the fields its program's last miss recorded.
+        SotcPretranslate::HintScope hint_scope{t.pretranslate && t.sw_stage == SwStage::Compute
+                                                   ? SotcPretranslate::AcquireHint(t.hash)
+                                                   : SotcPretranslate::HintPtr{}};
         t.new_program = std::make_unique<Program>(t.hw_stage, t.sw_stage, params);
         t.new_program->info.sotc_synthetic = t.pretranslate; // sotc: SOTC_PRETRANSLATE
         t.new_program->info.sotc_synthetic_variant = t.synthetic_variant;
@@ -1360,6 +1410,10 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
 }
 
 void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
+    if (!t.program && t.pretranslate && t.sw_stage == SwStage::Compute) {
+        InstallComputePrebuild(t); // sotc: SOTC_PRETRANSLATE_COMPUTE
+        return;
+    }
     if (!t.program && t.pretranslate) {
         // sotc: SOTC_PRETRANSLATE. A pre-translation that failed says nothing about the draws (their tables were
         // never read): the program stays unknown, and its first draw translates it as before.
@@ -1904,6 +1958,38 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
             ++g_tiny_jobs_queued;
             return true;
         };
+        // sotc: SOTC_TINY_GPL=1 (TinyGplOn). A tiny draw is served by a fast-linked pipeline now, and the
+        // optimized build follows on a worker. Its time is counted in g_tiny_gpl.
+        // Descriptor heap pipelines are never linked (GraphicsPipeline ctor): they would be built twice.
+        if (tiny_draw && !depth_only && TinyGplOn() && gpl_on && eligible &&
+            !async_workers.empty() && !instance.IsDescriptorHeapEnabled()) {
+            const auto fast_start = std::chrono::steady_clock::now();
+            const u64 link_before = g_gpl_counters.link_ns.load(std::memory_order_relaxed);
+            if (TryFastLink(it.value())) {
+                const u64 link_ns =
+                    g_gpl_counters.link_ns.load(std::memory_order_relaxed) - link_before;
+                const u64 total_ns = static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - fast_start)
+                        .count());
+                g_tiny_gpl.linked.fetch_add(1, std::memory_order_relaxed);
+                g_tiny_gpl.link_ns.fetch_add(link_ns, std::memory_order_relaxed);
+                g_tiny_gpl.lib_ns.fetch_add(total_ns > link_ns ? total_ns - link_ns : 0,
+                                            std::memory_order_relaxed);
+                // The optimized build: queued for a new pipeline (a queued one is already in flight).
+                if (!queued) {
+                    QueueAsyncPipeline(std::hash<GraphicsPipelineKey>{}(graphics_key), nullptr,
+                                       false);
+                    g_tiny_gpl.queued.fetch_add(1, std::memory_order_relaxed);
+                }
+                std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
+                last_graphics_pipeline = it->second.get();
+                last_graphics_size = graphics_pipelines.size();
+                g_gpl_counters.linked_served.fetch_add(1, std::memory_order_relaxed);
+                return it->second.get();
+            }
+            // Not linkable, or refused: the full build below, as without the switch.
+        }
         // sotc: SOTC_TINY_ASYNC=1: a tiny draw whose pipeline a worker is building is skipped, as
         // a geometry draw is, and the pipeline moves to the front. A display draw builds here.
         if (queued && tiny_mode == 1 && tiny_can_defer && !tiny_writes_display()) {
@@ -3063,6 +3149,9 @@ bool PipelineCache::RefreshComputeKey() {
         }
         std::tie(infos[0], modules[0], compute_key.value) =
             GetProgram(HwStage::Compute, SwStage::Compute, plain_params, binding);
+        if (!pre_compute_pred.empty()) {
+            NoteComputeDispatch(cs_pgm, cs_params.hash); // sotc: SOTC_PRETRANSLATE_COMPUTE (verify, once)
+        }
     }
     return true;
 }
@@ -3502,6 +3591,9 @@ void PipelineCache::PrecompileCheck() {
     // Every program the game loaded is translated and in the cache: the pack, the index, the cache files, and out.
     PrePackFinish();
     SaveShaderIndex();
+    // sotc: the run ends with _Exit, which skips the destructor: the driver cache (the pipelines built by this run,
+    // compute ones included) is written here, as the 60 s timer would have done.
+    SaveDriverCache();
     std::fprintf(stderr, "SOTC PRECOMPILE done: %llu shader translations written to the shader cache\n",
                  static_cast<unsigned long long>(done));
     std::fflush(stderr);
@@ -3528,8 +3620,23 @@ void PipelineCache::DrainPretranslate() {
     if (requests.empty()) {
         return;
     }
-    // A program variant (SOTC_SHADER_ADDR) mixes its variant into the hash: those keys are not made here.
+    // A program variant (SOTC_SHADER_ADDR) mixes its variant into the hash: those keys are not made here. The
+    // requests are counted as dropped (before this check they vanished silently: queued 0 in every such run).
     if (profile.shader_addr != 0) {
+        for (const auto& r : requests) {
+            SotcPretranslate::NoteDropped(r.stage == 1 ? 1 : 0, 2);
+        }
+        return;
+    }
+    // sotc: SOTC_PRETRANSLATE_COMPUTE: compute requests take their own path (QueueComputePrebuild).
+    for (auto& r : requests) {
+        if (r.stage == 2) {
+            QueueComputePrebuild(r);
+        }
+    }
+    std::erase_if(requests, [](const auto& r) { return r.stage == 2; });
+    if (requests.empty()) {
+        FeedPretranslate();
         return;
     }
     static const std::array<u32, Shader::ShaderParams::NumShaderUserData> zeros{};
@@ -3680,6 +3787,154 @@ void PipelineCache::FeedPretranslate() {
     async_cv.notify_all();
 }
 
+// sotc: SOTC_PRETRANSLATE_COMPUTE. A compute program's first dispatch computes its key with the stage's plain
+// params (RefreshComputeKey); the prebuilt pipeline uses the same key: HashCombine(hash, 0), the first permutation.
+void PipelineCache::QueueComputePrebuild(SotcPretranslate::Request& r) {
+    const ComputePipelineKey key{HashCombine(r.hash, size_t{0})};
+    if (IsProgramKnown(r.hash) || lazy_programs.contains(r.hash) || compute_pipelines.contains(key)) {
+        SotcPretranslate::NoteDropped(2, 0); // known: a warm session has it (as the other requests)
+        return;
+    }
+    // A heap profile looks up the heap variant first (RefreshComputeKey): its key is not the plain one made here.
+    if (profile.heap_images && profile.support_int64) {
+        SotcPretranslate::NoteDropped(2, 3);
+        return;
+    }
+    const SotcPretranslate::ComputeFields f = SotcPretranslate::ComputeFieldsOf(r.regs, r.cs_layout);
+    // The registers as the dispatch's ComputeProgram holds them: settings is RSRC1 then RSRC2 (regs_shader.h).
+    AmdGpu::ComputeProgram cs{};
+    const u32 settings[2] = {f.rsrc1, f.rsrc2};
+    if (sizeof(cs.settings) != sizeof settings) {
+        SotcPretranslate::NoteDropped(2, 3);
+        return;
+    }
+    std::memcpy(&cs.settings, settings, sizeof settings);
+    cs.num_thread_x.full = static_cast<u16>(f.nx);
+    cs.num_thread_y.full = static_cast<u16>(f.ny);
+    cs.num_thread_z.full = static_cast<u16>(f.nz);
+    auto rt = runtime_infos[u32(SwStage::Compute)]; // not default-constructible
+    rt.Initialize(HwStage::Compute, SwStage::Compute);
+    FillComputeRuntimeInfo(rt, cs);
+
+    pre_compute_pred[r.hash] = PreComputePrediction{f.rsrc1, f.rsrc2, f.nx, f.ny, f.nz, r.regs, r.cs_layout};
+    auto job = std::make_unique<AsyncPipelineJob>();
+    auto& t = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
+    t.hw_stage = HwStage::Compute;
+    t.sw_stage = SwStage::Compute;
+    t.hash = r.hash;
+    t.owned_code = r.code;
+    t.code = t.owned_code;
+    t.runtime_info = rt;
+    t.pretranslate = true;
+    SotcPretranslate::NoteQueued(2);
+    pre_backlog.push_back(std::move(job));
+}
+
+void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
+    if (pre_in_flight > 0) {
+        --pre_in_flight;
+    }
+    struct FeedNext {
+        PipelineCache& cache;
+        ~FeedNext() {
+            cache.FeedPretranslate();
+        }
+    } feed_next{*this};
+    const ComputePipelineKey key{HashCombine(t.hash, size_t{0})};
+    const auto fail = [&] {
+        SotcPretranslate::NoteBuilt(2, false);
+        pre_compute_pred.erase(t.hash);
+        if (t.module) {
+            instance.GetDevice().destroyShaderModule(t.module);
+            t.module = vk::ShaderModule{};
+        }
+    };
+    if (t.failed || !t.new_program || !t.spec || compute_pipelines.contains(key)) {
+        fail();
+        return;
+    }
+    Program* program = nullptr;
+    if (const auto found = program_cache.find(t.hash); found != program_cache.end()) {
+        // A draw translated the program meanwhile: its module serves the pipeline when the specialization is the same.
+        program = found.value().get();
+        if (program->modules.empty() || !(program->modules[0].spec == *t.spec)) {
+            fail();
+            return;
+        }
+        instance.GetDevice().destroyShaderModule(t.module);
+        t.module = vk::ShaderModule{};
+    } else {
+        auto [it, is_new] = program_cache.try_emplace(t.hash);
+        it.value() = std::move(t.new_program);
+        program = it.value().get();
+        program->sotc_pre = true;
+        // Stored as the graphics pre-translations are (the hold's pack, or loose files and the meta).
+        if (!((pre_holding || SotcPretranslate::Precompile()) &&
+              PrePackAdd(t.hash, 0, SerializeShaderMeta(program->info, *t.spec, HashCombine(t.hash, 0), 0), t.spv))) {
+            RegisterShaderBinary(std::move(t.spv), t.hash, 0);
+            SotcPredict::SetPretranslating(true);
+            RegisterShaderMeta(program->info, t.spec->fetch_shader_data, *t.spec, HashCombine(t.hash, 0), 0);
+            SotcPredict::SetPretranslating(false);
+        }
+        program->AddPermut(t.module, std::move(*t.spec));
+        program->info.UserData() = {};
+    }
+    // The ComputePipeline is made on the command processor (its layouts and the heap state are CP-only); a worker
+    // builds it (Build). Ordinary pipeline: SerializationSupport, RegisterPipelineData, the same as a draw's.
+    ComputePipeline::SerializationSupport sdata{};
+    auto pipe = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache, profile,
+                                                  *pipeline_cache, key, program->info, program->modules[0].module,
+                                                  sdata, false, true);
+    ComputePipeline* raw = pipe.get();
+    auto [cit, cnew] = compute_pipelines.try_emplace(key);
+    cit.value() = std::move(pipe);
+    RegisterPipelineData(key, sdata);
+    ++num_new_pipelines;
+    if (async_workers.empty()) {
+        raw->Build();
+        SotcPretranslate::NoteBuilt(2, raw->Handle() != vk::Pipeline{});
+        return;
+    }
+    auto job = std::make_unique<AsyncPipelineJob>();
+    job->compute = raw;
+    job->pre_compute = true;
+    pre_builds_pending.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{async_mutex};
+        async_queue.insert(async_queue.begin() + async_compute_queued++, std::move(job));
+    }
+    async_cv.notify_one();
+}
+
+// sotc: SOTC_PRETRANSLATE_COMPUTE. The dispatch's ComputeProgram against the prediction (once per program): the
+// settings dwords are RSRC1 and RSRC2, the thread counts the full part of NUM_THREAD_X/Y/Z.
+void PipelineCache::NoteComputeDispatch(const AmdGpu::ComputeProgram& cs, u64 hash) {
+    const auto it = pre_compute_pred.find(hash);
+    if (it == pre_compute_pred.end()) {
+        return;
+    }
+    const PreComputePrediction p = it->second;
+    pre_compute_pred.erase(it);
+    u32 real[2]{};
+    std::memcpy(real, &cs.settings, sizeof real);
+    const u32 nx = cs.num_thread_x.full, ny = cs.num_thread_y.full, nz = cs.num_thread_z.full;
+    const bool same = real[0] == p.rsrc1 && real[1] == p.rsrc2 && nx == p.nx && ny == p.ny && nz == p.nz;
+    SotcPretranslate::NoteVerify(same);
+    if (same) {
+        return;
+    }
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        std::fprintf(stderr,
+                     "SOTC PRETRANSLATE compute verify mismatch %#llx (layout %u): predicted rsrc1 %08x rsrc2 %08x "
+                     "threads %u %u %u, dispatch rsrc1 %08x rsrc2 %08x threads %u %u %u; descriptor %08x %08x %08x "
+                     "%08x %08x %08x %08x %08x\n",
+                     static_cast<unsigned long long>(hash), p.layout, p.rsrc1, p.rsrc2, p.nx, p.ny, p.nz, real[0],
+                     real[1], nx, ny, nz, p.raw[0], p.raw[1], p.raw[2], p.raw[3], p.raw[4], p.raw[5], p.raw[6],
+                     p.raw[7]);
+    }
+}
+
 void PipelineCache::MaybeHoldForPretranslate() {
     using Clock = std::chrono::steady_clock;
     static const Clock::time_point session_start = Clock::now();
@@ -3719,7 +3974,8 @@ void PipelineCache::MaybeHoldForPretranslate() {
         SotcStats::prep_writes.store(writes, std::memory_order_relaxed);
         const auto now = Clock::now();
         const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-        const bool idle = pre_backlog.empty() && pre_in_flight == 0 && !SotcPretranslate::Pending() &&
+        const bool idle = pre_backlog.empty() && pre_in_flight == 0 && pre_builds_pending.load() == 0 &&
+                          !SotcPretranslate::Pending() &&
                           pre_deferred.empty() && now_ns - SotcPretranslate::LastRequestNs() > 3'000'000'000LL &&
                           writes < 64;
         if (idle || now - start > std::chrono::minutes{45}) {
@@ -3736,6 +3992,7 @@ void PipelineCache::MaybeHoldForPretranslate() {
     }
     pre_holding = false;
     PrePackFinish(); // the variants of the hold, in one file; read back for their first draws
+    SaveDriverCache(); // sotc: the driver's pipelines of the hold are written now, not at the 60 s timer
     SotcStats::prep_active.store(false, std::memory_order_release); // the screen goes away
     SaveShaderIndex();
     // The programs no draw used yet leave memory: their modules are destroyed and they go back to the index on disk,
@@ -3745,7 +4002,8 @@ void PipelineCache::MaybeHoldForPretranslate() {
         size_t evicted = 0;
         for (auto it = program_cache.begin(); it != program_cache.end();) {
             Program& program = *it.value();
-            if (!program.sotc_pre || program.sotc_pre_checked || !program.pending_specs.empty()) {
+            if (!program.sotc_pre || program.sotc_pre_checked || !program.pending_specs.empty() ||
+                program.info.sw_stage == Shader::SwStage::Compute) { // sotc: a compute pipeline keeps its module
                 ++it;
                 continue;
             }
@@ -4050,8 +4308,12 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                              program->modules[0].spec.runtime_info.hw.vs.num_outputs);
             }
         }
-        SotcPretranslate::NoteFirstUse(sw_stage == SwStage::Vertex ? 1 : 0, hit,
+        SotcPretranslate::NoteFirstUse(sw_stage == SwStage::Vertex ? 1 : sw_stage == SwStage::Compute ? 2 : 0, hit,
                                        hit ? 0u : PretranslateDiff(spec, program->modules[0].spec));
+        if (sw_stage == SwStage::Compute) {
+            // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS: the dispatch's key against the prebuilt one (hint file, miss log).
+            SotcPretranslate::NoteComputeFirstUse(params.hash, hit, program->info, spec, program->modules[0].spec);
+        }
     }
     if (it == program->modules.end() && async_ok && !program->translate_in_place) {
         if (std::ranges::find(program->pending_specs, spec) == program->pending_specs.end()) {
@@ -4322,6 +4584,26 @@ void ReportPipeGpl(std::string& out, double seconds) {
         static_cast<unsigned long long>(reused[1]), static_cast<unsigned long long>(reused[2]),
         static_cast<unsigned long long>(reused[3]));
     out += line;
+    // sotc: SOTC_TINY_GPL counters, same window. Only printed when a tiny draw was served.
+    static u64 p_tgl{}, p_tgq{}, p_tglib{}, p_tglink{}, p_tgsync{}, p_tgsync_ns{};
+    const u64 tgl = take(g_tiny_gpl.linked, p_tgl);
+    const u64 tgq = take(g_tiny_gpl.queued, p_tgq);
+    const u64 tglib = take(g_tiny_gpl.lib_ns, p_tglib);
+    const u64 tglink = take(g_tiny_gpl.link_ns, p_tglink);
+    // sotc: tiny draws built synchronously on the command processor (any mode; g_tiny_stats).
+    const u64 tgsync = take(g_tiny_stats.sync_builds, p_tgsync);
+    const u64 tgsync_ns = take(g_tiny_stats.sync_ns, p_tgsync_ns);
+    if (tgl != 0 || tgq != 0 || tgsync != 0) {
+        char tline[320];
+        std::snprintf(tline, sizeof(tline),
+                      "SOTC tiny gpl: linked %llu (libraries %.1f ms, links %.1f ms, cp time), "
+                      "optimized queued %llu, built sync %llu (%.1f ms, cp time)\n",
+                      static_cast<unsigned long long>(tgl), static_cast<double>(tglib) / 1e6,
+                      static_cast<double>(tglink) / 1e6, static_cast<unsigned long long>(tgq),
+                      static_cast<unsigned long long>(tgsync),
+                      static_cast<double>(tgsync_ns) / 1e6);
+        out += tline;
+    }
     (void)seconds; // the counts are per window; a rate is the reader's division by the window
 }
 
