@@ -12,6 +12,7 @@
 #include "probe_ops.h"          // sotc: SOTC_OPS_PROBE (docs/re-backend/14-draw-reduction.md, R4 and R6)
 #include "probe_frame_rings.h" // sotc: SOTC_FRAME_RINGS (docs/re-backend/10-ring-reuse.md)
 #include "probe_xpr_groups.h"  // sotc: SOTC_XPR_GROUPS (XPR_INDEX_CULL, observe only)
+#include "probe_csdr.h"        // sotc: SOTC_CSDR_PROBE (RES_DECOMPRESS, observe only)
 #include "probe_vsize.h"       // sotc: SOTC_VSIZE_PROBE (VSIZE_VIEW_SITE, object map)
 #include "particle_prev.h"
 #include "decommit_budget.h"
@@ -53,6 +54,7 @@ void RegisterAllHandlers() {
     SotcProbes::RegisterPrepassProbe(); // sotc: SOTC_PREPASS_PROBE (observe only)
     SotcProbes::RegisterOpsProbe();     // sotc: SOTC_OPS_PROBE (observe only)
     SotcXprGroups::Register();          // sotc: SOTC_XPR_GROUPS (XPR_INDEX_CULL, observe only)
+    SotcCsdrProbe::Register();          // sotc: SOTC_CSDR_PROBE (RES_DECOMPRESS, observe only)
     SotcVsizeProbe::RegisterVsizeHooks(); // sotc: SOTC_VSIZE_PROBE (VSIZE_VIEW_SITE, observe only)
     SotcFrameRings::Register(); // sotc: SOTC_FRAME_RINGS (RING_INIT hook, observe only)
     SotcProbes::RegisterParticlePrev();

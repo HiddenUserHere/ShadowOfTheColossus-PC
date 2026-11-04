@@ -73,6 +73,7 @@
 #include "../../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK report (plan step 6)
 #include "../../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG report
 #include "../../../../sotc/probe_xpr_groups.h" // sotc: SOTC_XPR_GROUPS report
+#include "../../../../sotc/predict_probe.h" // sotc: SOTC_PREDICT_PROBE report
 #include "video_core/sotc_draw_runs.h"         // sotc: SOTC_DRAW_RUNS report
 #include "../../../../sotc/probe_vsize.h"     // sotc: SOTC_VSIZE_PROBE report
 #include "../../../../sotc/pc_ring.h"     // sotc: SOTC_PC_RING report
@@ -2400,6 +2401,7 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcMemClasses::Report(report, seconds);
             SotcRegionPredrain::Report(report, seconds); // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG
             SotcXprGroups::Report(report, seconds);      // sotc: SOTC_XPR_GROUPS (XPR draw groups, 5 s)
+            SotcPredict::Report(report, seconds);        // sotc: SOTC_PREDICT_PROBE (shader translation predictability)
             SotcDrawRuns::Report(report, seconds);       // sotc: SOTC_DRAW_RUNS (indirect draw runs, 5 s)
             SotcVsizeProbe::Report(report, seconds);     // sotc: SOTC_VSIZE_PROBE (unbounded binds, 5 s)
             SotcVertexExtent::Report(report, seconds);   // sotc: SOTC_VERTEX_EXTENT (only while it is on)

@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "../../../sotc/predict_probe.h" // sotc: SOTC_PREDICT_PROBE
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
@@ -259,6 +260,7 @@ void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash,
                         size_t perm_idx) {
+    SotcPredict::OnTranslate(info, spec, perm_idx); // sotc: SOTC_PREDICT_PROBE (gpu/sotc/predict_probe.cpp)
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
