@@ -288,3 +288,10 @@ per slot `k = 0..13` with `B = M + 0x60 + 0x48*k`:
 | Pass constructors (names and k) | 0xc1860, 0xc1ce0, 0xc1fc0, 0xc28c0, 0xc46c0 | `out/re/decomp/000c/` |
 | Descriptor table reads | `0x1604408..0x1604428`, D at `0x1604370`, `0x16043b0`, `0x1604390`, `0x16043d0`, `0x16043f0` | `out/eboot.elf` (read by a scratch ELF reader) |
 | Register names | `mmSPI_SHADER_PGM_LO_*` | `gpu/third_party/gcn/include/gcn/si_ci_vi_merged_offset.h` |
+
+## 7. T6 note on the K2 setters (added by the indirect-caller scan)
+
+- `0x860ea0` and `0x8613e0`: no static reference of any kind (DEAD for static paths).
+- `0x860c50` and `0x8612b0`: one tail jump each, from `sub_94a80` (`0x94aa5`) and `sub_949f0` (`0x94a18`). Those two
+  stage handlers have no static reference, so the GS and HS setters are UNKNOWN, not dead. Details in
+  `indirect-callers.md` section 3.

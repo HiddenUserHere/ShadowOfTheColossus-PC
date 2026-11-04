@@ -43,6 +43,7 @@
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (AscRptrMode below)
 #include "../../../sotc/pc_ring.h"                   // sotc: SOTC_PC_RING full ring (mode)
+#include "../../../sotc/probes.h"                    // sotc: SOTC_CALL_PROBE (NoteStepRateWrites)
 #include "video_core/buffer_cache/pc_ring_copy.h"    // sotc: SOTC_PC_RING full ring (copy)
 #include "video_core/buffer_cache/sync_events.h"  // sotc: SOTC_SYNC_EVENTS (drain at the submit start)
 #include "video_core/sotc_arch/guest_barrier.h"  // sotc: SOTC_BARRIER_GUEST (guest sync points)
@@ -4391,6 +4392,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
                 WriteRegsMarked(reg_addr, payload, count - 1);
+                // sotc: SOTC_CALL_PROBE=1 (off by default, observe only): counts the writes to VGT_INSTANCE_STEP_RATE_0/1
+                // from any path (probe_calls.cpp). Read once.
+                static const bool call_probe = [] {
+                    const char* v = std::getenv("SOTC_CALL_PROBE");
+                    return v && v[0] != '\0' && v[0] != '0';
+                }();
+                if (call_probe) {
+                    SotcProbes::NoteStepRateWrites(reg_addr, payload, static_cast<u32>(count - 1));
+                }
 
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context

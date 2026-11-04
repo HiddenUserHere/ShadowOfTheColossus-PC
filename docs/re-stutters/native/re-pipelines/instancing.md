@@ -12,7 +12,9 @@ Read-only: no source, build, game run or git change.
 
 ## 0. Summary
 
-1. **Step-rate register writer.** One writer exists: `FUN_0086BB90` (`0x86BB90`, 99 bytes). It writes
+1. **Step-rate register writer.** One writer exists: `FUN_0086BB90` (`0x86BB90`, 99 bytes). T6 (`indirect-callers.md`,
+   section 2.4) found no pointer, branch, RIP reference or table entry to it in the eboot image, so the conclusion
+   below holds for every static path. It writes
    `0xC0026900, 0x2A8, v0, v1` (SET_CONTEXT_REG, count 2), i.e. VGT_INSTANCE_STEP_RATE_0 = v0 and _1 = v1.
    **It has no static callers.** No other code writes 0xA2A8/0xA2A9 that the decompile or the tables show.
    **Inferred: the eboot never writes the step rates on any path I can see, so both stay at the reset value.**

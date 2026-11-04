@@ -49,6 +49,10 @@ bool BlockRemaining(uint64_t addr, uint64_t* remaining) noexcept;
 void RegisterCvars();
 void RegisterArea();
 void RegisterPass(); // sotc: SOTC_PASS_PROBE (probe_pass.cpp), observe only; prints its own 5 s summary
+// sotc: SOTC_CALL_PROBE (probe_calls.cpp), observe only; prints its own 5 s summary. RegisterCalls installs the
+// CALL_<addr> handlers; NoteStepRateWrites is the port-side count of VGT_INSTANCE_STEP_RATE_0/1 writes (liverpool.cpp).
+void RegisterCalls();
+void NoteStepRateWrites(uint32_t first_reg, const uint32_t* values, uint32_t count);
 // sotc: PC memory model, wave B (docs/re-stutters/PC-MEMORY-REWRITE.md section 5).
 void RegisterMemtype(); // probe_memtype.cpp, switch SOTC_HOOK_MEMTYPE_PROBE
 void RegisterXprMem();  // probe_xprmem.cpp, switch SOTC_HOOK_XPRMEM_PROBE

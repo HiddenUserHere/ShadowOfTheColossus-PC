@@ -801,3 +801,668 @@ Caveats:
 | MRT bind and clear | `0x92140` lines 150-159 | `out/re/decomp/0009/00092140.c` |
 | GBuffer set order | `0xa0a60` lines 89, 97-98 | `out/re/decomp/000a/000a0a60.c` |
 | Decal layout row | 1 `decal` row, colour bytes zero, tail `00010000` | `user/shader_predict/pass_layouts.txt`, `predict_table.tsv` (164 decal rows, 109 pixel) |
+
+## Export order (T2)
+
+Topic: which render target each MRT export (`mrt<i>`) of a GBuffer pixel shader writes, and whether the exported
+value matches the target's meaning. Checked on the translated SPIR-V in the port's pre-pack
+(`user/cache/CUSA08809_v13272bcc/sotc_pretranslate.pack`) and on the translator and Vulkan code. Script:
+`tools/re/gbuffer_exports.py` (stdlib, spirv-dis). Labels as in section 1. The GCN export instructions are not in the
+pack and were not decoded; the GCN side rests on the translator code (proven) and the SPIR-V (proven for the
+translated module).
+
+### T2.1 Answer in short
+
+1. **Export i goes to slot i.** The translator maps `EXP mrt<i>` to `IR::RenderTarget<i>` with index i, and the SPIR-V
+   output is declared with `Location i`. Vulkan attachment i is `CB_COLOR i`. **proven** (code, section T2.4).
+2. **Slot 0 = Albedo_AmbientOcclusion, slot 1 = Normal_Roughness.** This matches K5.3 and K6.7 (MRT0 Albedo, MRT1
+   Normal). **proven** for the content (section T2.2): loc 0 is gamma-encoded colour with a linear byte, loc 1 is an
+   octahedral normal with a linear byte.
+3. **The K1 table entry "c0 = Normal, c1 = Albedo" (section 7 of this file) is wrong.** The layout rows are indexed by
+   the same MRT index, so row c0 is Albedo_AmbientOcclusion and row c1 is Normal_Roughness. Both are 32 UINT, so the
+   file itself cannot tell them apart; the content can.
+4. The anchors hold: loc 4 is 16_16 float (Motion, 2 components) and loc 5 is 32_32 UINT (Ambient0, 2 components).
+
+### T2.2 Export order table
+
+Sample: the 1077 modules of pass `gbufferbakedambient` (all have the same export signature), plus the
+`gbufferdynamicambient_motion` and `gbufferbakedambient_motion` modules checked by hand. Decoration evidence: module
+`00000000000f9518` (`OpDecorate %64 Location 0` ... `%71 Location 6`, names `frag_color0..6`).
+
+| Location | Output name | Declared / stored | Content (from the export expression) | Target (K5/K6 name) | Evidence |
+|---|---|---|---|---|---|
+| 0 | frag_color0 | u32 (declared u32x4), comp 0 | four 8-bit unorm fields. Bytes 0..2: `255 * pow(x, 1/2.2)` (`Exp2(0.454545438 * Log2(x))`) of a thresholded lerp of texture layers. Byte 3: linear `255 * clamp(v)`, no gamma. | Albedo_AmbientOcclusion (id 4) | gamma pow only on the colour bytes; no normal term; several albedo-like samples |
+| 1 | frag_color1 | u32 (declared u32x4), comp 0 | two 12-bit unorm fields (bits 0..11 and 12..23) of `4095 * clamp(0.5 * v + 0.5)`, where v is an octahedral normal component (sign select `select(0 <= x, 1, -1) * -FAbs(...)`, division by an L1 sum of `FAbs`, `InverseSqrt` of squared sums). Byte 3: linear `255 * clamp(...)` (roughness, inferred). | Normal_Roughness (id 4) | normalisation (`InverseSqrt`, L1 fold, sign select) on interpolated tangent-frame inputs; 12+12 bit encode of [-1, 1] |
+| 2 | frag_color2 | u32, comp 0 | byte 3: linear clamp of a per-vertex input (`in2[v][3]` via `BaryCoordKHR`, meaning unknown); bits 12..14 and 20..23 are constant flag bits (`0x7000`, `0xF00000`). | PBRProperties (id 4) | no texture, no normal term; constant flag bits (inferred: a material/flag word) |
+| 3 | frag_color3 | u32, comp 0 | bytes 0..1: linear 8-bit values from per-vertex inputs `in1[v][0..1]`; bytes 2..3: constant 0. | ExtraPBRProperties (id 4) | no texture; two zero fields (inferred: two small material values) |
+| 4 | frag_color4 | f32, comps 0 and 1 | Motion. `x = FragCoord.x * buf[50] - 0.5 * buf[36] - (0.5 / w) * (...) - 0.5`; `y` uses dwords 51, 37 and `FragCoord.y`. Difference of two screen positions, one built from the pixel position and srt_flatbuf rows (inferred reprojection). | Motion (id 0x14, 16_16 F) | 2 components, FragCoord-based, two matrix row groups in `srt_flatbuf` |
+| 5 | frag_color5 | u32, comps 0 and 1 | Ambient0, two words. Each word ORs three fields shifted by 0, 9 and 18 with `Exp2`, `Log2`, `Floor` in the cone (shared-exponent, RGB9E5-like, inferred). | Ambient0 (id 0x18, 32_32 UINT) | 2 components, 9-bit shifts, exponent ops |
+| 6 | frag_color6 | u32, comp 0 | constant bits `0x00C00000` (bits 22..23) plus an 8-bit field at 24 from `select` and shifts (meaning unknown). | Ambient1 (id 4, 32 UINT) | constant bits, no texture |
+
+The declared type is `u32x4` / `f32x4` because the translator sizes the output from its component count, but only the
+listed components are stored. **proven** (declared types and stores in the disassembly).
+
+Consistency with the layout file: the `gbufferbakedambient` rows of `pass_layouts.txt` are c0..c3 32 UINT, c4 16_16
+float, c5 32_32 UINT, c6 32 UINT. All 1077 baked-ambient modules have exactly this output signature. **proven** for
+the 1077 modules.
+
+### T2.3 Packing shape (32 UINT targets)
+
+The 32-bit targets are built from `OpBitFieldInsert` chains (8-bit fields at 0, 8, 16, 24 for loc 0 and loc 3; a 12+12+8
+split for loc 1) and from shift/or chains (loc 5). Each 8-bit field is `u32(select(isnan(x), 0, clamp(round(255 * x), 0, 255)))`.
+**proven** (disassembly, `out/re/gbuffer_exports/<sha>.dis`). The per-module field lists are printed by the script
+(`--report FILE`).
+
+### T2.4 The mechanism: why Location i equals slot i
+
+1. `gpu/shadps4/shader_recompiler/frontend/translate/export.cpp:50-65` (`Translator::ExportRenderTarget`):
+   `color_buffer_idx = exp.target - RenderTarget0` (the MRT index). The only exception is dual-source blending, which
+   folds MRT1 into index 0 and is not used by the GBuffer. The layout is read as
+   `runtime_info.hw.fs.color_buffers[color_buffer_idx]`, so the layout slot is the MRT index too.
+   `export_format == Zero` or `exp.en == 0` drops the export; the index is never renumbered. `info.mrt_mask` records
+   the MRT.
+2. `gpu/shadps4/shader_recompiler/backend/spirv/spirv_emit_context.cpp`, `DefineOutputs` (Fragment case, around lines
+   860-875): for each `RenderTarget<i>` with stores, `DefineOutput(type, i)` gives `Location i` and the name
+   `frag_color<i>`. The type comes from `color_buffers[i].num_format`. Verified in the disassembly.
+3. `gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp:2962-2963`: `num_color_attachments =
+   bit_width(mrt_mask)`, and `vk_graphics_pipeline.cpp:350-362` builds `color_formats[i]` from `color_buffers[i]`.
+   The attachments are indexed by CB index, with no location remap. `vk_pipeline_cache.cpp:2836` clears the entries
+   whose `mrt_mask` bit is clear. `CB_SHADER_MASK` only sets blend and write-mask state
+   (`vk_graphics_pipeline.cpp:462-472`); it does not renumber.
+4. Consequence: an MRT with no export has no `frag_color<i>` in the module, but the index does not shift. Some gbuffer
+   modules have no `frag_color` outputs at all: their body is branch-only with no stores (module `000fe4af79a92841`,
+   which also carries the diagnostic string `sotc salt 41`). These are export-dropped variants, and the export set
+   depends on the layout, so the module is only comparable within one layout. **proven** for the module, **inferred**
+   for the cause.
+
+### T2.5 Caveats and open items
+
+1. The GCN `EXP` target numbers were not decoded (the GCN code is in the game dump, not in the pack). Step 1 of T2.4 is
+   translator code, not a byte-level check.
+2. "Albedo" and "Normal" are assignments from the expressions (gamma colour, octahedral normal), not from a debug name.
+   Roughness, metal and the flag bits of loc 2, loc 3 and loc 6 are inferred. Confidence: high for loc 0 and loc 1
+   (the decisive shapes), medium for the 8-bit linear fields.
+3. The motion formula (loc 4) is read from the expression and the srt rows (36, 37, 50, 51 in the baked module). It is
+   not checked against the engine's matrices at run time.
+4. The full run over all 4937 gbuffer modules (`python tools/re/gbuffer_exports.py --sample 0`) was started in the
+   background but had not finished when this section was written. The signature counts above come from the 1077
+   baked-ambient modules and the hand-checked motion samples only.
+5. Run check (one run, no draw change): at `0x92140` for the GBuffer set, compare set slot 0 and slot 1 pointers with
+   `M+0x60` and `M+0x58` (K6.9 item 7), and read the pass's `pass_layouts` row. This closes the GCN side without
+   decoding it.
+
+### T2.6 Evidence list (T2)
+
+| Item | Where |
+|---|---|
+| Script | `tools/re/gbuffer_exports.py` (new, read-only) |
+| Module examples | `out/re/gbuffer_exports/` (`.dis` cache): `00000000000f9518` (locations 0..6), `2a65df2e317793aa` (baked, expressions), `000fe4af79a92841` (no outputs) |
+| Translator export mapping | `gpu/shadps4/shader_recompiler/frontend/translate/export.cpp:50-65`, `:150-200` |
+| Output declaration | `gpu/shadps4/shader_recompiler/backend/spirv/spirv_emit_context.cpp`, `DefineOutputs` (Fragment) |
+| Vulkan attachments | `gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp:2836, 2962-2963`; `vk_graphics_pipeline.cpp:350-362, 462-472` |
+| Layout rows | `user/shader_predict/pass_layouts.txt` (`gbufferbakedambient` rows) |
+
+## PS4 Pro / Neo (T3)
+
+Topic: the Neo (PS4 Pro) side of the render targets, and what the port actually runs as. Read-only static analysis of
+the same EU 1.01 eboot export (`out/re/decomp`). Addresses are eboot VAs. Names `M` (manager), `V` (view), `S` (settings
+object of `0x90860`) follow K5 and K6. Labels: **proven** (decomp or port source read, file and line given),
+**inferred**, **unknown**. Run data: `user/last_run.log` and `last_run.1..4.log` (the five current runs, all base mode).
+Scratch table (script output, not a deliverable): `C:/Users/ptr/AppData/Local/Temp/claude/2331aaf31c520dc5/aad34483-bb0c-427c-b86e-432086b85d93/scratchpad/t3/kRTT_table.tsv`.
+
+### T3.1 Answer in short
+
+| # | Question | Answer | Label |
+|---|---|---|---|
+| 1 | What does the port report to `sceKernelIsNeoMode`? | 0 by default; 1 only with `SOTC_NEO=1`. One source, `runtime_sotc_neo()`. | proven |
+| 2 | Is Neo on in the runs we have? | No. The five current `last_run*.log` print `sceKernelIsNeoMode -> 0 (SOTC_NEO)` and `RTAllocator (GPU): +1 allocs (322.50 MiB)`. No log under `user/` has `-> 1`. | proven |
+| 3 | Which `.csdr` files load? | `_shipping.csdr`. The game command line has `+shaderTypeToLoad=Shipping`; with that cvar value Neo changes no file name. | proven (code and log) |
+| 4 | What do Neo targets look like? | Same formats, 1x samples, larger sizes. Named main scene 2560x1440, half 1280x720, quarter 640x360, display 3840x2160. Derived sets (view modes 0 and 2): 1920x1080 and 1600x900. | proven (code); mode meaning inferred |
+| 5 | Checkerboard, 2x MSAA, ID buffers? | None created. Every target creation call passes sample argument 0. | proven (code) |
+| 6 | Does Neo add pipeline-key variants? | No from sizes (the key has no size field). Formats and samples are unchanged. Neo gets its own shader cache folder (`<serial>_neo`), so its prebuild runs again. | proven (key); inferred (no new variants) |
+| 7 | What is the view mode under Neo? | Mode 0 at boot. The default raw value 3 gives mode 0 (1080p derived set). The Cinematic preset (raw 2) gives the named 1440p set. The preset mapping is inferred. | proven (code); preset mapping inferred |
+
+### T3.2 What the port reports (switches)
+
+Port side (all **proven**):
+- `src/runtime_sotc.c:45-55`: `runtime_sotc_neo()` reads env `SOTC_NEO` (`1` = on). `is_neo_mode()` prints
+  `Runtime: sceKernelIsNeoMode -> %d (SOTC_NEO)` and returns the value. Table entry at `src/runtime_sotc.c:472`.
+- `gpu/shim/bbgpu.cpp:383`: the GPU library's `sceKernelIsNeoMode` returns the same value.
+- `src/runtime_memory.c:28-34`: with Neo the direct-memory size is 5056 + 640 MiB.
+- `gpu/shadps4/video_core/cache_storage.cpp:169-172`: the shader cache folder gets suffix `_neo` when Neo is on.
+- `gpu/shadps4/video_core/texture_cache/sampler.cpp:28-33`: the DLSS mip bias assumes the game's own sizes in Neo.
+- `gpu/shim/bbport_overlay.cpp:659-664`: in Neo with `SOTC_MAX_IN_PRO=0`, texture quality Maximum is blocked.
+- `scripts/sotc_modes.py:303-311`: Neo forces the texture pool reserve to 0 (with the page allocator fix).
+- `launcher/sotc_launcher_win.py:167` default `'neo': False`; `:682` `SOTC_NEO = 1` only when the output is not wider
+  than 16:9 (`:683-684` writes a note otherwise); `:709-712` render-size override only when not Neo.
+  `user/launcher_settings.json` has `"neo": false`.
+- `scripts/sotc_modes.py` RENDER_SITES keep the Pro values next to the PS4 ones (comment at lines 77-78): the render
+  size patch only rewrites the PS4 branch.
+
+Game side (**proven**): the import `sceKernelIsNeoMode` (wrapper `0xf8fc40`) is called by `0x3f4e0` (`return == 1`),
+`0x882ec0`, `0x882f10`, `0x882fb0`, `0x883010`, `0x883080`, `0x95a90`, `0x9aef0`, `0x9fa90`, `0xa1110`. The
+`0x88xxxx` helpers latch the value once (`DAT_03294f20`, guard `DAT_03294f28`):
+- `0x882ec0` (68 bytes): 1 on Neo, 0 base. Used by `0x97a50` (lines 107, 115, 173) and by many others.
+- `0x882f10` (93 bytes): 911000000 on Neo, 800000000 base (unit and meaning unknown).
+- `0x882fb0`: 16 on Neo, 8 base. `0x883010`: 2 on Neo, 1 base. `0x883080`: 4 on Neo, 2 base. Meaning unknown.
+
+### T3.3 Which shader files: the `.csdr` suffix (`0xb0cc50`, `0xb0cb80`)
+
+Proven code, `out/re/decomp/00b0/00b0cc50.c` lines 49-58:
+
+```c
+iVar4 = *DAT_03305d80;                  // cvar shaderTypeToLoad (EShaderTypeToLoad)
+if (iVar4 == 3) iVar4 = 1 + 2*neo;      // PS4Neo_Shipping: 1 base (_shipping), 3 Neo (_neoshipping)
+else if (iVar4 == 2) iVar4 = 2*neo;     // PS4Neo_Debug:    0 base (none),      2 Neo (_neo)
+FUN_00b0cb80(out, name, iVar4);         // suffix = DAT_015d5820[iVar4]
+// cvar 0 (Debug) and 1 (Shipping): index unchanged, Neo has no effect
+```
+
+`neo` is `FUN_0003f4e0()` (`0x3f4e0` = `sceKernelIsNeoMode() == 1`). Suffix strings (`shader-collections.md` 2b):
+1 `_shipping.csdr`, 2 `_neo.csdr`, 3 `_neoshipping.csdr`.
+
+Consequences:
+- **proven**: Neo changes the loaded shader files only if the cvar is 2 or 3.
+- **proven (log)**: the command line of every current run has `+shaderTypeToLoad=Shipping` (cvar 1). So the port loads
+  `_shipping.csdr` with Neo on or off, and pretranslate (which predicts from the files loaded) needs no change for Neo.
+- **inferred**: the cvar value comes from the game's own command line string. No file in `scripts/`, `src/`, `gpu/` or
+  `out/cmdline.bin` sets it (grep).
+- **proven (tools)**: `tools/csdr/predict_table.py:39` strips `(_[0-9a-f]+)?_shipping\.csdr$` and
+  `tools/csdr/pack_csdr.py:37` keeps only `_shipping.csdr`. A `_neoshipping.csdr` file would keep `_neoshipping` in its
+  pass name and would not be packed. This must change before any test with cvar 3.
+
+### T3.4 Neo render targets
+
+#### T3.4.1 Sizes at creation
+
+Size table built in `0x95a90` (`local_a8`, 32 bytes, passed to `0x9aef0` at line 142) and unpacked in `0x9aef0` lines
+462-469 (`iVar38`..`iVar6`). **proven**:
+
+| Pair (variables in `0x9aef0`) | Base | Neo | Used by (kRTT calls, `0x9aef0` line) |
+|---|---|---|---|
+| pair0 `iVar38`, `iVar42` (table word 0x640 x 0x384) | 1600x900 | 1600x900 | UI_Offscreen_0 (2064), _1 (2078), _Fonts (2092) |
+| pair1 `iVar2`, `iVar1` (0x780 x 0x438) | 1920x1080 | 1920x1080 | Display (633); source of the mode-0 derived records |
+| pair2 `iVar3`, `iVar4` (`uVar9` x `local_94`) | 1920x1080 | 2560x1440 | MainColor (847), MainDepth (891), GBuffer family (1299-1385), Lighting (1635), PostProcessFinal (869), DOF (691-2000), and others |
+| pair3 `iVar5`, `iVar6` (`uVar8` x `uVar4`) | 1920x1080 | 3840x2160 | RenderTargetDisplay (934), UI_Onscreen (2107) |
+
+- Neo selection in `0x95a90`: `uVar4 = 0x870` and `uVar8 = 0xf00` (2160 and 3840) on Neo (lines 89, 93); `uVar9 = 0xa00`
+  and `local_94 = 0x5a0` (2560 and 1440) on Neo (lines 127, 132). Base values are 0x438 and 0x780 throughout.
+- Half and quarter tiers (`0x9aef0`, **proven**): `iVar33 = iVar3/2`, `iVar23 = iVar4/2` (lines 814-816); quarter
+  `iVar34 = iVar3/4`, `iVar31 = iVar4/4` (lines 1150-1152). Neo main 2560x1440 / 1280x720 / 640x360; base 1920x1080 /
+  960x540 / 480x270.
+- **DisplayBuffer** (`0x95a90` lines 104 and 122): `FUN_00097a50(uVar8, uVar4, 1,1,1, 0x19, 3, 0, "DisplayBuffer")`.
+  **3840x2160 on Neo**, 1920x1080 base. Two buffers (`param_1+6`, `+8`). Their 1080p view is `FUN_00096f70(.., 0x780, 0x438, 1)`
+  (lines 106, 124) in both modes.
+- **Heap** (`0x9aef0` lines 486-491): RTAllocator backing block `0x14280000` (322.5 MiB) base and `0x23d10000`
+  (573.06 MiB, binary) on Neo. The log value 322.50 MiB is the base one. `docs/re-stutters/native/heaps.md:190` says
+  "600 MiB", which is decimal.
+
+#### T3.4.2 Samples, formats, descriptor
+
+- **Samples: 1x everywhere (proven code).** `0x97a50` (2834 bytes) takes an eighth argument `p8`. On the depth path it
+  is used as `uVar6 = p8` when `< 3` (lines 232-236) and written into the depth descriptor (`local_90`). Every kRTT
+  creation call passes `p8 = 0` (grep of `0x9aef0`). `pass_layouts.txt` agrees: 48 of 68 rows have `num_samples = 1`
+  (K1 section 7). No MSAA, 2x targets or checkerboard pairs are created at boot.
+- **Formats: unchanged by Neo (proven copy, inferred for all records).** `0x96f70` (called from `0x9fa90` line 25 and
+  `0x95a90` line 106) copies the descriptor (`+0xe4..+0x11c`) from its source object (K1 section 6). A derived target
+  therefore has the format of its named object.
+- **Neo bit in the colour descriptor (proven code, meaning unknown).** `0x97a50` lines 107, 115 and 173: `FUN_00882ec0()`
+  (the Neo flag) goes into the descriptor for kinds 1 and 3 (`local_98`, then `FUN_0087dac0`), and two more bits come
+  from the format-table flag word (`bVar25`, `bVar26`, lines 99-108). `docs/re-stutters/native/arch-next/engine-gnm-layer.md`
+  calls `0x882ec0` the Neo gate for flag `0x10000000`. The meaning in the descriptor is **unknown**; an alt tile mode is
+  possible (inferred). The old CHANGELOG entry at `CHANGELOG.md:1294` records a crash in Pro mode with `alt_tile` buffers.
+
+#### T3.4.3 Derived sets per view mode (Neo only)
+
+Writers (**proven**): `0x9fa90` (264 bytes; the whole body is under `if (sceKernelIsNeoMode() != 0)`, line 13), called
+from the tail of `0x9aef0` (line 2182) before `0x9fba0` (2183) and `0xa0a60` (2185). The size records are written inline
+by `0x9aef0` for each kRTT call. Example, MainColor (`0x9aef0` lines 847-853): mode-2 record `M+0xfcc..0xfd4` =
+(pair0 w, pair0 h, 1); mode-0 record `M+0x48c..0x494` = (pair1 w, pair1 h, 1). Block layout: mode-0 records at
+`M+0x480+12n`, mode-2 records at `M+0xfc0+12n`. Derived objects: mode 0 at `M+0xb40+i`, mode 2 at `M+0x1680+i`, with
+`i` the named offset (K6.4). The derived objects are created once, in `0x9aef0`; a mode change does not rebuild them.
+`0x9ae80` (111 bytes, a helper that writes the same records) has no caller in the decomp; the inline writes make it
+unnecessary for this path (**unknown** whether it is dead code).
+
+Derived sizes (from the record writes; script output checked by hand for MainColor and MainDepth):
+
+| Class | kRTT (named offset) | Named, mode 1 (Neo) | Derived mode 0 (default) | Derived mode 2 | Base, all modes |
+|---|---|---|---|---|---|
+| main | MainColor (+0x8), MainDepth (+0x38), Normal_Roughness (+0x58), Albedo_AmbientOcclusion (+0x60), PBRProperties (+0x68), ExtraPBRProperties (+0x70), Ambient0 (+0x78), Ambient1 (+0x80), Lighting (+0x88), CollisionDepth (+0x50), Motion (+0xf8), SpecularIBL (+0x378), PostProcessFinal (+0x448), DOFResult (+0xb8) | 2560x1440 | 1920x1080 | 1600x900 | 1920x1080 |
+| half | MainDepth_HalfRes (+0x40), SSAO (+0x1f0), SSAO_Accumulation_A/B (+0x1f8, +0x200), SSAOTemp (+0x208), AmbientShadowRG_SSAOB (+0x210), LinearDepthMipped (+0x308), LinearNearDepth (+0x358), MainColorCopy (+0x218), PostColorHalfRes_A/B (+0x98, +0xa0), FullscreenBlur_0/1 (+0x450, +0x458), MotionBlur_Vel/MagDepth (+0x100, +0x108), AlphaDofAmount_HalfRes (+0x20), ParticleColor_HalfRes (+0x28) | 1280x720 | 960x540 | 800x450 | 960x540 |
+| quarter | ParticleColor_UltraLowRes (+0x30), ParticleBlocker (+0x188), MotionBlur_Tile_Horiz/Vert/Final (+0x110, +0x118, +0x120) | 640x360 | 480x270 | 400x225 | 480x270 |
+| display | RenderTargetDisplay (+0x90) | 3840x2160 | 1920x1080 | 1600x900 | 1920x1080 |
+| display | UI_Onscreen (+0x460) | 3840x2160 | 1920x1080 | 1920x1080 | 1920x1080 |
+| display | Display (+0x1b00) | 1920x1080 | none | none | 1920x1080 |
+
+Not resolved: the derived records of UI_Offscreen_0/1/Fonts (the script output mixes tiers for them). Their named size is
+1600x900 in both modes.
+
+Set consequences (**proven** for the order, **inferred** for the result):
+- The sets of K5/K6 keep their membership. The object bound to a slot is the first non-null of: primary `M+0x1b00+i`,
+  then (Neo, mode 0 or 2 only) the derived object, then the named object (`0x9fba0` lines 20-41, K5.3, K6.4).
+- Mode 0 (default, raw R = 3): derived A, 1080p main targets. Mode 1 (raw R = 2): named, 1440p main targets and 4K
+  display. Mode 2 (raw R = 1): derived B, 900p main targets.
+- Base mode: no derived objects exist (`0x9fa90` is gated), so every mode resolves to the named 1080p objects. The
+  mode changes nothing except the rebuild of the same sets.
+
+#### T3.5 View mode `M+0x3b70` under Neo
+
+- Raw R (`0x90860`, lines 193-200; K6.5): `S+0x4b8` if non-zero, else `S+0x4c0` if non-zero, else 3. Passed to
+  `0x95690` (line 200). **proven**.
+- `0x95690` (lines 8-16): returns when R is unchanged; stores R at `M+0x3c`; mode = 2 for R = 1, 1 for R = 2, else 0;
+  calls `0xa1cd0(M, mode)`. **proven**.
+- Boot value: `0x95a90` line 142 passes `param_5 = 0`, and `0x9aef0` line 459 stores it in `M+0x3b70`: mode 0 at
+  creation. **proven**.
+- Writers of the raw value: `0xe0db0` (lines 102-105) copies `param_2+0x80`, `+0x88`, `+0x98` to `S+0x4b4`, `+0x4bc`,
+  `+0x4c0`; `0x195370` calls it (lines 203-210). Writers of `S+0x4b8`: only the zeroing in `0xd0950` (line 86); no
+  non-zero writer found. **inferred**: the raw R is the saved graphics preset (options field `+0x98`), or 3 if it is 0.
+  The identity of `S` and of the options struct is **unknown**.
+- Preset names: the engine has three preset suffixes for its cvars: `_BasePS4`, `_Perf`, `_Cinematic`
+  (`docs/re-stutters/reports2/14-draw-sources.md` section 2.6; strings `0xf9cba6`..`0xf9cbfe`). The port already sets
+  `progSamplerAnisoLevel_BasePS4/_Perf/_Cinematic` (`scripts/sotc_modes.py:73-74`). The game's menu option is
+  "Cinematográfico" or "Desempenho" (`CHANGELOG.md:1247-1249`; `docs/sotc/README-SotC.md:56-58`). The 60 FPS mode uses
+  the game's Desempenho mode (`CHANGELOG.md:1032`).
+- **Inferred preset mapping** (not proven; check in T3.8):
+  - raw 2 = mode 1 = named 1440p = `_Cinematic` (matches the comment in `src/runtime_sotc.c:45-46`, "Cinematic (1440p)");
+  - raw 1 = mode 2 = 900p derived = `_Perf`;
+  - raw 3 (default) = mode 0 = 1080p derived = `_BasePS4`, the PS4 size. This fits the CHANGELOG remark that Pro only
+    unlocks the menu and the player must pick Cinematic or Desempenho (`CHANGELOG.md:1247-1249`).
+- Frequency of R changes during play: **unknown** (K6.9.5).
+- Menu strings: none found in the decomp (the labels are probably localized data or built by concatenation). **unknown**.
+
+### T3.6 What this means for the port
+
+1. **Today: base.** The port loads `_shipping.csdr`, sizes everything at 1920x1080 (1600x900 for UI offscreen), uses a
+   322.5 MiB RTAllocator and creates no derived sets.
+2. **Neo (`SOTC_NEO=1`).** The Pro sizes exist in mode 1 (Cinematic, inferred). The default mode 0 renders the main scene
+   at 1920x1080 through derived targets. So `SOTC_NEO=1` alone does not give 1440p; the preset must also be Cinematic
+   (inferred). The 4K display buffers and the 573 MiB heap are made whatever the preset.
+3. **Pipeline key: no size field.** `GraphicsPipelineKey` (`gpu/shadps4/video_core/renderer_vulkan/vk_graphics_pipeline.h:38-57`)
+   holds the stage hashes, `num_color_attachments`, `color_buffers` (formats), blend and write masks, `num_samples`,
+   `depth_samples`, `color_samples`, z and stencil formats and the primitive type. The render-pass part of the hash
+   (`vk_graphics_pipeline.cpp:550-556`) adds colour formats, colour samples and depth/stencil formats. Viewport and scissor
+   are not in it. So a Neo target with the same format and 1x samples uses the same pipeline.
+4. **Extra variants for Neo: none from sizes, formats or samples.** The Neo variants that exist are:
+   - (a) a separate shader cache folder `<serial>_neo` (`cache_storage.cpp:169-172`): the pipeline prebuild must run once
+     more for Neo; base prebuilt pipelines are not reused.
+   - (b) with `shaderTypeToLoad = 3` (not used today), the `_neoshipping.csdr` binaries are loaded and the predict and
+     pack tools miss them (T3.3).
+   - (c) the Neo colour-descriptor bit (T3.4.2) changes the target descriptor. If it changes the tile mode, the port's
+     colour decode changes too. **inferred**; it is not a pipeline-key field.
+5. Pretranslate needs no change while the cvar is 1: it predicts from the files loaded.
+
+### T3.7 Open items
+
+1. The raw preset field: which options field feeds `S+0x4c0` (`+0x98`), what `S` is, and the writer of a non-zero
+   `S+0x4b8` (none found).
+2. The preset mapping (raw value to `_BasePS4`, `_Perf`, `_Cinematic`) and the menu strings. Check by run (T3.8).
+3. Meaning of the Neo constants: `0x882f10` (911000000 / 800000000), `0x882fb0` (16 / 8), `0x883010` (2 / 1),
+   `0x883080` (4 / 2), and the colour-descriptor bit set by `0x97a50` from `0x882ec0`.
+4. The derived records of UI_Offscreen_0/1/Fonts (not resolved).
+5. Whether the `shaderTypeToLoad` value 1 comes from the eboot default or from the game's options (no writer found in the
+   port).
+6. The caller of `0x9ae80`, and whether it is dead code.
+
+### T3.8 One-run log spec (what stays open)
+
+Run with `SOTC_NEO=1`, no draw change, existing logging or RES_LOADED-style hooks only. Start at the Shrine with the
+default preset, then switch the menu preset to Cinematic, then to Perf, 10 s each.
+
+- At `0x95a90` return: the two DisplayBuffer objects' width and height (object `+0x198`, `+0x19c`, K1). Expect 3840x2160.
+- At `0x9aef0` return, with `M = *(DAT_02ed3670 + 0x80)`: width and height of the named objects at `M+0x8, +0x38, +0x58,
+  +0x60, +0x78, +0xf8, +0x378`, and of the derived objects at `M+0xb40+i` and `M+0x1680+i` (i = the named offset). Expect
+  named 2560x1440, derived mode 0 1920x1080, derived mode 2 1600x900.
+- At `0x90860`: `S`, `S+0x4b8`, `S+0x4c0` and R on each call (log changes only). Map each preset to R.
+- At `0xa1cd0` entry: old and new `M+0x3b70`, with the frame number.
+- At the first call of `0x882ec0`: its return value (expect 1). For one colour target, the descriptor flag word that
+  `0x97a50` writes at line 173.
+- At `0xb0cc50` line 49: the value of `*DAT_03305d80` (expect 1), and the names of the `.csdr` files the loader opens.
+- Pass log (existing `SOTC PASS` line): at the first `GBufferAmbientDynamic` draw, the size of the bound colour object
+  (set `+0x2a40`, slot 0).
+
+Pass criteria: the three presets map to the three size classes (main 1920x1080, 1600x900, 2560x1440). If a preset does
+not change the main size, T3.5 is wrong. If `shaderTypeToLoad` reads 3 or 2 with Neo on, T3.3 is wrong.
+
+### T3.9 Evidence list (T3)
+
+| Item | Address | File and line |
+|---|---|---|
+| Neo switch, port | `runtime_sotc_neo`, `is_neo_mode`, table entry | `src/runtime_sotc.c:45-55, 472` |
+| Neo, GPU library | `sceKernelIsNeoMode` | `gpu/shim/bbgpu.cpp:383` |
+| Neo cache folder | `_neo` suffix | `gpu/shadps4/video_core/cache_storage.cpp:169-172` |
+| Neo launcher | default and SOTC_NEO | `launcher/sotc_launcher_win.py:167, 682-684, 709-712` |
+| Neo import wrapper, helper | `0xf8fc40`, `0x3f4e0` | `out/re/decomp/00f8/00f8fc40.c`, `0003/0003f4e0.c` |
+| Latched Neo helpers | `0x882ec0`, `0x882f10`, `0x882fb0`, `0x883010`, `0x883080` | `out/re/decomp/0088/` |
+| csdr suffix choice | `0xb0cc50` (lines 49-58), `0xb0cb80` | `out/re/decomp/00b0/00b0cc50.c`, `00b0cb80.c` |
+| csdr port tools | regex | `tools/csdr/predict_table.py:39`, `tools/csdr/pack_csdr.py:37` |
+| Creation, Neo sizes | `0x95a90` (lines 74-142) | `out/re/decomp/0009/00095a90.c` |
+| Creation, size pairs, derived inline writes | `0x9aef0` (lines 459, 462-469, 486-491, 633-2107, 2182-2185) | `out/re/decomp/0009/0009aef0.c` |
+| Derived writer (Neo only) | `0x9fa90` (line 13) | `out/re/decomp/0009/0009fa90.c` |
+| Records helper, no caller | `0x9ae80` | `out/re/decomp/0009/0009ae80.c` |
+| Colour descriptor with Neo bit | `0x97a50` (lines 99-108, 107, 115, 173, 232-236) | `out/re/decomp/0009/00097a50.c` |
+| View mode | `0x90860` (193-200), `0x95690` (8-16), `0xa1cd0` | `out/re/decomp/0009/00090860.c`, `00095690.c`, `out/re/decomp/000a/000a1cd0.c` |
+| Raw R writers | `0xe0db0` (102-105), `0x195370` (203-210), `0xd0950` (86) | `out/re/decomp/000e/000e0db0.c`, `0019/00195370.c`, `000d/000d0950.c` |
+| Pipeline key | `GraphicsPipelineKey`, render-pass hash | `gpu/shadps4/video_core/renderer_vulkan/vk_graphics_pipeline.h:38-57`, `vk_graphics_pipeline.cpp:550-556` |
+| Preset suffixes | cvar variants | `docs/re-stutters/reports2/14-draw-sources.md` 2.6; `scripts/sotc_modes.py:73-74` |
+| Menu and mode notes | Pro and Desempenho | `CHANGELOG.md:1032, 1247-1249, 1294`; `docs/sotc/README-SotC.md:56-58` |
+| Heap note | 600 MiB (decimal) | `docs/re-stutters/native/heaps.md:190` |
+| Run logs | `sceKernelIsNeoMode -> 0`, RTAllocator 322.50 MiB, `+shaderTypeToLoad=Shipping` | `user/last_run.log`, `last_run.1..4.log` |
+
+
+## Neo bit and presets (T10)
+
+Topic: closes the two open items of T3 (T3.7 items 1-3, T3.8). Read-only static analysis of the EU 1.01 eboot export
+(`out/re/decomp`) and the port source. Addresses are eboot VAs. Labels as in section 1: **proven** (decomp or source read,
+address or file:line given), **inferred**, **unknown**. Nothing was run. The `S`, `M`, `V` names follow K5/K6 and T3.
+
+### T10.1 Answer in short
+
+| # | Question | Answer | Label |
+|---|---|---|---|
+| 1 | What does `0x882ec0` return? | A latched copy of `sceKernelIsNeoMode() == 1`: 1 on Neo, 0 base. Guarded once by `__cxa_guard` (guard byte `DAT_03294f28`, value `DAT_03294f20`). | proven |
+| 2 | Which descriptor field does the Neo flag change? | Colour targets (kinds 1 and 3, every kRTT colour target made with p5 = 1): the flag goes into spec field `[6]`, and `0x87dac0` puts it in **CB_COLORn_INFO bit 31**, the port's `Color0Info.alt_tile_mode` (`regs_color.h:172`). It also writes dword 6 of the descriptor (`CB_COLORn_DCC_CONTROL`, 0x31E) = 8. | proven (code and field names); the 0x31E meaning inferred |
+| 3 | Is it `ALT_TILE_MODE`? | Yes for the colour path. The port already reads that bit: `ImageInfo(ColorBuffer)` sets `alt_tile = sceKernelIsNeoMode() && info.alt_tile_mode` (`image_info.cpp:90`). | proven |
+| 4 | Does the port mis-detile or mis-key a Neo colour target? | Mis-key: no. The bit is part of the image identity (`texture_cache.cpp:638`, `:922`), not of the pipeline key. Mis-detile: possible, not proven. The colour `ImageInfo` leaves `bank_swizzle = 0` and the detiler never reads `alt_tile`, while the texture (T#) path computes a non-zero bank swizzle for the same bit (`resource.h:281`). Runtime check in T10.8. | proven (code); risk inferred |
+| 5 | Depth (`DB_Z_INFO`) alt bit? | None in the port (`regs_depth.h` has no alt field). The Neo effect on depth goes through the tile-query arguments and tile mode (T10.4), inferred. | proven (no field); effect inferred |
+| 6 | Source of raw R (T3) | Not the options object as T3 wrote. `S+0x4c0` is copied by `0xe0db0` from its second argument `+0x98`, and that argument is a per-model-group source record built in `0x195370`. The user's graphics cell is a separate object (`DAT_032454b8 + 0x60`). The link between the two is open. | proven (copy); link unknown |
+| 7 | Values of R and presets | The graphics cell takes 3 (base, forced by `0x70a6d0`), and 2 or 1 on Neo. R takes the same value set (1, 2, 3; 0 = unset, read as 3). Which of 1 and 2 is Cinematic is not proven. T3's mapping (raw 2 = Cinematic 1440p, raw 1 = Perf 900p, raw 3 = BasePS4 1080p) stays inferred; the launcher menu texts fit it. | proven (values); names inferred |
+| 8 | Does `sotc_modes.py` force a preset? | No. It writes `progSamplerAnisoLevel*` (all four suffixes, `af16`) and `TargetFramesPerSeconds=1` (`fps60game`). It does not write the graphics cell, setting `0x25`, `S+0x4b8` or `S+0x4c0`. | proven |
+
+### T10.2 `0x882ec0`: the Neo gate
+
+`out/re/decomp/0088/00882ec0.c` (68 bytes):
+
+```c
+if (DAT_03294f28 == 0 && __cxa_guard_acquire(&DAT_03294f28)) {
+    DAT_03294f20 = (sceKernelIsNeoMode() != 0);
+    __cxa_guard_release(&DAT_03294f28);
+}
+return DAT_03294f20;   // 0 or 1
+```
+
+- Latched once per process. The port's value is fixed at first call (`src/runtime_sotc.c:45-55`), so a mid-run change of
+  `SOTC_NEO` has no effect. proven.
+- Callers include `0x87dac0`, `0x97a50`, `0x866fa0`, `0x866f50`, `0x87da70`, `0x882f10`-`0x883080` and many others (file header).
+- The sibling helpers in the same latch give constants (T3.2): `0x882f10` 911000000 on Neo, 800000000 base; `0x882fb0`
+  16 / 8; `0x883010` 2 / 1; `0x883080` 4 / 2. Inferred: `0x882f10` is a clock in Hz (the public PS4 Pro GPU clock is
+  911 MHz, base 800 MHz). The other three are not identified.
+
+### T10.3 Colour target: where the Neo flag goes (kinds 1 and 3)
+
+`0x97a50` (`out/re/decomp/0009/00097a50.c`), colour block `LAB_00098014` (kind `p7` in {1, 3}, entered when `p5 == 1`):
+
+```c
+FUN_0087da70(&spec);                     // defaults: spec[6] = FUN_00882ec0(), spec[7..9] = 0  (0x87da70, proven)
+spec[0] = p1; spec[1] = p2;              // width, height
+spec[2] = 0;
+spec[3] = uVar10;                        // p4, or p4*6 when uVar19 == 1 (cube-like)
+spec[4] = iVar11;                        // format: DAT_02ed3680[p6*2 + srgb]
+spec[5] = local_7c[0];                   // tile mode index
+spec[6] = FUN_00882ec0();                // line 173: the Neo flag
+spec[7] = 0; spec[8] = 0;                // 1x samples (T3.4.2)
+spec[9] = (spec[9] & ~3) | ((uVar4 >> 16) & 0xff);   // line 176: low 2 bits from the kRTT flag word
+FUN_0087dac0(desc = target+0xe4, &spec);  // colour descriptor builder, line 178
+```
+
+Spec layout as the callee reads it (`0x87dac0`, `0x87da70`; proven from the field uses, names inferred):
+
+```c
+struct ColorSpec {         // 40 bytes, dword index in brackets
+  u32 width;               // [0]  1..0x4000 (checked)
+  u32 height;              // [1]  1..0x4000 (checked)
+  u32 zero;                // [2]  0 (checked: <= 0x4000)
+  u32 slice_max_arg;       // [3]  -> VIEW.slice_max (bits 13..23), scaled by 0x2000
+  u32 format;              // [4]  low byte = AMD DataFormat (checked 1..0x16), -> INFO.format
+  u32 tile_mode;           // [5]  -> ATTRIB.tile_mode_index (bits 0..4)
+  u32 neo;                 // [6]  == 1 on Neo -> INFO bit 31 (alt_tile_mode); dword 6 = 8
+  u32 samples_log2;        // [7]  -> ATTRIB bits 12..14 (num_samples_log2); 0 here
+  u32 fragments_log2;      // [8]  -> ATTRIB bits 15..16; 0 here
+  u32 flags;               // [9]  bit 0: width/height aligned to 8; bits 0..1 set here from the kRTT flag word;
+                           //      bit 4 (Neo DCC branch) never set on this path
+};
+```
+
+What `0x87dac0` (`out/re/decomp/0087/0087dac0.c`, 982 bytes) writes into the descriptor (proven, fields by address):
+
+| Descriptor dword (byte) | Field (port `ColorBuffer`) | Written when | Value |
+|---|---|---|---|
+| 4 (0x10) | `info` (CB_COLORn_INFO, 0x31C) | tile query `0x885f90` returns 0 | `(spec[6] == 1) << 31 \| (old & 0x7fffffff)`: bit 31 = Neo |
+| 3 (0x0c) | `view` (0x31B) | after the checks | `spec[3] * 0x2000`, masked to bits 13..23 |
+| 6 (0x18) | `pad0` (0x31E) | `spec[6] == 1` (else branch) | `8` |
+| 6 (0x18) | (same) | Neo and `spec[9] & 0x10`: not reached on colour targets | DCC bits (`uVar6`, `uVar7 * 4`) |
+
+Points that follow from the code:
+- The Neo branch of the first test (`Neo && spec[6] == 0`, which bails when `spec[9] & 0x13`) is never taken by the colour
+  path, because it always passes `spec[6] = Neo`. proven (decomp lines 167-178).
+- `spec[9] & 0x10` is never set on the colour path: `spec[9]` starts at 0 (`0x87da70`) and only bits 0..1 are written from
+  the kRTT flag word. So the Neo DCC branch is dead for colour targets. proven for the code; the kRTT flag word was not
+  decoded, so this holds for every colour call that goes through `0x97a50`.
+- So a Neo colour target gets INFO bit 31 = 1 and dword 6 = 8; a base target gets 0 and 0. proven for the code paths.
+  Inferred: `0x87dea0` (format write), `0x87dfe0` and `0x87e150` do not overwrite dword 6 (not read).
+
+The other `0x97a50` branches (`LAB_0009819c`, `0x8806d0` / `0x8806f0`, kinds not 1/3 or `p5 != 1`) build their own specs
+(`spec[9] = FUN_00882ec0()` at lines 302 and 319). Their descriptors were not traced: unknown whether they change a tile or
+alt bit.
+
+### T10.4 Depth target: Neo inputs (kind 2)
+
+`0x97a50` depth path (`p7 == 2`, `p5 == 1`). The spec is built by `0x866f50` (76 bytes) and then rewritten at lines 235-247:
+
+- `spec[6]` = the tile mode `local_7c[0]`. Not the Neo flag: the `0x866f50` default (`Neo * 2`) is overwritten. proven.
+- `spec[7]` = `FUN_00882ec0()` (lines 242, 245). proven.
+- `spec[8]` = `p8` if below 3, else 0 (samples; always 0 at the kRTT calls, T3.4.2). proven.
+- `spec[9]` = `((bVar25 & bVar27) << 1) | (uVar4 >> 24)`. `bVar25` is Neo AND the template gate (line 107), `bVar27 = (p6 != 10)`.
+  proven for the expression; the template byte meaning is unknown.
+
+Consumers, `0x866fa0` (`0086/00866fa0.c`, 1148 bytes):
+
+- Gate (lines 4-6): bail if `Neo && spec[7] == 0 && (spec[9] & 1) != 0`. On Neo `spec[7] = 1`, so the gate passes. proven.
+- `if (spec[7] == 1 && (~spec[9] & 3) == 0) tile = 4;` (uVar4 forced to 4 when `spec[9] & 3 == 3`). On base `spec[7] = 0`, so
+  this never fires. proven (code). This is the only Neo-dependent tile choice on the depth side.
+- `uStack_b4 = (spec[7] == 1) * 0x2000 + 2`, passed to `0x885f90` (the tile query). The meaning of `0x2000` is inferred.
+- The depth block at `target+0x164` gets `DB_Z_INFO` dword 0 = `(spec[8] & 3) << 2 | (spec[4] & 3)` (T3 and K1 table).
+- `0x97a50` lines ~296-300: when `bVar25 & bVar27`, the target dword at `+0xe0` gets `plVar12[0x31]` (a stencil or HTILE base
+  copied from `+0x188`) and byte `+0xde` gets bit 0x20. Meaning inferred (a Neo-only copy of an HTILE-like base).
+
+Port side: `DepthBuffer` (`regs_depth.h`) has no alt bit, so the depth Neo path reaches the port only through the tile mode the
+game writes to the `DB_*` registers (and the HTILE base), not through a flag. Inferred. A grep of `gpu/shadps4/video_core` for
+`neo`/`alt` finds only colour and texture uses.
+
+### T10.5 Register mapping and the port
+
+Port layout (`gpu/shadps4/video_core/amdgpu/regs_color.h:151-174`). The bit positions were summed to check: endian 0-1,
+format 2-6, linear_general 7, number_type 8-10, comp_swap 11-12, fast_clear 13, compression 14, blend_clamp 15,
+blend_bypass 16, simple_float 17, round_mode 18, cmask_is_linear 19, blend_opt_dont_rd_dst 20-22,
+blend_opt_discard_pixel 23-25, fmask_compression_disable_ci 26, fmask_compress_1frag_only 27, dcc_enable 28,
+cmask_addr_type 29-30, alt_tile_mode 31. That is 32 bits, so bit 31 is `alt_tile_mode`.
+
+Port handling of the bit (all proven by reading):
+
+| Place | What it does | Effect on a Neo colour target |
+|---|---|---|
+| `texture_cache/image_info.cpp:90` | colour `ImageInfo`: `alt_tile = sceKernelIsNeoMode() && buffer.info.alt_tile_mode` | Set to 1 (game bit 1 on Neo). |
+| `image_info.cpp:76-91` (ctor) | `guest_size = GetColorSliceSize() * layers`, mip 0 from that size; no `UpdateSize()` call in this ctor | The alt bit does not change the colour layout here (size comes from the game's slice field). |
+| `texture_cache/texture_cache.cpp:638`, `:922` | image identity (hash and match) and the overlap rule: a different `alt_tile` at the same address is an overlap by tiling and frees or merges the older image | A T# read with a different `alt_tile` of the same surface does not match the colour image. |
+| `texture_cache/image_info.cpp:194`, `amdgpu/resource.h:183` | T# `alt_tile = Neo && image.alt_tile_mode` | Same bit for textures. A match depends on the game setting the T# bit like the CB bit (not checked). |
+| `amdgpu/resource.h:281` `Image::GetBankSwizzle()` | non-zero only for a T# with alt tile and macro tiling | T# path only. |
+| `image_info.cpp:233` `RebaseToMip` | refuses alt-tile images | Not used for colour (single mip). |
+| `texture_cache/tile_manager.cpp:203`, `:294` | the detiler uses `info.bank_swizzle` and the mip layout; `alt_tile` is not read | A colour `ImageInfo` has `bank_swizzle = 0`, so a detile of a Neo colour target uses base geometry and no swizzle. |
+| `texture_cache/tile.h:292-293` `GetMacroTileExtents(..., alt)` | alt macro tile extents, used by `ImageSizeMacroTiled` (`image_info.cpp:306`) | Used when mip sizes are computed by `UpdateSize()` (T# and buffers). Not on the colour ctor path. |
+
+Verdict (inferred from the table; to be checked at run time in T10.8):
+- Pipelines: no effect. `GraphicsPipelineKey` has no size, tile or alt field (T3.6 item 3).
+- Image identity: consistent only if the game's T# bit equals the CB bit. On Neo, colour targets are `alt = 1`; a later
+  texture read of the same surface is `alt` from its own T# bit. If the two differ, the overlap rule (`texture_cache.cpp:922`)
+  creates a second image or frees one.
+- Detile on read-back: a risk. A colour target that is later read through the guest path (upload or download through
+  `DetileImage`) uses `bank_swizzle = 0` and base macro-tile geometry, while the T# view of the same memory computes a swizzle
+  and alt extents. Neither is checked against the GPU's own write layout. The port does not show a Neo colour target being
+  detiled today; the risk is for any guest round trip.
+
+### T10.6 Presets: the graphics cell, the menu, and the values
+
+Proven chain (addresses in the decomp file names):
+
+1. The settings store: `FUN_007dbae0(id)` reads and `FUN_007dbab0(id, value)` writes a numeric setting. `0x70a6d0` calls
+   `FUN_007dbab0(0x25, param_1)` first, so setting 0x25 is the Pro mode toggle `t` (inferred from that call).
+2. `0x70a6d0` (`out/re/decomp/0070/0070a6d0.c`, 725 bytes), with `t` its argument:
+   - Not Neo (`FUN_0003f4e0() == 0`): if the graphics cell (`**(int **)(DAT_032454b8 + 0x60)`) is not 3, set it to 3
+     (`FUN_0006a3a0`); then `FUN_0025e870` with 3; the mode is 3.
+   - Neo, `t == 0`: the cell becomes 2 (unless already 2); mode 2.
+   - Neo, `t != 0`: the cell becomes 1 (unless already 1); mode 1.
+   - Then `FUN_0005bb40(&DAT_02ea8ee8, mode)` (`0x5bb40`, 105 bytes): mode 1 uses `DAT_02eb30f0` / `DAT_02ebe598`, mode 2
+     uses `DAT_02eb2f40` / `DAT_02ebe3e8`, anything else (3) uses `DAT_02eb3018` / `DAT_02ebe4c0`, and writes `+0x1e8` and
+     `+0x49c`. proven (code). The three records are a per-mode table; their values were not read.
+3. Callers that set `t` (menu and load): the menu case `0x3d` (`0x559a10:127`, `0x558b20:385`, argument `bVar3 ^ 1` or
+   `param_2[1]`); `0x70a9b0:60` (`*(byte *)(DAT_02ed3670 + 0x3a) ^ 1`, after writing the cell through `FUN_000698c0`);
+   `0x70ac50:40` (`FUN_007dbae0(0x25)` read back, after writing the cell with `(iVar3 != 0) + 1`). The sign of `t` against the
+   cell differs between `0x70ac50` and `0x70a6d0` as I read them (`0x70ac50` writes 1 when `iVar3 == 0`, which `0x70a6d0`
+   maps to mode 1 only when `t != 0`); unknown which value of `t` is the menu's "Cinematic" item.
+4. The cell's value set is therefore {3 base; 1, 2 on Neo}. The launcher's menu text (`launcher/sotc_launcher_win.py:1353-1355`,
+   "Options > Presentation: Cinematic (1440p) or Performance") names the two Neo modes, which are the two non-default values.
+
+Where R comes from (T3 correction):
+
+- `0x90860` (`0009/00090860.c` lines 193-200): `R = S->+0x4b8`, else `S->+0x4c0`, else 3, with `S = param_2[9]`. proven.
+- `0xe0db0` (`000e/000e0db0.c` lines 102-105) copies `param_2+0x88` to `+0x4b0` and `+0x4bc`, `param_2+0x80` to `+0x4a8` and
+  `+0x4b4`, and `param_2+0x98` to `+0x4c0` (`+0xa0` to `+0x4c8`, `+0xac` to `+0x4d4`). proven.
+- The caller `0x195370` (`0019/00195370.c` line 171) passes `&local_620` as `param_2`. `0x196260` (line 93) fills that local
+  as a vector (begin, end, capacity) of the model-group source records at `lVar6 + 0x60`, where `lVar6 = FUN_0014d7b0(param_2 + 0x28)`.
+  So `+0x98` is a field of a model-group source record (from loaded data), not the options object that T3 named. The
+  decomp's typing of `local_620` is inconsistent (it is a vector, yet `0xe0db0` reads fields 0x20..0xb0 of it), so the exact
+  source is open.
+- The record fields `+0x4b8` and `+0x4c0` of the 0x530-byte group record are then set from the locals `uStack_b0` and
+  `uStack_a8` (`0x195370` lines 203-204), which have no visible assignment in the decomp. Unknown (a decompile artefact, or a
+  write through an alias).
+- No non-zero writer of `S+0x4b8` was found (T3). `0xd0950` line 86 only zeroes it.
+
+So R is read per camera build from a model-group record, and its value set is {1, 2, 3}. The link from the user's graphics cell
+(values 1-3) to that record is unknown. The cell is the only place where the game writes 1/2/3 from a user choice, which makes
+it the likely source, but no code path was found that copies it into the group record.
+
+Cvar suffixes:
+
+- `RegisterXprCvars` (`0x6efe0`, 112 KB; the decompile timed out, and `out/re/decomp/0006/0006efe0.c` is a stub). The suffix
+  strings are referenced only from it: `progSamplerAnisoLevel_Cinematic` `0xf9b86c`, `_BasePS4` `0xf9b88c`, `_Perf` `0xf9b8aa`;
+  `r_virtualGeometryNumShadowCascades_Cinematic` `0xf9cba6`, `_BasePS4` `0xf9cbd3`, `_Perf` `0xf9cbfe`
+  (`tools/re/eboot_re.py str`). proven (string references).
+- The lookup that appends the suffix at read time is not located. `0x6efe0` is the registration; the choice of variant at read
+  time is inside code that was not decompiled. T3's "name suffix from the preset" is therefore unverified.
+- The port's launcher writes all four variants of the grass cascade count (`launcher/sotc_launcher_win.py:649-651`, comment:
+  "the game takes the one of its graphics mode"). That fits an engine choice by mode, not a port choice.
+
+Port (`scripts/sotc_modes.py`, `src/runtime_sotc.c`):
+
+- No preset is forced. `CVAR_MODES` writes `TargetFramesPerSeconds=1` (`fps60game`, "until the options code runs") and
+  `progSamplerAnisoLevel{,_BasePS4,_Perf,_Cinematic}=16` plus `linearSamplerAnisoLevel=16` (`af16`). The 60 FPS code patches
+  (`0xb0a7a6`, `0x89a47f`, `0x89a499`) are not in `0x70a6d0`. proven.
+- The graphics cell, setting `0x25`, `S+0x4b8` and `S+0x4c0` are not written by the port (grep of `scripts/`, `gpu/sotc/`,
+  `src/`, `launcher/`). proven.
+- `SOTC_NEO=1` makes the game take the Neo branch of `0x70a6d0` on its own (cell 2 or 1 by `t`). The port does not choose.
+
+Preset mapping, status:
+
+| Raw value | Named size (`0x95690`) | Presumed preset | Status |
+|---|---|---|---|
+| 3 (default, base) | derived mode 0, 1080p main | `_BasePS4` | 3 is proven as the base and default value (`0x70a6d0`, `0x5bb40`, `0x90860`); the name is inferred. |
+| 2 | named mode 1, 1440p main (4K display) | `_Cinematic` | value proven as one of the two Neo values; name inferred (matches the launcher text "Cinematic 1440p"). |
+| 1 | derived mode 2, 900p main | `_Perf` | value proven as the other Neo value; name inferred ("Performance", 60 FPS). |
+
+T3's mapping is kept as inferred and not confirmed: the value set is right, but the names depend on the menu toggle `t` and on
+how R is fed from the cell, and neither is proven. The "options +0x98" source in T3 is corrected (R source above).
+
+### T10.7 Corrections to T3
+
+1. T3.4.2 "meaning unknown; an alt tile mode is possible". Now proven: CB_COLORn_INFO bit 31 = `alt_tile_mode`, set from the
+   Neo flag through spec `[6]` (T10.3). The "two more bits from the format-table flag word" are not from the table:
+   `bVar25` and `bVar26` come from the kRTT spec template bytes and act on the depth path only (T10.4).
+2. T3.5 "raw R is the saved graphics preset (options field +0x98)". Not supported. `+0x98` is a model-group source field
+   (T10.6). The graphics cell is a separate object (`DAT_032454b8 + 0x60`), and the link is open.
+3. T3.5 preset mapping: values confirmed as a set, names still inferred (T10.6 table).
+4. T3.1 row 7, "the Cinematic preset (raw 2) gives the named 1440p set": the size part is proven (`0x95690` maps 2 to mode 1,
+   named 1440p); the preset part is inferred.
+5. T3.7 item 3, meaning of the Neo constants: `0x882f10` 911000000 / 800000000 is probably the GPU clock in Hz (inferred).
+
+### T10.8 Refined one-run log spec (exact hook points and bytes)
+
+Run once with `SOTC_NEO=1`, no draw change. Hooks at the VAs below (entry unless a return is named). Log only changes for the
+variable ones. Start at the Shrine, switch the menu toggle to each option, 10 s each (as T3.8).
+
+Colour descriptor (settles T10.3):
+1. `0x882ec0` return: `eax`, and the byte at `0x3294f20` (`DAT_03294f20`). Expect 1 with `SOTC_NEO=1`.
+2. `0x87dac0` entry: dump 40 bytes at `param_2` (the spec, 10 dwords). Expect `spec[6] == 1`, `spec[7] == 0`, `spec[8] == 0`
+   for kind 1/3 calls. Also dump `spec[9]`; expect 0..3 (bit 4 clear).
+3. `0x86a1a0` entry (writes CB_COLORn with the `0xC00E6900` packet): dump 8 dwords of the descriptor argument. Expect dword 2
+   (INFO) bit 31 = 1 and dword 6 (0x31E) = 8 for every Neo colour target. Base run: both 0.
+4. `0x86a1a0` packet (18 dwords): confirm the register offsets 0x318 + 15n, and dwords 2 and 6 at packet offsets +8 and +24.
+5. Port side (existing log, no hook): the colour `ImageInfo` constructor (`image_info.cpp:90`) with `alt_tile` and
+   `tile_mode`, and the existing `Alt tile:` lines of the overlap log (`texture_cache.cpp:955-1025`, `:984`). Expect
+   `alt tile: true` for Neo colour targets. An `Unresolvable image overlap` line after a Neo run means the T# and CB bits differ.
+
+Depth (settles T10.4):
+6. `0x866fa0` entry: dump 40 bytes at `param_2`. Expect `spec[7] == 1` on Neo (0 base). Count how often `spec[9] & 3 == 3`
+   occurs (the forced tile 4).
+7. `0x866f50` entry: dump the spec it creates; expect `spec[4] == 3` (Z32F) or 1 (Z16).
+
+Presets (settles T10.6):
+8. `0x70a6d0` entry: log `param_1` (the setting 0x25 value), and the cell `*(int **)(DAT_032454b8 + 0x60)` before and after
+   (expect 3 on base, 2 or 1 on Neo).
+9. `0x5bb40` entry: `param_2` (1, 2 or 3) and the frame number.
+10. `0x90860` entry: `S = param_2[9]` (pointer); dwords at `S+0x4b4`, `S+0x4b8`, `S+0x4bc`, `S+0x4c0`; the value of `iVar9`
+    (R); and the graphics cell. Log changes only. This tests the link: if R follows the cell, the link exists; if R stays
+    at 3 while the cell is 1 or 2, the link is broken and the T10.6 source stands.
+11. `0x195370` after the `memcpy` at line 193 (the 0x480-byte copy into the group record): dump the group name (record `+0x480`)
+    and the dwords at `+0x4b8` and `+0x4c0` of each record. This settles the `uStack_b0` / `uStack_a8` question and shows the
+    source of R directly.
+12. `0xa1cd0` entry: old and new `M+0x3b70`, with the frame number (T3.8).
+13. Preset names without decoding `0x6efe0`: set three distinct values through `engine_cvars` (for example
+    `r_virtualGeometryNumShadowCascades_BasePS4=1`, `_Perf=2`, `_Cinematic=4`, others unchanged) and log which value the
+    cascade count takes in each menu preset. The value that appears names the preset. This is a cvar-only test (no code
+    change).
+
+Pass criteria: (a) colour targets on Neo have INFO bit 31 = 1 and dword 6 = 8, base has 0 and 0; (b) the cell takes 3 on
+base and 1 or 2 on Neo; (c) R tracks the cell, or the link is shown broken; (d) the cvar test gives one name per value. If (a)
+fails, the Neo flag is not in `[6]` and T10.3 is wrong. If (c) shows R stays at 3, the presets do not reach the group record,
+and the mapping needs another source.
+
+### T10.9 Open items
+
+1. The link from the graphics cell (`DAT_032454b8 + 0x60`) to R (`S+0x4c0`): not found. T10.8 items 10-11.
+2. The source of the model-group field `+0x98` (`0x195370` `local_620`, `0x196260`): decomp typing unresolved.
+3. `uStack_b0` / `uStack_a8` of `0x195370`: no visible writer.
+4. The name of each preset value (`_Cinematic`, `_Perf`, `_BasePS4` to 1, 2, 3): T10.8 item 13 gives it at run time.
+5. The meaning of `t` (setting `0x25`) against the menu item, and the sign used in `0x70ac50`.
+6. The depth-side Neo effects: the forced tile 4 (`spec[9] & 3 == 3`), the `0x2000` query bit, the `+0xe0` / `+0xde` copy.
+7. Bits 0..1 of the kRTT flag word (`uVar4 >> 16`) and the byte `uVar4 >> 24` of each kRTT spec: not decoded, so the set of
+   colour targets with a non-zero `spec[9]` is unknown.
+8. The `0x882f10`, `0x882fb0`, `0x883010`, `0x883080` constants (T10.2): only the first is guessed.
+9. The colour `ImageInfo` has `bank_swizzle = 0`; whether the GPU applies a swizzle on Neo CB writes is unknown (T10.5).
+10. `0x9ae80` and the `0x8806f0` branch (T3.7 item 6 and the T10.3 last paragraph): not traced.
+
+### T10.10 Evidence list (T10)
+
+| Item | Address | File and line |
+|---|---|---|
+| Neo latch, Neo flag | `0x882ec0` (guard `DAT_03294f28`, value `DAT_03294f20`) | `out/re/decomp/0088/00882ec0.c` |
+| Neo constants | `0x882f10`, `0x882fb0`, `0x883010`, `0x883080` | `out/re/decomp/0088/00882f10.c`, `00882fb0.c`, `00883010.c`, `00883080.c` |
+| Neo import wrapper | `0x3f4e0` (`== 1`) | `out/re/decomp/0003/0003f4e0.c` |
+| Colour target builder, Neo flag at spec `[6]` | `0x97a50` lines 99-108, 107, 115, 167-178 | `out/re/decomp/0009/00097a50.c` |
+| Depth spec and rewrite | `0x97a50` lines 235-247, 296-300 | `out/re/decomp/0009/00097a50.c` |
+| Colour spec default | `0x87da70` | `out/re/decomp/0087/0087da70.c` |
+| Colour descriptor writer (INFO bit 31, dword 6) | `0x87dac0` | `out/re/decomp/0087/0087dac0.c` |
+| Depth spec default and builder | `0x866f50`, `0x866fa0` | `out/re/decomp/0086/00866f50.c`, `00866fa0.c` |
+| Graphics mode, cell writes (1/2/3) | `0x70a6d0` | `out/re/decomp/0070/0070a6d0.c` |
+| Mode table | `0x5bb40` | `out/re/decomp/0005/0005bb40.c` |
+| Menu and load callers of `0x70a6d0` | `0x559a10` (lines 127, 202), `0x558b20` (385), `0x70a9b0` (60), `0x70ac50` (40) | `out/re/decomp/0055/00559a10.c`, `00558b20.c`; `0070/0070a9b0.c`, `0070ac50.c` |
+| View mode R | `0x90860` (193-200), `0x95690` | `out/re/decomp/0009/00090860.c`, `00095690.c` |
+| R copy and source | `0xe0db0` (102-105), `0x195370` (171, 193, 203-210), `0x196260` (93) | `out/re/decomp/000e/000e0db0.c`, `0019/00195370.c`, `0019/00196260.c` |
+| Suffixed cvar registration | `0x6efe0` (timed out); strings `0xf9b86c`, `0xf9b88c`, `0xf9b8aa`, `0xf9cba6`, `0xf9cbd3`, `0xf9cbfe` | `out/re/decomp/0006/0006efe0.c` (stub); `tools/re/eboot_re.py str` |
+| Port alt-tile field | `Color0Info.alt_tile_mode` (bit 31) | `gpu/shadps4/video_core/amdgpu/regs_color.h:151-174` |
+| Port colour ImageInfo | `alt_tile` from the bit | `gpu/shadps4/video_core/texture_cache/image_info.cpp:76-90` |
+| Port T# alt and swizzle | `alt_tile` from the T# bit; `GetBankSwizzle` | `image_info.cpp:194`; `gpu/shadps4/video_core/amdgpu/resource.h:183, 281` |
+| Port alt identity and overlap | `texture_cache.cpp:638, 922, 955-1025` | `gpu/shadps4/video_core/texture_cache/texture_cache.cpp` |
+| Port detiler | `bank_swizzle` only | `gpu/shadps4/video_core/texture_cache/tile_manager.cpp:203, 294` |
+| Port depth registers (no alt) | `DepthBuffer` | `gpu/shadps4/video_core/amdgpu/regs_depth.h` |
+| Port presets and cvars | `af16`, `fps60game` | `scripts/sotc_modes.py:59-74` |
+| Launcher preset text and cascade variants | menu and cvars | `launcher/sotc_launcher_win.py:649-652, 1353-1355` |
+| Neo runtime switch | `runtime_sotc_neo` | `src/runtime_sotc.c:45-55` |

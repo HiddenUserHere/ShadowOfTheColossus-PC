@@ -43,6 +43,7 @@ void RegisterAllHandlers() {
     SotcProbes::RegisterCvars();
     SotcProbes::RegisterArea();
     SotcProbes::RegisterPass(); // sotc: SOTC_PASS_PROBE (probe_pass.cpp), observe only
+    SotcProbes::RegisterCalls(); // sotc: SOTC_CALL_PROBE (probe_calls.cpp), observe only
     SotcProbes::RegisterMemtype(); // sotc: PC memory model, wave B
     SotcProbes::RegisterXprMem();
     SotcPcRing::Register(); // sotc: SOTC_PC_RING (PC memory model)
