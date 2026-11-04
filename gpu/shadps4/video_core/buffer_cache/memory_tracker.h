@@ -582,6 +582,19 @@ private:
     bool IteratePages(VAddr cpu_address, u64 size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, RegionManager*, u64, size_t>::type;
         static constexpr bool BOOL_BREAK = std::is_same_v<FuncReturn, bool>;
+        // sotc: the same bound as MaybeWriteProtected. An address past the tracked range indexed
+        // top_tier out of bounds and read a garbage region (crash after a colossus jump, 4 Nov 2026:
+        // IsRegionGpuModified on 0x5805a0051805). Logged once so the source can be found.
+        constexpr u64 kLimit = u64{1} << MAX_CPU_PAGE_BITS;
+        if (cpu_address >= kLimit) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "SOTC MEMTRACK address past the tracked range: 0x%llx size 0x%llx (ignored)\n",
+                             static_cast<unsigned long long>(cpu_address), static_cast<unsigned long long>(size));
+            }
+            return false;
+        }
+        size = std::min(size, kLimit - cpu_address);
         u64 remaining_size = size;
         u64 page_index = cpu_address >> HIGHER_PAGE_BITS;
         u64 page_offset = cpu_address & HIGHER_PAGE_MASK;

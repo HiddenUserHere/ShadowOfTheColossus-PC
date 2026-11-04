@@ -846,8 +846,11 @@ void DrawColossi() {
             ImGui::TableNextRow();
             ImGui::PushID(i);
             ImGui::TableSetColumnIndex(0);
+            // sotc: the row selectable spans every column, including the Fight button's: without
+            // AllowOverlap it took the click and the button never fired (no boss command was sent).
             if (ImGui::Selectable(std::to_string(i + 1).c_str(), ui.colossus_sel == i,
-                                  ImGuiSelectableFlags_SpanAllColumns)) {
+                                  ImGuiSelectableFlags_SpanAllColumns |
+                                      ImGuiSelectableFlags_AllowOverlap)) {
                 ui.colossus_sel = i;
             }
             ImGui::TableSetColumnIndex(1);
