@@ -275,6 +275,71 @@ One stage at a time, verify first, on the test route (user/routes/tests.json), o
 | S3 | `SOTC_GCN_TEX=1` | image misses < 5/frame in steady play, image |
 | S5 | `SOTC_GCN_BARRIER=2`, then `=1` | would-drop counts, then image and per-op cost |
 | S3 skip (measurement) | `SOTC_GCN_TEX_SKIP_RESOLVE=1` with TEX=1 and BARRIER=1 | texture phase cost; not a correctness mode |
+| S6 verify | `SOTC_PARALLEL_RECORD=1 SOTC_GCN_COMMIT=2` (with S1-S5 on) | `SOTC GCN COMMIT`: verify mismatch 0, eligible % |
+| S6 | `SOTC_GCN_COMMIT=1` | per-op cost (metrics.csv draw_busy_ms / draw_ops), dispatch cost |
 
 The 5 s report prints one `SOTC GCN ...` line per stage that is on; the startup log prints the decision of each stage
 (`SOTC GCN: mem=... buf=... tex=... sync=... barrier=...`) and a `refused: <reason>` line for any stage refused.
+
+# S6 (thin draw thread)
+
+## D13. S6 builds on SOTC_PARALLEL_RECORD; what is already off the draw thread stays there
+
+**Decision.** S6 (`SOTC_GCN_COMMIT`) needs `SOTC_PARALLEL_RECORD=1` and adds only what the prep threads do not do yet.
+Already off the draw thread before S6: the pipeline lookup (command processor, `op.pipeline`), and for draws the push
+data, dynamic state values, bind hashes, resolved resources (SOTC_PR_RESOLVE) and heap memo keys (SOTC_PR_KEYS); the
+render state memo (SOTC_RS_MEMO) and the pending-operations fast path (SOTC_POP_FAST) already exist.
+
+**Why.** Re-doing them would duplicate verified machinery. What S0 measured as still on the draw thread is: every
+dispatch's preparation (dispatches are 30-38% of ops and the costliest, 10-12.7 us), and the bind caches' own cost
+(the frame bind cache lookup 8.1% and BindResources' prologue 8.2%), which buys little once S2-S4 make the binds
+themselves cheap.
+
+## D14. S6a: dispatches are prepared like draws
+
+**Decision.** The GpuPrep threads fill the op's PreparedDraw slot for dispatches too (`Rasterizer::PrepareDispatch`,
+from the prep thread's replayed registers and the stage's flat copy; the compute program registers `op.cs` are only
+the dispatch size and HLE inputs, which stay on the draw thread), and the draw thread hands it to
+DispatchDirect / DispatchIndirect -> BindResources. Mode 2 computes and compares, never uses (the SOTC_VERIFY pattern).
+
+**Why.** The slot, the publish protocol (ready_seq, map_epoch) and the verify already exist for draws; dispatches only
+needed their compute-specific inputs.
+
+## D15. S6b: a commit lane for fully GCN ops instead of more caching
+
+**Decision.** An op whose pipeline is commit-eligible (every guest buffer table-addressed with S4 freshness, every
+texture and sampler from the T# table with the Resolve skip, S5 barriers) skips the fast bind, the bind cache and the
+frame bind cache, lookup and store, and binds directly. Eligibility is a pure function of the pipeline, cached on it.
+
+**Why.** The caches exist to avoid per-op resource resolution; for an eligible op that resolution is already a bit test
+per buffer and a GPU table probe per texture, so the cache lookup (hashing the op, validating the entry) costs about as
+much as what it saves. Mode 2 keeps the caches and only counts eligible ops, which also measures S2-S5's coverage: the
+share of ops that can go through the lane is the share the GCN model fully covers.
+
+Implementation notes (S6 agents):
+- **Commit eligibility is a whitelist**: of the port's special buffers only the flat buffer, clip planes and LOD
+  feedback are allowed (GDS, the BDA page table / fault buffer, shared memory and the BDA block table make a pipeline
+  ineligible); a stage with DMA reads, sharp tables or fmasks is ineligible; any stage with images or samplers must be
+  a gcn_tex == 1 heap stage whose bindings are all in the table, with the Resolve skip. When unsure, not eligible: the
+  mode 2 counters show the coverage, and the list can widen from measured reasons.
+- **Commit needs SOTC_PARALLEL_RECORD=1** only for the dispatch part; when the machine has too few threads for prep
+  workers the lane still applies and the SYNC/COMMIT line shows 0% prepared dispatches.
+- **Dispatch slots** carry `is_dispatch`; TakePrepared refuses a slot of the other kind and keeps the draw counters
+  (pr_*) draw-only. The SOTC_CULL_EXPRESS footprint of dispatch slots is filled as before (after PrepareDispatch).
+- **Dispatch preparation takes the prep thread's registers** (`PrepareDispatch(regs, cs, pipeline, slot)`): the
+  registers replayed on the GpuPrep thread equal the draw thread's back registers at that op, so the push data, bind
+  cache eligibility and hashes, frame cache key, heap memo key and resolved resources of a dispatch are all computed
+  ahead, as for draws. Mode 2 (and SOTC_VERIFY=1) compares every field with the draw thread's inline values (mismatch
+  mask in the first 16 log lines); mode 1 with SOTC_VERIFY uses the slot only on a match.
+- **The slot is used only for ops whose pipeline the command processor resolved** (`use_resolved`), so the slot and the
+  pipeline the draw thread binds are the same one.
+- **The commit lane forces the op's cache eligibility off** (cache_eligible and fast_eligible), which switches off every
+  cache path at once (fast bind, the older bind cache, the frame cache, packet caches, heap holds, compute binds) for
+  lookup and store, without a second bind path. BindCacheSync still runs as for any ineligible op.
+- **Counting**: "dispatches prepared" counts slots available at the draw thread (liverpool); verify counts matches.
+- **Review fixes (R6)**: Eligible caches only the per-pipeline part and reads Buf/Sync/Barrier on every call (a stage
+  refused after first use must take the lane off); a pipeline with two heap stages of one kind is ineligible (the op is
+  dropped); the bind cache sync still gets the op's pre-lane eligibility, so lane draws do not invalidate other cache
+  entries; image-bearing pipelines need heap_images == 1 (not the heap GPU verify).
+- **Lane tiers**: buffer-only pipelines (most compute) take the lane with S2/S4/S5 alone; pipelines with textures need
+  the Resolve skip, so for them the lane has the same measurement-only status as SOTC_GCN_TEX_SKIP_RESOLVE.

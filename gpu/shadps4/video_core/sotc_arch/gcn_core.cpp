@@ -4,6 +4,7 @@
 // switch once, at its first use, and every stage's mode is then one relaxed atomic load.
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
@@ -22,13 +23,14 @@ constexpr int kBuf = static_cast<int>(Stage::Buf);
 constexpr int kTex = static_cast<int>(Stage::Tex);
 constexpr int kSync = static_cast<int>(Stage::Sync);
 constexpr int kBarrier = static_cast<int>(Stage::Barrier);
+constexpr int kCommit = static_cast<int>(Stage::Commit);
 
-constexpr const char* kNames[kStages] = {"mem", "buf", "tex", "sync", "barrier"};
-constexpr const char* kSwitches[kStages] = {"SOTC_GCN_MEM", "SOTC_GCN_BUF", "SOTC_GCN_TEX", "SOTC_GCN_SYNC",
-                                            "SOTC_GCN_BARRIER"};
+constexpr const char* kNames[kStages] = {"mem", "buf", "tex", "sync", "barrier", "commit"};
+constexpr const char* kSwitches[kStages] = {"SOTC_GCN_MEM",  "SOTC_GCN_BUF",     "SOTC_GCN_TEX",
+                                            "SOTC_GCN_SYNC", "SOTC_GCN_BARRIER", "SOTC_GCN_COMMIT"};
 
 /// -1: not read yet (ReadAllLocked sets every stage at once). Otherwise 0, 1 or 2.
-std::atomic<int> g_mode[kStages]{-1, -1, -1, -1, -1};
+std::atomic<int> g_mode[kStages]{-1, -1, -1, -1, -1, -1};
 /// One refusal line per stage for the run.
 std::atomic<bool> g_logged[kStages]{};
 /// Serializes the first read and the refusals (never taken on the fast path of Mode).
@@ -66,6 +68,14 @@ void ReadAllLocked() {
             }
         }
     }
+    // S6: the commit lane rides on the prep threads of SOTC_PARALLEL_RECORD, read as liverpool.cpp reads it (= "1").
+    if (modes[kCommit] != 0) {
+        const char* parallel = std::getenv("SOTC_PARALLEL_RECORD");
+        if (!parallel || parallel[0] != '1') {
+            LogRefusal(kCommit, "needs SOTC_PARALLEL_RECORD=1, which is off");
+            modes[kCommit] = 0;
+        }
+    }
     for (int i = 0; i < kStages; ++i) {
         g_mode[i].store(modes[i], std::memory_order_relaxed);
     }
@@ -95,8 +105,8 @@ void Refuse(Stage stage, const char* reason) {
 }
 
 void LogDecisions() {
-    LOG_INFO(Render, "SOTC GCN: mem={} buf={} tex={} sync={} barrier={}", Mode(Stage::Mem), Mode(Stage::Buf),
-             Mode(Stage::Tex), Mode(Stage::Sync), Mode(Stage::Barrier));
+    LOG_INFO(Render, "SOTC GCN: mem={} buf={} tex={} sync={} barrier={} commit={}", Mode(Stage::Mem),
+             Mode(Stage::Buf), Mode(Stage::Tex), Mode(Stage::Sync), Mode(Stage::Barrier), Mode(Stage::Commit));
 }
 
 void Report(char* out, u32 size, double seconds) {
@@ -122,7 +132,8 @@ void Report(char* out, u32 size, double seconds) {
     // A stage contributes only while it is on: a run with every mode 0 reports nothing.
     const auto on = [](Stage stage) { return Mode(stage) != 0; };
     char line[512];
-    if (on(Stage::Mem) || on(Stage::Buf) || on(Stage::Tex) || on(Stage::Sync) || on(Stage::Barrier)) {
+    if (on(Stage::Mem) || on(Stage::Buf) || on(Stage::Tex) || on(Stage::Sync) || on(Stage::Barrier) ||
+        on(Stage::Commit)) {
         line[0] = '\0';
         if (on(Stage::Buf) || on(Stage::Tex)) {
             Globals::Report(line, sizeof line, seconds);
@@ -153,6 +164,11 @@ void Report(char* out, u32 size, double seconds) {
             Barrier::Report(line, sizeof line, seconds);
             append(line);
         }
+        if (on(Stage::Commit)) {
+            line[0] = '\0';
+            Commit::Report(line, sizeof line, seconds);
+            append(line);
+        }
     }
 }
 
@@ -166,6 +182,19 @@ struct MissContext {
 };
 
 } // namespace
+
+namespace Tex {
+
+bool SkipResolve() {
+    // sotc: the rasterizer's former local read (SOTC_GCN_TEX_SKIP_RESOLVE=1), read once.
+    static const bool skip = [] {
+        const char* v = std::getenv("SOTC_GCN_TEX_SKIP_RESOLVE");
+        return v && v[0] == '1';
+    }();
+    return skip;
+}
+
+} // namespace Tex
 
 void OnSubmitStart(VideoCore::BufferCache& cache, VideoCore::TextureCache& texture_cache,
                    Vulkan::Scheduler& scheduler) {

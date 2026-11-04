@@ -9,6 +9,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_heap.h" // sotc: SOTC_DESCRIPTOR_HEAP (heap plan of a pipeline)
 #include "video_core/sotc_arch/sotc_arch.h"
 
+#include <atomic> // sotc: SOTC_GCN_COMMIT (Pipeline::sotc_gcn_commit)
 #include <mutex>
 #include <span>
 #include <vector>
@@ -237,6 +238,9 @@ protected:
     bool packet_range{};
     vk::DeviceSize desc_layout_size{};             ///< sotc: descriptor buffer size of one set
     std::vector<vk::DeviceSize> desc_binding_offsets; ///< sotc: by binding number, in the set
+public:
+    // sotc: SOTC_GCN_COMMIT: Commit::Eligible cached, -1 unknown
+    mutable std::atomic<s8> sotc_gcn_commit{-1};
 };
 
 } // namespace Vulkan

@@ -85,9 +85,11 @@ public:
     bool async_candidate{};
     AmdGpu::OpFootprint async_fp{};
 
-    void DispatchDirect(const Pipeline* resolved = nullptr, bool use_resolved = false);
+    /// sotc: SOTC_GCN_COMMIT. prepared: the slot PrepareDispatch made for this op (used only with use_resolved).
+    void DispatchDirect(const Pipeline* resolved = nullptr, bool use_resolved = false,
+                        const PreparedDraw* prepared = nullptr);
     void DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved = nullptr,
-                          bool use_resolved = false);
+                          bool use_resolved = false, const PreparedDraw* prepared = nullptr);
 
     /// sotc: the pipeline lookups of the draws and dispatches alone (command processor thread).
     const Pipeline* LookupGraphicsPipeline(u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
@@ -113,9 +115,13 @@ public:
     /// for several callers.
     void PrepareDraw(const AmdGpu::Regs& regs, const Pipeline* pipeline, bool is_indexed,
                      bool direct, PreparedDraw& out) const;
+    /// sotc: SOTC_GCN_COMMIT. A GpuPrep thread, after the op's stages are set up (Shader::g_info_slot) and map_epoch
+    /// is set: the prepared resource inputs of a dispatch (draw_prep.h, is_dispatch). Sets valid when done.
+    void PrepareDispatch(const AmdGpu::Regs& regs, const AmdGpu::ComputeProgram& cs, const Pipeline* resolved,
+                         PreparedDraw& out) const;
     /// sotc: SOTC_PR_RESOLVE. Called at the end of PrepareDraw on a GpuPrep thread: the
-    /// PreparedResources of a graphics draw (draw_prep.h). Resets everything it writes.
-    void PrepareResources(const GraphicsPipeline* pipeline, PreparedResources& out) const;
+    /// PreparedResources of a graphics draw or a dispatch (draw_prep.h). Resets everything it writes.
+    void PrepareResources(const Pipeline* pipeline, PreparedResources& out) const;
     void PrefetchImagesShared(const Pipeline* pipeline);
     /// sotc: SOTC_PARALLEL_RECORD: moves on every MapMemory / UnmapMemory (a prepared draw is
     /// used only while it stands still).
@@ -269,6 +275,12 @@ private:
     const PreparedDraw* CheckPrepared(const PreparedDraw& prepared,
                                       const GraphicsPipeline* pipeline, bool is_indexed,
                                       bool direct);
+    /// sotc: SOTC_GCN_COMMIT. The prepared slot of a dispatch the draw thread may use: null unless SOTC_GCN_COMMIT is on,
+    /// the slot is a valid dispatch and use_resolved (the pipeline is the one the slot was prepared for). Mode 2 compares
+    /// the slot with the inline values and returns null (never used); SOTC_VERIFY=1 compares it too and returns null on
+    /// a difference. Draw thread.
+    const PreparedDraw* CheckPreparedDispatch(const PreparedDraw* prepared, bool use_resolved,
+                                              const Pipeline* pipeline);
 
     bool FilterDraw();
 

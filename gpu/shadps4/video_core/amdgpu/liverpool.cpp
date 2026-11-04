@@ -1806,13 +1806,25 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         SotcPrepassProbe::t_cp_mark = 0;
         break;
     case BackOp::Kind::Dispatch:
+    case BackOp::Kind::DispatchIndirect: {
         back_cs = op.cs;
-        rasterizer->DispatchDirect(op.pipeline, true);
+        // sotc: SOTC_GCN_COMMIT: the prepared dispatch (PrepLoop, Rasterizer::PrepareDispatch), if it
+        // is usable; null otherwise, and the dispatch computes inline as before.
+        const Vulkan::PreparedDraw* prepared = nullptr;
+        if (SotcGcn::Commit::On() && prep_workers) {
+            const Vulkan::PreparedDraw* taken = TakePrepared(back_exec_seq, true);
+            if (taken && taken->is_dispatch) {
+                prepared = taken;
+            }
+            SotcGcn::Commit::NoteDispatchPrepared(prepared != nullptr);
+        }
+        if (op.kind == BackOp::Kind::Dispatch) {
+            rasterizer->DispatchDirect(op.pipeline, true, prepared);
+        } else {
+            rasterizer->DispatchIndirect(op.address, op.offset, op.size, op.pipeline, true, prepared);
+        }
         break;
-    case BackOp::Kind::DispatchIndirect:
-        back_cs = op.cs;
-        rasterizer->DispatchIndirect(op.address, op.offset, op.size, op.pipeline, true);
-        break;
+    }
     }
     if (n5_on) { // sotc: SOTC_N5_GRAPH: closes the sample (N5Begin)
         N5End();
@@ -1835,6 +1847,8 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
     Regs& prep = *prep_regs[index];
     // sotc: the op footprints are filled for SOTC_CULL_EXPRESS and for SOTC_OP_OVERLAP.
     const bool fp_fill = xp_on || ovl_on || n5_on;
+    // sotc: SOTC_GCN_COMMIT: dispatches get a full prepared slot (PrepareDispatch).
+    const bool commit_on = SotcGcn::Commit::On();
     u64 seq = 0;
     while (!stoken.stop_requested()) {
         if (back_head.load(std::memory_order_acquire) == seq) {
@@ -1881,6 +1895,9 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
             seq >= back_tail.load(std::memory_order_acquire)) {
             Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
             slot.map_epoch = rasterizer->MapEpoch();
+            if (commit_on) { // sotc: SOTC_GCN_COMMIT: this slot is a draw (TakePrepared checks it)
+                slot.is_dispatch = false;
+            }
             setup_stages();
             if (fp_fill) {
                 slot.resources_ready = false; // sotc: SOTC_CULL_EXPRESS / SOTC_OP_OVERLAP
@@ -1893,14 +1910,28 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
                 XpFillResources(slot, op.pipeline);
             }
             slot.ready_seq.store(seq, std::memory_order_release);
-        } else if (fp_fill && is_disp && seq % prep_workers == index &&
+        } else if ((commit_on || fp_fill) && is_disp && seq % prep_workers == index &&
                    seq >= back_tail.load(std::memory_order_acquire)) {
-            // sotc: SOTC_CULL_EXPRESS: dispatches get a slot too, with the resource footprint only.
             Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
-            slot.resources_ready = false;
-            slot.mrt_mask = 0xFF;
+            if (commit_on) {
+                // sotc: SOTC_GCN_COMMIT: the dispatch's prepared inputs, as a draw's. Reset first; the
+                // computation sets valid and is_dispatch only when it finished.
+                slot.map_epoch = rasterizer->MapEpoch();
+                slot.valid = false;
+                slot.is_dispatch = false;
+            }
+            if (fp_fill) {
+                // sotc: SOTC_CULL_EXPRESS: dispatches get a slot too, with the resource footprint.
+                slot.resources_ready = false;
+                slot.mrt_mask = 0xFF;
+            }
             setup_stages();
-            XpFillResources(slot, op.pipeline);
+            if (commit_on && op.pipeline) { // sotc: SOTC_GCN_COMMIT (a dropped dispatch stays invalid)
+                rasterizer->PrepareDispatch(prep, op.cs, op.pipeline, slot);
+            }
+            if (fp_fill && !slot.resources_ready) {
+                XpFillResources(slot, op.pipeline);
+            }
             slot.ready_seq.store(seq, std::memory_order_release);
         }
         ++seq;
@@ -1912,23 +1943,32 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
     }
 }
 
-const Vulkan::PreparedDraw* Liverpool::TakePrepared(u64 seq) {
+const Vulkan::PreparedDraw* Liverpool::TakePrepared(u64 seq, bool dispatch) {
     // sotc: SOTC_AB_PR (7c.0): in the "off" windows the draw thread computes inline, as when a
     // prepared draw is not ready.
     if (SotcStats::AbPrIgnoring()) {
-        SotcStats::ab_ignored.fetch_add(1, std::memory_order_relaxed);
+        if (!dispatch) { // sotc: SOTC_GCN_COMMIT: dispatches have their own counts (Commit)
+            SotcStats::ab_ignored.fetch_add(1, std::memory_order_relaxed);
+        }
         return nullptr;
     }
     // sotc: SOTC_PARALLEL_RECORD: published for this very op (the slot is reused every
     // BackRingSize ops) and no mapping changed since it was computed.
     const Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
-    const auto count = [](std::atomic<uint64_t>& counter) {
-        if (SotcStats::kFpsLog) {
+    // sotc: SOTC_GCN_COMMIT: the draw counters (pr_*) count draws only; a dispatch take is counted
+    // by SotcGcn::Commit::NoteDispatchPrepared.
+    const auto count = [dispatch](std::atomic<uint64_t>& counter) {
+        if (SotcStats::kFpsLog && !dispatch) {
             counter.fetch_add(1, std::memory_order_relaxed);
         }
     };
     if (slot.ready_seq.load(std::memory_order_acquire) != seq) {
         count(SotcStats::pr_not_ready);
+        return nullptr;
+    }
+    // sotc: SOTC_GCN_COMMIT: a slot of the other kind (a stale dispatch slot read as a draw, or the
+    // reverse) is never handed out.
+    if (slot.is_dispatch != dispatch) {
         return nullptr;
     }
     if (!slot.valid) {

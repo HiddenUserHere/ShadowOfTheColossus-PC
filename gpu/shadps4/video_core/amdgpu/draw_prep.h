@@ -120,6 +120,11 @@ struct PreparedDraw {
     /// false: the prep thread looked at the op but prepared nothing (not a graphics draw with a
     /// pipeline); the draw thread computes inline.
     bool valid{};
+    /// sotc: SOTC_GCN_COMMIT. true when PrepareDispatch made the slot (a dispatch), false when
+    /// PrepareDraw did. A dispatch's slot fills the register-only inputs BindResources reads (push_data,
+    /// fast_static (false), cache_eligible, fast_hash, res_ok, res_hash, table_keys, resolved). It does
+    /// not set dynamic, has_offsets or is_indexed, and BindResources reads none of them for a dispatch.
+    bool is_dispatch{};
     bool is_indexed{};
     bool fast_static{};    ///< FastBindEligible without the feedback-loop test (draw thread)
     bool cache_eligible{}; ///< BindCacheEligible

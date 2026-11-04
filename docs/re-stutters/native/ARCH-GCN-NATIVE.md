@@ -287,4 +287,6 @@ taken during the implementation, the review fixes, what is known not to be cover
 are in [GCN-NATIVE-DECISIONS.md](GCN-NATIVE-DECISIONS.md). Main differences from the plan above: S2 checks residency on
 the CPU with a bit test and keeps the GPU miss ring as a safety net (no frames of zeros); S3 keeps the per-op Resolve
 by default (the table is proven first, the skip is a measurement switch); S5's own transition drop adds little on top of
-the unified layouts, its value is the global writer barrier. S6 is not started.
+the unified layouts, its value is the global writer barrier. S6 (`SOTC_GCN_COMMIT`, needs SOTC_PARALLEL_RECORD=1)
+prepares dispatches on the GpuPrep threads like draws and adds a commit lane that skips the bind caches for fully GCN
+pipelines; =2 verifies the prepared dispatches and counts the lane's coverage (decisions D13-D15).

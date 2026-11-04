@@ -1051,7 +1051,8 @@ private:
         return tail;
     }
     /// Draw thread: the prepared inputs of op seq when they are usable, else null (counted).
-    const Vulkan::PreparedDraw* TakePrepared(u64 seq);
+    /// dispatch: a compute op; its take is not counted in the draw counters (pr_*).
+    const Vulkan::PreparedDraw* TakePrepared(u64 seq, bool dispatch = false);
 
     /// sotc: SOTC_EOP_TICK=1 (needs back_threaded). End-of-pipe labels wait for the GPU through
     /// the scheduler's deferred operations instead of being written when the command processor

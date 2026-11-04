@@ -3767,7 +3767,8 @@ void Rasterizer::AsyncBeforeOp(const Vulkan::FrameGraph::Sample& s) {
     }
 }
 
-void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
+void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved,
+                                const PreparedDraw* prepared) {
     RENDERER_TRACE;
     const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     MdiBreak(); // sotc: SOTC_MDI_STATS
@@ -3899,6 +3900,8 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
                            cs_program.start_z == 0 && groups != 0;
         t_direct_dispatch = {cs.pgm_hash, plain ? groups : 0, groups * local};
     }
+    // sotc: SOTC_GCN_COMMIT (S6a). The prepared dispatch inputs, when the prep thread made them for this op.
+    const PreparedDraw* dispatch_prepared = CheckPreparedDispatch(prepared, use_resolved, pipeline);
     // sotc: SOTC_CS_STATS (measurement only)
     u64 cs_key = 0;
     bool cs_key_ok = false, cs_writes = false, cs_res_ok = false;
@@ -3915,7 +3918,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
         cs_gen = XXH3_64bits(gens, sizeof(gens));
         cs_t0 = std::chrono::steady_clock::now();
     }
-    const bool cs_bound = BindResources(pipeline);
+    const bool cs_bound = BindResources(pipeline, dispatch_prepared);
     if (cs_bound) {
         PrepassProbeNoteBind(false, nullptr, pipeline, texture_cache, bound_images); // sotc: SOTC_PREPASS_PROBE
     }
@@ -3981,7 +3984,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved,
-                                  bool use_resolved) {
+                                  bool use_resolved, const PreparedDraw* prepared) {
     RENDERER_TRACE;
     const VideoCore::TexProtectScope tex_protect_scope; // sotc: SOTC_TEX_PROTECT_BATCH, see Draw
     const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDispatchIndirect}; // sotc: SOTC_OP_PHASES
@@ -4007,6 +4010,8 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
         CensusNote(pipeline, SotcGcnCensus::kDispatchIndirect);
     }
 
+    // sotc: SOTC_GCN_COMMIT (S6a). The prepared dispatch inputs, when the prep thread made them for this op.
+    const PreparedDraw* dispatch_prepared = CheckPreparedDispatch(prepared, use_resolved, pipeline);
     // sotc: SOTC_CS_STATS (measurement only)
     u64 cs_key = 0;
     bool cs_key_ok = false, cs_writes = false, cs_res_ok = false;
@@ -4023,7 +4028,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
         cs_gen = XXH3_64bits(gens, sizeof(gens));
         cs_t0 = std::chrono::steady_clock::now();
     }
-    const bool cs_bound = BindResources(pipeline);
+    const bool cs_bound = BindResources(pipeline, dispatch_prepared);
     if (cs_bound) {
         PrepassProbeNoteBind(false, nullptr, pipeline, texture_cache, bound_images); // sotc: SOTC_PREPASS_PROBE
     }
@@ -4399,7 +4404,7 @@ static bool SotcPrPredOn() {
 // sotc: SOTC_PR_KEYS. The heap stages of a pipeline, as BindResources finds them: out[0] the fragment-kind heap
 // stage, out[1] the vertex-kind one (SOTC_HEAP_VS). False when a kind has two stages (the draw is dropped there):
 // nothing is precomputed for it. Reads the pipeline and its profile only.
-static bool PrHeapStages(const GraphicsPipeline& pipeline, const Shader::Info* (&out)[2]) {
+static bool PrHeapStages(const Pipeline& pipeline, const Shader::Info* (&out)[2]) {
     out[0] = out[1] = nullptr;
     for (const auto* stage : pipeline.GetStages()) {
         if (stage && Shader::Backend::SPIRV::UsesHeapImages(*stage, pipeline.GetProfile())) {
@@ -4694,6 +4699,22 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     }
     bind_bindless_rec.clear();                // sotc: SOTC_N5_BINDLESS (refs of this bind)
     bind_bindless_gen = BindlessGeneration(); // sotc: a stored bind is replayed only while it holds
+    // sotc: SOTC_GCN_COMMIT (S6b). A commit-eligible op (its buffers and textures are served by the GCN tables, see
+    // SotcGcn::Commit::Eligible) has nothing left for the fast bind and the bind caches to save: it skips them, lookup and
+    // store, and binds directly. Mode 2 keeps the caches and only counts the ops the lane would take.
+    const bool commit_on = SotcGcn::Commit::On();
+    const bool commit_lane = commit_on && SotcGcn::Commit::Eligible(*pipeline);
+    const bool commit_bypass = commit_lane && !SotcGcn::Commit::Verify();
+    if (commit_on) {
+        SotcGcn::Commit::NoteOp(commit_lane, pipeline->IsCompute());
+        if (commit_bypass) {
+            SotcGcn::Commit::NoteBypass();
+        }
+    }
+    // sotc: the register-only inputs below (push data, hashes, eligibility, heap keys) come from the slot, for a draw
+    // (PrepareDraw) and a dispatch (PrepareDispatch, SOTC_GCN_COMMIT) alike. CheckPreparedDispatch passes a dispatch's
+    // slot as it is in mode 1 (as a draw's); SOTC_VERIFY=1 passes it only when it matches the inline values.
+    const PreparedDraw* reg_prepared = prepared;
     // sotc: SOTC_PACKET (ARCH-DRAW section 12). A pipeline with the packet range reads its window words and its index
     // table from this op's packet, so its binds take no bind cache and no fast bind (their replays would push the
     // addresses of an earlier tick). The arena window is 0: the ring-8 runs are many (SotcGuestMemory keeps a map of
@@ -4786,14 +4807,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // then, so BindHeapImages runs neither the transitions nor the classic decline cases (render target of the draw,
     // stencil image, rebind, composite op): that mode is for measurement until those cases are events (see
     // GCN-NATIVE-DECISIONS.md). Unset: Resolve runs and prefills the table (NoteResolved), the shader reads the table.
-    static const bool gcn_tex_skip_resolve = [] {
-        const char* v = std::getenv("SOTC_GCN_TEX_SKIP_RESOLVE");
-        return v && v[0] == '1';
-    }();
     // sotc: only when every image binding of the heap stages is in the table (gcn_rules.h TableStage). A binding the
     // table cannot express still reads the index table, so its stage keeps Resolve.
     const bool gcn_tex_skip =
-        gcn_tex_skip_resolve && pipeline->GetProfile().gcn_tex == 1 && SotcGcn::Barrier::On() &&
+        SotcGcn::Tex::SkipResolve() && pipeline->GetProfile().gcn_tex == 1 && SotcGcn::Barrier::On() &&
         (heap_stage || heap_vs_stage) && (!heap_stage || Shader::Gcn::TableStage(*heap_stage)) &&
         (!heap_vs_stage || Shader::Gcn::TableStage(*heap_vs_stage));
     const auto resolve_heap_tables = [&]() -> bool {
@@ -4804,7 +4821,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         if (heap_stage) {
             // sotc: SOTC_PR_KEYS: the memo key the prep thread computed for this stage (null: KeyOf here).
             const SotcArch::TableMemo::PreKey* heap_key =
-                prepared && SotcPrKeysOn() ? &prepared->table_keys[0] : nullptr;
+                reg_prepared && SotcPrKeysOn() ? &reg_prepared->table_keys[0] : nullptr;
             const auto table = SotcArch::TableMemo::Resolve(
                 texture_cache, *heap_stage, liverpool->DrawRegs().ta_bc_base, BindlessGeneration(),
                 heap_real ? &heap_binds : nullptr, heap_key);
@@ -4826,7 +4843,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             ASSERT_MSG(pipeline->GetProfile().heap_images == 1,
                        "SOTC HEAP_VS: a vertex heap stage needs the real heap");
             const SotcArch::TableMemo::PreKey* heap_vs_key =
-                prepared && SotcPrKeysOn() ? &prepared->table_keys[1] : nullptr; // sotc: SOTC_PR_KEYS
+                reg_prepared && SotcPrKeysOn() ? &reg_prepared->table_keys[1] : nullptr; // sotc: SOTC_PR_KEYS
             const auto table = SotcArch::TableMemo::Resolve(texture_cache, *heap_vs_stage,
                                                             liverpool->DrawRegs().ta_bc_base, BindlessGeneration(),
                                                             &heap_vs_binds, heap_vs_key);
@@ -4859,9 +4876,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
                                    pipeline->GetProfile().heap_images == 1;
     const bool packet_cacheable =
         !packet_op || (SotcStats::kBindCacheFrame && (packet_heap_free || packet_heap_cache));
-    const bool cache_eligible =
+    // sotc: SOTC_GCN_COMMIT. cache_sync_eligible is the eligibility the caches' sync always had: a lane op still runs the
+    // sync with it, so the other entries are flushed as before. The lane only turns off its own cache use (cache_eligible).
+    const bool cache_sync_eligible =
         SotcStats::kBindCache && packet_cacheable &&
-        (prepared ? prepared->cache_eligible : BindCacheEligible(pipeline));
+        (reg_prepared ? reg_prepared->cache_eligible : BindCacheEligible(pipeline));
+    const bool cache_eligible = cache_sync_eligible && !commit_bypass; // sotc: SOTC_GCN_COMMIT (lane: no caches)
     // sotc: SOTC_BIND_CACHE_HEAP. The heap resolutions of a packet op the frame cache may take are made on a miss only:
     // a hit replays the ones its entry holds (TryBindCacheFrame). Any other op resolves them here, as before.
     const u32 heap_mask_op = (heap_stage ? 1u : 0u) | (heap_vs_stage ? 2u : 0u);
@@ -4876,9 +4896,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     }
     if (SotcStats::kBindCache) {
         if (SotcStats::kBindCacheFrame) {
-            BindCacheSyncFrame(pipeline, cache_eligible);
+            BindCacheSyncFrame(pipeline, cache_sync_eligible); // sotc: SOTC_GCN_COMMIT (the sync is not the lane's)
         } else {
-            BindCacheSync(pipeline, cache_eligible);
+            BindCacheSync(pipeline, cache_sync_eligible);
         }
     }
     if (SotcStats::kFpsLog && SotcStats::kBindCache) { // sotc: SOTC_FPS, why a bind is refused (sotc_stats.h)
@@ -4994,14 +5014,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // resource handles. The generation bumps catch reallocated buffers/images and dead samplers.
     // sotc: SOTC_PACKET: a packet op takes the fast bind unless it has a heap stage (its index table is per op). Its
     // hits replay the addressed ranges (PacketAddrReplay) and the barrier rule (packet_barrier).
-    const bool fast_eligible = (!packet_op || packet_heap_free) &&
-                               (prepared ? prepared->fast_static && !attachment_feedback_loop
-                                         : FastBindEligible(pipeline));
+    const bool fast_eligible = (!packet_op || packet_heap_free) && !commit_bypass && // sotc: SOTC_GCN_COMMIT (lane)
+                               (reg_prepared ? reg_prepared->fast_static && !attachment_feedback_loop
+                                             : FastBindEligible(pipeline));
     u64 fast_hash = 0;
     if (fast_eligible) {
         SotcStats::fast_bind_eligible.fetch_add(1, std::memory_order_relaxed);
-        const auto input_push = prepared ? prepared->push_data : MakeUserData(liverpool->DrawRegs());
-        fast_hash = prepared ? prepared->fast_hash : FastBindHash(pipeline, input_push);
+        const auto input_push = reg_prepared ? reg_prepared->push_data : MakeUserData(liverpool->DrawRegs());
+        fast_hash = reg_prepared ? reg_prepared->fast_hash : FastBindHash(pipeline, input_push);
         // Same state as the last full bind, ignoring the submit tick (SOTC_FASTBIND_WIDE needs it).
         bool fast_state_same =
             fast_bind.valid && fast_bind.pipeline == pipeline &&
@@ -5106,7 +5126,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             fast_bind.compute_cleared = true; // sotc: SOTC_FPS, see FastBindState::compute_cleared
         }
         fast_bind.valid = false;
-        push_data = prepared ? prepared->push_data : MakeUserData(liverpool->DrawRegs());
+        push_data = reg_prepared ? reg_prepared->push_data : MakeUserData(liverpool->DrawRegs());
     }
 
     // sotc: SOTC_BIND_CACHE: the same state as an earlier full bind of this submit.
@@ -5124,9 +5144,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             // (BindResourceHash); the constants around them are refreshed by the hit. A pipeline
             // that binds by constants keeps the full key below.
             u64 res_hash = 0;
-            const bool res_ok = prepared ? prepared->res_ok : BindResourceHash(pipeline, res_hash);
-            if (prepared) {
-                res_hash = prepared->res_hash;
+            const bool res_ok = reg_prepared ? reg_prepared->res_ok : BindResourceHash(pipeline, res_hash);
+            if (reg_prepared) {
+                res_hash = reg_prepared->res_hash;
             }
             if (res_ok) {
                 cache_hash = XXH3_64bits_withSeed(&bc_base, sizeof(bc_base), res_hash);
@@ -5135,8 +5155,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         }
         if (!bind_level2) {
             cache_hash = fast_eligible ? fast_hash
-                         : prepared    ? prepared->fast_hash
-                                       : FastBindHash(pipeline, push_data);
+                         : reg_prepared ? reg_prepared->fast_hash
+                                        : FastBindHash(pipeline, push_data);
             cache_hash = XXH3_64bits_withSeed(&bc_base, sizeof(bc_base), cache_hash);
             if (SotcStats::kBindCacheFrame) {
                 // sotc: entries now outlive many frames: a pipeline erased and another made at the
@@ -5361,7 +5381,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             // sotc: SOTC_PR_GEN=2: the owner's own computation is what gets used; the prepared
             // values are compared with it (both computed from the same sums).
             PreparedResources fresh{};
-            PrepareResources(static_cast<const GraphicsPipeline*>(pipeline), fresh);
+            PrepareResources(pipeline, fresh); // sotc: SOTC_GCN_COMMIT: a dispatch's pipeline is not a graphics one
             const bool same = SamePreparedResources(fresh, prepared->resolved);
             static std::atomic<u32> shown_gen{0};
             if (!same && shown_gen.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -11360,6 +11380,7 @@ void Rasterizer::PrepareDraw(const AmdGpu::Regs& regs, const Pipeline* resolved,
     // and its own Shader::g_info_slot, filled from the op like the draw thread's. Only the
     // register-only inputs the draw thread would compute the same way; the decisions stay there.
     out.valid = false;
+    out.is_dispatch = false; // sotc: SOTC_GCN_COMMIT (a dispatch's slot is made by PrepareDispatch)
     out.has_offsets = false;
     // sotc: SOTC_PR_KEYS: no table key from an earlier op in this slot (BindResources checks valid).
     for (auto& table_key : out.table_keys) {
@@ -11428,8 +11449,50 @@ void Rasterizer::PrepareDraw(const AmdGpu::Regs& regs, const Pipeline* resolved,
     }
 }
 
-void Rasterizer::PrepareResources(const GraphicsPipeline* pipeline, PreparedResources& out) const {
-    // sotc: SOTC_PR_RESOLVE, on a GpuPrep thread. Resets everything it writes: the slot keeps the
+void Rasterizer::PrepareDispatch(const AmdGpu::Regs& regs, const AmdGpu::ComputeProgram& cs,
+                                 const Pipeline* resolved, PreparedDraw& out) const {
+    // sotc: SOTC_GCN_COMMIT (S6a), on a GpuPrep thread after the op's stages are set up (g_info_slot holds the op's user
+    // data and flat copy) and after map_epoch. `regs` are the prep thread's replayed registers at this op, equal to the
+    // draw thread's DrawRegs(). Fills the register-only inputs BindResources reads for a compute op, each computed as the
+    // inline path computes it (the same calls, with regs in place of DrawRegs()): push data, the cache eligibility, the
+    // fast-bind static test and hash, the bind resource hash, the compute heap stage's table key, and the resources
+    // (PrepareResources, under SOTC_PR_RESOLVE / SOTC_PR_GEN). The program registers are not needed: the resources come
+    // from the stage's flat copy, and the dispatch extent is set by DispatchDirect (t_direct_dispatch).
+    out.is_dispatch = true;
+    out.valid = false;
+    out.has_offsets = false; // compute: no vertex offsets
+    for (auto& table_key : out.table_keys) {
+        table_key.valid = false;
+    }
+    (void)cs;
+    if (!resolved || !resolved->IsCompute()) {
+        return;
+    }
+    out.push_data = MakeUserData(regs);
+    out.fast_static = FastBindStatic(resolved, regs); // false for compute (FastBindStatic)
+    out.cache_eligible = BindCacheEligible(resolved, regs);
+    out.fast_hash = FastBindHash(resolved, out.push_data, regs);
+    out.res_ok = SotcStats::kBindCacheFrame && out.cache_eligible && BindResourceHash(resolved, out.res_hash);
+    if (SotcPrKeysOn() && SotcArch::TableMemo::On() && resolved->HasPacketRange()) {
+        // sotc: SOTC_PR_KEYS: the compute heap stage's memo key (BindResources' resolve_heap_tables, kind 0), with this
+        // op's border color base.
+        const Shader::Info* heap[2]{};
+        if (PrHeapStages(*resolved, heap)) {
+            for (u32 k = 0; k < 2; ++k) {
+                if (heap[k]) {
+                    SotcArch::TableMemo::ComputeKey(*heap[k], regs.ta_bc_base, out.table_keys[k]);
+                }
+            }
+        }
+    }
+    if (SotcPrResolveOn() || SotcPrGenMode() != 0) {
+        PrepareResources(resolved, out.resolved);
+    }
+    out.valid = true;
+}
+
+void Rasterizer::PrepareResources(const Pipeline* pipeline, PreparedResources& out) const {
+    // sotc: SOTC_PR_RESOLVE, on a GpuPrep thread (draws and dispatches). Resets everything it writes: the slot keeps the
     // previous op's data until it is overwritten.
     out.num_buffers = 0;
     out.num_images = 0;
@@ -11567,6 +11630,87 @@ const PreparedDraw* Rasterizer::CheckPrepared(const PreparedDraw& prepared,
                      static_cast<unsigned long long>(regs.ps_program.Address<uintptr_t>()));
     }
     return nullptr;
+}
+
+const PreparedDraw* Rasterizer::CheckPreparedDispatch(const PreparedDraw* prepared, bool use_resolved,
+                                                      const Pipeline* pipeline) {
+    // sotc: SOTC_GCN_COMMIT (S6a). Draw thread. The slot is used as it is (mode 1); mode 2 and SOTC_VERIFY=1 compare its
+    // resource inputs with the inline computation (PrepareResources here, field by field, as CheckPrepared does for
+    // draws). Mode 2 never uses the slot; SOTC_VERIFY=1 uses it only when it agrees.
+    if (!SotcGcn::Commit::On()) {
+        return nullptr;
+    }
+    pr_verify_off = false; // sotc: SOTC_PR_RESOLVE (BindResources reads this flag for the slot it is given)
+    const bool ready = prepared && use_resolved && prepared->valid && prepared->is_dispatch;
+    if (!ready) {
+        return nullptr; // the availability count is liverpool's (NoteDispatchPrepared)
+    }
+    const bool verify = SotcGcn::Commit::Verify();
+    if (!verify && !SotcVerify::VerifyAll()) {
+        return prepared;
+    }
+    // The inline values of the register inputs, as BindResources computes them for a dispatch without a slot.
+    const auto& regs = liverpool->DrawRegs();
+    const auto push = MakeUserData(regs);
+    const bool fast_static = FastBindStatic(pipeline, regs);
+    const bool cache_eligible = BindCacheEligible(pipeline, regs);
+    const u64 fast_hash = FastBindHash(pipeline, push, regs);
+    u64 res_hash = 0;
+    const bool res_ok = SotcStats::kBindCacheFrame && cache_eligible && BindResourceHash(pipeline, res_hash);
+    u32 mismatch = 0;
+    mismatch |= std::memcmp(&push, &prepared->push_data, sizeof(push)) == 0 ? 0u : 1u;
+    mismatch |= fast_static == prepared->fast_static ? 0u : 2u;
+    mismatch |= cache_eligible == prepared->cache_eligible ? 0u : 4u;
+    mismatch |= fast_hash == prepared->fast_hash ? 0u : 8u;
+    mismatch |= res_ok == prepared->res_ok && (!res_ok || res_hash == prepared->res_hash) ? 0u : 16u;
+    // The compute heap stage's table key (SOTC_PR_KEYS), recomputed with this op's border color base.
+    if (SotcPrKeysOn() && (prepared->table_keys[0].valid || prepared->table_keys[1].valid)) {
+        const auto same_key = [](const SotcArch::TableMemo::PreKey& a,
+                                 const SotcArch::TableMemo::PreKey& b) {
+            return a.stage == b.stage && a.border == b.border && a.hash == b.hash &&
+                   a.words == b.words &&
+                   std::memcmp(a.key.data(), b.key.data(), a.words * sizeof(u64)) == 0;
+        };
+        const Shader::Info* heap[2]{};
+        const bool stages_ok = PrHeapStages(*pipeline, heap);
+        bool keys_bad = false;
+        for (u32 k = 0; k < 2; ++k) {
+            if (!prepared->table_keys[k].valid) {
+                continue;
+            }
+            SotcArch::TableMemo::PreKey fresh{};
+            if (!stages_ok || !heap[k] ||
+                !SotcArch::TableMemo::ComputeKey(*heap[k], regs.ta_bc_base, fresh) ||
+                !same_key(fresh, prepared->table_keys[k])) {
+                keys_bad = true;
+            }
+        }
+        if (keys_bad) {
+            mismatch |= 32u;
+        }
+    }
+    // The resources (SOTC_PR_RESOLVE / SOTC_PR_GEN), while the table generation the slot was made under still stands.
+    if ((SotcPrResolveOn() || SotcPrGenMode() != 0) &&
+        prepared->resolved.runtime_gen == runtime_memory_generation()) {
+        PreparedResources fresh{};
+        PrepareResources(pipeline, fresh);
+        if (!SamePreparedResources(fresh, prepared->resolved)) {
+            mismatch |= 64u;
+        }
+    }
+    const bool match = mismatch == 0;
+    if (!match) {
+        static std::atomic<u32> shown_dispatch{0};
+        if (shown_dispatch.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::fprintf(stderr,
+                         "SOTC GCN COMMIT dispatch verify mismatch: mask %#x (1 push data, 2 fast static, 4 cache "
+                         "eligible, 8 fast hash, 16 bind resource hash, 32 heap table key, 64 resources), the dispatch "
+                         "uses the inline values\n",
+                         mismatch);
+        }
+    }
+    SotcGcn::Commit::NoteDispatchVerify(match);
+    return !verify && match ? prepared : nullptr;
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed,

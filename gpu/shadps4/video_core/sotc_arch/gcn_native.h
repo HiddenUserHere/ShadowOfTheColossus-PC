@@ -16,6 +16,7 @@
 //   SOTC_GCN_TEX      S3 GPU T#/S# table with miss feedback                              needs SOTC_HEAP on, layouts unified
 //   SOTC_GCN_SYNC     S4 freshness per submit (dirty pages and images in one batch)      needs GCN_MEM
 //   SOTC_GCN_BARRIER  S5 static barriers, GENERAL layouts, no per-op transitions          needs layouts unified active
+//   SOTC_GCN_COMMIT   S6 thin draw thread: dispatches prepared ahead, commit lane            needs SOTC_PARALLEL_RECORD=1
 #pragma once
 
 #include <cstdint>
@@ -29,6 +30,7 @@
 namespace Vulkan {
 class Instance;
 class Scheduler;
+class Pipeline;
 } // namespace Vulkan
 
 namespace VideoCore {
@@ -48,7 +50,7 @@ struct SamplerResource;
 
 namespace SotcGcn {
 
-enum class Stage : u8 { Mem, Buf, Tex, Sync, Barrier, Count };
+enum class Stage : u8 { Mem, Buf, Tex, Sync, Barrier, Commit, Count };
 
 /// The effective mode of a stage (0, 1, 2) after its requirements (Refuse sets it to 0). Read once, then constant,
 /// except that Refuse may lower it before the first frame. Cheap (one relaxed load).
@@ -172,6 +174,9 @@ void OnImageEvent(u32 image_index, u8 cause);
 /// bindless LRU eviction never takes a slot the table still serves (with SOTC_GCN_TEX_SKIP_RESOLVE no per-op Resolve
 /// stamps them). Draw thread.
 void StampLiveSlots();
+/// SOTC_GCN_TEX_SKIP_RESOLVE=1 (read once; gcn_core.cpp): gcn_tex == 1 heap stages whose bindings are all in the
+/// table skip the per-op TableMemo::Resolve (needs Barrier on). Measurement until the classic decline cases are events.
+bool SkipResolve();
 void ForEachReferencedImage(VideoCore::TextureCache& texture_cache, void (*fn)(void* user, VideoCore::Image&),
                             void* user);
 void Report(char* out, u32 size, double seconds);
@@ -214,6 +219,38 @@ void BeforeOp(Vulkan::Scheduler& scheduler, bool in_render_pass);
 void OnPassBoundary(Vulkan::Scheduler& scheduler);
 void Report(char* out, u32 size, double seconds);
 } // namespace Barrier
+
+// ---------------------------------------------------------------------------------------------------------------
+// S6. Thin draw thread. gcn_commit.cpp (switch, eligibility, counters); the prep and draw paths in liverpool.cpp and
+// vk_rasterizer.cpp. Two parts:
+//   a. Dispatches are prepared on the GpuPrep threads like draws (Rasterizer::PrepareDispatch into the op's
+//      PreparedDraw slot; the draw thread takes it with Liverpool::TakePrepared and hands it to DispatchDirect /
+//      DispatchIndirect, which pass it to BindResources). Mode 2: the slot is computed and compared with the inline
+//      values (counted), never used.
+//   b. Commit lane: an op whose pipeline is commit-eligible (Eligible) has nothing left for the bind caches to save
+//      (its buffers are table-addressed with S4 freshness, its textures come from the T# table), so BindResources
+//      skips the fast bind, the bind cache and the frame bind cache for it (lookup and store) and binds directly.
+//      Mode 2: the caches run as before; eligible ops are only counted.
+namespace Commit {
+bool On();     ///< Mode(Stage::Commit) != 0 (refused without SOTC_PARALLEL_RECORD=1)
+bool Verify(); ///< Mode(Stage::Commit) == 2
+/// Whether the commit lane may take ops of this pipeline: Buf on with the pipeline's profile gcn_buf != 0 and every
+/// guest buffer of every stage shader-addressed (Shader::ShaderAddrBufferAt on the pipeline's profile) except the
+/// port's special buffers; Sync::SkipOpSync(); Barrier::On(); every image and sampler binding of the pipeline served by
+/// the T# table (a heap stage with profile gcn_tex == 1 and Shader::Gcn::TableStage, with SOTC_GCN_TEX_SKIP_RESOLVE=1),
+/// (and heap_images == 1), or no images and samplers at all. The pipeline part is cached on the pipeline object
+/// (Pipeline::sotc_gcn_commit); the global terms (Buf, Sync, Barrier on) are read on every call, since a stage can be
+/// refused after the first use. Draw thread (BindResources).
+bool Eligible(const Vulkan::Pipeline& pipeline);
+/// Counters: an op went through the commit lane (bypass = it skipped the caches; false in mode 2 = would have).
+void NoteOp(bool eligible, bool is_dispatch);
+void NoteBypass();
+/// A dispatch reached the draw thread with a prepared slot (taken) or without one (not ready, ineligible, epoch).
+void NoteDispatchPrepared(bool taken);
+/// Mode 2 and SOTC_VERIFY: a prepared dispatch compared with the inline computation.
+void NoteDispatchVerify(bool match);
+void Report(char* out, u32 size, double seconds);
+} // namespace Commit
 
 // ---------------------------------------------------------------------------------------------------------------
 // Draw thread, at each submit start (PcRingCopy::OnSubmitStart's caller): drains the miss ring (Buf / Tex sinks),
