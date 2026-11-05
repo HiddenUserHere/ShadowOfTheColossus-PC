@@ -119,6 +119,7 @@ uint64_t runtime_memory_chunk_opens_locked(void);
 #include "../../../../sotc/particle_prev.h"
 #include "../../../../sotc/ram_report.h" // sotc: SOTC_RAM_REPORT
 #include "../../../../sotc/cmd_counters.h" // sotc: SOTC_CMD_COUNTERS (5 s report)
+#include "../../../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER (5 s report)
 #include "../../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE report
 #include "../../../../sotc/decommit_budget.h"
 #include "../../../../sotc/mip_budget.h"
@@ -2591,6 +2592,9 @@ void VideoOutDriver::Flip(const Request& req) {
                                  d.cpu_ns[RoleCp] / per, d.cpu_ns[RoleDraw] / per,
                                  d.cpu_ns[RoleRecorder] / per, d.cpu_ns[RolePassSecondary] / per,
                                  d.cpu_ns[RoleUpload] / per);
+                    if (SotcBlockLedger::kOn) { // sotc: SOTC_BLOCK_LEDGER
+                        std::fprintf(stderr, "%s\n", SotcBlockLedger::TakeReport(flips).c_str());
+                    }
                     std::fprintf(stderr,
                                  "SOTC draw waits/frame: gpu %.2f (%.1f), recorder %.2f (%.1f), "
                                  "upload %.2f, tc lock %.2f ms\n",

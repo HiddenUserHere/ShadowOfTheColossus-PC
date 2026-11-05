@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "../../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER
 
 namespace Vulkan {
 
@@ -46,13 +47,16 @@ public:
 
 vk::Pipeline GplLibraryCache::GetOrBuild(Part part, const std::string& key, bool& built,
                                          const std::function<vk::UniquePipeline()>& build) {
+    std::optional<SotcBlockLedger::Scope> lock_wait{std::in_place, SotcBlockLedger::GplLockWait};
     std::scoped_lock lock{mutex};
+    lock_wait.reset();
     auto& map = parts[part];
     if (const auto it = map.find(key); it != map.end()) {
         built = false;
         return *it->second;
     }
     built = true;
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::GplBuild};
     vk::UniquePipeline library = build();
     if (!library) {
         return {};

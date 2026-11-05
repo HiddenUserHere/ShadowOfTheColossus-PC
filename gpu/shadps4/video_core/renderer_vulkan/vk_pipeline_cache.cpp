@@ -46,6 +46,8 @@
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (SOTC_PIPE_DIRTY default, N5)
 #include "../../../sotc/predict_probe.h" // sotc: SOTC_PRETRANSLATE (pixel layouts)
 #include "../../../sotc/pipe_predict.h"  // sotc: SOTC_PIPE_PREDICT
+#include "../../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER
+#include "../../../sotc/nonblocking.h"  // sotc: SOTC_NB_* (non-blocking frame)
 #include "video_core/sotc_arch/addr_table.h" // sotc: ARCH-GCN-NATIVE (Init before the profile)
 #include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE (Profile::gcn_buf, gcn_tex)
 #include "bbport_threads.h"
@@ -674,11 +676,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // New pipelines (first visits) are saved every minute while playing: the game is often
         // closed by killing the process, which skips the destructor.
         driver_cache_saver = std::jthread([this](std::stop_token stop) {
-            std::mutex m;
-            std::condition_variable_any cv;
             while (!stop.stop_requested()) {
-                std::unique_lock lk{m};
-                cv.wait_for(lk, stop, std::chrono::seconds{60}, [] { return false; });
+                {
+                    // sotc: every 60 s, or now when RequestDriverCacheSave asks (SOTC_NB_IO).
+                    std::unique_lock lk{driver_cache_cv_mutex};
+                    driver_cache_cv.wait_for(lk, stop, std::chrono::seconds{60},
+                                             [this] { return driver_cache_save_requested; });
+                    driver_cache_save_requested = false;
+                }
                 if (!stop.stop_requested()) {
                     SaveDriverCache();
                 }
@@ -716,13 +721,27 @@ PipelineCache::~PipelineCache() {
     }
 }
 
+void PipelineCache::RequestDriverCacheSave() {
+    if (!driver_cache_saver.joinable()) {
+        SaveDriverCache();
+        return;
+    }
+    {
+        std::scoped_lock lk{driver_cache_cv_mutex};
+        driver_cache_save_requested = true;
+    }
+    driver_cache_cv.notify_all();
+}
+
 void PipelineCache::SaveDriverCache() {
     if (!DriverCacheEnabled() || !pipeline_cache) {
         return;
     }
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::DriverCacheSave};
     std::scoped_lock lk{driver_cache_save_mutex};
     size_t size = 0;
     const vk::Device device = instance.GetDevice();
+    std::optional<SotcBlockLedger::Scope> get_timer{std::in_place, SotcBlockLedger::DriverCacheGet};
     if (device.getPipelineCacheData(*pipeline_cache, &size, nullptr) != vk::Result::eSuccess ||
         size == 0 || size == saved_driver_cache_size) {
         return;
@@ -732,6 +751,7 @@ void PipelineCache::SaveDriverCache() {
         vk::Result::eSuccess) {
         return;
     }
+    get_timer.reset();
     data.resize(size);
     // Written next to it and renamed: a crash while writing keeps the old copy.
     const auto path = DriverCachePath();
@@ -1349,6 +1369,13 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                 --async_priority_queued;
             }
         }
+        if (job->lazy) { // sotc: SOTC_NB_IO pack load
+            RunLazyLoad(*job->lazy);
+            std::scoped_lock lock{async_mutex};
+            async_done.push_back(std::move(job));
+            async_done_count.fetch_add(1, std::memory_order_release);
+            continue;
+        }
         if (job->translate) {
             RunAsyncTranslate(*job->translate);
             std::scoped_lock lock{async_mutex};
@@ -1419,6 +1446,10 @@ void PipelineCache::CollectAsyncPipelines() {
     for (auto& job : done) {
         if (job->translate) {
             InstallTranslation(*job->translate);
+            continue;
+        }
+        if (job->lazy) { // sotc: SOTC_NB_IO pack load
+            InstallLazyLoad(*job->lazy);
             continue;
         }
         if (pipe_predict && !job->compute) { // sotc: SOTC_PIPE_PREDICT throttle
@@ -2369,10 +2400,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         GraphicsPipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, layout_cache, profile, graphics_key, *pipeline_cache,
-            infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+        {
+            const SotcBlockLedger::Scope ledger{SotcBlockLedger::PipeBuild};
+            it.value() = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, layout_cache, profile, graphics_key, *pipeline_cache,
+                infos,
+                runtime_infos, fetch_shader, modules, sdata, false);
+        }
         LogSyncPipeline("graphics",
                         async_workers.empty() ? "async off"
                         : tiny_draw           ? "tiny draw"
@@ -2457,10 +2491,13 @@ const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
         const bool deferred = !async_workers.empty() && AsyncComputeEnabled() &&
                               scheduler.HasRecordThread() && !EmulatorSettings.IsShaderCollect();
         const auto sync_start = std::chrono::steady_clock::now();
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap,
-                                                       layout_cache, profile, *pipeline_cache,
-                                                       compute_key, *infos[0],
-                                                       modules[0], sdata, false, deferred);
+        {
+            const SotcBlockLedger::Scope ledger{SotcBlockLedger::ComputeBuild};
+            it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap,
+                                                           layout_cache, profile, *pipeline_cache,
+                                                           compute_key, *infos[0],
+                                                           modules[0], sdata, false, deferred);
+        }
         if (deferred) {
             auto job = std::make_unique<AsyncPipelineJob>();
             job->compute = it.value().get();
@@ -3491,6 +3528,10 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
                                               std::vector<u32>* spv_out) {
     // sotc: N5. A shader translated on the command processor is a stall (not on a worker).
     const N5SyncScope n5_scope{N5Kind::Shader, N5Clock::now(), !worker_pools};
+    std::optional<SotcBlockLedger::Scope> ledger; // sotc: SOTC_BLOCK_LEDGER, inline translations only
+    if (!worker_pools) {
+        ledger.emplace(SotcBlockLedger::Translate);
+    }
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     // sotc: the frame columns are command-processor time; worker time is counted apart.
@@ -3976,6 +4017,9 @@ void PipelineCache::DrainPretranslate() {
             if (r.deferred_ns == 0) {
                 SotcPretranslate::NoteDropped(stage, 0);
             }
+            if (SotcNonBlocking::Io()) { // sotc: loaded from the pack by a worker before its first draw
+                QueueLazyPrefetch(r.hash);
+            }
             continue;
         }
         const HwStage hw = stage == 1 ? HwStage::Vertex : HwStage::Fragment;
@@ -4123,6 +4167,9 @@ void PipelineCache::QueueComputePrebuild(SotcPretranslate::Request& r) {
     const ComputePipelineKey key{HashCombine(r.hash, size_t{0})};
     if (IsProgramKnown(r.hash) || lazy_programs.contains(r.hash) || compute_pipelines.contains(key)) {
         SotcPretranslate::NoteDropped(2, 0); // known: a warm session has it (as the other requests)
+        if (SotcNonBlocking::Io()) { // sotc: loaded from the pack by a worker before its first dispatch
+            QueueLazyPrefetch(r.hash);
+        }
         return;
     }
     // A heap profile looks up the heap variant first (RefreshComputeKey): its key is not the plain one made here.
@@ -4322,7 +4369,13 @@ void PipelineCache::MaybeHoldForPretranslate() {
     }
     pre_holding = false;
     PrePackFinish(); // the variants of the hold, in one file; read back for their first draws
-    SaveDriverCache(); // sotc: the driver's pipelines of the hold are written now, not at the 60 s timer
+    // sotc: the driver's pipelines of the hold are written now, not at the 60 s timer. SOTC_NB_IO: by the saver
+    // thread, so the hold screen does not wait for it (17.6 s on the CP in the P0 baseline).
+    if (SotcNonBlocking::Io()) {
+        RequestDriverCacheSave();
+    } else {
+        SaveDriverCache();
+    }
     SotcStats::prep_active.store(false, std::memory_order_release); // the screen goes away
     SaveShaderIndex();
     // The programs no draw used yet leave memory: their modules are destroyed and they go back to the index on disk,

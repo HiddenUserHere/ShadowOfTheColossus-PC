@@ -53,6 +53,7 @@
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
+#include "../../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER
 
 namespace Vulkan {
 
@@ -1966,11 +1967,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             }
             // sotc: SOTC_DRAW_WORK: the draw thread's ops of this frame; taken every frame so the count restarts.
             const SotcStats::FrameDrawOps frame_ops = SotcStats::TakeFrameDrawOps();
+            // sotc: SOTC_BLOCK_LEDGER: the frame threads' inline secondary work of this frame (taken every frame).
+            const std::string ledger_text = SotcBlockLedger::kOn ? SotcBlockLedger::TakeFrameText() : std::string{};
             if (last_us >= 0 && now_us - last_us > stall_us) {
                 std::fprintf(stderr,
                              "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
                              "(%.0f ms), images %llu (%.0f ms: query %.0f, alloc %.0f, %llu dedicated), "
-                             "readbacks %llu (%.0f ms), ops %llu (draws %llu, dispatches %llu)%s\n",
+                             "readbacks %llu (%.0f ms), ops %llu (draws %llu, dispatches %llu)%s%s\n",
                              static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
                              static_cast<unsigned long long>(cur[0] - last[0]), (cur[1] - last[1]) / 1e6,
                              static_cast<unsigned long long>(cur[2] - last[2]), (cur[3] - last[3]) / 1e6,
@@ -1982,7 +1985,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                              static_cast<unsigned long long>(frame_ops.draws + frame_ops.dispatches),
                              static_cast<unsigned long long>(frame_ops.draws),
                              static_cast<unsigned long long>(frame_ops.dispatches),
-                             account_text);
+                             account_text, ledger_text.c_str());
             }
             last_us = now_us;
             std::copy(std::begin(cur), std::end(cur), std::begin(last));

@@ -25,6 +25,7 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#include "../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER
 
 namespace {
 
@@ -462,7 +463,9 @@ void DataBase::Clear() {
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
     {
-        auto request = std::packaged_task<void()>{[=]() {
+        // sotc: the blob is moved into the request (it was copied, on the caller's thread: the command processor for
+        // most saves, SOTC_BLOCK_LEDGER "storage save").
+        auto request = std::packaged_task<void()>{[type, path_ = std::move(path_), v = std::move(v)]() {
             auto path{path_};
             path.replace_extension(GetBlobFileExtension(type));
             if (EmulatorSettings.IsPipelineCacheArchived()) {
@@ -536,6 +539,7 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& da
     if (!opened) {
         return false;
     }
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::StorageSave};
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
@@ -549,6 +553,7 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& d
     if (!opened) {
         return false;
     }
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::StorageSave};
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
@@ -562,6 +567,7 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
     if (!opened) {
         return;
     }
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::StorageLoad};
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
@@ -590,6 +596,7 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
     if (!opened) {
         return;
     }
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::StorageLoad};
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;

@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "../../../sotc/predict_probe.h" // sotc: SOTC_PREDICT_PROBE
+#include "../../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER
 #include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE (ShaderBinaryVersion, profile bytes)
 
 namespace Serialization {
@@ -180,11 +181,21 @@ bool IsCollidedPerm(size_t perm_hash) {
 // left it. Before, it still counted as taken, so the permutation was left out of the cache and the
 // slot's meta was never rewritten: the shader was translated again every session, its pipelines
 // counted as stale at every start.
+} // namespace
+namespace {
+// sotc: a stage of the SOTC_PRETRANSLATE pack by its stage hash (HashCombine(program hash, permutation)), for the
+// readers that find no loose file (the pack loads no longer write loose copies). Defined with the pack below.
+bool PackStageMeta(u64 stage_hash, std::vector<u8>& meta);
+bool PackStageSpv(u64 stage_hash, std::vector<u32>& spv);
+
 bool SlotHasCurrentMeta(u64 pgm_hash, size_t perm_idx) {
     std::vector<u8> blob;
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
                                        fmt::format("{:#018x}", HashCombine(pgm_hash, u64(perm_idx))),
                                        blob);
+    if (blob.empty()) {
+        PackStageMeta(HashCombine(pgm_hash, u64(perm_idx)), blob); // a pack slot is taken too
+    }
     if (blob.empty()) {
         return false;
     }
@@ -354,6 +365,7 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::RegisterBinary};
 
     const auto name = fmt::format("{:#018x}_{}", pgm_hash, perm_idx);
     if (!EmulatorSettings.IsPipelineCacheArchived()) {
@@ -442,6 +454,9 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     std::vector<u8> meta_blob;
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
                                        fmt::format("{:#018x}", compute_key.value), meta_blob);
+    if (meta_blob.empty()) {
+        PackStageMeta(compute_key.value, meta_blob); // sotc: a stage of the pretranslate pack
+    }
     if (meta_blob.empty()) {
         return false;
     }
@@ -565,6 +580,9 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
                                            fmt::format("{:#018x}", hash), meta_blob);
         if (meta_blob.empty()) {
+            PackStageMeta(hash, meta_blob); // sotc: a stage of the pretranslate pack
+        }
+        if (meta_blob.empty()) {
             g_cache_diag[0].fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -627,6 +645,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         Storage::DataBase::Instance().Load(
             Storage::BlobType::ShaderBinary,
             fmt::format("{:#018x}_{}", program->info.CacheHash(), perm_idx), spv);
+        if (spv.empty()) { // sotc: a stage of the pretranslate pack
+            PackStageSpv(HashCombine(program->info.CacheHash(), u64(perm_idx)), spv);
+        }
     }
     if (spv.empty()) {
         if (g_cache_diag[3].fetch_add(1, std::memory_order_relaxed) < 6) {
@@ -812,6 +833,7 @@ void PipelineCache::WarmUp() {
         }
     }
 
+    PrePackLoad(); // sotc: the warm-up reads the stages that have no loose file from the pretranslate pack
     u32 num_pipelines{};
     u32 num_total_pipelines{};
     const auto warmup_start = std::chrono::steady_clock::now();
@@ -937,6 +959,7 @@ void PipelineCache::LoadShaderIndex() {
 }
 
 void PipelineCache::SaveShaderIndex() {
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::ShaderIndex};
     std::vector<u32> data;
     {
         std::scoped_lock lock{g_index_mutex};
@@ -973,14 +996,49 @@ bool g_pack_closed = false; // finished (or failed) this session: no second writ
 std::vector<PackEntry> g_pack_written;
 std::FILE* g_pack_in = nullptr;
 std::unordered_map<u64, std::vector<PackEntry>> g_pack_index;
+std::unordered_map<u64, PackEntry> g_pack_by_stage; ///< HashCombine(hash, perm) -> entry (PackStageMeta / PackStageSpv)
+// sotc: SOTC_NB_IO: pack loads also run on workers (RunLazyLoad); reads and the reopen of g_pack_in take this lock.
+std::mutex g_pack_mutex;
+// sotc: SOTC_NB_IO counters (CP), printed every 5 s by InstallLazyLoad.
+struct LazyStats {
+    u64 queued{}, installed{}, already_loaded{}, dropped{}, read_failed{};
+    std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
+} g_lazy_stats;
 
 std::filesystem::path PackPath() {
     return Storage::DataBase::Instance().CachePath() / "sotc_pretranslate.pack";
 }
 
 bool PackRead(u64 offset, void* out, size_t n) {
+    std::scoped_lock lock{g_pack_mutex};
     return g_pack_in && _fseeki64(g_pack_in, static_cast<s64>(offset), SEEK_SET) == 0 &&
            std::fread(out, 1, n, g_pack_in) == n;
+}
+
+bool PackStageMeta(u64 stage_hash, std::vector<u8>& meta) {
+    const auto it = g_pack_by_stage.find(stage_hash);
+    if (it == g_pack_by_stage.end()) {
+        return false;
+    }
+    meta.resize(it->second.meta_size);
+    if (!PackRead(it->second.offset, meta.data(), it->second.meta_size)) {
+        meta.clear();
+        return false;
+    }
+    return true;
+}
+
+bool PackStageSpv(u64 stage_hash, std::vector<u32>& spv) {
+    const auto it = g_pack_by_stage.find(stage_hash);
+    if (it == g_pack_by_stage.end()) {
+        return false;
+    }
+    spv.resize(it->second.spv_size / sizeof(u32));
+    if (!PackRead(it->second.offset + it->second.meta_size, spv.data(), it->second.spv_size)) {
+        spv.clear();
+        return false;
+    }
+    return true;
 }
 } // namespace
 
@@ -1042,11 +1100,15 @@ void PipelineCache::PrePackFinish() {
 }
 
 void PipelineCache::PrePackLoad() {
-    if (g_pack_in) {
-        std::fclose(g_pack_in);
-        g_pack_in = nullptr;
+    {
+        std::scoped_lock lock{g_pack_mutex};
+        if (g_pack_in) {
+            std::fclose(g_pack_in);
+            g_pack_in = nullptr;
+        }
     }
     g_pack_index.clear();
+    g_pack_by_stage.clear();
     std::FILE* f = std::fopen(PackPath().string().c_str(), "rb");
     if (!f) {
         return;
@@ -1072,15 +1134,20 @@ void PipelineCache::PrePackLoad() {
         }
         auto& list = g_pack_index[e.hash];
         list.push_back(e);
+        g_pack_by_stage[HashCombine(e.hash, u64{e.perm})] = e;
         auto& known = lazy_programs[e.hash];
         known = std::max(known, e.perm + 1);
     }
-    g_pack_in = f;
+    {
+        std::scoped_lock lock{g_pack_mutex};
+        g_pack_in = f;
+    }
     std::fprintf(stderr, "SOTC PRETRANSLATE pack: %zu programs ready on disk\n", g_pack_index.size());
 }
 
 bool PipelineCache::LoadLazyProgram(u64 hash) {
     const auto entry = lazy_programs.find(hash);
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::LazyLoad};
     if (entry == lazy_programs.end()) {
         return false;
     }
@@ -1110,14 +1177,8 @@ bool PipelineCache::LoadLazyProgram(u64 hash) {
                 }
                 break;
             }
-            if (!meta_blob.empty()) {
-                // The pipeline warm-up of the next sessions reads loose files: the variant a draw uses gets them now.
-                Storage::DataBase::Instance().Save(Storage::BlobType::ShaderMeta,
-                                                   fmt::format("{:#018x}", HashCombine(hash, u64{idx})),
-                                                   std::vector<u8>(meta_blob));
-                Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
-                                                   fmt::format("{:#018x}_{}", hash, idx), std::vector<u32>(packed_spv));
-            }
+            // sotc: no loose copies: the pipeline warm-up of the next sessions reads the stages from the pack when
+            // a loose file is missing (PackStageMeta / PackStageSpv).
         }
         if (meta_blob.empty()) {
             Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
@@ -1146,28 +1207,164 @@ bool PipelineCache::LoadLazyProgram(u64 hash) {
         if (spv.empty()) {
             continue;
         }
-        auto [it_pgm, is_new] = program_cache.try_emplace(hash);
-        // sotc: a permutation whose resources differ from the program's would be drawn with descriptors written for
-        // the program's Info (SameBindingLayout): it is not loaded (a draw that needs it translates it again).
-        if (!is_new && !SameBindingLayout(it_pgm.value()->info, program->info)) {
-            static std::atomic<u32> logged{0};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                std::fprintf(stderr, "SOTC SHADER CACHE: permutation %u of %#llx not loaded, its resources differ from "
-                             "the program's\n", idx, static_cast<unsigned long long>(hash));
-            }
+        AsyncPipelineJob::LazyLoad::Perm perm{idx, std::move(program), std::move(spec), {}};
+        const auto existing_pgm = program_cache.find(hash);
+        if (existing_pgm != program_cache.end() && !SameBindingLayout(existing_pgm.value()->info, perm.program->info)) {
+            InstallLazyPerm(hash, perm); // logs and refuses it, without creating the module
             continue;
         }
-        const vk::ShaderModule module = CompileSPV(spv, instance.GetDevice());
-        if (is_new) {
-            it_pgm.value() = std::move(program);
-        } else {
-            Shader::CombineBindlessCache(it_pgm.value()->info.bindless, program->info.bindless);
+        perm.module = CompileSPV(spv, instance.GetDevice());
+        if (InstallLazyPerm(hash, perm)) {
+            loaded = true;
+        } else if (perm.module) {
+            instance.GetDevice().destroyShaderModule(perm.module);
         }
-        spec.info = &it_pgm.value()->info;
-        it_pgm.value()->InsertPermut(module, std::move(spec), idx);
-        loaded = true;
     }
     return loaded;
+}
+
+bool PipelineCache::InstallLazyPerm(u64 hash, AsyncPipelineJob::LazyLoad::Perm& perm) {
+    auto [it_pgm, is_new] = program_cache.try_emplace(hash);
+    // sotc: a permutation whose resources differ from the program's would be drawn with descriptors written for
+    // the program's Info (SameBindingLayout): it is not loaded (a draw that needs it translates it again).
+    if (!is_new && !SameBindingLayout(it_pgm.value()->info, perm.program->info)) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::fprintf(stderr, "SOTC SHADER CACHE: permutation %u of %#llx not loaded, its resources differ from "
+                         "the program's\n", perm.idx, static_cast<unsigned long long>(hash));
+        }
+        return false;
+    }
+    if (!perm.module) {
+        if (is_new) {
+            program_cache.erase(hash);
+        }
+        return false;
+    }
+    if (is_new) {
+        it_pgm.value() = std::move(perm.program);
+    } else {
+        Shader::CombineBindlessCache(it_pgm.value()->info.bindless, perm.program->info.bindless);
+    }
+    perm.spec.info = &it_pgm.value()->info;
+    it_pgm.value()->InsertPermut(perm.module, std::move(perm.spec), perm.idx);
+    perm.module = vk::ShaderModule{}; // owned by the program now
+    return true;
+}
+
+bool PipelineCache::QueueLazyPrefetch(u64 hash) {
+    const auto lazy = lazy_programs.find(hash);
+    if (lazy == lazy_programs.end() || lazy_prefetch.contains(hash) || async_workers.empty()) {
+        return false;
+    }
+    const auto packed = g_pack_index.find(hash);
+    if (packed == g_pack_index.end()) {
+        return false; // loose files only: its first draw loads it (Storage reads stay on the command processor)
+    }
+    auto load = std::make_unique<AsyncPipelineJob::LazyLoad>();
+    load->hash = hash;
+    for (u32 idx = 0; idx < lazy->second; ++idx) {
+        const auto e = std::ranges::find(packed->second, idx, &PackEntry::perm);
+        if (e == packed->second.end()) {
+            return false; // a permutation outside the pack: the first draw loads them all
+        }
+        load->entries.push_back({e->perm, e->offset, e->meta_size, e->spv_size});
+    }
+    auto job = std::make_unique<AsyncPipelineJob>();
+    job->lazy = std::move(load);
+    lazy_prefetch.insert(hash);
+    ++g_lazy_stats.queued;
+    lazy_backlog.push_back(std::move(job));
+    FeedLazyPrefetch();
+    return true;
+}
+
+void PipelineCache::FeedLazyPrefetch() {
+    // At most 2 pack loads on the workers: the rest of the workers stay free for the jobs the frame waits for
+    // (compute pipelines, translations). The first P1 run gave every worker to 11,465 loads at once.
+    constexpr u32 kInFlight = 2;
+    bool fed = false;
+    while (lazy_in_flight < kInFlight && !lazy_backlog.empty()) {
+        {
+            std::scoped_lock lock{async_mutex};
+            async_queue.push_back(std::move(lazy_backlog.front())); // behind the draws' own jobs
+        }
+        lazy_backlog.pop_front();
+        ++lazy_in_flight;
+        fed = true;
+    }
+    if (fed) {
+        async_cv.notify_all();
+    }
+}
+
+void PipelineCache::RunLazyLoad(AsyncPipelineJob::LazyLoad& load) {
+    for (const auto& e : load.entries) {
+        std::vector<u8> meta_blob(e.meta_size);
+        std::vector<u32> spv(e.spv_size / sizeof(u32));
+        if (!PackRead(e.offset, meta_blob.data(), e.meta_size) ||
+            !PackRead(e.offset + e.meta_size, spv.data(), e.spv_size)) {
+            continue;
+        }
+        // No loose copies (the warm-up reads the pack, PackStageMeta / PackStageSpv).
+        AsyncPipelineJob::LazyLoad::Perm perm;
+        perm.idx = e.perm;
+        perm.program = std::make_unique<Program>();
+        perm.spec.info = &perm.program->info;
+        size_t perm_idx{};
+        try {
+            Serialization::Archive ar{std::move(meta_blob)};
+            if (!LoadShaderMeta(ar, perm.program->info, perm.spec, perm_idx) || perm_idx != e.perm) {
+                continue;
+            }
+        } catch (...) {
+            continue;
+        }
+        perm.module = CompileSPV(spv, instance.GetDevice());
+        load.perms.push_back(std::move(perm));
+    }
+}
+
+void PipelineCache::InstallLazyLoad(AsyncPipelineJob::LazyLoad& load) {
+    lazy_prefetch.erase(load.hash);
+    if (lazy_in_flight > 0) {
+        --lazy_in_flight;
+    }
+    FeedLazyPrefetch();
+    // A draw that came first loaded the program inline (LoadLazyProgram erased its entry): its permutations are there.
+    lazy_programs.erase(load.hash);
+    if (load.perms.size() < load.entries.size()) {
+        ++g_lazy_stats.read_failed;
+    }
+    for (auto& perm : load.perms) {
+        const auto existing = program_cache.find(load.hash);
+        if (existing != program_cache.end() && perm.idx < existing.value()->modules.size() &&
+            existing.value()->modules[perm.idx].module) {
+            ++g_lazy_stats.already_loaded;
+        } else if (InstallLazyPerm(load.hash, perm)) {
+            ++g_lazy_stats.installed;
+            continue;
+        } else {
+            ++g_lazy_stats.dropped;
+        }
+        if (perm.module) {
+            instance.GetDevice().destroyShaderModule(perm.module);
+            perm.module = vk::ShaderModule{};
+        }
+    }
+    // A permutation the worker could not read is left to the program's draws (translated again if needed).
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_lazy_stats.last >= std::chrono::seconds(5)) {
+        g_lazy_stats.last = now;
+        std::fprintf(stderr,
+                     "SOTC NB IO: pack prefetch queued %llu, permutations installed %llu, already loaded by a draw "
+                     "%llu, refused %llu, programs with a read failure %llu, queued or running %zu\n",
+                     static_cast<unsigned long long>(g_lazy_stats.queued),
+                     static_cast<unsigned long long>(g_lazy_stats.installed),
+                     static_cast<unsigned long long>(g_lazy_stats.already_loaded),
+                     static_cast<unsigned long long>(g_lazy_stats.dropped),
+                     static_cast<unsigned long long>(g_lazy_stats.read_failed), lazy_prefetch.size());
+    }
 }
 
 void PipelineCache::Sync() {

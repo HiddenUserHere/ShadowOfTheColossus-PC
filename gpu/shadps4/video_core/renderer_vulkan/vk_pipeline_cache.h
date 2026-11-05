@@ -477,6 +477,27 @@ private:
             bool first_variant{};   ///< the job that may queue the synthetic variant 1
         };
         std::unique_ptr<Translate> translate; ///< a translation job
+
+        /// sotc: SOTC_NB_IO: a program of the pretranslate pack, loaded by a worker (RunLazyLoad: pack read, meta,
+        /// module) and installed by the command processor (InstallLazyLoad), instead of at its first draw.
+        struct LazyLoad {
+            struct Entry {
+                u32 perm{};
+                u64 offset{};
+                u32 meta_size{};
+                u32 spv_size{};
+            };
+            struct Perm {
+                u32 idx{};
+                std::unique_ptr<Program> program;
+                Shader::StageSpecialization spec{};
+                vk::ShaderModule module{};
+            };
+            u64 hash{};
+            std::vector<Entry> entries; ///< every permutation of the program, from the pack index
+            std::vector<Perm> perms;    ///< the ones the worker read
+        };
+        std::unique_ptr<LazyLoad> lazy; ///< a pack load job
     };
     bool AsyncPipelineEligible() const;
     void QueueAsyncPipeline(u64 hash,
@@ -533,6 +554,21 @@ private:
     /// on the port's loading screen with a progress bar until they are all in the cache.
     void MaybeHoldForPretranslate();
     void CollectAsyncPipelines();
+    /// sotc: SOTC_NB_IO. Command processor: queues the pack load of a program the game announced (pretranslate
+    /// request of a known program) when it is still in the pack. False when nothing was queued.
+    bool QueueLazyPrefetch(u64 hash);
+    /// sotc: SOTC_NB_IO. Worker: reads the job's permutations from the pack and creates their modules.
+    void RunLazyLoad(AsyncPipelineJob::LazyLoad& load);
+    /// sotc: SOTC_NB_IO. Command processor: installs a finished pack load (the permutations a draw did not load
+    /// meanwhile).
+    void InstallLazyLoad(AsyncPipelineJob::LazyLoad& load);
+    /// sotc: installs one loaded permutation (LoadLazyProgram and InstallLazyLoad). False when it was not installed;
+    /// the caller then destroys its module.
+    bool InstallLazyPerm(u64 hash, AsyncPipelineJob::LazyLoad::Perm& perm);
+    /// sotc: SOTC_NB_IO. Wakes the saver thread to save the driver cache now (inline when there is no saver).
+    void RequestDriverCacheSave();
+    /// sotc: SOTC_NB_IO. Moves pack loads from lazy_backlog to the workers, at most 2 at a time.
+    void FeedLazyPrefetch();
     /// sotc: SOTC_PIPE_PREDICT (gpu/sotc/pipe_predict.h). Command processor, before a draw's key is built: reads the
     /// queued materials and queues the pipelines of their pass slots whose pass template is known.
     void PredictPipelines();
@@ -566,6 +602,10 @@ private:
     vk::UniquePipelineCache pipeline_cache;
     size_t saved_driver_cache_size{};
     std::mutex driver_cache_save_mutex;
+    /// sotc: SOTC_NB_IO: RequestDriverCacheSave wakes the saver (declared before it: it outlives the thread).
+    std::mutex driver_cache_cv_mutex;
+    std::condition_variable_any driver_cache_cv;
+    bool driver_cache_save_requested{};
     std::jthread driver_cache_saver;
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
@@ -618,6 +658,10 @@ private:
     std::unordered_set<u64> pre_pending;
     /// sotc: programs of the shader cache index not loaded yet (CP only): hash -> permutations on disk.
     std::unordered_map<u64, u32> lazy_programs;
+    /// sotc: SOTC_NB_IO (CP only): programs whose pack load is queued or running on a worker.
+    std::unordered_set<u64> lazy_prefetch;
+    std::deque<std::unique_ptr<AsyncPipelineJob>> lazy_backlog; ///< sotc: SOTC_NB_IO pack loads not on a worker yet
+    u32 lazy_in_flight{};                                       ///< sotc: SOTC_NB_IO pack loads on the workers
     std::deque<std::unique_ptr<AsyncPipelineJob>> pre_backlog; ///< sotc: pre-translation jobs not given to workers
     u32 pre_in_flight{};                                       ///< sotc: pre-translation jobs on the workers
     bool pre_holding{};                                        ///< sotc: the boot hold is waiting for them
