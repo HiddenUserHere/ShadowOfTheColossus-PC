@@ -99,13 +99,23 @@ struct Program {
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
         modules.emplace_back(module, std::move(spec));
+        if (new_perm_log) {
+            new_perm_log->emplace_back(info.CacheHash(), modules.size() - 1);
+        }
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                       size_t perm_idx) {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         modules[perm_idx] = {module, std::move(spec)};
+        if (new_perm_log) {
+            new_perm_log->emplace_back(info.CacheHash(), perm_idx);
+        }
     }
+
+    /// sotc: SOTC_NB_GPL (P4): every new permutation (program cache hash, index), for the library warm-up. Programs get
+    /// modules on the command processor only; null when the warm-up is off.
+    static inline std::vector<std::pair<u64, size_t>>* new_perm_log = nullptr;
 };
 
 struct DrawIndirectParams {
@@ -206,7 +216,7 @@ public:
 
     /// sotc: writes the driver's compiled pipelines to disk (sotc_vk_pipelines.bin), so the next
     /// start, also after an update of the port, does not compile them again.
-    void SaveDriverCache();
+    void SaveDriverCache(bool final_save = false);
     void Sync();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
@@ -439,6 +449,9 @@ private:
         /// sotc: SOTC_NB_GPL: a link job. The worker builds the missing per-shader libraries and links them (the
         /// fast pipeline the draws use until the optimized build of the same key replaces it).
         bool link_only{};
+        /// sotc: SOTC_NB_GPL (P4): a library warm-up job: a link job whose only purpose is building the new shader's
+        /// library ahead of its first draw; its linked pipeline is dropped.
+        bool warm_lib{};
         ComputePipeline* compute{}; ///< a compute job: only Build() is run
         bool priority{}; ///< sotc: a depth-only (shadow) graphics job queued ahead of the others
         bool pre_compute{}; ///< sotc: SOTC_PRETRANSLATE_COMPUTE: a prebuilt compute pipeline (its build counts as done)
@@ -607,6 +620,11 @@ private:
     void RequestDriverCacheSave();
     /// sotc: SOTC_NB_GPL. Queues a link job for the current key (translate lane: draws wait for it).
     void QueueLinkJob();
+    /// sotc: SOTC_NB_GPL (P4). Command processor: queues library warm-up jobs for new vertex and pixel permutations,
+    /// using the last drawn vertex+pixel pipeline as the template for the rest of the state.
+    void FeedWarmLibraries();
+    /// sotc: SOTC_NB_GPL (P4). Command processor: the current draw's VS+PS state becomes the warm-up template.
+    void NoteWarmTemplate();
     /// sotc: SOTC_NB_IO. Moves pack loads from lazy_backlog to the workers, at most 2 at a time.
     void FeedLazyPrefetch();
     /// sotc: SOTC_PIPE_PREDICT (gpu/sotc/pipe_predict.h). Command processor, before a draw's key is built: reads the
@@ -683,6 +701,16 @@ private:
     /// a pipeline the command processor built itself. Entries leave when the job is collected.
     std::unordered_map<GraphicsPipelineKey, AsyncPipelineJob*> queued_graphics;
     std::unordered_set<GraphicsPipelineKey> link_pending; ///< sotc: SOTC_NB_GPL link jobs not collected (CP only)
+    /// sotc: SOTC_NB_GPL (P4) warm-up state (CP only).
+    struct WarmTemplate {
+        bool valid{};
+        GraphicsPipelineKey key{};
+        u64 vs_hash{}, ps_hash{};
+        size_t vs_perm{}, ps_perm{};
+    } warm_template;
+    std::vector<std::pair<u64, size_t>> warm_log;        ///< new permutations not warmed yet (Program::new_perm_log)
+    std::unordered_set<u64> warm_done;                    ///< HashCombine(hash, perm) already queued
+    u64 warm_queued{}, warm_built{}, warm_skipped{};
     /// sotc: compute pipelines of the boot preload built by the workers (SOTC_ASYNC_PRELOAD);
     /// WarmUp waits for them and drops the ones the driver refused, as it does when it builds
     /// them itself.

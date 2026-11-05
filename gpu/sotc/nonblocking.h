@@ -37,4 +37,11 @@ inline bool Gpl() {
     return on;
 }
 
+/// P4 (SOTC_NB_WARM=1, with SOTC_NB_GPL): libraries of new vertex and pixel shaders built ahead of their first draw on
+/// background workers. Measured slower on the first session (the warm-up takes workers and CPU the frame needs); off.
+inline bool Warm() {
+    static const bool on = SwitchOn("SOTC_NB_WARM");
+    return on;
+}
+
 } // namespace SotcNonBlocking

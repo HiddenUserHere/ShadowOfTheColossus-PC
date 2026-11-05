@@ -198,3 +198,46 @@ Run `gpl3_cold.log` / `gpl3_warm.log` (salt 80) against `gpl2_*`:
 The inline cost moved from whole pipelines to libraries but hardly shrank: these draws' libraries take 22-53 ms each
 (not the 17 ms average), and the full-screen passes use many distinct pixel shaders. What is left for the first
 session is building those libraries before the draw: P4.
+
+## P4. Libraries ahead of the draw (`SOTC_NB_WARM=1`): gate failed, off
+
+Built: every new vertex or pixel permutation (`Program::AddPermut` / `InsertPermut` log it once the boot hold's
+eviction is past) gets a warm-up job in the background lane: a link job on the last drawn VS+PS pipeline with the
+new shader in its stage, so the worker builds just that shader's library; the linked pipeline is dropped
+(`FeedWarmLibraries`, `NoteWarmTemplate`).
+
+Cold run with P1+P2+P3 on (`user/nb4/gpl4_cold.log`, salt 81) against P3 without it (`user/nb3/gpl3_cold.log`):
+
+| | P3 | P3 + warm-up |
+|---|---|---|
+| route p50 / p99 / max | 33.5 / 242.5 / 349.5 ms | 41.8 / 290.1 / 423.1 ms |
+| frames over 50 / 100 ms | 26 / 7 | 52 / 14 |
+| graphics job wait, third gameplay window | 0.3-0.9 s | 2.96 s avg |
+
+The warm-up built 2,167 libraries (27 s of worker time) on half the workers; the graphics jobs the frame needed
+waited longer, and the frame threads got less CPU (the same pattern as the material prediction of 3c). It also came
+too late for the first full-screen passes, which appear right after the boot hold: the command processor still
+built ~1.6 s of libraries inline. Kept behind its own switch, off; `SOTC_NB_GPL` alone is P3 as measured.
+
+## P5. The driver cache file
+
+P5.0, two warm sessions on the same port cache (salt 73, P1 on): `user/nb5/dc_off.log` (`SOTC_DRIVER_CACHE=0`) and
+`dc_on.log` (default):
+
+| warm session | app file off | app file on |
+|---|---|---|
+| compute / graphics driver time | 14.8 / 2.9 s | 23.5 / 5.0 s |
+| graphics driver cache hits | 287 | 286 |
+| route p50 / p99 / max | 33.3 / 42.4 / 58.2 ms | 33.3 / 34.2 / 57.9 ms |
+| session length | 26 s | 50 s (1.8 GB read at start, 1.9 GB written) |
+| save on the saver thread | - | 25.1 s (vkGetPipelineCacheData 0.6 s, the file write 24.5 s) |
+
+On NVIDIA the driver's own disk cache served the pipelines without the app file (it survived a rebuild of
+`bb-probe.exe` at the same path: `dc_off` ran right after one). The port keeps the file because, per the comment at
+its load, "the driver's own cache is tied to the executable": a release in a new folder was not measured, so the
+file stays on.
+
+Done: the periodic saves rewrite the file only when it grew by 5% or 64 MiB (`SaveDriverCache(final_save)`; the save
+at shutdown writes any growth; `SOTC_DRIVER_CACHE_ALWAYS=1` keeps the old rule). Warm session `dc_on2.log`: no rewrite
+(0 ms), session 23 s. Open: turning the file off by default on the NVIDIA driver needs the new-folder release case
+measured first.

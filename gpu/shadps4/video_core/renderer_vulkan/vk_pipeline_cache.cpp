@@ -717,7 +717,7 @@ PipelineCache::~PipelineCache() {
     if (driver_cache_saver.joinable()) {
         driver_cache_saver.request_stop();
         driver_cache_saver.join();
-        SaveDriverCache();
+        SaveDriverCache(true);
     }
 }
 
@@ -733,7 +733,7 @@ void PipelineCache::RequestDriverCacheSave() {
     driver_cache_cv.notify_all();
 }
 
-void PipelineCache::SaveDriverCache() {
+void PipelineCache::SaveDriverCache(bool final_save) {
     if (!DriverCacheEnabled() || !pipeline_cache) {
         return;
     }
@@ -744,6 +744,17 @@ void PipelineCache::SaveDriverCache() {
     std::optional<SotcBlockLedger::Scope> get_timer{std::in_place, SotcBlockLedger::DriverCacheGet};
     if (device.getPipelineCacheData(*pipeline_cache, &size, nullptr) != vk::Result::eSuccess ||
         size == 0 || size == saved_driver_cache_size) {
+        return;
+    }
+    // sotc: P5 of the non-blocking frame. The file is rewritten whole (1.9 GB, 25 s of disk writes on the saver thread
+    // in a warm session), so the periodic saves wait until it grew by 5% or 64 MiB; the save at shutdown writes any
+    // growth. SOTC_DRIVER_CACHE_ALWAYS=1 keeps the old rule (any growth).
+    static const bool always = [] {
+        const char* v = std::getenv("SOTC_DRIVER_CACHE_ALWAYS");
+        return v && v[0] == '1';
+    }();
+    if (!final_save && !always && saved_driver_cache_size != 0 && size > saved_driver_cache_size &&
+        size - saved_driver_cache_size < std::max<size_t>(size_t{64} << 20, saved_driver_cache_size / 20)) {
         return;
     }
     std::vector<u8> data(size);
@@ -1294,11 +1305,11 @@ namespace {
 // being made and a worker taking them, and how long they ran. Workers add; the command processor prints every 5 s.
 enum JobClass : u8 {
     JobCompute, JobComputePrebuild, JobTranslate, JobPretranslate, JobTiny, JobShadow, JobGraphics, JobPreload,
-    JobLazy, JobPredict, JobLink, JobClassCount
+    JobLazy, JobPredict, JobLink, JobWarm, JobClassCount
 };
 constexpr std::array<const char*, JobClassCount> kJobClassNames{
     "compute", "compute prebuild", "translate", "pretranslate", "tiny", "shadow", "graphics", "preload", "pack load",
-    "predicted", "gpl link",
+    "predicted", "gpl link", "gpl warm",
 };
 // sotc: SOTC_NB_SCHED counters, printed with the job queue report.
 std::atomic<u64> g_sched_cancelled{0}, g_sched_demand{0};
@@ -1417,6 +1428,109 @@ void PipelineCache::QueueLinkJob() {
     async_cv.notify_one();
 }
 
+void PipelineCache::NoteWarmTemplate() {
+    const auto* vs = infos[u32(Shader::SwStage::Vertex)];
+    const auto* ps = infos[u32(Shader::SwStage::Fragment)];
+    if (!vs || !ps) {
+        return;
+    }
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        if (i != u32(Shader::SwStage::Vertex) && i != u32(Shader::SwStage::Fragment) && infos[i]) {
+            return;
+        }
+    }
+    const auto perm_of = [](u64 stage_hash, u64 hash) -> std::optional<size_t> {
+        for (size_t p = 0; p < Program::MaxPermutations; ++p) {
+            if (HashCombine(hash, u64{p}) == stage_hash) {
+                return p;
+            }
+        }
+        return std::nullopt;
+    };
+    const auto vp = perm_of(graphics_key.stage_hashes[u32(Shader::SwStage::Vertex)], vs->CacheHash());
+    const auto pp = perm_of(graphics_key.stage_hashes[u32(Shader::SwStage::Fragment)], ps->CacheHash());
+    if (!vp || !pp) {
+        return;
+    }
+    warm_template = {true, graphics_key, vs->CacheHash(), ps->CacheHash(), *vp, *pp};
+}
+
+void PipelineCache::FeedWarmLibraries() {
+    // The log starts once the boot hold evicted the programs no draw used (their modules are destroyed there).
+    if (!Program::new_perm_log) {
+        if (!pre_hold_done || pre_holding) {
+            return;
+        }
+        Program::new_perm_log = &warm_log;
+        return;
+    }
+    if (!warm_template.valid || warm_log.empty()) {
+        return;
+    }
+    const auto tpl_vs = program_cache.find(warm_template.vs_hash);
+    const auto tpl_ps = program_cache.find(warm_template.ps_hash);
+    if (tpl_vs == program_cache.end() || tpl_ps == program_cache.end() ||
+        warm_template.vs_perm >= tpl_vs.value()->modules.size() ||
+        warm_template.ps_perm >= tpl_ps.value()->modules.size()) {
+        warm_template.valid = false; // the template's programs left: the next new draw gives another
+        return;
+    }
+    // A few per draw: each is a job for a worker (background lane), the command processor only fills it.
+    for (int n = 0; n < 4 && !warm_log.empty(); ++n) {
+        const auto [hash, perm] = warm_log.back();
+        warm_log.pop_back();
+        if (!warm_done.insert(HashCombine(hash, u64{perm})).second) {
+            continue;
+        }
+        const auto pgm = program_cache.find(hash);
+        if (pgm == program_cache.end() || perm >= pgm.value()->modules.size() || !pgm.value()->modules[perm].module) {
+            ++warm_skipped;
+            continue;
+        }
+        Program& program = *pgm.value();
+        const auto stage = program.info.sw_stage;
+        if (stage != Shader::SwStage::Vertex && stage != Shader::SwStage::Fragment) {
+            continue; // compute and the rest have no library
+        }
+        Program& vs = stage == Shader::SwStage::Vertex ? program : *tpl_vs.value();
+        Program& ps = stage == Shader::SwStage::Fragment ? program : *tpl_ps.value();
+        const size_t vs_perm = stage == Shader::SwStage::Vertex ? perm : warm_template.vs_perm;
+        const size_t ps_perm = stage == Shader::SwStage::Fragment ? perm : warm_template.ps_perm;
+        auto job = std::make_unique<AsyncPipelineJob>();
+        job->key = warm_template.key;
+        job->key.stage_hashes[u32(Shader::SwStage::Vertex)] = HashCombine(vs.info.CacheHash(), u64{vs_perm});
+        job->key.stage_hashes[u32(Shader::SwStage::Fragment)] = HashCombine(ps.info.CacheHash(), u64{ps_perm});
+        job->hash = std::hash<GraphicsPipelineKey>{}(job->key);
+        job->infos.fill(nullptr);
+        job->modules.fill(vk::ShaderModule{});
+        job->infos[u32(Shader::SwStage::Vertex)] = &vs.info;
+        job->infos[u32(Shader::SwStage::Fragment)] = &ps.info;
+        job->modules[u32(Shader::SwStage::Vertex)] = vs.modules[vs_perm].module;
+        job->modules[u32(Shader::SwStage::Fragment)] = ps.modules[ps_perm].module;
+        job->runtime_infos[u32(Shader::SwStage::Vertex)] = vs.modules[vs_perm].spec.runtime_info;
+        job->runtime_infos[u32(Shader::SwStage::Fragment)] = ps.modules[ps_perm].spec.runtime_info;
+        if (const auto& fetch = vs.modules[vs_perm].spec.fetch_shader_data; !fetch.Empty()) {
+            job->fetch_shader = fetch;
+        }
+        job->link_only = true;
+        job->warm_lib = true;
+        ++warm_queued;
+        {
+            std::scoped_lock lock{async_mutex};
+            PushJobLocked(JobLane::Background, std::move(job));
+        }
+        async_cv.notify_one();
+    }
+    static auto last = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(5)) {
+        last = now;
+        std::fprintf(stderr,
+                     "SOTC NB WARM: library warm-up jobs queued %llu, done %llu, skipped %llu, waiting %zu\n",
+                     static_cast<unsigned long long>(warm_queued), static_cast<unsigned long long>(warm_built),
+                     static_cast<unsigned long long>(warm_skipped), warm_log.size());
+    }
+}
+
 u32 PipelineCache::BackgroundCap() const {
     // sotc: SOTC_NB_SCHED: background jobs (pretranslation, pack loads, prebuilds, prediction) on at most half the
     // workers while the game runs; the boot hold waits for them, so it gives them every worker.
@@ -1518,7 +1632,8 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             if (!job) {
                 continue;
             }
-            job_class = job->link_only           ? JobLink
+            job_class = job->warm_lib            ? JobWarm
+                        : job->link_only           ? JobLink
                         : job->lazy                ? JobLazy
                         : job->compute           ? (job->pre_compute ? JobComputePrebuild : JobCompute)
                         : job->translate         ? (job->translate->pretranslate ? JobPretranslate : JobTranslate)
@@ -1670,6 +1785,10 @@ void PipelineCache::CollectAsyncPipelines() {
             }
         }
         const auto it = graphics_pipelines.find(job->key);
+        if (job->warm_lib) { // sotc: SOTC_NB_GPL (P4): only its library mattered; the linked pipeline was never bound
+            ++warm_built;
+            continue;
+        }
         if (job->link_only) { // sotc: SOTC_NB_GPL link job: serves the draws until the optimized build
             link_pending.erase(job->key);
             if (it != graphics_pipelines.end() && !it.value() && job->pipeline && job->pipeline->Handle()) {
@@ -2410,6 +2529,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
     if (SotcPipePredict::On() && !async_workers.empty()) {
         PredictPipelines();
     }
+    // sotc: SOTC_NB_GPL (P4): libraries of new shaders, built before their first draw.
+    if (SotcNonBlocking::Gpl() && SotcNonBlocking::Warm() && !async_workers.empty()) {
+        FeedWarmLibraries();
+    }
     // sotc: full-screen passes (tiny draws, see below) are never skipped, so their shaders are
     // translated here. Without dynamic vertex input the key needs the vertex shader's sharps.
     async_translate_ok = !async_workers.empty() && AsyncTranslateEnabled() &&
@@ -2445,6 +2568,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (pipe_predict) { // sotc: SOTC_PIPE_PREDICT: templates and hits
         NotePredictDraw(is_new, !is_new && it->second != nullptr);
+    }
+    if (is_new && SotcNonBlocking::Gpl() && SotcNonBlocking::Warm()) { // sotc: SOTC_NB_WARM (P4): the template
+        NoteWarmTemplate();
     }
     if (key_hit) { // =2 only: the slow path runs too and must give the same pipeline
         g_pipe_memo.graphics_hits.fetch_add(1, std::memory_order_relaxed);
