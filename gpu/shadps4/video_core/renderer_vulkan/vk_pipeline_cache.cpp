@@ -4554,7 +4554,7 @@ void PipelineCache::DrainPretranslate() {
             if (r.deferred_ns == 0) {
                 SotcPretranslate::NoteDropped(stage, 0);
             }
-            if (SotcNonBlocking::Io()) { // sotc: loaded from the pack by a worker before its first draw
+            if (SotcNonBlocking::Prefetch()) { // sotc: loaded from the pack by a worker before its first draw
                 QueueLazyPrefetch(r.hash);
             }
             continue;
@@ -4704,7 +4704,7 @@ void PipelineCache::QueueComputePrebuild(SotcPretranslate::Request& r) {
     const ComputePipelineKey key{HashCombine(r.hash, size_t{0})};
     if (IsProgramKnown(r.hash) || lazy_programs.contains(r.hash) || compute_pipelines.contains(key)) {
         SotcPretranslate::NoteDropped(2, 0); // known: a warm session has it (as the other requests)
-        if (SotcNonBlocking::Io()) { // sotc: loaded from the pack by a worker before its first dispatch
+        if (SotcNonBlocking::Prefetch()) { // sotc: loaded from the pack by a worker before its first dispatch
             QueueLazyPrefetch(r.hash);
         }
         return;

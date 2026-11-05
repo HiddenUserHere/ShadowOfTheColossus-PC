@@ -13,10 +13,18 @@ inline bool SwitchOn(const char* name) {
     return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
 }
 
-/// P1 (SOTC_NB_IO=1): secondary work leaves the frame threads. The driver cache save at the end of the boot hold goes to
-/// the saver thread, and the programs of the pretranslate pack are loaded by a worker when the game announces them.
+/// P1 (SOTC_NB_IO=1): secondary work leaves the frame threads: the driver cache save at the end of the boot hold goes to
+/// the saver thread.
 inline bool Io() {
     static const bool on = SwitchOn("SOTC_NB_IO");
+    return on;
+}
+
+/// P1 (SOTC_NB_PREFETCH=1, off): the programs of the pretranslate pack are loaded by a worker when the game announces
+/// them, before their first draw. The game announces far more programs than it draws (16,661 queued against ~1,700
+/// drawn in a warm session), and every loaded program stays in memory; off, a program is loaded at its first draw.
+inline bool Prefetch() {
+    static const bool on = SwitchOn("SOTC_NB_PREFETCH");
     return on;
 }
 
@@ -50,6 +58,14 @@ inline bool Warm() {
 /// draw waits for, are not capped. New pipelines and objects may appear a few frames later. Off: no cap, as before.
 inline bool WorkerCap() {
     static const bool on = SwitchOn("SOTC_NB_WORKER_CAP");
+    return on;
+}
+
+/// SOTC_NB_LAZY_PSO=1: the boot warm-up does not build the saved pipelines nor load their programs (~6,200 pipelines and
+/// ~7,500 programs resident from the start); each is built or loaded at its first draw or dispatch, from the driver's
+/// own disk cache. Less memory and a shorter start; a pipeline's first draw is skipped while it builds.
+inline bool LazyPso() {
+    static const bool on = SwitchOn("SOTC_NB_LAZY_PSO");
     return on;
 }
 

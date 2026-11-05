@@ -461,3 +461,21 @@ At the 30 FPS cap no switch moves the per-frame thread times beyond the spread b
 and `SOTC_PARALLEL_RECORD=1` gave the best route numbers of the round (the latter costs ~0.8 core more). After the
 precise-wait finding (0 counted violations, broken depth on screen), verify counters are not enough: anything kept
 needs the user's visual check. Not yet run: the uncapped Shrine scene, where a gain in per-frame cost shows as FPS.
+
+## RAM: what stays loaded (5 Nov 2026, `user/ram/*.log`, warm, salt 73, `SOTC_RAM_REPORT=1`, one round each)
+
+| config | working set | pipelines / programs resident | route p50 / p99 / max |
+|---|---|---|---|
+| sotc.ini (NB_IO, futex, worker cap), driver cache file on | 9,381-9,611 MiB | 1,948 graphics, 4,269 compute / 7,473 | 33.4 / 58.6 / 167.6 ms |
+| + `SOTC_NB_PREFETCH=1` (pack pre-load, split out of `SOTC_NB_IO`) | 10,267-10,531 MiB (2,016 programs pre-loaded, 13,239 still queued) | - | 33.5 / 76.1 / 164.5 ms (25 frames > 50 ms) |
+| `SOTC_PRETRANSLATE_COMPUTE=0` | 9,827 MiB | unchanged (the warm-up loads them) | 33.3 / 66.7 / 156.6 ms |
+| `SOTC_DRIVER_CACHE=0` | 7,928 MiB | unchanged; no 1,883 MiB cache blob | 33.4 / 58.9 / 178.1 ms |
+| + `SOTC_NB_LAZY_PSO=1` | 6,331 MiB | 845 graphics, 444 compute / 1,796 | 33.4 / 126.5 / 229.7 ms (3 frames > 100 ms) |
+
+- The pack pre-load (P1 item 3) now has its own switch, `SOTC_NB_PREFETCH`, off: it loads every program the game announces
+  (16,659 queued against ~1,700 drawn) and each stays in memory.
+- The app's driver cache file takes ~1.7-1.9 GB of RAM (the driver keeps the loaded blob); on NVIDIA it did not help
+  (P5.0). sotc.ini now has `SOTC_DRIVER_CACHE=0` (the untested case: a release in a new folder).
+- `SOTC_NB_LAZY_PSO=1` (new, off): the boot warm-up no longer builds every saved pipeline and loads its programs; the
+  route used 23% of the saved graphics pipelines and 10% of the compute ones. Saves 1.6 GB more, costs first-use
+  builds during play (p99 58.9 -> 126.5 ms in this round).

@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "../../../sotc/predict_probe.h" // sotc: SOTC_PREDICT_PROBE
 #include "../../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER
+#include "../../../sotc/nonblocking.h"  // sotc: SOTC_NB_LAZY_PSO
 #include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE (ShaderBinaryVersion, profile bytes)
 
 namespace Serialization {
@@ -847,6 +848,9 @@ void PipelineCache::WarmUp() {
     const auto load_blob = [&](std::vector<u8>&& data, u32 uses) {
         ++num_total_pipelines;
         SotcStats::warmup_done.fetch_add(1, std::memory_order_relaxed);
+        if (SotcNonBlocking::LazyPso()) {
+            return; // sotc: built at its first draw or dispatch instead
+        }
         warm_uses = uses;
 
         bool result{};
