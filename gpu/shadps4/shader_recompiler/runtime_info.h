@@ -172,6 +172,9 @@ struct SwVertexRuntimeInfo {
     u16 vertex_sgpr_offset{};
     u16 instance_sgpr_offset{};
     bool tess_emulated_primitive{};
+    /// sotc: SOTC_VS_DRAW_KIND=1 (info.h): the start instance SGPR is user data + BaseInstance, one module for the
+    /// direct draws (BaseInstance 0, the SGPR keeps its user data) and the indirect ones (the SGPR's user data is 0).
+    bool instance_sgpr_add{};
 
     bool operator==(const SwVertexRuntimeInfo& other) const noexcept = default;
 };

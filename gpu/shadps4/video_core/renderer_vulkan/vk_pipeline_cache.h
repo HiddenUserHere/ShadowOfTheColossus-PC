@@ -565,6 +565,8 @@ private:
     Shader::Profile profile{};
     Shader::Pools pools;
     DrawIndirectParams draw_indirect_params{};
+    /// sotc: SOTC_VS_DRAW_KIND: the vertex stage's user data of an indirect draw, with the start instance SGPR zeroed.
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> vs_draw_kind_user_data{};
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     // sotc: any erase or clear must also null last_graphics_pipeline (see GetGraphicsPipeline).

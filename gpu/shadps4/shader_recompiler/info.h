@@ -134,6 +134,22 @@ inline bool SpvProgramIds() {
     return on;
 }
 
+/// sotc: SOTC_VS_DRAW_KIND=1 (default off): one vertex module for both draw kinds of an instanced vertex program (VGPR
+/// component count 3). SotC draws them direct (user SGPR 2 is user data, no start instance) or indirect (the command
+/// processor writes the start instance to user SGPR 2), and each kind was a permutation of its own. With the switch the
+/// SGPR is translated as user data + BaseInstance (SwVertexRuntimeInfo::instance_sgpr_add), a direct draw has
+/// BaseInstance 0, and an indirect draw sees user data 0 in that SGPR (PipelineCache bind_stage), so the two kinds
+/// share the module, the pipeline and the pretranslated variant (docs/re-stutters/native/re-pipelines/README.md, 3a).
+inline bool VsDrawKindOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_VS_DRAW_KIND");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+/// The start instance SGPR of SotC's indirect draws: SPI_SHADER_USER_DATA_VS_0 (0x4c) + 2, user SGPR 2.
+constexpr uint16_t kVsDrawKindInstanceSgpr = 0x4c + 2;
+
 /// sotc: SOTC_GCN_MISS_EMIT=0 (diagnostic): table-mode loads do not emit the S2 page-miss record (gcn_layout.h).
 /// Only to measure the driver compile cost of that code; a page that is not resident then reads zero unrecorded.
 inline bool GcnMissEmit() {

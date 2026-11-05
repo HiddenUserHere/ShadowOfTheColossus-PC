@@ -100,7 +100,10 @@ static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 43u : 140
                                        // loads are DontInline functions (first-run compile cost); 0 keeps them inline.
                                        (Shader::SpvFuncs() ? 0u : 512u) +
                                        // sotc: SOTC_SPV_PROGRAM_IDS=1 (info.h): modules with the program hash, apart.
-                                       (Shader::SpvProgramIds() ? 256u : 0u);
+                                       (Shader::SpvProgramIds() ? 256u : 0u) +
+                                       // sotc: SOTC_VS_DRAW_KIND=1 (info.h): instanced vertex modules shared by both
+                                       // draw kinds (user data + BaseInstance), apart.
+                                       (Shader::VsDrawKindOn() ? 128u : 0u);
 // sotc: 22 (from 21): the record ends with the stage variant (SOTC_HEAP). Without it a cached Plain or Heap
 // program came back as Default, so its layout disagreed with its binary (slot-word assert, device lost).
 // 23: a variant's pgm_hash is the game's hash again (Info::CacheHash keys the caches), so 22's variant records differ.

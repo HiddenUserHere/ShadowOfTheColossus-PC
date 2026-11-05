@@ -178,6 +178,16 @@ static void FillComputeRuntimeInfo(Shader::RuntimeInfo& info, const AmdGpu::Comp
     info.hw.cs.shared_memory_size = cs_pgm.SharedMemSize();
 }
 
+// sotc: SOTC_VS_DRAW_KIND (info.h). True when a vertex stage of this draw kind uses the shared module: an instanced
+// program (VGPR component count 3) on the hardware VS stage, no base vertex SGPR, and the start instance either absent
+// (direct draw) or in user SGPR 2 (SotC's indirect draws).
+static bool VsDrawKindShared(HwStage stage, u32 num_input_vgprs, u16 vertex_sgpr_offset,
+                             u16 instance_sgpr_offset) {
+    return Shader::VsDrawKindOn() && stage == HwStage::Vertex && num_input_vgprs >= 3 &&
+           vertex_sgpr_offset == 0 &&
+           (instance_sgpr_offset == 0 || instance_sgpr_offset == Shader::kVsDrawKindInstanceSgpr);
+}
+
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = runtime_infos[u32(l_stage)];
     const auto& regs = liverpool->regs;
@@ -338,6 +348,14 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.vs.step_rate_1 = regs.vgt_instance_step_rate_1;
         info.sw.vs.vertex_sgpr_offset = draw_indirect_params.vertex_sgpr_offset;
         info.sw.vs.instance_sgpr_offset = draw_indirect_params.instance_sgpr_offset;
+        // sotc: SOTC_VS_DRAW_KIND (info.h): both draw kinds of an instanced program take one key. bind_stage zeroes
+        // the SGPR's user data for the indirect kind under the same condition (VsDrawKindIndirect).
+        info.sw.vs.instance_sgpr_add = false;
+        if (VsDrawKindShared(stage, info.props.num_input_vgprs, info.sw.vs.vertex_sgpr_offset,
+                             info.sw.vs.instance_sgpr_offset)) {
+            info.sw.vs.instance_sgpr_offset = Shader::kVsDrawKindInstanceSgpr;
+            info.sw.vs.instance_sgpr_add = true;
+        }
         info.sw.vs.tess_emulated_primitive =
             regs.primitive_type == AmdGpu::PrimitiveType::RectList ||
             regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
@@ -2912,6 +2930,16 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
 
         auto params = AmdGpu::GetParams(*pgm);
+        // sotc: SOTC_VS_DRAW_KIND (info.h): an indirect draw of a shared instanced program sees user data 0 in the
+        // start instance SGPR (the shader adds BaseInstance). On the GPU the command processor overwrites that SGPR,
+        // so its user data is never the program's input.
+        if (stage_out == SwStage::Vertex && draw_indirect_params.instance_sgpr_offset != 0 &&
+            VsDrawKindShared(stage_in, pgm->settings.vgpr_comp_cnt, draw_indirect_params.vertex_sgpr_offset,
+                             draw_indirect_params.instance_sgpr_offset)) {
+            std::copy(params.user_data.begin(), params.user_data.end(), vs_draw_kind_user_data.begin());
+            vs_draw_kind_user_data[Shader::kVsDrawKindInstanceSgpr - 0x4c] = 0;
+            params.user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{vs_draw_kind_user_data};
+        }
         // sotc: SOTC_HEAP: a variant is a program of its own, so its hash differs (the program, memo and key caches).
         params.variant = stage_out == SwStage::Fragment  ? fragment_variant
                          : stage_out == SwStage::Vertex ? vertex_variant
@@ -3672,6 +3700,8 @@ void PipelineCache::DrainPretranslate() {
             // VGPR (RSRC1.VGPR_COMP_CNT 3) is an instanced one.
             rt.sw.vs.vertex_sgpr_offset = 0;
             rt.sw.vs.instance_sgpr_offset = rt.props.num_input_vgprs >= 3 ? 0x4c + 2 : 0;
+            // sotc: SOTC_VS_DRAW_KIND: the shared module serves both kinds (the second variant below is not made).
+            rt.sw.vs.instance_sgpr_add = VsDrawKindShared(hw, rt.props.num_input_vgprs, 0, rt.sw.vs.instance_sgpr_offset);
         }
         Shader::Backend::Bindings start{};
         if (stage == 0) {
@@ -3744,7 +3774,7 @@ void PipelineCache::DrainPretranslate() {
                     variants.push_back(v);
                 }
             }
-        } else if (rt.sw.vs.instance_sgpr_offset != 0) {
+        } else if (rt.sw.vs.instance_sgpr_offset != 0 && !rt.sw.vs.instance_sgpr_add) {
             Shader::RuntimeInfo v = rt;
             v.sw.vs.instance_sgpr_offset = 0;
             variants.push_back(v);

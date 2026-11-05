@@ -107,8 +107,15 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         const s8 base_instance_sgpr =
             UdRegFromShOffset(runtime_info.sw.vs.instance_sgpr_offset, info.hw_stage);
         if (base_instance_sgpr != -1) {
-            ir.SetScalarReg(IR::ScalarReg(base_instance_sgpr),
-                            ir.GetAttributeU32(IR::Attribute::BaseInstance));
+            IR::U32 start_instance = ir.GetAttributeU32(IR::Attribute::BaseInstance);
+            // sotc: SOTC_VS_DRAW_KIND (info.h): user data + BaseInstance serves both draw kinds.
+            // A fetch shader may take its instance offset from user data (GetDrawOffsets): not shared.
+            if (runtime_info.sw.vs.instance_sgpr_add && fetch_data.Empty() &&
+                static_cast<u32>(base_instance_sgpr) < runtime_info.props.num_user_data) {
+                start_instance =
+                    ir.IAdd(ir.GetUserData(IR::ScalarReg(base_instance_sgpr)), start_instance);
+            }
+            ir.SetScalarReg(IR::ScalarReg(base_instance_sgpr), start_instance);
         }
 
         // The GCN instance ID VGPRs count from 0 in every draw: the start instance reaches the
