@@ -131,6 +131,33 @@ Key facts:
      a material is known before its draw (always the shared one), which (c) needs. Visual check (4 Nov 2026): a Lab
      session with the switch on (`user/last_run.log` of that session) looked right to the user; no crash, and only the
      40 pixel export failures that `dd_new.log` also has.
+   - **(c) first version (4 Nov 2026), switch `SOTC_PIPE_PREDICT=1`, default off: makes the cold session worse;
+     not usable yet.** `gpu/sotc/pipe_predict.cpp` (hook PIPE_PREDICT_MATERIAL, wrap 0xf9390) reads each material's
+     VS+PS slots; `PipelineCache::PredictPipelines` / `NotePredictDraw` learn one key template per slot k from the
+     first draw of a known pair and queue the other pairs of that k on the pipeline workers (programs loaded from
+     the pretranslate pack with `LoadLazyProgram`). Three cold Lab-route runs with `SOTC_VS_DRAW_KIND=1`
+     (`user/dedup1/pp_new*.log`) against `vk_new.log` (same switches without prediction):
+
+     | run | queued | used by a draw (built by then) | pipelines / driver time | p50 / p99 / frames > 100 ms |
+     |---|---|---|---|---|
+     | vk_new (off) | - | - | 911 / 105 s | 33.4 / 225.9 ms / 5 |
+     | pp_new (programs not loaded) | 56 | 6 | 781 / 120 s | 34.0 / 217.9 ms / 11 |
+     | pp_new2 (unthrottled) | 3,866 | 579 | 4,031 / 496 s | 35.5 / 671.6 ms / 54 |
+     | pp_new3 (one at a time, idle queue, half the workers) | 957 | 256 (251) | 1,346 / 150 s | 66.3 / 362.1 ms / 23 |
+
+     What the runs showed:
+     - The material side works: ~5,000 materials read per run, 4,522 distinct (VS, PS) pairs, no unreadable slot,
+       and the draws match them (the pair lookup at draw time hits).
+     - Most loaded materials are not drawn soon: 4,522 pairs are loaded, the route draws about 900 pipelines, and
+       only 27% of the throttled predictions were used during the route. Building ahead of time competes for the CPU
+       with the command processor (the port is CPU-bound there), and the route got slower, not smoother.
+     - One template per slot k is not enough for k3 (several target sets: color count, formats, samples, MRT mask
+       differ; 1,460-2,311 conflicts per run), k8 (alpha: per-material blend, the material's state object +0x560),
+       k7 and k0 (a few). The other material slots were stable. The throttled run skips slots with conflicts.
+     - Loading programs from the pack on the command processor cost 0.7-2.1 s per run.
+     Next options (not done): predict only what is about to be drawn (a later hook than the factory, measured for its
+     lead time), keep predicted builds off the CPU the game needs (one low-priority worker), and key k3 / k8 by the
+     material's target set and blend state.
 4. Content-hash permutation keys (BuildSpecKey) instead of discovery-order indexes, so caches are stable across
    runs.
 5. Remaining: the DRAW-only fields (vertex formats per mesh, instance step rates, image T# fields from the material

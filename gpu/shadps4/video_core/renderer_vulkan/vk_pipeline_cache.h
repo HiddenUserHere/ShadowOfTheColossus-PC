@@ -533,6 +533,12 @@ private:
     /// on the port's loading screen with a progress bar until they are all in the cache.
     void MaybeHoldForPretranslate();
     void CollectAsyncPipelines();
+    /// sotc: SOTC_PIPE_PREDICT (gpu/sotc/pipe_predict.h). Command processor, before a draw's key is built: reads the
+    /// queued materials and queues the pipelines of their pass slots whose pass template is known.
+    void PredictPipelines();
+    /// sotc: SOTC_PIPE_PREDICT. After a draw's key is looked up: learns the pass template from a draw of a known
+    /// material slot, and counts the draws that found a predicted pipeline.
+    void NotePredictDraw(bool is_new, bool built);
     /// sotc: N5 (SOTC_N5_PSO=1). Waits for the graphics pipelines of the boot prebuild (queued by
     /// WarmUp), collecting them as they are built, up to SOTC_N5_PSO_WAIT_S seconds from start.
     /// The rest is built on the workers while the game runs.
@@ -578,6 +584,8 @@ private:
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     Shader::Gcn::FetchShaderData* fetch_shader{};
     GraphicsPipelineKey graphics_key{};
+    /// sotc: SOTC_PIPE_PREDICT state (vk_pipeline_cache.cpp), command processor only; null with the switch off.
+    std::shared_ptr<struct PipePredictState> pipe_predict;
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
 

@@ -27,6 +27,7 @@
 #include "freecam.h"
 
 #include "native/native_particles.h"
+#include "pipe_predict.h"
 #include "native/native_results.h"
 #include "native/native_sync.h"
 namespace SotcNativeHooks { // sotc: SOTC_NATIVE write hooks (gpu/sotc/native/native_hooks.cpp)
@@ -46,6 +47,7 @@ void RegisterAllHandlers() {
     SotcProbes::RegisterPass(); // sotc: SOTC_PASS_PROBE (probe_pass.cpp), observe only
     SotcProbes::RegisterCalls(); // sotc: SOTC_CALL_PROBE (probe_calls.cpp), observe only
     SotcProbes::RegisterRe();    // sotc: SOTC_RE_PROBE (probe_re.cpp), observe only
+    SotcPipePredict::Register(); // sotc: SOTC_PIPE_PREDICT (pipe_predict.cpp), observe only
     SotcProbes::RegisterMemtype(); // sotc: PC memory model, wave B
     SotcProbes::RegisterXprMem();
     SotcPcRing::Register(); // sotc: SOTC_PC_RING (PC memory model)

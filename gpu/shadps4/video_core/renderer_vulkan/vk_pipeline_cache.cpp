@@ -45,6 +45,7 @@
 #include "video_core/sotc_frame_metrics.h" // sotc: SOTC_FRAME_METRICS
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (SOTC_PIPE_DIRTY default, N5)
 #include "../../../sotc/predict_probe.h" // sotc: SOTC_PRETRANSLATE (pixel layouts)
+#include "../../../sotc/pipe_predict.h"  // sotc: SOTC_PIPE_PREDICT
 #include "video_core/sotc_arch/addr_table.h" // sotc: ARCH-GCN-NATIVE (Init before the profile)
 #include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE (Profile::gcn_buf, gcn_tex)
 #include "bbport_threads.h"
@@ -973,6 +974,295 @@ bool PipelineCache::AsyncPreloadEnabled() const {
     return enabled && !async_workers.empty() && !EmulatorSettings.IsShaderCollect();
 }
 
+// sotc: SOTC_PIPE_PREDICT (gpu/sotc/pipe_predict.h). Command processor only.
+struct PipePredictState {
+    /// The rest of a pass's key (stage hashes zeroed) and its pixel layout, from the first draw of a known slot.
+    struct Template {
+        bool valid{};
+        GraphicsPipelineKey key{};
+        std::array<Shader::PsColorBuffer, Shader::MaxColorBuffers> color_buffers{};
+        u32 mrtz_mask{};
+        u32 num_samples{};
+    };
+    std::array<Template, 16> templates{};
+    /// (VS hash, PS hash) of every material slot read -> its pass slot k.
+    std::unordered_map<u64, u8> pair_k;
+    std::array<std::vector<SotcPipePredict::Slot>, 16> blocked; ///< slots waiting for their pass template
+    std::deque<SotcPipePredict::Slot> ready;                    ///< template known, not built yet
+    std::vector<SotcPipePredict::Slot> no_program;              ///< programs not translated yet: tried again later
+    std::unordered_set<GraphicsPipelineKey> predicted;          ///< queued keys no draw has found yet
+    std::unordered_set<GraphicsPipelineKey> inflight;           ///< queued keys not collected yet
+    std::vector<SotcPipePredict::Slot> scratch;
+    u64 calls{};
+    // Counters (report line).
+    u64 slots_new{}, slots_dup{}, queued{}, existing{}, no_template_now{}, no_vs{}, no_ps{}, no_layout{},
+        ineligible{}, hits{}, draw_new_known{}, template_conflicts{}, templates_learned{}, lazy_loaded{},
+        cp_ns{}, hits_built{}, unstable_skipped{}, busy_waits{};
+    /// Template conflicts by key field (kPredictFields order), and the conflicts of each pass slot.
+    std::array<u64, 12> conflict_fields{};
+    std::array<u64, 16> conflict_k{};
+    int conflict_lines{};
+    std::chrono::steady_clock::time_point last_report{std::chrono::steady_clock::now()};
+};
+
+static u64 PredictPairKey(u64 vs, u64 ps) {
+    return HashCombine(vs, ps);
+}
+
+// The key fields after the stage hashes, by offset (GraphicsPipelineKey, vk_graphics_pipeline.h).
+struct PredictField {
+    const char* name;
+    size_t begin, end;
+};
+static const std::array<PredictField, 12> kPredictFields{{
+    {"vertex formats", offsetof(GraphicsPipelineKey, vertex_buffer_formats),
+     offsetof(GraphicsPipelineKey, patch_control_points)},
+    {"patch", offsetof(GraphicsPipelineKey, patch_control_points), offsetof(GraphicsPipelineKey, num_color_attachments)},
+    {"color count", offsetof(GraphicsPipelineKey, num_color_attachments), offsetof(GraphicsPipelineKey, color_buffers)},
+    {"color formats", offsetof(GraphicsPipelineKey, color_buffers), offsetof(GraphicsPipelineKey, blend_controls)},
+    {"blend", offsetof(GraphicsPipelineKey, blend_controls), offsetof(GraphicsPipelineKey, write_masks)},
+    {"write masks", offsetof(GraphicsPipelineKey, write_masks), offsetof(GraphicsPipelineKey, cb_shader_mask)},
+    {"shader mask", offsetof(GraphicsPipelineKey, cb_shader_mask), offsetof(GraphicsPipelineKey, logic_op)},
+    {"logic op", offsetof(GraphicsPipelineKey, logic_op), offsetof(GraphicsPipelineKey, num_samples)},
+    {"samples", offsetof(GraphicsPipelineKey, num_samples), offsetof(GraphicsPipelineKey, mrt_mask)},
+    {"mrt mask", offsetof(GraphicsPipelineKey, mrt_mask), offsetof(GraphicsPipelineKey, mrt_mask) + sizeof(u32)},
+    {"depth/prim", offsetof(GraphicsPipelineKey, mrt_mask) + sizeof(u32), sizeof(GraphicsPipelineKey)},
+    {"(none)", 0, 0},
+}};
+
+void PipelineCache::PredictPipelines() {
+    if (!pipe_predict) {
+        pipe_predict = std::make_shared<PipePredictState>();
+    }
+    auto& st = *pipe_predict;
+    ++st.calls;
+    const auto t0 = std::chrono::steady_clock::now();
+    // New materials (one per draw: TakeSlots reads guest memory).
+    st.scratch.clear();
+    SotcPipePredict::TakeSlots(st.scratch, 1);
+    for (const auto& s : st.scratch) {
+        const auto [it, fresh] = st.pair_k.try_emplace(PredictPairKey(s.vs, s.ps), s.k);
+        if (!fresh) {
+            ++st.slots_dup;
+            continue;
+        }
+        ++st.slots_new;
+        if (s.k < st.templates.size() && st.templates[s.k].valid) {
+            st.ready.push_back(s);
+        } else if (s.k < st.blocked.size()) {
+            ++st.no_template_now;
+            st.blocked[s.k].push_back(s);
+        }
+    }
+    // Slots whose programs were not translated yet, again every 4096 draws.
+    if ((st.calls & 4095) == 0 && !st.no_program.empty()) {
+        st.ready.insert(st.ready.end(), st.no_program.begin(), st.no_program.end());
+        st.no_program.clear();
+    }
+    // Lowest priority: one prediction at a time, only while no draw, compute or translation job waits, and on at most
+    // half of the workers (a draw's job may still find every worker busy for one build).
+    bool queue_idle = false;
+    if (!st.ready.empty() && st.inflight.size() < std::max<size_t>(1, async_workers.size() / 2)) {
+        std::scoped_lock lock{async_mutex};
+        queue_idle = async_queue.empty();
+        if (!queue_idle) {
+            ++st.busy_waits;
+        }
+    }
+    for (int n = 0; n < 1 && queue_idle && !st.ready.empty(); ++n) {
+        const SotcPipePredict::Slot s = st.ready.front();
+        st.ready.pop_front();
+        const auto& tpl = st.templates[s.k];
+        // A pass slot whose draws disagree on the rest of the key (per-material blend, several target sets) is
+        // not predicted.
+        if (st.conflict_k[s.k & 15] > 8) {
+            ++st.unstable_skipped;
+            continue;
+        }
+        // A program the boot hold translated is in the pack until its first draw: its modules are created now.
+        for (const u64 h : {s.vs, s.ps}) {
+            if (!program_cache.contains(h) && LoadLazyProgram(h)) {
+                ++st.lazy_loaded;
+            }
+        }
+        const auto vs_it = program_cache.find(s.vs);
+        const auto ps_it = program_cache.find(s.ps);
+        if (vs_it == program_cache.end() || vs_it->second->modules.empty()) {
+            ++st.no_vs;
+            st.no_program.push_back(s);
+            continue;
+        }
+        if (ps_it == program_cache.end() || ps_it->second->modules.empty()) {
+            ++st.no_ps;
+            st.no_program.push_back(s);
+            continue;
+        }
+        Program& vs = *vs_it.value();
+        Program& ps = *ps_it.value();
+        // The vertex variant: the first (with SOTC_VS_DRAW_KIND the only one of an instanced program). The pixel
+        // variant: the one translated for this pass's render-target layout.
+        const size_t vs_perm = 0;
+        size_t ps_perm = ps.modules.size();
+        for (size_t i = 0; i < ps.modules.size(); ++i) {
+            const auto& fs = ps.modules[i].spec.runtime_info.hw.fs;
+            if (std::ranges::equal(fs.color_buffers, tpl.color_buffers) && fs.mrtz_mask == tpl.mrtz_mask &&
+                fs.num_samples == tpl.num_samples) {
+                ps_perm = i;
+                break;
+            }
+        }
+        if (ps_perm == ps.modules.size()) {
+            ++st.no_layout;
+            continue;
+        }
+        GraphicsPipelineKey key = tpl.key;
+        key.stage_hashes[u32(Shader::SwStage::Vertex)] = HashCombine(s.vs, u64{vs_perm});
+        key.stage_hashes[u32(Shader::SwStage::Fragment)] = HashCombine(s.ps, u64{ps_perm});
+        if (graphics_pipelines.contains(key)) {
+            ++st.existing;
+            continue;
+        }
+        // The draw's stage state is replaced for the job and put back (RefreshGraphicsKey runs next anyway).
+        const auto saved_key = graphics_key;
+        const auto saved_infos = infos;
+        const auto saved_modules = modules;
+        const auto saved_runtime = runtime_infos;
+        auto* const saved_fetch = fetch_shader;
+        graphics_key = key;
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        infos[u32(Shader::SwStage::Vertex)] = &vs.info;
+        infos[u32(Shader::SwStage::Fragment)] = &ps.info;
+        modules[u32(Shader::SwStage::Vertex)] = vs.modules[vs_perm].module;
+        modules[u32(Shader::SwStage::Fragment)] = ps.modules[ps_perm].module;
+        runtime_infos[u32(Shader::SwStage::Vertex)] = vs.modules[vs_perm].spec.runtime_info;
+        runtime_infos[u32(Shader::SwStage::Fragment)] = ps.modules[ps_perm].spec.runtime_info;
+        auto& fetch = vs.modules[vs_perm].spec.fetch_shader_data;
+        fetch_shader = fetch.Empty() ? nullptr : &fetch;
+        if (AsyncPipelineEligible()) {
+            graphics_pipelines.try_emplace(key); // null until collected, as for a draw's async build
+            QueueAsyncPipeline(std::hash<GraphicsPipelineKey>{}(key), nullptr, false);
+            st.predicted.insert(key);
+            st.inflight.insert(key);
+            ++st.queued;
+        } else {
+            ++st.ineligible;
+        }
+        graphics_key = saved_key;
+        infos = saved_infos;
+        modules = saved_modules;
+        runtime_infos = saved_runtime;
+        fetch_shader = saved_fetch;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    st.cp_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t0).count());
+    if (now - st.last_report >= std::chrono::seconds(5)) {
+        st.last_report = now;
+        const auto m = SotcPipePredict::Stats();
+        size_t blocked = 0;
+        for (const auto& b : st.blocked) {
+            blocked += b.size();
+        }
+        std::fprintf(stderr,
+                     "SOTC PIPE PREDICT: materials %llu (read %llu, no slot %llu), slots %llu (new pairs %llu, repeated "
+                     "%llu, unreadable %llu), templates %llu, queued %llu, draws that found one %llu, draws that "
+                     "built a known pair %llu; waiting: template %zu, program %zu, ready %zu; skipped: existing %llu, "
+                     "no VS %llu, no PS %llu, no PS layout %llu, ineligible %llu; template conflicts %llu; programs "
+                     "loaded from the pack %llu; command processor %.1f ms; built before their draw %llu, in "
+                     "flight %zu, unstable slot %llu, worker queue busy %llu\n",
+                     static_cast<unsigned long long>(m.queued), static_cast<unsigned long long>(m.read),
+                     static_cast<unsigned long long>(m.empty), static_cast<unsigned long long>(m.slots),
+                     static_cast<unsigned long long>(st.slots_new), static_cast<unsigned long long>(st.slots_dup),
+                     static_cast<unsigned long long>(m.unreadable),
+                     static_cast<unsigned long long>(st.templates_learned),
+                     static_cast<unsigned long long>(st.queued), static_cast<unsigned long long>(st.hits),
+                     static_cast<unsigned long long>(st.draw_new_known), blocked, st.no_program.size(),
+                     st.ready.size(), static_cast<unsigned long long>(st.existing),
+                     static_cast<unsigned long long>(st.no_vs), static_cast<unsigned long long>(st.no_ps),
+                     static_cast<unsigned long long>(st.no_layout), static_cast<unsigned long long>(st.ineligible),
+                     static_cast<unsigned long long>(st.template_conflicts),
+                     static_cast<unsigned long long>(st.lazy_loaded), static_cast<double>(st.cp_ns) / 1e6,
+                     static_cast<unsigned long long>(st.hits_built), st.inflight.size(),
+                     static_cast<unsigned long long>(st.unstable_skipped),
+                     static_cast<unsigned long long>(st.busy_waits));
+        std::string fields;
+        for (size_t f = 0; f < kPredictFields.size(); ++f) {
+            if (st.conflict_fields[f]) {
+                fields += fmt::format(" {} {},", kPredictFields[f].name, st.conflict_fields[f]);
+            }
+        }
+        std::string ks;
+        for (size_t k = 0; k < st.conflict_k.size(); ++k) {
+            if (st.conflict_k[k]) {
+                ks += fmt::format(" k{} {},", k, st.conflict_k[k]);
+            }
+        }
+        std::fprintf(stderr, "SOTC PIPE PREDICT conflicts: fields%s; slots%s\n", fields.c_str(), ks.c_str());
+    }
+}
+
+void PipelineCache::NotePredictDraw(bool is_new, bool built) {
+    auto& st = *pipe_predict;
+    if (!is_new && !st.predicted.empty() && st.predicted.erase(graphics_key) != 0) {
+        ++st.hits;
+        if (built) {
+            ++st.hits_built;
+        }
+    }
+    const auto* vs = infos[u32(Shader::SwStage::Vertex)];
+    const auto* ps = infos[u32(Shader::SwStage::Fragment)];
+    if (!vs || !ps) {
+        return;
+    }
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        if (i != u32(Shader::SwStage::Vertex) && i != u32(Shader::SwStage::Fragment) && infos[i]) {
+            return; // VS+PS pipelines only
+        }
+    }
+    const auto found = st.pair_k.find(PredictPairKey(vs->pgm_hash, ps->pgm_hash));
+    if (found == st.pair_k.end()) {
+        return;
+    }
+    const u8 k = found->second;
+    if (is_new) {
+        ++st.draw_new_known; // a draw built a pipeline of a known material slot: not predicted (yet)
+    }
+    GraphicsPipelineKey rest = graphics_key;
+    rest.stage_hashes.fill(0);
+    auto& tpl = st.templates[k];
+    if (tpl.valid) {
+        if (std::memcmp(&rest, &tpl.key, sizeof(rest)) != 0) {
+            ++st.template_conflicts;
+            ++st.conflict_k[k & 15];
+            std::string which;
+            const auto* a = reinterpret_cast<const u8*>(&rest);
+            const auto* b = reinterpret_cast<const u8*>(&tpl.key);
+            for (size_t f = 0; f + 1 < kPredictFields.size(); ++f) {
+                const auto& fd = kPredictFields[f];
+                if (std::memcmp(a + fd.begin, b + fd.begin, fd.end - fd.begin) != 0) {
+                    ++st.conflict_fields[f];
+                    which += fmt::format(" {}", fd.name);
+                }
+            }
+            if (st.conflict_lines++ < 16) {
+                std::fprintf(stderr, "SOTC PIPE PREDICT conflict: slot k %u, vs %#llx ps %#llx differs in%s\n",
+                             unsigned{k}, static_cast<unsigned long long>(vs->pgm_hash),
+                             static_cast<unsigned long long>(ps->pgm_hash), which.c_str());
+            }
+        }
+        return;
+    }
+    const auto& fs = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+    tpl.key = rest;
+    std::copy(fs.color_buffers.begin(), fs.color_buffers.end(), tpl.color_buffers.begin());
+    tpl.mrtz_mask = fs.mrtz_mask;
+    tpl.num_samples = fs.num_samples;
+    tpl.valid = true;
+    ++st.templates_learned;
+    st.ready.insert(st.ready.end(), st.blocked[k].begin(), st.blocked[k].end());
+    st.blocked[k].clear();
+}
+
 void PipelineCache::QueueAsyncPipeline(u64 hash,
                                        const GraphicsPipeline::SerializationSupport* preloaded,
                                        bool priority) {
@@ -1130,6 +1420,9 @@ void PipelineCache::CollectAsyncPipelines() {
         if (job->translate) {
             InstallTranslation(*job->translate);
             continue;
+        }
+        if (pipe_predict && !job->compute) { // sotc: SOTC_PIPE_PREDICT throttle
+            pipe_predict->inflight.erase(job->key);
         }
         const auto it = graphics_pipelines.find(job->key);
         if (it == graphics_pipelines.end()) {
@@ -1863,6 +2156,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
     if (async_done_count.load(std::memory_order_acquire) != 0) {
         CollectAsyncPipelines();
     }
+    // sotc: SOTC_PIPE_PREDICT: the materials' pipelines, queued before their first draw (no draw state is used).
+    if (SotcPipePredict::On() && !async_workers.empty()) {
+        PredictPipelines();
+    }
     // sotc: full-screen passes (tiny draws, see below) are never skipped, so their shaders are
     // translated here. Without dynamic vertex input the key needs the vertex shader's sharps.
     async_translate_ok = !async_workers.empty() && AsyncTranslateEnabled() &&
@@ -1896,6 +2193,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         return last_graphics_pipeline;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    if (pipe_predict) { // sotc: SOTC_PIPE_PREDICT: templates and hits
+        NotePredictDraw(is_new, !is_new && it->second != nullptr);
+    }
     if (key_hit) { // =2 only: the slow path runs too and must give the same pipeline
         g_pipe_memo.graphics_hits.fetch_add(1, std::memory_order_relaxed);
         if (is_new || it.value().get() != last_graphics_pipeline) {
