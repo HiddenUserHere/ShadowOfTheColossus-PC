@@ -61,9 +61,10 @@ inline bool WorkerCap() {
     return on;
 }
 
-/// SOTC_NB_LAZY_PSO=1: the boot warm-up does not build the saved pipelines nor load their programs (~6,200 pipelines and
-/// ~7,500 programs resident from the start); each is built or loaded at its first draw or dispatch, from the driver's
-/// own disk cache. Less memory and a shorter start; a pipeline's first draw is skipped while it builds.
+/// SOTC_NB_LAZY_PSO=1: the boot warm-up builds only the saved pipelines used in the last 3 sessions (the list is
+/// sotc_recent_pso.bin in the versioned cache folder), not all of them (~6,200 pipelines and ~7,500 programs resident
+/// from the start); the rest are built or loaded at their first draw or dispatch, from the driver's own disk cache.
+/// The first session after enabling it has no list yet and builds none at boot.
 inline bool LazyPso() {
     static const bool on = SwitchOn("SOTC_NB_LAZY_PSO");
     return on;

@@ -637,6 +637,12 @@ private:
     /// the list of the next boot holds (RecordTinyPipeline), which build their libraries before the first draw
     /// (BuildTinyLibraries, at the end of the hold, before the eviction).
     void RecordTinyPipeline();
+    /// sotc: SOTC_NB_LAZY_PSO: the pipelines used in the last sessions (id -> session of the last use), so the lazy
+    /// warm-up still builds what the player is likely to meet. LoadRecentPipelines at the warm-up, NoteRecentPipeline at
+    /// a pipeline's first use in the session, saved every 5 s (when changed) by a detached thread.
+    void LoadRecentPipelines();
+    void NoteRecentPipeline(u64 id);
+    bool RecentPipeline(u64 id) const;
     void BuildTinyLibraries();
     /// sotc: SOTC_NB_IO. Moves pack loads from lazy_backlog to the workers, at most 2 at a time.
     void FeedLazyPrefetch();
@@ -730,6 +736,10 @@ private:
         u32 vs_perm{}, ps_perm{};
     };
     std::unordered_map<GraphicsPipelineKey, TinyEntry> tiny_list;
+    std::unordered_map<u64, u32> recent_pso;
+    u32 recent_session{};
+    bool recent_dirty{};
+    std::chrono::steady_clock::time_point recent_saved{};
     bool tiny_list_loaded{};
     /// sotc: compute pipelines of the boot preload built by the workers (SOTC_ASYNC_PRELOAD);
     /// WarmUp waits for them and drops the ones the driver refused, as it does when it builds

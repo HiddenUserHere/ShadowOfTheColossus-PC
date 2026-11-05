@@ -81,6 +81,11 @@ public:
     /// holds (saved_use_count), as for GraphicsPipeline.
     mutable u32 use_count{};
     u32 saved_use_count{};
+    /// sotc: SOTC_NB_LAZY_PSO: already noted in the recently used list this session.
+    mutable bool recent_noted{};
+    u64 KeyValue() const {
+        return compute_key.value;
+    }
 
 private:
     void CreatePipeline();

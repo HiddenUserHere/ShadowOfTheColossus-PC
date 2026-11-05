@@ -471,6 +471,8 @@ needs the user's visual check. Not yet run: the uncapped Shrine scene, where a g
 | `SOTC_PRETRANSLATE_COMPUTE=0` | 9,827 MiB | unchanged (the warm-up loads them) | 33.3 / 66.7 / 156.6 ms |
 | `SOTC_DRIVER_CACHE=0` | 7,928 MiB | unchanged; no 1,883 MiB cache blob | 33.4 / 58.9 / 178.1 ms |
 | + `SOTC_NB_LAZY_PSO=1` | 6,331 MiB | 845 graphics, 444 compute / 1,796 | 33.4 / 126.5 / 229.7 ms (3 frames > 100 ms) |
+| + recent list, session 1 (no list yet, `user/rec2/ram_recent1.log`) | 6,761 MiB | 945 graphics, 444 compute / 1,947 | 33.4 / 84.7 / 148.0 ms |
+| + recent list, session 2 (1,367 recent pipelines built at boot, warm-up 1.1 s) | 6,891 MiB | 961 graphics, 444 compute / 1,979 | 33.3 / 51.3 / 154.9 ms (3 frames > 50 ms) |
 
 - The pack pre-load (P1 item 3) now has its own switch, `SOTC_NB_PREFETCH`, off: it loads every program the game announces
   (16,659 queued against ~1,700 drawn) and each stays in memory.
@@ -479,3 +481,8 @@ needs the user's visual check. Not yet run: the uncapped Shrine scene, where a g
 - `SOTC_NB_LAZY_PSO=1` (new, off): the boot warm-up no longer builds every saved pipeline and loads its programs; the
   route used 23% of the saved graphics pipelines and 10% of the compute ones. Saves 1.6 GB more, costs first-use
   builds during play (p99 58.9 -> 126.5 ms in this round).
+- Recent list (same switch): each pipeline's first use in a session is noted (graphics key hash, or the compute key),
+  and the list is written every 5 s when it changed, by a detached thread, to `sotc_recent_pso.bin` in the versioned
+  cache folder. At the next boot the lazy warm-up builds only the saved pipelines used in the last 3 sessions. Session 2:
+  1 GB less than building every saved pipeline (6,891 against 7,928 MiB) and a lower route p99 (51.3 against 58.9 ms).
+  The two first sessions (126.5 and 84.7 ms) are the same code path, so their gap is round-to-round noise.

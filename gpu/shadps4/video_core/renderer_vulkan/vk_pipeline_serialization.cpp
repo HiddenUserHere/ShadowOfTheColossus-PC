@@ -835,6 +835,9 @@ void PipelineCache::WarmUp() {
     }
 
     PrePackLoad(); // sotc: the warm-up reads the stages that have no loose file from the pretranslate pack
+    if (SotcNonBlocking::LazyPso()) {
+        LoadRecentPipelines(); // sotc: the pipelines the lazy warm-up still builds
+    }
     u32 num_pipelines{};
     u32 num_total_pipelines{};
     const auto warmup_start = std::chrono::steady_clock::now();
@@ -849,7 +852,23 @@ void PipelineCache::WarmUp() {
         ++num_total_pipelines;
         SotcStats::warmup_done.fetch_add(1, std::memory_order_relaxed);
         if (SotcNonBlocking::LazyPso()) {
-            return; // sotc: built at its first draw or dispatch instead
+            // sotc: only the pipelines of the last sessions are built now; the rest at their first draw or dispatch.
+            // The blob: version (u32), compute flag (u32), then the key (ComputePipelineKey value, or the graphics key).
+            u64 id = 0;
+            if (data.size() >= 8 + sizeof(u64)) {
+                u32 compute_flag{};
+                std::memcpy(&compute_flag, data.data() + 4, sizeof compute_flag);
+                if (compute_flag) {
+                    std::memcpy(&id, data.data() + 8, sizeof id);
+                } else if (data.size() >= 8 + sizeof(GraphicsPipelineKey)) {
+                    GraphicsPipelineKey key;
+                    std::memcpy(&key, data.data() + 8, sizeof key);
+                    id = std::hash<GraphicsPipelineKey>{}(key);
+                }
+            }
+            if (!RecentPipeline(id)) {
+                return;
+            }
         }
         warm_uses = uses;
 

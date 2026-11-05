@@ -168,6 +168,8 @@ public:
     /// holds (saved_use_count), so SaveUseCounts rewrites only the blobs that changed.
     mutable u32 use_count{};
     u32 saved_use_count{};
+    /// sotc: SOTC_NB_LAZY_PSO: already noted in the recently used list this session.
+    mutable bool recent_noted{};
 
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>

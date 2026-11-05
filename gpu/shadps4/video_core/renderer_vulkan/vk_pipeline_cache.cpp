@@ -2670,6 +2670,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     const GraphicsPipeline* pipeline = GetGraphicsPipelineLookup(params);
     if (pipeline) {
         ++pipeline->use_count;
+        if (!pipeline->recent_noted && SotcNonBlocking::LazyPso()) { // sotc: once per pipeline object
+            pipeline->recent_noted = true;
+            NoteRecentPipeline(std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()));
+        }
     }
     return pipeline;
 }
@@ -2987,8 +2991,93 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     const ComputePipeline* pipeline = GetComputePipelineLookup();
     if (pipeline) {
         ++pipeline->use_count;
+        if (!pipeline->recent_noted && SotcNonBlocking::LazyPso()) { // sotc: once per pipeline object
+            pipeline->recent_noted = true;
+            NoteRecentPipeline(pipeline->KeyValue());
+        }
     }
     return pipeline;
+}
+
+namespace {
+// sotc: SOTC_NB_LAZY_PSO recently used pipelines, in the versioned cache folder (the ids are this version's keys).
+// Header: magic, the session that wrote it, the count; then (id, session of the last use).
+constexpr u32 kRecentMagic = 0x54435352; // "RSCT"
+constexpr u32 kRecentSessions = 3;       // a pipeline unused for this many sessions is no longer built at boot
+std::filesystem::path RecentPsoPath() {
+    return Storage::DataBase::Instance().CachePath() / "sotc_recent_pso.bin";
+}
+} // namespace
+
+void PipelineCache::LoadRecentPipelines() {
+    recent_pso.clear();
+    recent_session = 1;
+    if (std::FILE* f = _wfopen(RecentPsoPath().c_str(), L"rb")) {
+        u32 header[3]{};
+        if (std::fread(header, sizeof header, 1, f) == 1 && header[0] == kRecentMagic) {
+            recent_session = header[1] + 1;
+            for (u32 i = 0; i < header[2]; ++i) {
+                u64 id{};
+                u32 session{};
+                if (std::fread(&id, sizeof id, 1, f) != 1 || std::fread(&session, sizeof session, 1, f) != 1) {
+                    break;
+                }
+                if (session + kRecentSessions > recent_session) {
+                    recent_pso.emplace(id, session);
+                }
+            }
+        }
+        std::fclose(f);
+    }
+    recent_saved = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "SOTC NB LAZY PSO: session %u, %zu pipelines used in the last %u sessions\n", recent_session,
+                 recent_pso.size(), kRecentSessions);
+}
+
+bool PipelineCache::RecentPipeline(u64 id) const {
+    return recent_pso.contains(id);
+}
+
+void PipelineCache::NoteRecentPipeline(u64 id) {
+    if (recent_session == 0) {
+        return; // the warm-up did not run (no cache): nothing to keep
+    }
+    auto& session = recent_pso[id];
+    if (session != recent_session) {
+        session = recent_session;
+        recent_dirty = true;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!recent_dirty || now - recent_saved < std::chrono::seconds(5)) {
+        return;
+    }
+    recent_saved = now;
+    recent_dirty = false;
+    // A few tens of KB, written by a detached thread (no file I/O on the command processor).
+    std::vector<u8> data;
+    const auto put = [&data](const void* p, size_t n) {
+        data.insert(data.end(), static_cast<const u8*>(p), static_cast<const u8*>(p) + n);
+    };
+    const u32 header[3] = {kRecentMagic, recent_session, static_cast<u32>(recent_pso.size())};
+    put(header, sizeof header);
+    for (const auto& [pso, last] : recent_pso) {
+        put(&pso, sizeof pso);
+        put(&last, sizeof last);
+    }
+    std::thread([path = RecentPsoPath(), data = std::move(data)] {
+        auto tmp = path;
+        tmp += ".tmp";
+        if (std::FILE* f = _wfopen(tmp.c_str(), L"wb")) {
+            const bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+            std::fclose(f);
+            std::error_code ec;
+            if (ok) {
+                std::filesystem::rename(tmp, path, ec);
+            } else {
+                std::filesystem::remove(tmp, ec);
+            }
+        }
+    }).detach();
 }
 
 // sotc: SOTC_PIPE_FAST: the full lookup; GetComputePipelineLookup runs it unless a record applies.
