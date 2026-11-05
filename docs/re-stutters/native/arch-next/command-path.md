@@ -423,3 +423,41 @@ threads) and halves the frame rate. With it off the process uses about 5 of 16 t
 `SOTC_PIPE_PREDICT=0`. Of the spin switches, the futex and no-spin waits halve the recorder's CPU (its spin), about
 half a core, with no change beyond one round's noise in the route; `SOTC_REC_SPIN_US=0` did not change the recorder.
 The worker cap has nothing to cap warm (workers idle); it needs the cold run.
+
+### C1.3 worker cap, cold, and C2 (`user/c2/*.log`, one round each)
+
+| config | process cores | route p50 / p99 / max | boot preparation | CP blocked on draw |
+|---|---|---|---|---|
+| cold, no cap (salt 87) | 11.65, 7.89, 8.34 | 33.4 / 143.2 / 375.9 ms | 64.2 s | 8.06 ms/frame |
+| cold, `SOTC_NB_WORKER_CAP=1` (salt 88) | 8.47, 9.01 | 33.5 / 93.2 / 102.3 ms | 75.7 s | 6.10 |
+| warm, `SOTC_CP_PRECISE_WAIT=2` | 6.01, 5.41 | 33.4 / 58.7 / 100.5 ms | - | 7.28 (avoided 240/s, verified 240/s, violations 0) |
+| warm, `SOTC_CP_PRECISE_WAIT=1` | 5.80, 5.65 | 33.4 / 67.3 / 84.7 ms | - | 4.15 (avoided 1,887/s, violations 0 in =2) |
+| warm, `SOTC_CP_LABEL_SKIP=1` | 5.80, 5.30 | 33.3 / 58.1 / 59.2 ms | - | 19.25 (4,515 waits/s) |
+
+- Worker cap: the cold route improved in this round but the boot preparation took 11 s longer (the pretranslation
+  queued before the hold starts is capped; earlier cold holds ranged 59.5-78.8 s, so not conclusive). Off.
+- Precise wait: 0 counted violations in verify mode, and in mode 1 the CP's blocked time falls from ~7 to 4.15 ms per
+  frame. Rejected anyway: the user saw the game's depth broken with `SOTC_CP_PRECISE_WAIT=2` (5 Nov). Verify mode
+  uses the lookup made without the full wait and only compares a digest (`CpDigest`), so a read outside the checked
+  set (`CpCollectReads`: stage code, fetch shader, sharp tables) goes uncounted; the visible fault says such reads
+  exist. Not used as a base for C3.
+- Label skip: the CP waits ~15x more often for the draw thread (19.25 ms/frame blocked). Rejected.
+
+### C3 matrix (warm Lab route, salt 73, P1 on, without precise wait; `user/c3/c3b_*.log`, one round each)
+
+| switch | route p99 / max, frames > 50 ms | draw cpu / cp cpu / bind (ms per frame, two windows) | process cores | verify |
+|---|---|---|---|---|
+| none (base) | 58.6 / 83.4, 8 | 34.8 / 33.7 / 18.2; 34.7 / 32.2 / 18.3 | 5.92, 5.70 | - |
+| `SOTC_DEDUP_PUSH=1` | 59.0 / 75.2, 9 | 38.6 / 36.3 / 20.1; 31.4 / 29.9 / 16.5 | 5.85, 5.55 | - |
+| `SOTC_SYNC_FAST=1` | 58.4 / 75.4, 8 | 37.2 / 35.0 / 19.7; 33.1 / 31.2 / 17.6 | 5.80, 5.55 | - |
+| `SOTC_FASTBIND_WIDE=1` | 76.4 / 100.8, 13 | 37.7 / 36.0 / 19.7; 35.3 / 32.7 / 18.8 | 5.75, 5.67 | - |
+| `SOTC_PIPE_FAST=1` | 84.2 / 127.2, 27 | 42.9 / 40.0 / 22.9; 30.5 / 29.2 / 16.0 | 5.78, 5.39 | graphics hits 35%, compute 0% |
+| `SOTC_SPEC_MEMO=2` | 58.7 / 67.1, 9 | 36.3 / 34.5 / 18.8; 33.0 / 31.5 / 17.5 | 5.69, 5.48 | hits 100%, mismatches 0 |
+| `SOTC_SPEC_MEMO=1` | 50.1 / 58.3, 3 | 34.5 / 33.0 / 18.1; 30.4 / 29.1 / 15.8 | 5.86, 5.27 | hits 100% |
+| `SOTC_PARALLEL_RECORD=1` | 50.1 / 58.3, 3 | 35.6 / 33.4 / 18.4; 32.0 / 30.4 / 16.7 | 6.78, 6.14 | - |
+
+At the 30 FPS cap no switch moves the per-frame thread times beyond the spread between two windows of the same run
+(draw cpu 30-39 ms in every row). `SOTC_PIPE_FAST` and `SOTC_FASTBIND_WIDE` made the route worse; `SOTC_SPEC_MEMO=1`
+and `SOTC_PARALLEL_RECORD=1` gave the best route numbers of the round (the latter costs ~0.8 core more). After the
+precise-wait finding (0 counted violations, broken depth on screen), verify counters are not enough: anything kept
+needs the user's visual check. Not yet run: the uncapped Shrine scene, where a gain in per-frame cost shows as FPS.
