@@ -52,6 +52,9 @@ public:
     struct SetRequest {
         std::span<const vk::DescriptorSetLayoutBinding> bindings;
         vk::DescriptorSetLayoutCreateFlags flags{};
+        /// sotc: SOTC_NB_GPL: a VK_NULL_HANDLE set (allowed in a layout with independent sets): the part of a
+        /// pipeline library that does not use this set.
+        bool null_set{};
     };
 
     /// What makes a pipeline layout: its sets in order (set 0 first), then its push constants.
@@ -64,6 +67,8 @@ public:
         /// sotc: a second push constant range (the bindless sampler slots, after PushData), used
         /// when its size is not zero.
         vk::PushConstantRange slot_constants{};
+        /// sotc: SOTC_NB_GPL: VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT for the per-shader libraries.
+        vk::PipelineLayoutCreateFlags layout_flags{};
     };
 
     using SetLayouts = boost::container::static_vector<vk::DescriptorSetLayout,
@@ -105,7 +110,8 @@ private:
     static Key MakeSetKey(const SetRequest& set);
     vk::UniqueDescriptorSetLayout CreateSetLayout(const SetRequest& set);
     vk::UniquePipelineLayout CreatePipelineLayout(std::span<const vk::DescriptorSetLayout> sets,
-                                                  std::span<const vk::PushConstantRange> push);
+                                                  std::span<const vk::PushConstantRange> push,
+                                                  vk::PipelineLayoutCreateFlags flags = {});
     vk::DescriptorSetLayout FindSetLayout(const SetRequest& set);
 
     const Instance& instance;
@@ -217,6 +223,11 @@ protected:
     vk::UniquePipeline pipeline;
     LayoutCache::Owned owned_layouts; ///< sotc: only when the layout cache is off
     vk::PipelineLayout pipeline_layout; ///< sotc: from LayoutCache, not owned here
+    /// sotc: SOTC_NB_GPL: the layouts of the per-shader libraries (only the vertex set / only the fragment set), null
+    /// when the pipeline's libraries use the full layout.
+    vk::PipelineLayout gpl_vs_layout{};
+    vk::PipelineLayout gpl_fs_layout{};
+    LayoutCache::Owned owned_gpl_layouts[2]; ///< sotc: only when the layout cache is off
     vk::DescriptorSetLayout desc_layout; ///< sotc: set 0's layout, from LayoutCache
     LayoutCache::SetLayouts set_layouts; ///< sotc: all sets of the layout, in set order
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};

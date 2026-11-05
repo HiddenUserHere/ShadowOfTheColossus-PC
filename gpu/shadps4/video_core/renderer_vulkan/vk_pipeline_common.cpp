@@ -88,8 +88,10 @@ vk::UniqueDescriptorSetLayout LayoutCache::CreateSetLayout(const SetRequest& set
 }
 
 vk::UniquePipelineLayout LayoutCache::CreatePipelineLayout(
-    std::span<const vk::DescriptorSetLayout> sets, std::span<const vk::PushConstantRange> push) {
+    std::span<const vk::DescriptorSetLayout> sets, std::span<const vk::PushConstantRange> push,
+    vk::PipelineLayoutCreateFlags flags) {
     const vk::PipelineLayoutCreateInfo layout_info = {
+        .flags = flags,
         .setLayoutCount = static_cast<u32>(sets.size()),
         .pSetLayouts = sets.data(),
         .pushConstantRangeCount = static_cast<u32>(push.size()),
@@ -102,6 +104,9 @@ vk::UniquePipelineLayout LayoutCache::CreatePipelineLayout(
 }
 
 vk::DescriptorSetLayout LayoutCache::FindSetLayout(const SetRequest& set) {
+    if (set.null_set) {
+        return {}; // sotc: SOTC_NB_GPL, a set the library does not use
+    }
     auto [it, is_new] = set_entries.try_emplace(MakeSetKey(set));
     if (is_new) {
         it.value() = CreateSetLayout(set);
@@ -121,13 +126,17 @@ LayoutCache::Layouts LayoutCache::Get(const Request& request, Owned& owned) {
     if (!enabled) {
         owned.sets.clear();
         for (const auto& set : request.sets) {
+            if (set.null_set) {
+                result.sets.push_back(vk::DescriptorSetLayout{});
+                continue;
+            }
             owned.sets.push_back(CreateSetLayout(set));
             result.sets.push_back(*owned.sets.back());
         }
         if (request.trailing_set) {
             result.sets.push_back(request.trailing_set);
         }
-        owned.pipeline_layout = CreatePipelineLayout(result.sets, push_ranges);
+        owned.pipeline_layout = CreatePipelineLayout(result.sets, push_ranges, request.layout_flags);
         result.pipeline_layout = *owned.pipeline_layout;
         result.created = true;
         ++num_created;
@@ -147,6 +156,7 @@ LayoutCache::Layouts LayoutCache::Get(const Request& request, Owned& owned) {
     key.push_back(static_cast<u64>(static_cast<VkFlags>(request.push_constants.stageFlags)));
     key.push_back(request.push_constants.offset);
     key.push_back(request.push_constants.size);
+    key.push_back(static_cast<u64>(static_cast<VkFlags>(request.layout_flags))); // sotc: SOTC_NB_GPL
     if (request.slot_constants.size != 0) {
         key.push_back(static_cast<u64>(static_cast<VkFlags>(request.slot_constants.stageFlags)));
         key.push_back(request.slot_constants.offset);
@@ -154,7 +164,7 @@ LayoutCache::Layouts LayoutCache::Get(const Request& request, Owned& owned) {
     }
     auto [it, is_new] = pipeline_entries.try_emplace(std::move(key));
     if (is_new) {
-        it.value() = CreatePipelineLayout(result.sets, push_ranges);
+        it.value() = CreatePipelineLayout(result.sets, push_ranges, request.layout_flags);
         ++num_created;
     } else {
         ++num_reused;

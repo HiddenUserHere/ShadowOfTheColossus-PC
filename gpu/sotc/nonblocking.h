@@ -28,4 +28,13 @@ inline bool Sched() {
     return on;
 }
 
+/// P3 (SOTC_NB_GPL=1, with SOTC_PIPE_GPL=1 and SOTC_STAGE_BINDINGS=1): never-wait pipelines. Graphics pipeline layouts
+/// are created with independent sets; pre-rasterization and fragment libraries are built per shader (a layout holding
+/// only that stage's set; the fragment part without attachment formats). The command processor only links parts that
+/// exist (no library build on it); a missing part goes to a worker link job and the draw is skipped meanwhile.
+inline bool Gpl() {
+    static const bool on = SwitchOn("SOTC_NB_GPL");
+    return on;
+}
+
 } // namespace SotcNonBlocking

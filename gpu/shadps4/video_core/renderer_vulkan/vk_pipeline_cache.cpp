@@ -1294,11 +1294,11 @@ namespace {
 // being made and a worker taking them, and how long they ran. Workers add; the command processor prints every 5 s.
 enum JobClass : u8 {
     JobCompute, JobComputePrebuild, JobTranslate, JobPretranslate, JobTiny, JobShadow, JobGraphics, JobPreload,
-    JobLazy, JobPredict, JobClassCount
+    JobLazy, JobPredict, JobLink, JobClassCount
 };
 constexpr std::array<const char*, JobClassCount> kJobClassNames{
     "compute", "compute prebuild", "translate", "pretranslate", "tiny", "shadow", "graphics", "preload", "pack load",
-    "predicted",
+    "predicted", "gpl link",
 };
 // sotc: SOTC_NB_SCHED counters, printed with the job queue report.
 std::atomic<u64> g_sched_cancelled{0}, g_sched_demand{0};
@@ -1394,6 +1394,25 @@ void PipelineCache::QueueAsyncPipeline(u64 hash,
         // translation jobs, which the recorder or a draw waits for); predicted ones go to the background.
         PushJobLocked(priority ? JobLane::Shadow : background ? JobLane::Background : JobLane::Graphics,
                       std::move(job));
+    }
+    async_cv.notify_one();
+}
+
+void PipelineCache::QueueLinkJob() {
+    auto job = std::make_unique<AsyncPipelineJob>();
+    job->key = graphics_key;
+    job->hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+    job->infos = infos;
+    job->runtime_infos = runtime_infos;
+    if (fetch_shader) {
+        job->fetch_shader = *fetch_shader;
+    }
+    job->modules = modules;
+    job->link_only = true;
+    link_pending.insert(graphics_key);
+    {
+        std::scoped_lock lock{async_mutex};
+        PushJobLocked(JobLane::Translate, std::move(job)); // draws are skipped until it is linked
     }
     async_cv.notify_one();
 }
@@ -1499,7 +1518,8 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             if (!job) {
                 continue;
             }
-            job_class = job->lazy                ? JobLazy
+            job_class = job->link_only           ? JobLink
+                        : job->lazy                ? JobLazy
                         : job->compute           ? (job->pre_compute ? JobComputePrebuild : JobCompute)
                         : job->translate         ? (job->translate->pretranslate ? JobPretranslate : JobTranslate)
                         : lane == JobLane::Tiny  ? JobTiny
@@ -1582,7 +1602,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                 instance, scheduler, desc_heap, layout_cache, profile, job->key, *pipeline_cache,
                 job->infos,
                 job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
-                job->sdata, job->preloaded, true);
+                job->sdata, job->preloaded, true, job->link_only ? &gpl_libs : nullptr);
             SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         }
         note_job();
@@ -1597,16 +1617,23 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
     }
 }
 
-bool PipelineCache::TryFastLink(std::unique_ptr<GraphicsPipeline>& slot) {
+bool PipelineCache::TryFastLink(std::unique_ptr<GraphicsPipeline>& slot, bool allow_build) {
     const N5Clock::time_point link_start = N5Clock::now(); // sotc: N5
     if (!GraphicsPipeline::FastLinkable(graphics_key, infos, runtime_infos, profile)) {
         g_gpl_counters.unlinkable.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     GraphicsPipeline::SerializationSupport sdata{};
+    // sotc: SOTC_NB_GPL: the command processor only links libraries that exist; a missing one is built by a worker
+    // (QueueLinkJob).
+    // allow_build: a tiny full-screen draw (never skipped) builds its missing libraries here, ~17 ms each, instead of
+    // a whole pipeline.
+    const bool lookup_only = SotcNonBlocking::Gpl() && !allow_build;
+    GplLibraryCache::SetLookupOnly(lookup_only);
     auto pipe = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, layout_cache, profile, graphics_key, *pipeline_cache,
         infos, runtime_infos, fetch_shader, modules, sdata, false, false, &gpl_libs);
+    GplLibraryCache::SetLookupOnly(false);
     if (!pipe->IsLinked()) {
         return false;
     }
@@ -1643,6 +1670,14 @@ void PipelineCache::CollectAsyncPipelines() {
             }
         }
         const auto it = graphics_pipelines.find(job->key);
+        if (job->link_only) { // sotc: SOTC_NB_GPL link job: serves the draws until the optimized build
+            link_pending.erase(job->key);
+            if (it != graphics_pipelines.end() && !it.value() && job->pipeline && job->pipeline->Handle()) {
+                it.value() = std::move(job->pipeline);
+                last_graphics_pipeline = nullptr;
+            }
+            continue;
+        }
         if (it == graphics_pipelines.end()) {
             continue;
         }
@@ -2438,6 +2473,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         // sotc: SOTC_PIPE_GPL: the draw runs on a fast-linked pipeline; the queued build replaces it
         // when it is collected (CollectAsyncPipelines).
         if (!gpl_on || !TryFastLink(it.value())) {
+            if (gpl_on && SotcNonBlocking::Gpl() && !link_pending.contains(graphics_key)) {
+                QueueLinkJob(); // sotc: SOTC_NB_GPL, the libraries are built off the command processor
+            }
             note_skip_demand();
             return nullptr;
         }
@@ -2499,11 +2537,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         // sotc: SOTC_TINY_GPL=1 (TinyGplOn). A tiny draw is served by a fast-linked pipeline now, and the
         // optimized build follows on a worker. Its time is counted in g_tiny_gpl.
         // Descriptor heap pipelines are never linked (GraphicsPipeline ctor): they would be built twice.
-        if (tiny_draw && !depth_only && TinyGplOn() && gpl_on && eligible &&
+        if (tiny_draw && !depth_only && (TinyGplOn() || SotcNonBlocking::Gpl()) && gpl_on && eligible &&
             !async_workers.empty() && !instance.IsDescriptorHeapEnabled()) {
             const auto fast_start = std::chrono::steady_clock::now();
             const u64 link_before = g_gpl_counters.link_ns.load(std::memory_order_relaxed);
-            if (TryFastLink(it.value())) {
+            if (TryFastLink(it.value(), true)) {
                 const u64 link_ns =
                     g_gpl_counters.link_ns.load(std::memory_order_relaxed) - link_before;
                 const u64 total_ns = static_cast<u64>(
@@ -2547,6 +2585,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
             // sotc: SOTC_PIPE_GPL: the draw runs on a fast-linked pipeline now (not registered here:
             // the optimized build registers when it replaces it).
             if (!gpl_on || !TryFastLink(it.value())) {
+                if (gpl_on && SotcNonBlocking::Gpl()) {
+                    QueueLinkJob(); // sotc: SOTC_NB_GPL, the libraries are built off the command processor
+                }
                 return nullptr; // the draws that need it are skipped until it is ready
             }
             std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));

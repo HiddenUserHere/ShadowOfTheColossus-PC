@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "../../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER
+#include "../../../sotc/nonblocking.h"  // sotc: SOTC_NB_GPL
 
 namespace Vulkan {
 
@@ -45,25 +46,51 @@ public:
 };
 } // namespace
 
+namespace {
+thread_local bool t_gpl_lookup_only = false; // sotc: SOTC_NB_GPL (GplLibraryCache::SetLookupOnly)
+} // namespace
+
+void GplLibraryCache::SetLookupOnly(bool lookup_only) {
+    t_gpl_lookup_only = lookup_only;
+}
+
+bool GplLibraryCache::LookupOnly() {
+    return t_gpl_lookup_only;
+}
+
 vk::Pipeline GplLibraryCache::GetOrBuild(Part part, const std::string& key, bool& built,
                                          const std::function<vk::UniquePipeline()>& build) {
-    std::optional<SotcBlockLedger::Scope> lock_wait{std::in_place, SotcBlockLedger::GplLockWait};
-    std::scoped_lock lock{mutex};
-    lock_wait.reset();
-    auto& map = parts[part];
-    if (const auto it = map.find(key); it != map.end()) {
-        built = false;
-        return *it->second;
+    // sotc: SOTC_NB_GPL: the lock only covers the map, never a build. It was held while a worker compiled a library
+    // (~17 ms each), so the command processor's lookups waited for whole builds (14.7 s in one 5 s window of a cold
+    // run). Two threads may now build the same library; the second copy is dropped.
+    {
+        std::optional<SotcBlockLedger::Scope> lock_wait{std::in_place, SotcBlockLedger::GplLockWait};
+        std::scoped_lock lock{mutex};
+        lock_wait.reset();
+        auto& map = parts[part];
+        if (const auto it = map.find(key); it != map.end()) {
+            built = false;
+            return *it->second;
+        }
     }
-    built = true;
-    const SotcBlockLedger::Scope ledger{SotcBlockLedger::GplBuild};
-    vk::UniquePipeline library = build();
+    if (t_gpl_lookup_only) {
+        built = false;
+        return {}; // sotc: SOTC_NB_GPL, built by a worker's link job instead
+    }
+    vk::UniquePipeline library;
+    {
+        const SotcBlockLedger::Scope ledger{SotcBlockLedger::GplBuild};
+        library = build();
+    }
     if (!library) {
+        built = false;
         return {};
     }
-    const vk::Pipeline handle = *library;
-    map.emplace(key, std::move(library));
-    return handle;
+    std::scoped_lock lock{mutex};
+    auto& map = parts[part];
+    const auto [it, inserted] = map.try_emplace(key, std::move(library));
+    built = inserted; // a library another thread stored first wins; this copy is destroyed with `library`
+    return *it->second;
 }
 
 bool GraphicsPipeline::FastLinkable(const GraphicsPipelineKey& key,
@@ -544,13 +571,20 @@ GraphicsPipeline::GraphicsPipeline(
             pipeline_flags | vk::PipelineCreateFlagBits::eLibraryKHR;
 
         // Every part has the layout and the dynamic states: the libraries of one link must agree.
-        const auto add_common = [&](GplKey& k) {
-            k.Add(static_cast<VkPipelineLayout>(layout));
+        // sotc: SOTC_NB_GPL: per-shader parts carry their own stage's layout (independent sets), the interface
+        // parts none.
+        const bool per_shader = gpl_vs_layout && gpl_fs_layout;
+        const vk::PipelineLayout pre_layout = per_shader ? gpl_vs_layout : layout;
+        const vk::PipelineLayout fs_layout = per_shader ? gpl_fs_layout : layout;
+        const vk::PipelineLayout interface_layout = per_shader ? vk::PipelineLayout{} : layout;
+        const auto add_common_with = [&](GplKey& k, vk::PipelineLayout part_layout) {
+            k.Add(static_cast<VkPipelineLayout>(part_layout));
             k.Add(static_cast<u32>(dynamic_states.size()));
             for (const auto state : dynamic_states) {
                 k.Add(static_cast<u32>(state));
             }
         };
+        const auto add_common = [&](GplKey& k) { add_common_with(k, layout); };
         // The rendering info (attachment formats and samples) of the fragment and output parts.
         const auto add_render = [&](GplKey& k) {
             k.Add(pipeline_rendering_ci.colorAttachmentCount);
@@ -569,7 +603,7 @@ GraphicsPipeline::GraphicsPipeline(
 
         // Vertex input interface: the vertex attributes (when not dynamic) and the topology.
         GplKey vi_key;
-        add_common(vi_key);
+        add_common_with(vi_key, interface_layout);
         vi_key.Add(static_cast<u32>(topology));
         vi_key.Add(static_cast<u32>(instance.IsVertexInputDynamicState()));
         vi_key.Add(static_cast<u32>(sdata.vertex_attributes.size()));
@@ -588,7 +622,7 @@ GraphicsPipeline::GraphicsPipeline(
         // Pre-rasterization: the vertex, tessellation and geometry modules, and the rasterization
         // state, a function of these key fields and of the instance.
         GplKey pre_key;
-        add_common(pre_key);
+        add_common_with(pre_key, pre_layout);
         for (const auto stage : {Shader::SwStage::Vertex, Shader::SwStage::Geometry,
                                  Shader::SwStage::TessellationControl,
                                  Shader::SwStage::TessellationEval}) {
@@ -604,17 +638,21 @@ GraphicsPipeline::GraphicsPipeline(
 
         // Fragment: the fragment module, the multisampling and the depth/stencil formats.
         GplKey fs_key;
-        add_common(fs_key);
+        add_common_with(fs_key, fs_layout);
         fs_key.Add(stage_module(Shader::SwStage::Fragment));
         fs_key.Add(static_cast<u32>(sdata.multisampling.rasterizationSamples));
         fs_key.Add(static_cast<u32>(sdata.multisampling.sampleShadingEnable));
         fs_key.Add(static_cast<u32>(key.z_format));
         fs_key.Add(static_cast<u32>(key.stencil_format));
-        add_render(fs_key);
+        // sotc: SOTC_NB_GPL: fragment shader state ignores the attachment formats (only the view mask, 0 here), so a
+        // per-shader fragment library serves every render-target set.
+        if (!per_shader) {
+            add_render(fs_key);
+        }
 
         // Fragment output: the blend state, the multisampling and the rendering info.
         GplKey fo_key;
-        add_common(fo_key);
+        add_common_with(fo_key, interface_layout);
         fo_key.Add(static_cast<u32>(sdata.multisampling.rasterizationSamples));
         fo_key.Add(static_cast<u32>(sdata.multisampling.sampleShadingEnable));
         fo_key.Add(static_cast<u32>(color_blending.logicOpEnable));
@@ -677,7 +715,7 @@ GraphicsPipeline::GraphicsPipeline(
                 !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
             .pInputAssemblyState = &input_assembly,
             .pDynamicState = &dynamic_info,
-            .layout = layout,
+            .layout = interface_layout,
         };
         const vk::Pipeline vi_handle =
             get_library(GplLibraryCache::VertexInput, vi_key.bytes, vi_ci);
@@ -694,7 +732,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pViewportState = &viewport_info,
             .pRasterizationState = &raster_chain.get(),
             .pDynamicState = &dynamic_info,
-            .layout = layout,
+            .layout = pre_layout,
         };
         const vk::Pipeline pre_handle =
             get_library(GplLibraryCache::PreRaster, pre_key.bytes, pre_ci);
@@ -712,7 +750,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pDepthStencilState =
                 !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
             .pDynamicState = &dynamic_info,
-            .layout = layout,
+            .layout = fs_layout,
         };
         const vk::Pipeline fs_handle =
             get_library(GplLibraryCache::Fragment, fs_key.bytes, fs_ci);
@@ -727,7 +765,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pMultisampleState = &sdata.multisampling,
             .pColorBlendState = &color_blending,
             .pDynamicState = &dynamic_info,
-            .layout = layout,
+            .layout = interface_layout,
         };
         const vk::Pipeline fo_handle =
             get_library(GplLibraryCache::FragmentOutput, fo_key.bytes, fo_ci);
@@ -735,6 +773,9 @@ GraphicsPipeline::GraphicsPipeline(
         const std::array<vk::Pipeline, 4> libraries = {vi_handle, pre_handle, fs_handle,
                                                        fo_handle};
         if (std::ranges::any_of(libraries, [](vk::Pipeline lib) { return !lib; })) {
+            if (GplLibraryCache::LookupOnly()) {
+                return; // sotc: SOTC_NB_GPL, a part is not built yet (a worker's link job builds it)
+            }
             LOG_WARNING(Render_Vulkan, "Pipeline libraries of {} not built, not linked",
                         debug_str);
             g_gpl_counters.link_failed.fetch_add(1, std::memory_order_relaxed);
@@ -1039,17 +1080,44 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
             .flags = flags,
         });
     }
+    // sotc: SOTC_NB_GPL: per-shader libraries need a layout with independent sets, on every such graphics pipeline
+    // (linked or optimized, so both bind their sets the same way): one set per stage, vertex + fragment only.
+    const bool per_shader_gpl = stage_sets && SotcNonBlocking::Gpl() && instance.IsGraphicsPipelineLibrary() &&
+                                num_sets == 2 && !uses_bindless_samplers && !uses_slot_words && !packet_range;
     const LayoutCache::Request request{
         .sets = requests,
         .push_constants = push_constants,
         .trailing_set = uses_bindless_samplers ? desc_heap.BindlessSamplerLayout()
                                                : vk::DescriptorSetLayout{},
         .slot_constants = uses_slot_words ? slot_push_constants : vk::PushConstantRange{},
+        .layout_flags = per_shader_gpl ? vk::PipelineLayoutCreateFlags{vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT}
+                                       : vk::PipelineLayoutCreateFlags{},
     };
     const auto layouts = layout_cache.Get(request, owned_layouts);
     set_layouts = layouts.sets;
     desc_layout = set_layouts[0];
     pipeline_layout = layouts.pipeline_layout;
+    // sotc: SOTC_NB_GPL: the per-shader library layouts. Same push range and flags; the fragment one holds only the
+    // fragment set (set 0), the vertex one a null set 0 and the vertex set (set 1).
+    gpl_vs_layout = vk::PipelineLayout{};
+    gpl_fs_layout = vk::PipelineLayout{};
+    if (per_shader_gpl) {
+        const std::array<LayoutCache::SetRequest, 1> fs_sets{requests[0]};
+        const LayoutCache::Request fs_request{
+            .sets = fs_sets,
+            .push_constants = push_constants,
+            .layout_flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT,
+        };
+        gpl_fs_layout = layout_cache.Get(fs_request, owned_gpl_layouts[0]).pipeline_layout;
+        const std::array<LayoutCache::SetRequest, 2> vs_sets{LayoutCache::SetRequest{.null_set = true},
+                                                             requests[1]};
+        const LayoutCache::Request vs_request{
+            .sets = vs_sets,
+            .push_constants = push_constants,
+            .layout_flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT,
+        };
+        gpl_vs_layout = layout_cache.Get(vs_request, owned_gpl_layouts[1]).pipeline_layout;
+    }
     // sotc: the offsets are per set layout, so every pipeline queries them from the shared handle.
     if (!stage_sets) {
         QueryDescriptorBufferLayout(set_bindings[0]);

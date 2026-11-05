@@ -149,3 +149,52 @@ A/B, one round each (`user/nb2/nb2s_*.log` salt 76 against `user/nb1/nb1b_*.log`
 Graphics jobs wait 30-47% less on average (demand order: 1,315 and 3,640 skipped-draw points in those windows), the
 warm run is the same or better, the cold route p99 and max are higher in this one round. Not decided by one round:
 it stays off by default.
+
+## P3 step 2: per-shader GPL libraries (`SOTC_NB_GPL=1` with `SOTC_PIPE_GPL=1 SOTC_STAGE_BINDINGS=1`)
+
+Built: graphics layouts with independent sets and the two per-stage library layouts (`LayoutCache` `layout_flags`,
+`null_set`; `GraphicsPipeline::gpl_vs_layout`, `gpl_fs_layout`); library keys per shader, the fragment part without
+attachment formats; on the command processor `TryFastLink` only looks libraries up
+(`GplLibraryCache::SetLookupOnly`), a miss queues a worker link job (`QueueLinkJob`, translate lane) that builds the
+missing libraries and links; the optimized build still replaces the linked pipeline (`CollectAsyncPipelines`).
+
+First run (`user/nb3/gpl_cold.log`, salt 77): `GplLibraryCache::GetOrBuild` held its mutex while a worker built a
+library, so the command processor's lookups waited for whole builds ("gpl lock" 14.7 s in one 5 s window; cold route
+p99 925.6 ms, max 2,565 ms). Fixed: the lock covers the map only, the build runs outside it, a duplicate is dropped.
+
+After the fix, one round each (`gpl2_cold.log` salt 78, `gpl2_warm.log`), against per-stage sets without GPL
+(`sb_*.log`):
+
+| | sets, cold | sets + GPL, cold | sets, warm | sets + GPL, warm |
+|---|---|---|---|---|
+| route p50 / p99 / max | 33.4 / 266.2 / 459.6 ms | 33.4 / 237.1 / 441.5 ms | 33.3 / 50.4 / 84.3 ms | 33.3 / 50.9 / 58.9 ms |
+| frames over 50 / 100 ms | 12 / 5 | 25 / 8 | 3 / 0 | 3 / 0 |
+| GPL: draws served by a link, links, failures | - | 334, 119, 0 | - | 2, 22, 0 |
+| libraries built / reused (pre-raster, fragment) | - | 71 / 446, 108 / 58 | - | 19 / 16, 20 / 2 |
+| gpl lock wait on the CP | - | 0.0-0.7 ms per 5 s | - | - |
+
+No device lost in either run. The command processor still builds 30 pipelines inline in the cold run (2.1 s, the tiny
+full-screen draws, which are never skipped), the largest item left in the ledger. Not checked: validation layers (not
+installed on this machine) and the image.
+
+### P3 validation and the tiny draws
+
+Validation layers (`mingw-w64-clang-x86_64-vulkan-validation-layers` 1.4.363, `BB_VK_VALIDATION=1`,
+`VK_LAYER_PATH=C:/msys64/clang64/bin`):
+- warm run (`user/nb3/gpl_val.log`): 7 links; the only message is VUID-StandaloneSpirv-OpEntryPoint-08721 on
+  `vkCreateShaderModule` (two inputs on one location component, from the recompiler's SPIR-V, not related to GPL);
+- cold run without pretranslation, so every pipeline goes through the library path (`gpl_val2.log`, salt 79):
+  79 links, 117 libraries built with independent-set layouts, 0 link failures, no validation message at all.
+
+Tiny full-screen draws (never skipped) now build only their missing libraries on the command processor and link
+(`TryFastLink(slot, true)`, the `SOTC_TINY_GPL` path, on with `SOTC_NB_GPL`), the optimized build follows on a worker.
+Run `gpl3_cold.log` / `gpl3_warm.log` (salt 80) against `gpl2_*`:
+
+| | gpl2 cold | gpl3 cold | gpl2 warm | gpl3 warm |
+|---|---|---|---|---|
+| route p50 / p99 / max | 33.4 / 237.1 / 441.5 ms | 33.5 / 242.5 / 349.5 ms | 33.3 / 50.9 / 58.9 ms | 33.3 / 50.4 / 58.1 ms |
+| CP inline: pipelines / gpl libraries | 2,079 ms (30) / - | 10 ms (1) / 1,960 ms (60) | - | - |
+
+The inline cost moved from whole pipelines to libraries but hardly shrank: these draws' libraries take 22-53 ms each
+(not the 17 ms average), and the full-screen passes use many distinct pixel shaders. What is left for the first
+session is building those libraries before the draw: P4.

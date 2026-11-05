@@ -436,6 +436,9 @@ private:
         /// and set when the command processor built the pipeline itself (the worker then skips the build).
         std::atomic<u32> demand{0};
         std::atomic<bool> cancelled{false};
+        /// sotc: SOTC_NB_GPL: a link job. The worker builds the missing per-shader libraries and links them (the
+        /// fast pipeline the draws use until the optimized build of the same key replaces it).
+        bool link_only{};
         ComputePipeline* compute{}; ///< a compute job: only Build() is run
         bool priority{}; ///< sotc: a depth-only (shadow) graphics job queued ahead of the others
         bool pre_compute{}; ///< sotc: SOTC_PRETRANSLATE_COMPUTE: a prebuilt compute pipeline (its build counts as done)
@@ -602,6 +605,8 @@ private:
     bool InstallLazyPerm(u64 hash, AsyncPipelineJob::LazyLoad::Perm& perm);
     /// sotc: SOTC_NB_IO. Wakes the saver thread to save the driver cache now (inline when there is no saver).
     void RequestDriverCacheSave();
+    /// sotc: SOTC_NB_GPL. Queues a link job for the current key (translate lane: draws wait for it).
+    void QueueLinkJob();
     /// sotc: SOTC_NB_IO. Moves pack loads from lazy_backlog to the workers, at most 2 at a time.
     void FeedLazyPrefetch();
     /// sotc: SOTC_PIPE_PREDICT (gpu/sotc/pipe_predict.h). Command processor, before a draw's key is built: reads the
@@ -619,7 +624,7 @@ private:
     void SaveUseCounts();
     /// sotc: SOTC_PIPE_GPL. Builds the fast-linked pipeline of graphics_key into slot, when its
     /// state can be linked. Returns false (slot untouched) when it cannot. Command processor only.
-    bool TryFastLink(std::unique_ptr<GraphicsPipeline>& slot);
+    bool TryFastLink(std::unique_ptr<GraphicsPipeline>& slot, bool allow_build = false);
     /// sotc: SOTC_ASYNC_COMPUTE_XLATE: waits for (or takes back) a prefetched translation.
     void WaitPendingTranslation(u64 hash);
     void AsyncPipelineWorker(std::stop_token token);
@@ -677,6 +682,7 @@ private:
     /// sotc: SOTC_NB_SCHED (CP only): queued graphics jobs by key, for the demand of skipped draws and the cancel of
     /// a pipeline the command processor built itself. Entries leave when the job is collected.
     std::unordered_map<GraphicsPipelineKey, AsyncPipelineJob*> queued_graphics;
+    std::unordered_set<GraphicsPipelineKey> link_pending; ///< sotc: SOTC_NB_GPL link jobs not collected (CP only)
     /// sotc: compute pipelines of the boot preload built by the workers (SOTC_ASYNC_PRELOAD);
     /// WarmUp waits for them and drops the ones the driver refused, as it does when it builds
     /// them itself.

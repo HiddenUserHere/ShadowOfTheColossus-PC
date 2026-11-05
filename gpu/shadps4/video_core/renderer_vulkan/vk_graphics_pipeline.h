@@ -87,6 +87,11 @@ public:
     vk::Pipeline GetOrBuild(Part part, const std::string& key, bool& built,
                             const std::function<vk::UniquePipeline()>& build);
 
+    /// sotc: SOTC_NB_GPL. While set on the calling thread (the command processor's TryFastLink), GetOrBuild only looks
+    /// up: a missing library is not built, and the link fails instead.
+    static void SetLookupOnly(bool lookup_only);
+    static bool LookupOnly();
+
 private:
     std::mutex mutex;
     tsl::robin_map<std::string, vk::UniquePipeline> parts[NumParts];
