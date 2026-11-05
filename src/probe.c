@@ -867,7 +867,7 @@ static DWORD WINAPI profiler_all(void *unused) {
     qsort(order,count,sizeof(*order),all_by_busy);
     char where[MAX_PATH+64];
     fprintf(stderr,"SOTC profile of all %u threads: %u rounds\n",count,rounds);
-    for (uint32_t r=0;r<count && r<30 && all_threads[order[r]].busy;++r) {
+    for (uint32_t r=0;r<count && all_threads[order[r]].busy;++r) { /* sotc: every thread (pipeline and driver workers too) */
         const AllThread *t=&all_threads[order[r]];
         fprintf(stderr,"  %6u busy  kernel %7.0f ms  user %7.0f ms  tid %5lu  '%s'\n",t->busy,
                 filetime_ms(t->kernel0,t->kernel1),filetime_ms(t->user0,t->user1),t->tid,t->name);

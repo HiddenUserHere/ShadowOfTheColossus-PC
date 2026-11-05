@@ -155,6 +155,22 @@ Key facts:
        differ; 1,460-2,311 conflicts per run), k8 (alpha: per-material blend, the material's state object +0x560),
        k7 and k0 (a few). The other material slots were stable. The throttled run skips slots with conflicts.
      - Loading programs from the pack on the command processor cost 0.7-2.1 s per run.
+     Why the session got slower (all-threads sampler `SOTC_PROFILE=*`, 20 s window from 72 s, cold runs
+     `user/prof1/pf_off2.log` and `pf_on2.log`, 16 hardware threads):
+     - Not CPU saturation: all threads together used 7.9 cores without prediction and 8.5 with it. The 12
+       pipeline workers used 70.4 s and 74.9 s of CPU in the window.
+     - The draw and recorder threads wait for work (their hottest frames are condition-variable waits: recorder 24%
+       without, 57% with), so the command processor is the chain's bottleneck; it got 10.1 s of CPU without and
+       6.4 s with prediction, i.e. it waited more.
+     - In both runs the command processor writes the whole driver pipeline cache right after the boot hold
+       (`SaveDriverCache`, call at the end of the hold, 1.6 GB: "SOTC driver cache: 1590357 KB saved" /
+       "1668204 KB saved"), which is where the 3.0-3.6 FPS window after the hold comes from. With prediction
+       38% of the command processor's samples in the window were that save (fwrite in ucrtbase), so the window
+       mixes it with the prediction's effect. Moving that save off the command processor is a first-session fix of
+       its own.
+     - Prediction itself: graphics driver time 95 s -> 172 s (1,017 queued, 252 used), and its command processor time
+       (pack reads in LoadLazyProgram) 0.7-2.1 s per run. What else holds the command processor back with prediction
+       on is not measured yet (needs a window after the save).
      Next options (not done): predict only what is about to be drawn (a later hook than the factory, measured for its
      lead time), keep predicted builds off the CPU the game needs (one low-priority worker), and key k3 / k8 by the
      material's target set and blend state.
