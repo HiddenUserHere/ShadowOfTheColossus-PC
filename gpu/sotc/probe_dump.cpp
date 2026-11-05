@@ -68,6 +68,13 @@ const Config& Cfg() {
         if (!dir || !*dir || std::strcmp(dir, "0") == 0) {
             return c;
         }
+        // sotc: the hook manifest only installs a numeric switch value, so "1" means <user dir>/re_dump.
+        static std::string default_dir;
+        if (std::strcmp(dir, "1") == 0) {
+            const char* user = std::getenv("BB_GPU_USER_DIR");
+            default_dir = std::string(user && *user ? user : "user") + "/re_dump";
+            dir = default_dir.c_str();
+        }
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         if (ec) {
@@ -209,7 +216,8 @@ void WriteFile(const std::string& file, const std::string& type, const unsigned 
     std::fprintf(stderr, "SOTC RES DUMP %s %zu %s %s\n", type.c_str(), n, path.c_str(), name.c_str());
 }
 
-// RES_CREATE: entry of the loader 0x147160; rsi is the request (param_2).
+// RES_CREATE: site 0x147182 after the prologue of the loader 0x147160 (its entry is a tail-call target); rsi is
+// still the request (param_2).
 HookAction OnCreate(GuestRegs& regs, void*) {
     t_request = regs.rsi;
     return HookAction::Continue;

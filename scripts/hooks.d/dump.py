@@ -1,6 +1,7 @@
 """Resource dump (gpu/sotc/probe_dump.cpp, SOTC_RES_DUMP=<dir>). Observe only.
 
-RES_CREATE  entry of 0x147160, ResourceFactory::CreateResource (the loader; rsi = its request, param_2). Keeps the
+RES_CREATE  site 0x147182 in ResourceFactory::CreateResource 0x147160 (the loader; rsi = its request, param_2);
+            the entry is a tail-call jump target, so the entry detour is refused. Keeps the
             request for the RES_LOADED handler of the same thread (the name is at request+0xa8).
             Found with tools/re/eboot_re.py sig 0x147160 -n 28.
 CWKS_BODY   entry of 0x14edc0, ResourcePool::RecordResourceDependencies (rdi = the pool). Dumps the workspace
@@ -19,10 +20,12 @@ HOOKS = [
         name='RES_CREATE',
         switch='SOTC_RES_DUMP',
         group='res_dump_create',
-        mode='entry',
-        # push rbp; mov rbp,rsp; push r15..rbx; sub rsp,0x1c8; mov r13,[rip+..]; (stack protector load)
-        pattern='55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec c8 01 00 00 4c 8b 2d ?? ?? ?? ?? 48',
-        expected={EU_FINGERPRINT: 0x147160},
+        # Not the entry: the function tail-calls itself with a jmp to 0x147160, which the entry detour refuses.
+        # Site after the prologue, where rsi is still the request: mov r15,rsi; mov rax,[r13];
+        # mov [rbp-0x30],rax; mov rbx,[r15]; mov rdi,rbx; call 0x14d210
+        mode='site',
+        pattern='49 89 f7 49 8b 45 00 48 89 45 d0 49 8b 1f 48 89 df e8',
+        expected={EU_FINGERPRINT: 0x147182},
     ),
     dict(
         name='CWKS_BODY',

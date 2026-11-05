@@ -75,7 +75,7 @@ constexpr int kEntryLinesPerList = 32;       // material-entry lines per list
 constexpr int kMatDepth = 16;                // open wrap calls kept per thread
 // Manager of the video out: the owner O is the global at image + kOwnerGlobal, M = *(O + 0x80) (pass-targets.md K6.3).
 constexpr uintptr_t kOwnerGlobal = 0x2ed3670;
-constexpr uintptr_t kManagerOwnerOffset = 0x80;
+[[maybe_unused]] constexpr uintptr_t kManagerOwnerOffset = 0x80; // sotc: wrong (see ManagerM)
 
 // Material (texture-binding.md T1.3, T8.1, A.2). A MatTexBlock: payload +0x00, data +0x08, size +0x38, count +0x3c.
 constexpr uintptr_t kMatMask = 0x468;
@@ -227,6 +227,13 @@ void AppendFloats(std::string& out, uintptr_t a, int n) {
 }
 
 // Formats n dwords of guest memory at a as hex ("[w0 w1 ...]").
+// sotc: hex text of a value (the "0x" prefix is in the caller's literal).
+std::string Hx(unsigned long long v) {
+    char buf[24];
+    std::snprintf(buf, sizeof buf, "%llx", v);
+    return buf;
+}
+
 void AppendDwords(std::string& out, uintptr_t a, int n) {
     uint32_t w[16] = {};
     char buf[16];
@@ -517,8 +524,8 @@ HookAction OnSkinPalette(GuestRegs& regs, void*) {
     if (!NewKey(kSkinPalette, key)) {
         return HookAction::Continue;
     }
-    std::string line = "SOTC RE skin-palette obj=0x" + std::to_string(static_cast<unsigned long long>(obj)) + " rec=0x" +
-                       std::to_string(static_cast<unsigned long long>(rec));
+    std::string line = "SOTC RE skin-palette obj=0x" + Hx(static_cast<unsigned long long>(obj)) + " rec=0x" +
+                       Hx(static_cast<unsigned long long>(rec));
     char buf[160];
     std::snprintf(buf, sizeof buf, " mgr20=%d rec10=%u", static_cast<int>(U32At(obj + 0x20)),
                   static_cast<unsigned>(U32At(rec + 0x10)));
@@ -591,8 +598,8 @@ void PostScratch(GuestRegs&, void*) {
     if (!NewKey(kSkinScratch, key)) {
         return;
     }
-    std::string line = "SOTC RE skin-scratch obj=0x" + std::to_string(static_cast<unsigned long long>(obj)) +
-                       " head=0x" + std::to_string(static_cast<unsigned long long>(head)) + " count=" +
+    std::string line = "SOTC RE skin-scratch obj=0x" + Hx(static_cast<unsigned long long>(obj)) +
+                       " head=0x" + Hx(static_cast<unsigned long long>(head)) + " count=" +
                        std::to_string(count) + " scratch_dw0=" + std::to_string(dw0) + " scratch_dw1=" +
                        std::to_string(dw1) + " node0=";
     if (ok) {
@@ -630,13 +637,13 @@ HookAction OnSkinDispatch(GuestRegs& regs, void*) {
     if (!NewKey(kSkinDispatch, key)) {
         return HookAction::Continue;
     }
-    std::string line = "SOTC RE skin-dispatch rec=0x" + std::to_string(static_cast<unsigned long long>(rec)) +
-                       " res=0x" + std::to_string(static_cast<unsigned long long>(res)) + " out=0x" +
-                       std::to_string(static_cast<unsigned long long>(out)) + " p=" + std::to_string(p) +
-                       " rsi=0x" + std::to_string(static_cast<unsigned long long>(regs.rsi)) + " ctx=0x" +
-                       std::to_string(static_cast<unsigned long long>(ctx)) + " pal=0x" +
-                       std::to_string(static_cast<unsigned long long>(pal)) + " pal_base=0x" +
-                       std::to_string(static_cast<unsigned long long>(base)) + " pal_v=";
+    std::string line = "SOTC RE skin-dispatch rec=0x" + Hx(static_cast<unsigned long long>(rec)) +
+                       " res=0x" + Hx(static_cast<unsigned long long>(res)) + " out=0x" +
+                       Hx(static_cast<unsigned long long>(out)) + " p=" + std::to_string(p) +
+                       " rsi=0x" + Hx(static_cast<unsigned long long>(regs.rsi)) + " ctx=0x" +
+                       Hx(static_cast<unsigned long long>(ctx)) + " pal=0x" +
+                       Hx(static_cast<unsigned long long>(pal)) + " pal_base=0x" +
+                       Hx(static_cast<unsigned long long>(base)) + " pal_v=";
     AppendDwords(line, pal, 4);
     line += " out_v0=";
     AppendDwords(line, o + 0xe8 + 0x28 * p, 4);
@@ -668,9 +675,9 @@ HookAction OnSkinStore(GuestRegs& regs, void*) {
     if (!NewKey(kSkinStore, key)) {
         return HookAction::Continue;
     }
-    std::string line = "SOTC RE skin-store P=0x" + std::to_string(static_cast<unsigned long long>(p_obj)) +
-                       " holder=0x" + std::to_string(static_cast<unsigned long long>(holder)) + " table=0x" +
-                       std::to_string(static_cast<unsigned long long>(table)) + " parity_P=" + std::to_string(par) +
+    std::string line = "SOTC RE skin-store P=0x" + Hx(static_cast<unsigned long long>(p_obj)) +
+                       " holder=0x" + Hx(static_cast<unsigned long long>(holder)) + " table=0x" +
+                       Hx(static_cast<unsigned long long>(table)) + " parity_P=" + std::to_string(par) +
                        " table_v=";
     AppendDwords(line, table + 0x10, 4);
     Emit(kSkinStore, line);
@@ -687,7 +694,8 @@ uint64_t ManagerM() {
         return 0;
     }
     const uint64_t owner = U64At(static_cast<uintptr_t>(base + kOwnerGlobal));
-    return owner ? U64At(static_cast<uintptr_t>(owner + kManagerOwnerOffset)) : 0;
+    // sotc: run of 4 Nov 2026: *(owner + 0x80) was 0 in every use; 0x9fba0 / 0xa1cd0 get the global itself.
+    return owner;
 }
 
 // RE_PASS_FLIP: entry of 0x90860 (R in rdi, param_2 in rsi, S = param_2[9]). Items 2 and 3 are logged once, at the
@@ -759,7 +767,7 @@ HookAction OnPassTable(GuestRegs& regs, void*) {
     if (!NewKey(kPassTable, key)) {
         return HookAction::Continue;
     }
-    std::string line = "SOTC RE pass-table M=0x" + std::to_string(static_cast<unsigned long long>(m)) + " neo=" +
+    std::string line = "SOTC RE pass-table M=0x" + Hx(static_cast<unsigned long long>(m)) + " neo=" +
                        std::to_string(runtime_sotc_neo());
     char buf[64];
     for (int k = 0; k < 10; ++k) {
@@ -825,7 +833,7 @@ HookAction OnVSharp(GuestRegs& regs, void* user) {
             continue;
         }
         std::string line = "SOTC RE skin-vsharp hook=0x" +
-                           std::to_string(static_cast<unsigned long long>(base)) + " idx=" + std::to_string(idx) +
+                           Hx(static_cast<unsigned long long>(base)) + " idx=" + std::to_string(idx) +
                            " words=";
         AppendDwords(line, src + 16 * static_cast<uintptr_t>(i), 4);
         char tail[96];
