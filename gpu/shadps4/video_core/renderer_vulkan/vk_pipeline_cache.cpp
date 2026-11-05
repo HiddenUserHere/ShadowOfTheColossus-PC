@@ -1428,6 +1428,132 @@ void PipelineCache::QueueLinkJob() {
     async_cv.notify_one();
 }
 
+namespace {
+// sotc: the tiny pipeline list lives next to the versioned cache folders, so it survives a port or driver update (the
+// cache of a new version starts empty). Records: GraphicsPipelineKey bytes, then the vertex and pixel program hash and
+// permutation. A file made with another key size is ignored.
+constexpr u32 kTinyMagic = 0x594E4954; // "TINY"
+std::filesystem::path TinyListPath() {
+    return Storage::DataBase::Instance().CachePath().parent_path() / "sotc_tiny_pipelines.bin";
+}
+std::optional<size_t> PermOfStage(u64 stage_hash, u64 hash) {
+    for (size_t p = 0; p < Program::MaxPermutations; ++p) {
+        if (HashCombine(hash, u64{p}) == stage_hash) {
+            return p;
+        }
+    }
+    return std::nullopt;
+}
+} // namespace
+
+void PipelineCache::RecordTinyPipeline() {
+    const auto* vs = infos[u32(Shader::SwStage::Vertex)];
+    const auto* ps = infos[u32(Shader::SwStage::Fragment)];
+    if (!vs || !ps || tiny_list.contains(graphics_key)) {
+        return;
+    }
+    const auto vp = PermOfStage(graphics_key.stage_hashes[u32(Shader::SwStage::Vertex)], vs->CacheHash());
+    const auto pp = PermOfStage(graphics_key.stage_hashes[u32(Shader::SwStage::Fragment)], ps->CacheHash());
+    if (!vp || !pp) {
+        return;
+    }
+    tiny_list.emplace(graphics_key, TinyEntry{vs->CacheHash(), ps->CacheHash(), static_cast<u32>(*vp),
+                                              static_cast<u32>(*pp)});
+    // A few KB, written by a detached thread (no file I/O on the command processor).
+    std::vector<u8> data;
+    const auto put = [&data](const void* p, size_t n) {
+        data.insert(data.end(), static_cast<const u8*>(p), static_cast<const u8*>(p) + n);
+    };
+    const u32 header[3] = {kTinyMagic, static_cast<u32>(sizeof(GraphicsPipelineKey)),
+                           static_cast<u32>(tiny_list.size())};
+    put(header, sizeof header);
+    for (const auto& [key, e] : tiny_list) {
+        put(&key, sizeof key);
+        put(&e, sizeof e);
+    }
+    std::thread([path = TinyListPath(), data = std::move(data)] {
+        auto tmp = path;
+        tmp += ".tmp";
+        if (std::FILE* f = _wfopen(tmp.c_str(), L"wb")) {
+            const bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+            std::fclose(f);
+            std::error_code ec;
+            if (ok) {
+                std::filesystem::rename(tmp, path, ec);
+            } else {
+                std::filesystem::remove(tmp, ec);
+            }
+        }
+    }).detach();
+}
+
+void PipelineCache::BuildTinyLibraries() {
+    if (!tiny_list_loaded) {
+        tiny_list_loaded = true;
+        if (std::FILE* f = _wfopen(TinyListPath().c_str(), L"rb")) {
+            u32 header[3]{};
+            if (std::fread(header, sizeof header, 1, f) == 1 && header[0] == kTinyMagic &&
+                header[1] == sizeof(GraphicsPipelineKey)) {
+                for (u32 i = 0; i < header[2]; ++i) {
+                    GraphicsPipelineKey key;
+                    TinyEntry e;
+                    if (std::fread(&key, sizeof key, 1, f) != 1 || std::fread(&e, sizeof e, 1, f) != 1) {
+                        break;
+                    }
+                    tiny_list.emplace(key, e);
+                }
+            }
+            std::fclose(f);
+        }
+    }
+    const u64 built_before = warm_built;
+    u64 queued = 0;
+    for (const auto& [key, e] : tiny_list) {
+        const auto vs = program_cache.find(e.vs_hash);
+        const auto ps = program_cache.find(e.ps_hash);
+        if (vs == program_cache.end() || ps == program_cache.end() || e.vs_perm >= vs.value()->modules.size() ||
+            e.ps_perm >= ps.value()->modules.size() || !vs.value()->modules[e.vs_perm].module ||
+            !ps.value()->modules[e.ps_perm].module) {
+            continue; // not loaded this session (yet): its first draw builds it as before
+        }
+        Program& v = *vs.value();
+        Program& p = *ps.value();
+        auto job = std::make_unique<AsyncPipelineJob>();
+        job->key = key;
+        job->hash = std::hash<GraphicsPipelineKey>{}(key);
+        job->infos.fill(nullptr);
+        job->modules.fill(vk::ShaderModule{});
+        job->infos[u32(Shader::SwStage::Vertex)] = &v.info;
+        job->infos[u32(Shader::SwStage::Fragment)] = &p.info;
+        job->modules[u32(Shader::SwStage::Vertex)] = v.modules[e.vs_perm].module;
+        job->modules[u32(Shader::SwStage::Fragment)] = p.modules[e.ps_perm].module;
+        job->runtime_infos[u32(Shader::SwStage::Vertex)] = v.modules[e.vs_perm].spec.runtime_info;
+        job->runtime_infos[u32(Shader::SwStage::Fragment)] = p.modules[e.ps_perm].spec.runtime_info;
+        if (const auto& fetch = v.modules[e.vs_perm].spec.fetch_shader_data; !fetch.Empty()) {
+            job->fetch_shader = fetch;
+        }
+        job->link_only = true;
+        job->warm_lib = true;
+        ++queued;
+        {
+            std::scoped_lock lock{async_mutex};
+            PushJobLocked(JobLane::Translate, std::move(job));
+        }
+        async_cv.notify_one();
+    }
+    // The screen stays up until they are built (they use the hold's modules, which the eviction below destroys).
+    const auto start = std::chrono::steady_clock::now();
+    while (warm_built - built_before < queued && std::chrono::steady_clock::now() - start < std::chrono::seconds(20)) {
+        CollectAsyncPipelines();
+        std::unique_lock lock{async_mutex};
+        translate_done_cv.wait_for(lock, std::chrono::milliseconds{20},
+                                   [this] { return async_done_count.load(std::memory_order_relaxed) != 0; });
+    }
+    std::fprintf(stderr, "SOTC NB TINY: %zu full-screen pipelines on the list, %llu built before play in %.1f s\n",
+                 tiny_list.size(), static_cast<unsigned long long>(warm_built - built_before),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+}
+
 void PipelineCache::NoteWarmTemplate() {
     const auto* vs = infos[u32(Shader::SwStage::Vertex)];
     const auto* ps = infos[u32(Shader::SwStage::Fragment)];
@@ -2668,6 +2794,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
             const auto fast_start = std::chrono::steady_clock::now();
             const u64 link_before = g_gpl_counters.link_ns.load(std::memory_order_relaxed);
             if (TryFastLink(it.value(), true)) {
+                if (SotcNonBlocking::Gpl()) {
+                    RecordTinyPipeline(); // sotc: built before the first draw from the next boot hold on
+                }
                 const u64 link_ns =
                     g_gpl_counters.link_ns.load(std::memory_order_relaxed) - link_before;
                 const u64 total_ns = static_cast<u64>(
@@ -4732,6 +4861,10 @@ void PipelineCache::MaybeHoldForPretranslate() {
         std::unique_lock lock{async_mutex};
         translate_done_cv.wait_for(lock, std::chrono::milliseconds{50},
                                    [this] { return async_done_count.load(std::memory_order_relaxed) != 0; });
+    }
+    // sotc: SOTC_NB_GPL: the libraries of the full-screen passes earlier sessions met, while the screen is still up.
+    if (SotcNonBlocking::Gpl()) {
+        BuildTinyLibraries();
     }
     pre_holding = false;
     PrePackFinish(); // the variants of the hold, in one file; read back for their first draws

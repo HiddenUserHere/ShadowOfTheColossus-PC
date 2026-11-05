@@ -625,6 +625,11 @@ private:
     void FeedWarmLibraries();
     /// sotc: SOTC_NB_GPL (P4). Command processor: the current draw's VS+PS state becomes the warm-up template.
     void NoteWarmTemplate();
+    /// sotc: SOTC_NB_GPL. A tiny full-screen draw built its pipeline on the command processor: its key and shaders go to
+    /// the list of the next boot holds (RecordTinyPipeline), which build their libraries before the first draw
+    /// (BuildTinyLibraries, at the end of the hold, before the eviction).
+    void RecordTinyPipeline();
+    void BuildTinyLibraries();
     /// sotc: SOTC_NB_IO. Moves pack loads from lazy_backlog to the workers, at most 2 at a time.
     void FeedLazyPrefetch();
     /// sotc: SOTC_PIPE_PREDICT (gpu/sotc/pipe_predict.h). Command processor, before a draw's key is built: reads the
@@ -711,6 +716,13 @@ private:
     std::vector<std::pair<u64, size_t>> warm_log;        ///< new permutations not warmed yet (Program::new_perm_log)
     std::unordered_set<u64> warm_done;                    ///< HashCombine(hash, perm) already queued
     u64 warm_queued{}, warm_built{}, warm_skipped{};
+    /// sotc: SOTC_NB_GPL tiny full-screen pipelines (CP only): key -> its vertex and pixel program and permutation.
+    struct TinyEntry {
+        u64 vs_hash{}, ps_hash{};
+        u32 vs_perm{}, ps_perm{};
+    };
+    std::unordered_map<GraphicsPipelineKey, TinyEntry> tiny_list;
+    bool tiny_list_loaded{};
     /// sotc: compute pipelines of the boot preload built by the workers (SOTC_ASYNC_PRELOAD);
     /// WarmUp waits for them and drops the ones the driver refused, as it does when it builds
     /// them itself.

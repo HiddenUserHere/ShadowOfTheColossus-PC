@@ -241,3 +241,48 @@ Done: the periodic saves rewrite the file only when it grew by 5% or 64 MiB (`Sa
 at shutdown writes any growth; `SOTC_DRIVER_CACHE_ALWAYS=1` keeps the old rule). Warm session `dc_on2.log`: no rewrite
 (0 ms), session 23 s. Open: turning the file off by default on the NVIDIA driver needs the new-folder release case
 measured first.
+
+## Gap: the cold frames the ledger does not explain
+
+Profiles of frames over 200 ms (`SOTC_PROFILE_SLOW_MS=200`, 45 s from 50 s, cold runs):
+`user/nb6/cp.prof.slow` (P1 config, salt 82), `draw.prof.slow` (salt 83), `cp_gpl.prof.slow` (P1+P3, salt 84);
+`tools/profile_functions.py ... --qualified [--callers NAME]`.
+
+- Draw thread (P1): 58% of its slow-frame samples wait for work from the command processor
+  (`condition_variable::wait_until` in `BackLoop`); `ExecuteBackOp` 19%, `BindResources` 10.6%. The slow frames are
+  command-processor bound.
+- Command processor, P1: `GraphicsPipeline` constructor 26.3% (the tiny full-screen passes built inline; 22.9% in
+  `nvgpucomp64.dll`), waiting for the draw thread (`WaitBackWritesSlow`) 6.5%, pack loads 3.4%.
+- Command processor, P1+P3: `GplLibraryCache::GetOrBuild` 14.7% (the tiny passes' libraries built inline),
+  `ProcessCompute` 17.8%, `GetGraphicsPipelineLookupSlow` without the link ~9%, `GetProgram` and
+  `RefreshGraphicsStages` ~8%, `WaitBackWritesSlow` 6.2%, pack loads 2.6%, `fprintf` 1.4%. The 10-16% under
+  `mutex::unlock` is a stack artifact (0.7% of samples come through a direct call): wait time in ntdll.
+
+Reading: the frames the ledger did not explain are the first-time work of the command processor, i.e. building the
+full-screen passes (the one compile that still blocks) and making keys, specializations and lookups for every new
+pipeline and program. The second part is not secondary work this plan can move; it is the per-new-object cost of the
+command path, and it is gone in the warm session. What this plan can still do: the full-screen passes (their
+libraries built before their first draw, or the passes deferred with `SOTC_TINY_ASYNC=1`, whose known risk is a
+once-only pass staying wrong).
+
+## Full-screen passes: libraries before the first draw from the second session on
+
+Tiny full-screen draws are never skipped (deferring them, `SOTC_TINY_ASYNC=1`, can leave a pass the game runs once,
+such as a lookup table made at load, wrong for good), so with `SOTC_NB_GPL` they build their missing libraries on the
+command processor. Now each such pipeline is recorded (`RecordTinyPipeline`: key, vertex and pixel program and
+permutation) in `user/cache/sotc_tiny_pipelines.bin`, next to the versioned cache folders so that it survives a port or
+driver update; at the end of every boot hold, before the eviction, the libraries of the recorded pipelines whose
+programs are loaded are built on the workers while the screen is still up (`BuildTinyLibraries`).
+
+Two cold sessions with different salts, the second standing in for the first session after an update
+(`user/nb7/tiny_first.log` salt 85, `tiny_update.log` salt 86):
+
+| | first run, empty list | after an update, 32 on the list |
+|---|---|---|
+| built at the end of the hold | - | 26 of 32 in 0.3 s (6 had no program loaded yet) |
+| full-screen libraries built on the CP during play | 1,546 ms (57) | 285 ms |
+| boot preparation | 64.1 s | 61.5 s |
+| route p50 / p99 / max (one round) | 33.4 / 416.8 / 622.8 ms | 33.4 / 343.3 / 650.4 ms |
+
+Limit: the very first session of an install has no list, so its full-screen passes still build their libraries on
+the command processor (~1.5 s over the first frames after the hold).
