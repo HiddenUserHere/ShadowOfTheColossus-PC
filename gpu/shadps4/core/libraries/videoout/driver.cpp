@@ -2592,6 +2592,44 @@ void VideoOutDriver::Flip(const Request& req) {
                                  d.cpu_ns[RoleCp] / per, d.cpu_ns[RoleDraw] / per,
                                  d.cpu_ns[RoleRecorder] / per, d.cpu_ns[RolePassSecondary] / per,
                                  d.cpu_ns[RoleUpload] / per);
+#ifdef _WIN32
+                    // sotc: CPU cores the process used over this window (GetProcessTimes), and
+                    // the window split by GPU role; "rest" = pipeline workers, game, driver.
+                    {
+                        static uint64_t cpu_prev_100ns = 0; // kernel + user of the last report
+                        static auto cpu_prev_wall = std::chrono::steady_clock::now();
+                        static bool cpu_primed = false;
+                        FILETIME ft_create{}, ft_exit{}, ft_kernel{}, ft_user{};
+                        const auto cpu_now_wall = std::chrono::steady_clock::now();
+                        if (GetProcessTimes(GetCurrentProcess(), &ft_create, &ft_exit, &ft_kernel, &ft_user)) {
+                            const auto ft_to_u64 = [](const FILETIME& f) {
+                                return (static_cast<uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
+                            };
+                            const uint64_t cpu_now_100ns = ft_to_u64(ft_kernel) + ft_to_u64(ft_user);
+                            if (cpu_primed) {
+                                const double wall_ns =
+                                    std::chrono::duration<double, std::nano>(cpu_now_wall - cpu_prev_wall).count();
+                                if (wall_ns > 0.0) {
+                                    const double proc_ns = static_cast<double>(cpu_now_100ns - cpu_prev_100ns) * 100.0;
+                                    const auto cores = [&](CpuRole r) { return static_cast<double>(d.cpu_ns[r]) / wall_ns; };
+                                    const double cp = cores(RoleCp), draw = cores(RoleDraw), rec = cores(RoleRecorder);
+                                    const double passsec = cores(RolePassSecondary), upload = cores(RoleUpload);
+                                    const double guest = cores(RoleGuest);
+                                    const double process = proc_ns / wall_ns;
+                                    const double rest = process - (cp + draw + rec + passsec + upload + guest);
+                                    std::fprintf(stderr,
+                                                 "SOTC CPU cores (5 s): process %.2f of %u hardware threads; cp %.2f draw %.2f rec %.2f "
+                                                 "passsec %.2f upload %.2f guest %.2f; rest (pipeline workers, game, driver) %.2f\n",
+                                                 process, std::thread::hardware_concurrency(), cp, draw, rec, passsec,
+                                                 upload, guest, rest > 0.0 ? rest : 0.0);
+                                }
+                            }
+                            cpu_prev_100ns = cpu_now_100ns;
+                            cpu_prev_wall = cpu_now_wall;
+                            cpu_primed = true;
+                        }
+                    }
+#endif
                     if (SotcBlockLedger::kOn) { // sotc: SOTC_BLOCK_LEDGER
                         std::fprintf(stderr, "%s\n", SotcBlockLedger::TakeReport(flips).c_str());
                     }

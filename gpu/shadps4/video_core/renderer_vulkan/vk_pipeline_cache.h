@@ -531,6 +531,8 @@ private:
     struct JobQueues {
         std::array<std::deque<std::unique_ptr<AsyncPipelineJob>>, static_cast<size_t>(JobLane::Count)> lanes;
         u32 background_running{}; ///< background jobs taken by workers and not finished
+        /// sotc: jobs of the capped lanes (Shadow, Graphics, Background; CappedLane) taken by workers and not finished
+        u32 capped_running{};
         std::deque<std::unique_ptr<AsyncPipelineJob>>& operator[](JobLane lane) {
             return lanes[static_cast<size_t>(lane)];
         }
@@ -550,6 +552,12 @@ private:
     /// sotc: a worker can take a job now (async_mutex held).
     bool HasRunnableJobLocked() const;
     u32 BackgroundCap() const;
+    /// sotc: the lanes whose jobs no draw or recorder is blocked on right now (SOTC_NB_WORKER_CAP caps them).
+    static constexpr bool CappedLane(JobLane lane) {
+        return lane == JobLane::Shadow || lane == JobLane::Graphics || lane == JobLane::Background;
+    }
+    /// sotc: how many capped-lane jobs may run at once (unlimited when SOTC_NB_WORKER_CAP is off or during the boot hold).
+    u32 CappedCap() const;
     bool AsyncPipelineEligible() const;
     void QueueAsyncPipeline(u64 hash,
                             const GraphicsPipeline::SerializationSupport* preloaded = nullptr,

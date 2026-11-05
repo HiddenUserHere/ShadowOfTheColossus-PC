@@ -399,3 +399,27 @@ and 2 have their own gates in ARCH-GCN-NATIVE.md, and no step has run in the gam
   `gpu/shadps4/video_core/sotc_arch/passes.h`, `sotc.ini`.
 - Companion: `docs/re-stutters/native/arch-next/engine-gnm-layer.md` (agent C2) did not exist when this was written. Its
   setter map should be checked against section 3.c.
+
+## Results of the CPU-budget plan, C0-C1 (5 Nov 2026, branch arch/nonblocking-frame)
+
+New 5 s line (with `SOTC_FPS`): `SOTC CPU cores (5 s): process X of N hardware threads; cp .. draw .. rec .. ...; rest
+(pipeline workers, game, driver)` (`driver.cpp`, `GetProcessTimes` and the `SotcStats` CPU roles).
+
+Warm Lab route, same port cache (salt 73), P1 on, one round each (`user/c1/*.log`):
+
+| config | process cores (two windows) | recorder cores | route p50 / p99 / max |
+|---|---|---|---|
+| `SOTC_PIPE_PREDICT=1` (the user's sotc.ini until now) | 10.62, 10.65 | 0.99 | 50.6 / 125.7 / 143.7 ms |
+| base (prediction off) | 5.21, 5.49 | 0.99 | 33.4 / 66.7 / 76.1 ms |
+| `SOTC_REC_SPIN_US=0` | 5.88, 5.34 | 0.99 | 33.3 / 58.9 / 66.9 ms |
+| `SOTC_FUTEX_WAIT=1` | 5.36, 4.86 | 0.53, 0.48 | 33.4 / 66.4 / 74.7 ms |
+| `SOTC_CP_IDLE_US=50` | 5.54, 5.08 | 0.99 | 33.4 / 50.4 / 66.4 ms |
+| `SOTC_WAIT_NOSPIN=1` | 5.40, 4.93 | 0.55, 0.51 | 33.4 / 66.7 / 92.7 ms |
+| `SOTC_FPS_LEAN=1` | 6.00, 5.42 | 0.99 | 33.4 / 58.2 / 92.1 ms |
+| `SOTC_NB_WORKER_CAP=1` | 5.84, 5.02 | 0.99 | 33.4 / 58.3 / 83.9 ms |
+
+The ~99% CPU the user saw was the material prediction left on in sotc.ini: it doubles the process's CPU (10.6 of 16
+threads) and halves the frame rate. With it off the process uses about 5 of 16 threads warm; sotc.ini now has
+`SOTC_PIPE_PREDICT=0`. Of the spin switches, the futex and no-spin waits halve the recorder's CPU (its spin), about
+half a core, with no change beyond one round's noise in the route; `SOTC_REC_SPIN_US=0` did not change the recorder.
+The worker cap has nothing to cap warm (workers idle); it needs the cold run.

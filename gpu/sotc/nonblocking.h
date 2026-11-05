@@ -44,4 +44,13 @@ inline bool Warm() {
     return on;
 }
 
+/// SOTC_NB_WORKER_CAP=1 (independent of the phases above): the pipeline workers spend less CPU during play. Jobs no draw
+/// or recorder waits for on this frame (the Shadow, Graphics and Background lanes) run on at most a quarter of the
+/// hardware threads (at least 2) at below-normal priority; Compute, Translate and Tiny jobs, which the recorder or a
+/// draw waits for, are not capped. New pipelines and objects may appear a few frames later. Off: no cap, as before.
+inline bool WorkerCap() {
+    static const bool on = SwitchOn("SOTC_NB_WORKER_CAP");
+    return on;
+}
+
 } // namespace SotcNonBlocking

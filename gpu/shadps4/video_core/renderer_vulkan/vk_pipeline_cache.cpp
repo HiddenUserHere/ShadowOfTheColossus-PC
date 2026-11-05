@@ -1666,6 +1666,15 @@ u32 PipelineCache::BackgroundCap() const {
     return std::max<u32>(1, static_cast<u32>(async_workers.size()) / 2);
 }
 
+u32 PipelineCache::CappedCap() const {
+    // sotc: SOTC_NB_WORKER_CAP: the capped lanes (CappedLane) run on a quarter of the hardware threads, at least 2.
+    // The boot hold waits for them, so it gives them every worker.
+    if (!SotcNonBlocking::WorkerCap() || pre_holding) {
+        return std::numeric_limits<u32>::max();
+    }
+    return std::max<u32>(2, std::thread::hardware_concurrency() / 4);
+}
+
 void PipelineCache::PushJobLocked(JobLane lane, std::unique_ptr<AsyncPipelineJob> job) {
     job_queues[lane].push_back(std::move(job));
 }
@@ -1676,6 +1685,10 @@ bool PipelineCache::HasRunnableJobLocked() const {
             continue;
         }
         if (static_cast<JobLane>(l) == JobLane::Background && job_queues.background_running >= BackgroundCap()) {
+            continue;
+        }
+        // sotc: SOTC_NB_WORKER_CAP: a capped lane waits while its quota of workers is busy.
+        if (CappedLane(static_cast<JobLane>(l)) && job_queues.capped_running >= CappedCap()) {
             continue;
         }
         return true;
@@ -1690,11 +1703,18 @@ std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::PopJobLocked(Job
             continue;
         }
         lane = static_cast<JobLane>(l);
+        // sotc: SOTC_NB_WORKER_CAP: a capped lane waits while its quota of workers is busy (checked before any count).
+        if (CappedLane(lane) && job_queues.capped_running >= CappedCap()) {
+            continue;
+        }
         if (lane == JobLane::Background) {
             if (job_queues.background_running >= BackgroundCap()) {
                 continue;
             }
             ++job_queues.background_running;
+        }
+        if (CappedLane(lane)) {
+            ++job_queues.capped_running; // sotc: released by CappedSlot in AsyncPipelineWorker
         }
         auto pick = q.begin();
         // sotc: SOTC_NB_SCHED: the graphics job most draws are waiting for, aged so that none waits forever
@@ -1792,6 +1812,31 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                 cache.async_cv.notify_one();
             }
         } background_slot{*this, lane == JobLane::Background};
+        // sotc: SOTC_NB_WORKER_CAP: a job of a capped lane runs below normal priority (when the cap is on) and frees its
+        // quota slot (capped_running, counted by PopJobLocked) in every exit path, since the destructor runs at the end
+        // of this loop iteration, including the early `continue`s and the cancelled-graphics path.
+        struct CappedSlot {
+            PipelineCache& cache;
+            bool active;
+            CappedSlot(PipelineCache& c, bool a) : cache(c), active(a) {
+                if (active && SotcNonBlocking::WorkerCap()) {
+                    SetWorkerBelowNormal(true);
+                }
+            }
+            ~CappedSlot() {
+                if (!active) {
+                    return;
+                }
+                if (SotcNonBlocking::WorkerCap()) {
+                    SetWorkerBelowNormal(false);
+                }
+                {
+                    std::scoped_lock lock{cache.async_mutex};
+                    --cache.job_queues.capped_running;
+                }
+                cache.async_cv.notify_all();
+            }
+        } capped_slot{*this, CappedLane(lane)};
         // sotc: SOTC_BLOCK_LEDGER job queue report: the wait ends here, the run ends when the job is done.
         const u64 job_taken_ns = SotcJobClockNs();
         const u64 job_wait_ns = job_taken_ns - std::min(job_taken_ns, job->created_ns);
