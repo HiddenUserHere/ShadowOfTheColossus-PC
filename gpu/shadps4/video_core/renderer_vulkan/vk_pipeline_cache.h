@@ -177,6 +177,9 @@ struct SpecMemoState {
     u32 tail{SpecMemoEntry::None};      ///< least recently used: the eviction victim
 };
 
+/// sotc: steady clock in ns, for AsyncPipelineJob::created_ns.
+u64 SotcJobClockNs() noexcept;
+
 class PipelineCache {
 public:
     /// sotc: SOTC_RAM_REPORT: counts of the programs and pipelines kept in host memory, and the size
@@ -426,6 +429,13 @@ private:
     /// a new compute pipeline is built by a worker ahead of the graphics jobs, and the recording
     /// thread waits for it when it binds it (ComputePipeline::BindWhenReady).
     struct AsyncPipelineJob {
+        /// sotc: SOTC_BLOCK_LEDGER job queue report: when the job was made (its queue wait is measured from here;
+        /// for the backlogs of pretranslation and pack loads, the backlog time is included).
+        u64 created_ns{SotcJobClockNs()};
+        /// sotc: SOTC_NB_SCHED. Draws skipped for this graphics job (the command processor adds, the scheduler reads),
+        /// and set when the command processor built the pipeline itself (the worker then skips the build).
+        std::atomic<u32> demand{0};
+        std::atomic<bool> cancelled{false};
         ComputePipeline* compute{}; ///< a compute job: only Build() is run
         bool priority{}; ///< sotc: a depth-only (shadow) graphics job queued ahead of the others
         bool pre_compute{}; ///< sotc: SOTC_PRETRANSLATE_COMPUTE: a prebuilt compute pipeline (its build counts as done)
@@ -499,10 +509,35 @@ private:
         };
         std::unique_ptr<LazyLoad> lazy; ///< a pack load job
     };
+    /// sotc: the job lanes of the pipeline workers (JobQueues), highest first. A worker takes the first job of the
+    /// first lane that has one; Background is capped (SOTC_NB_SCHED) and Graphics is ordered by demand.
+    enum class JobLane : u8 { Compute, Translate, Tiny, Shadow, Graphics, Background, Count };
+    struct JobQueues {
+        std::array<std::deque<std::unique_ptr<AsyncPipelineJob>>, static_cast<size_t>(JobLane::Count)> lanes;
+        u32 background_running{}; ///< background jobs taken by workers and not finished
+        std::deque<std::unique_ptr<AsyncPipelineJob>>& operator[](JobLane lane) {
+            return lanes[static_cast<size_t>(lane)];
+        }
+        bool Empty() const {
+            for (const auto& l : lanes) {
+                if (!l.empty()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    };
+    /// sotc: queues a job in a lane (async_mutex held by the caller) and counts it for the report.
+    void PushJobLocked(JobLane lane, std::unique_ptr<AsyncPipelineJob> job);
+    /// sotc: the job a worker takes now (async_mutex held), or null when only capped background jobs wait.
+    std::unique_ptr<AsyncPipelineJob> PopJobLocked(JobLane& lane);
+    /// sotc: a worker can take a job now (async_mutex held).
+    bool HasRunnableJobLocked() const;
+    u32 BackgroundCap() const;
     bool AsyncPipelineEligible() const;
     void QueueAsyncPipeline(u64 hash,
                             const GraphicsPipeline::SerializationSupport* preloaded = nullptr,
-                            bool priority = false);
+                            bool priority = false, bool background = false);
     bool AsyncPreloadEnabled() const;
     bool IsDepthOnlyDraw() const;
     const char* AsyncIneligibleReason() const;
@@ -638,8 +673,10 @@ private:
     // they are stopped and joined before anything they use is destroyed.
     std::mutex async_mutex;
     std::condition_variable_any async_cv;
-    std::deque<std::unique_ptr<AsyncPipelineJob>> async_queue;
-    size_t async_compute_queued{}; ///< compute jobs at the head of async_queue, oldest first
+    JobQueues job_queues; ///< sotc: the workers' job lanes (async_mutex)
+    /// sotc: SOTC_NB_SCHED (CP only): queued graphics jobs by key, for the demand of skipped draws and the cancel of
+    /// a pipeline the command processor built itself. Entries leave when the job is collected.
+    std::unordered_map<GraphicsPipelineKey, AsyncPipelineJob*> queued_graphics;
     /// sotc: compute pipelines of the boot preload built by the workers (SOTC_ASYNC_PRELOAD);
     /// WarmUp waits for them and drops the ones the driver refused, as it does when it builds
     /// them itself.
@@ -649,8 +686,7 @@ private:
     /// sotc: preloaded compute pipelines the driver refused, out of the map but kept alive: their
     /// worker job may still be queued (it returns at once, the pipeline being claimed).
     std::vector<std::unique_ptr<ComputePipeline>> preload_refused;
-    size_t async_translate_queued{}; ///< translation jobs right after them, oldest first
-    size_t async_priority_queued{}; ///< sotc: shadow graphics jobs right after those, oldest first
+
     std::unordered_set<u64> pending_programs; ///< new programs being translated (CP only)
     std::unordered_set<u64> in_place_programs; ///< failed on a worker: translated here (CP only)
     /// sotc: SOTC_PRETRANSLATE (CP only): programs whose pending translation is a pre-translation (a draw that needs

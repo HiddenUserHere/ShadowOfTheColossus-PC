@@ -85,3 +85,67 @@ Warm prefetch: 16,661 programs queued over the session (the game announces every
 permutations installed before their first draw, 2,257 loaded by a draw first; the backlog drains 2 at a time.
 Still on the CP in the cold run: inline graphics pipelines (1,908 ms in 34 calls), pack loads of programs the boot
 hold translated (223 ms), and the recorder's compute waits (885 ms): P2 and P3.
+
+## P2. Job classes: measured first, rewrite not done
+
+`SOTC JOB QUEUE` line (with `SOTC_BLOCK_LEDGER=1`, `vk_pipeline_cache.cpp` `NoteJob` / `ReportJobs`): per job class
+the wait between the job being made and a worker taking it, and its run time. Cold run with P1 on
+(`user/nb2/nb2q_cold.log`, salt 74), the windows after the boot hold:
+
+| class | wait avg / max | run avg |
+|---|---|---|
+| compute | 0-14 / 31 ms | 19-217 ms |
+| translate | 24 / 37 ms | 8 ms |
+| shadow (depth-only graphics) | 6-51 / 208 ms | 31 ms |
+| graphics | 531-884 / 1,871 ms | 148-153 ms |
+
+The recorder's compute waits are build time, not queue time (compute jobs are already first and wait about 10 ms).
+Graphics jobs wait 0.5-0.9 s because each build takes ~150 ms and they come in bursts; reordering classes does not add
+throughput. The class rewrite of the plan is therefore not done (the measurement stays); the graphics wait is P3's
+target (a link of ~0.006 ms on libraries built once per shader instead of a ~150 ms build per pipeline).
+
+## P3.0 step 1: per-stage descriptor sets still work and cost the same
+
+Per-shader GPL libraries need a descriptor layout that depends on one stage only, i.e. one set per stage
+(`SOTC_STAGE_BINDINGS=1`, `StageDescriptorSet`, bindings numbered from 0 in each set; active when
+`maxBoundDescriptorSets` >= 5, 32 here). That mode gives up push descriptors (`uses_push_descriptors` is false with
+`stage_sets`), so its draw-thread cost had to be measured before building on it. Runs with P1 on
+(`user/nb3/sb_cold.log` salt 75, `sb_warm.log` same salt) against `user/nb1/nb1b_warm.log`:
+
+| warm route | push descriptors (P1) | per-stage sets |
+|---|---|---|
+| p50 / p99 / max | 33.3 / 50.3 / 66.4 ms | 33.3 / 50.4 / 84.3 ms |
+| bind time on the draw thread (SOTC DRAW SPLIT) | 15.7-15.9 ms per frame | 15.3-16.7 ms per frame |
+| draw thread CPU per frame | 30.1-31.6 ms | 30.2-33.7 ms |
+| error lines | 40 (the known pretranslate export failures) | 40 (the same) |
+
+Same cost within one round. Not checked yet: the image (a Lab session with the switch on, by the user).
+
+Step 2 (to build): per-shader libraries. The pre-rasterization library is keyed by the VS module, a layout holding
+only the VS set (created with `VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT`), the topology class and the static
+raster state; the fragment library by the PS module, a layout holding only the PS set, and the multisample and
+depth/stencil state, without the attachment formats (the spec has fragment shader state ignore them). Vertex input
+and fragment output libraries carry no layout. The linked pipeline and the optimized one use the full per-stage layout
+with the same flag, so descriptor sets bind as today.
+
+### P2 rewrite (`SOTC_NB_SCHED=1`, asked for by the user after the measurement)
+
+The single deque with front-insert counters is replaced by job lanes (`JobQueues`, `PushJobLocked`, `PopJobLocked`,
+`HasRunnableJobLocked`): Compute, Translate, Tiny, Shadow, Graphics, Background, highest first. Background holds the
+pretranslate jobs, pack loads, compute prebuilds outside the boot hold and predicted pipelines. With the switch:
+graphics jobs are taken by demand (each draw skipped for a queued key adds 1, worth 10 ms of age) plus age; a job
+whose pipeline the command processor built itself is cancelled (`queued_graphics`, `cancelled`); background jobs run
+on at most half the workers at below-normal thread priority (all workers during the boot hold). Without the switch the
+lanes keep today's order, FIFO, except that background jobs no longer sit ahead of graphics jobs queued after them.
+
+A/B, one round each (`user/nb2/nb2s_*.log` salt 76 against `user/nb1/nb1b_*.log` salt 73, both with P1):
+
+| | P1 cold | P1+P2 cold | P1 warm | P1+P2 warm |
+|---|---|---|---|---|
+| route p50 / p99 / max | 33.3 / 107.1 / 276.5 ms | 33.4 / 184.8 / 350.2 ms | 33.3 / 50.3 / 66.4 ms | 33.3 / 50.1 / 59.0 ms |
+| frames over 50 / 100 ms | 11 / 3 | 10 / 4 | 4 / 0 | 3 / 0 |
+| graphics job wait, first two gameplay windows | 531 / 884 ms avg | 281 / 627 ms avg | - | - |
+
+Graphics jobs wait 30-47% less on average (demand order: 1,315 and 3,640 skipped-draw points in those windows), the
+warm run is the same or better, the cold route p99 and max are higher in this one round. Not decided by one round:
+it stays off by default.

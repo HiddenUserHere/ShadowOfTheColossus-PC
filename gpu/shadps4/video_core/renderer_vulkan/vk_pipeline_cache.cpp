@@ -807,7 +807,7 @@ namespace {
 // sotc: tiny jobs queued (SOTC_TINY_ASYNC=1). They form a run right after the compute and
 // translation jobs, before the priority jobs. Guarded by PipelineCache::async_mutex. Only one
 // PipelineCache exists per process; the workers reset it when they drain the queue.
-std::size_t g_tiny_jobs_queued{};
+
 
 // sotc: display buffers as guest ranges [begin, end), from SotcTinyAsyncNoteDisplayBuffer.
 std::mutex g_display_mutex;
@@ -1084,7 +1084,7 @@ void PipelineCache::PredictPipelines() {
     bool queue_idle = false;
     if (!st.ready.empty() && st.inflight.size() < std::max<size_t>(1, async_workers.size() / 2)) {
         std::scoped_lock lock{async_mutex};
-        queue_idle = async_queue.empty();
+        queue_idle = job_queues.Empty();
         if (!queue_idle) {
             ++st.busy_waits;
         }
@@ -1161,7 +1161,7 @@ void PipelineCache::PredictPipelines() {
         fetch_shader = fetch.Empty() ? nullptr : &fetch;
         if (AsyncPipelineEligible()) {
             graphics_pipelines.try_emplace(key); // null until collected, as for a draw's async build
-            QueueAsyncPipeline(std::hash<GraphicsPipelineKey>{}(key), nullptr, false);
+            QueueAsyncPipeline(std::hash<GraphicsPipelineKey>{}(key), nullptr, false, true);
             st.predicted.insert(key);
             st.inflight.insert(key);
             ++st.queued;
@@ -1283,9 +1283,90 @@ void PipelineCache::NotePredictDraw(bool is_new, bool built) {
     st.blocked[k].clear();
 }
 
+u64 SotcJobClockNs() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+namespace {
+// sotc: SOTC_BLOCK_LEDGER job queue report (non-blocking frame P2.0): per job class, how long jobs waited between
+// being made and a worker taking them, and how long they ran. Workers add; the command processor prints every 5 s.
+enum JobClass : u8 {
+    JobCompute, JobComputePrebuild, JobTranslate, JobPretranslate, JobTiny, JobShadow, JobGraphics, JobPreload,
+    JobLazy, JobPredict, JobClassCount
+};
+constexpr std::array<const char*, JobClassCount> kJobClassNames{
+    "compute", "compute prebuild", "translate", "pretranslate", "tiny", "shadow", "graphics", "preload", "pack load",
+    "predicted",
+};
+// sotc: SOTC_NB_SCHED counters, printed with the job queue report.
+std::atomic<u64> g_sched_cancelled{0}, g_sched_demand{0};
+
+// sotc: SOTC_NB_SCHED: a pipeline worker running a background job yields to the game's threads.
+void SetWorkerBelowNormal(bool below) {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), below ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_NORMAL);
+#else
+    (void)below;
+#endif
+}
+struct JobClassStats {
+    std::atomic<u64> count{0}, wait_ns{0}, wait_max_ns{0}, run_ns{0}, run_max_ns{0};
+};
+std::array<JobClassStats, JobClassCount> g_job_stats;
+
+void AtomicMax(std::atomic<u64>& a, u64 v) {
+    u64 cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+    }
+}
+
+void NoteJob(JobClass c, u64 wait_ns, u64 run_ns) {
+    auto& s = g_job_stats[c];
+    s.count.fetch_add(1, std::memory_order_relaxed);
+    s.wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+    s.run_ns.fetch_add(run_ns, std::memory_order_relaxed);
+    AtomicMax(s.wait_max_ns, wait_ns);
+    AtomicMax(s.run_max_ns, run_ns);
+}
+
+void ReportJobs() {
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(5)) {
+        return;
+    }
+    last = now;
+    std::string line = "SOTC JOB QUEUE (5 s; n, wait avg/max ms, run avg/max ms):";
+    char buf[160];
+    for (u32 c = 0; c < JobClassCount; ++c) {
+        auto& s = g_job_stats[c];
+        const u64 n = s.count.exchange(0, std::memory_order_relaxed);
+        const u64 w = s.wait_ns.exchange(0, std::memory_order_relaxed);
+        const u64 wm = s.wait_max_ns.exchange(0, std::memory_order_relaxed);
+        const u64 r = s.run_ns.exchange(0, std::memory_order_relaxed);
+        const u64 rm = s.run_max_ns.exchange(0, std::memory_order_relaxed);
+        if (n == 0) {
+            continue;
+        }
+        std::snprintf(buf, sizeof buf, " %s %llu, %.1f/%.1f, %.1f/%.1f;", kJobClassNames[c],
+                      static_cast<unsigned long long>(n), w / 1e6 / n, wm / 1e6, r / 1e6 / n, rm / 1e6);
+        line += buf;
+    }
+    if (SotcNonBlocking::Sched()) {
+        std::snprintf(buf, sizeof buf, " scheduler: skipped-draw demand %llu, cancelled builds %llu;",
+                      static_cast<unsigned long long>(g_sched_demand.exchange(0, std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(g_sched_cancelled.exchange(0, std::memory_order_relaxed)));
+        line += buf;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+} // namespace
+
 void PipelineCache::QueueAsyncPipeline(u64 hash,
                                        const GraphicsPipeline::SerializationSupport* preloaded,
-                                       bool priority) {
+                                       bool priority, bool background) {
     auto job = std::make_unique<AsyncPipelineJob>();
     job->key = graphics_key;
     job->hash = hash;
@@ -1301,23 +1382,81 @@ void PipelineCache::QueueAsyncPipeline(u64 hash,
         job->fetch_shader = *fetch_shader;
     }
     job->modules = modules;
+    job->priority = priority;
+    // sotc: SOTC_NB_SCHED: the skipped draws of this key raise its demand; a pipeline the command processor builds
+    // itself cancels it.
+    if (SotcNonBlocking::Sched() && !preloaded && !background) {
+        queued_graphics[graphics_key] = job.get();
+    }
     {
         std::scoped_lock lock{async_mutex};
-        // sotc: shadow (depth-only) pipelines go ahead of the other graphics pipelines (after the
-        // compute and translation jobs at the front, which the recorder or a draw waits for).
-        if (priority) {
-            // Oldest first among them (FIFO), so the first shadow pipeline is not starved.
-            job->priority = true;
-            // sotc: behind the tiny run (SOTC_TINY_ASYNC), which is empty unless that is on.
-            const std::size_t front = std::min<std::size_t>(
-                async_queue.size(), async_compute_queued + async_translate_queued +
-                                        g_tiny_jobs_queued + async_priority_queued++);
-            async_queue.insert(async_queue.begin() + front, std::move(job));
-        } else {
-            async_queue.push_back(std::move(job));
-        }
+        // sotc: shadow (depth-only) pipelines go ahead of the other graphics pipelines (after the compute and
+        // translation jobs, which the recorder or a draw waits for); predicted ones go to the background.
+        PushJobLocked(priority ? JobLane::Shadow : background ? JobLane::Background : JobLane::Graphics,
+                      std::move(job));
     }
     async_cv.notify_one();
+}
+
+u32 PipelineCache::BackgroundCap() const {
+    // sotc: SOTC_NB_SCHED: background jobs (pretranslation, pack loads, prebuilds, prediction) on at most half the
+    // workers while the game runs; the boot hold waits for them, so it gives them every worker.
+    if (!SotcNonBlocking::Sched() || pre_holding) {
+        return std::numeric_limits<u32>::max();
+    }
+    return std::max<u32>(1, static_cast<u32>(async_workers.size()) / 2);
+}
+
+void PipelineCache::PushJobLocked(JobLane lane, std::unique_ptr<AsyncPipelineJob> job) {
+    job_queues[lane].push_back(std::move(job));
+}
+
+bool PipelineCache::HasRunnableJobLocked() const {
+    for (size_t l = 0; l < static_cast<size_t>(JobLane::Count); ++l) {
+        if (job_queues.lanes[l].empty()) {
+            continue;
+        }
+        if (static_cast<JobLane>(l) == JobLane::Background && job_queues.background_running >= BackgroundCap()) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::PopJobLocked(JobLane& lane) {
+    for (size_t l = 0; l < static_cast<size_t>(JobLane::Count); ++l) {
+        auto& q = job_queues.lanes[l];
+        if (q.empty()) {
+            continue;
+        }
+        lane = static_cast<JobLane>(l);
+        if (lane == JobLane::Background) {
+            if (job_queues.background_running >= BackgroundCap()) {
+                continue;
+            }
+            ++job_queues.background_running;
+        }
+        auto pick = q.begin();
+        // sotc: SOTC_NB_SCHED: the graphics job most draws are waiting for, aged so that none waits forever
+        // (one skipped draw counts as 10 ms of age).
+        if (lane == JobLane::Graphics && SotcNonBlocking::Sched() && q.size() > 1) {
+            const u64 now = SotcJobClockNs();
+            u64 best = 0;
+            for (auto it = q.begin(); it != q.end(); ++it) {
+                const u64 age_ms = (now - std::min(now, (*it)->created_ns)) / 1'000'000;
+                const u64 score = u64{(*it)->demand.load(std::memory_order_relaxed)} * 10 + age_ms;
+                if (it == q.begin() || score > best) {
+                    best = score;
+                    pick = it;
+                }
+            }
+        }
+        auto job = std::move(*pick);
+        q.erase(pick);
+        return job;
+    }
+    return nullptr;
 }
 
 void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
@@ -1337,40 +1476,72 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
     BbThreads::PlaceThread(BbThreads::Role::PipelineWorker);
     for (;;) {
         std::unique_ptr<AsyncPipelineJob> job;
+        JobClass job_class = JobGraphics;
+        JobLane lane = JobLane::Graphics;
         {
             std::unique_lock lock{async_mutex};
-            async_cv.wait(lock, token, [this] { return !async_queue.empty(); });
+            async_cv.wait(lock, token, [this] { return HasRunnableJobLocked(); });
             if (token.stop_requested()) {
                 // A queued compute pipeline may be waited for by the recording thread: build
                 // those before leaving.
-                while (!async_queue.empty()) {
-                    job = std::move(async_queue.front());
-                    async_queue.pop_front();
-                    if (job->compute) {
-                        job->compute->Build();
+                for (auto& q : job_queues.lanes) {
+                    while (!q.empty()) {
+                        job = std::move(q.front());
+                        q.pop_front();
+                        if (job->compute) {
+                            job->compute->Build();
+                        }
                     }
                 }
-                g_tiny_jobs_queued = 0; // sotc: SOTC_TINY_ASYNC, the queue is empty now
                 return;
             }
-            job = std::move(async_queue.front());
-            async_queue.pop_front();
-            if (job->compute) {
-                --async_compute_queued;
-            } else if (job->translate) {
-                if (!job->translate->pretranslate) { // sotc: SOTC_PRETRANSLATE jobs are not counted
-                    --async_translate_queued;
-                }
-            } else if (g_tiny_jobs_queued != 0) {
-                // sotc: SOTC_TINY_ASYNC. The tiny run follows the compute and translation jobs, so
-                // with it non-empty the head is one of its jobs.
-                --g_tiny_jobs_queued;
-            } else if (job->priority) {
-                --async_priority_queued;
+            job = PopJobLocked(lane);
+            if (!job) {
+                continue;
             }
+            job_class = job->lazy                ? JobLazy
+                        : job->compute           ? (job->pre_compute ? JobComputePrebuild : JobCompute)
+                        : job->translate         ? (job->translate->pretranslate ? JobPretranslate : JobTranslate)
+                        : lane == JobLane::Tiny  ? JobTiny
+                        : job->priority          ? JobShadow
+                        : job->preloaded         ? JobPreload
+                        : lane == JobLane::Background ? JobPredict
+                                                 : JobGraphics;
         }
+        // sotc: SOTC_NB_SCHED: a background job runs below normal priority, and frees its slot when done.
+        struct BackgroundSlot {
+            PipelineCache& cache;
+            bool active;
+            BackgroundSlot(PipelineCache& c, bool a) : cache(c), active(a) {
+                if (active && SotcNonBlocking::Sched()) {
+                    SetWorkerBelowNormal(true);
+                }
+            }
+            ~BackgroundSlot() {
+                if (!active) {
+                    return;
+                }
+                if (SotcNonBlocking::Sched()) {
+                    SetWorkerBelowNormal(false);
+                }
+                {
+                    std::scoped_lock lock{cache.async_mutex};
+                    --cache.job_queues.background_running;
+                }
+                cache.async_cv.notify_one();
+            }
+        } background_slot{*this, lane == JobLane::Background};
+        // sotc: SOTC_BLOCK_LEDGER job queue report: the wait ends here, the run ends when the job is done.
+        const u64 job_taken_ns = SotcJobClockNs();
+        const u64 job_wait_ns = job_taken_ns - std::min(job_taken_ns, job->created_ns);
+        const auto note_job = [&] {
+            if (SotcBlockLedger::kOn) {
+                NoteJob(job_class, job_wait_ns, SotcJobClockNs() - job_taken_ns);
+            }
+        };
         if (job->lazy) { // sotc: SOTC_NB_IO pack load
             RunLazyLoad(*job->lazy);
+            note_job();
             std::scoped_lock lock{async_mutex};
             async_done.push_back(std::move(job));
             async_done_count.fetch_add(1, std::memory_order_release);
@@ -1378,6 +1549,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         }
         if (job->translate) {
             RunAsyncTranslate(*job->translate);
+            note_job();
             std::scoped_lock lock{async_mutex};
             async_done.push_back(std::move(job));
             async_done_count.fetch_add(1, std::memory_order_release);
@@ -1399,14 +1571,21 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                     std::chrono::steady_clock::now() - start)
                     .count(),
                 std::memory_order_relaxed);
+            note_job();
             continue;
         }
-        job->pipeline = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, layout_cache, profile, job->key, *pipeline_cache,
-            job->infos,
-            job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
-            job->sdata, job->preloaded, true);
-        SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
+        if (job->cancelled.load(std::memory_order_acquire)) {
+            // sotc: SOTC_NB_SCHED: the command processor built this pipeline itself; nothing to build.
+            g_sched_cancelled.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            job->pipeline = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, layout_cache, profile, job->key, *pipeline_cache,
+                job->infos,
+                job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
+                job->sdata, job->preloaded, true);
+            SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
+        }
+        note_job();
         std::scoped_lock lock{async_mutex};
         const bool boot = job->preloaded; // sotc: N5
         async_done.push_back(std::move(job));
@@ -1437,6 +1616,9 @@ bool PipelineCache::TryFastLink(std::unique_ptr<GraphicsPipeline>& slot) {
 }
 
 void PipelineCache::CollectAsyncPipelines() {
+    if (SotcBlockLedger::kOn) {
+        ReportJobs(); // sotc: SOTC_BLOCK_LEDGER job queue report, every 5 s
+    }
     std::vector<std::unique_ptr<AsyncPipelineJob>> done;
     {
         std::scoped_lock lock{async_mutex};
@@ -1454,6 +1636,11 @@ void PipelineCache::CollectAsyncPipelines() {
         }
         if (pipe_predict && !job->compute) { // sotc: SOTC_PIPE_PREDICT throttle
             pipe_predict->inflight.erase(job->key);
+        }
+        if (!job->compute && !queued_graphics.empty()) { // sotc: SOTC_NB_SCHED
+            if (const auto f = queued_graphics.find(job->key); f != queued_graphics.end() && f->second == job.get()) {
+                queued_graphics.erase(f);
+            }
         }
         const auto it = graphics_pipelines.find(job->key);
         if (it == graphics_pipelines.end()) {
@@ -1603,8 +1790,7 @@ void PipelineCache::QueueAsyncTranslate(HwStage hw_stage, SwStage sw_stage,
     }
     {
         std::scoped_lock lock{async_mutex};
-        async_queue.insert(async_queue.begin() + async_compute_queued + async_translate_queued++,
-                           std::move(job));
+        PushJobLocked(JobLane::Translate, std::move(job));
     }
     async_cv.notify_one();
 }
@@ -1646,14 +1832,12 @@ void PipelineCache::WaitPendingTranslation(u64 hash) {
         // No worker started it yet: translating it here is quicker than waiting behind the
         // jobs ahead of it. Translation jobs sit right after the compute jobs.
         std::scoped_lock lock{async_mutex};
-        const auto first = async_queue.begin() + static_cast<std::ptrdiff_t>(async_compute_queued);
-        const auto last = first + static_cast<std::ptrdiff_t>(async_translate_queued);
-        const auto it = std::find_if(first, last, [hash](const auto& job) {
+        auto& lane = job_queues[JobLane::Translate];
+        const auto it = std::find_if(lane.begin(), lane.end(), [hash](const auto& job) {
             return !job->translate->program && job->translate->hash == hash;
         });
-        if (it != last) {
-            async_queue.erase(it);
-            --async_translate_queued;
+        if (it != lane.end()) {
+            lane.erase(it);
             pending_programs.erase(hash);
             SotcStats::compute_prefetch_taken_back.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -2240,10 +2424,21 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
     if (gpl_on && (is_new || queued)) {
         g_gpl_counters.cold_misses.fetch_add(1, std::memory_order_relaxed);
     }
+    // sotc: SOTC_NB_SCHED: one more draw is waiting for this key's queued job.
+    const auto note_skip_demand = [this] {
+        if (!SotcNonBlocking::Sched()) {
+            return;
+        }
+        if (const auto f = queued_graphics.find(graphics_key); f != queued_graphics.end()) {
+            f->second->demand.fetch_add(1, std::memory_order_relaxed);
+            g_sched_demand.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
     if (queued && liverpool->regs.num_indices > 6 && !depth_only) {
         // sotc: SOTC_PIPE_GPL: the draw runs on a fast-linked pipeline; the queued build replaces it
         // when it is collected (CollectAsyncPipelines).
         if (!gpl_on || !TryFastLink(it.value())) {
+            note_skip_demand();
             return nullptr;
         }
         std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
@@ -2285,27 +2480,21 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         // (a worker may have taken it already) or it is in the run already.
         const auto move_to_tiny_run = [this] {
             std::scoped_lock lock{async_mutex};
-            const auto found =
-                std::find_if(async_queue.begin(), async_queue.end(), [this](const auto& job) {
-                    return !job->compute && !job->translate && job->key == graphics_key;
-                });
-            const std::size_t head = async_compute_queued + async_translate_queued;
-            if (found == async_queue.end() ||
-                static_cast<std::size_t>(std::distance(async_queue.begin(), found)) <
-                    head + g_tiny_jobs_queued) {
-                return false;
-            }
-            auto job = std::move(*found);
-            async_queue.erase(found);
-            if (job->priority) {
+            // A queued graphics or shadow job of this key moves to the tiny lane (after compute and translate).
+            for (const JobLane from : {JobLane::Graphics, JobLane::Shadow}) {
+                auto& q = job_queues[from];
+                const auto found = std::find_if(q.begin(), q.end(),
+                                                [this](const auto& job) { return job->key == graphics_key; });
+                if (found == q.end()) {
+                    continue;
+                }
+                auto job = std::move(*found);
+                q.erase(found);
                 job->priority = false;
-                --async_priority_queued;
+                PushJobLocked(JobLane::Tiny, std::move(job));
+                return true;
             }
-            const std::size_t at = std::min(head + g_tiny_jobs_queued, async_queue.size());
-            async_queue.insert(async_queue.begin() + static_cast<std::ptrdiff_t>(at),
-                               std::move(job));
-            ++g_tiny_jobs_queued;
-            return true;
+            return false;
         };
         // sotc: SOTC_TINY_GPL=1 (TinyGplOn). A tiny draw is served by a fast-linked pipeline now, and the
         // optimized build follows on a worker. Its time is counted in g_tiny_gpl.
@@ -2346,6 +2535,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
                 g_tiny_stats.moved.fetch_add(1, std::memory_order_relaxed);
             }
             g_tiny_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+            note_skip_demand();
             return nullptr;
         }
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
@@ -2406,6 +2596,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
                 instance, scheduler, desc_heap, layout_cache, profile, graphics_key, *pipeline_cache,
                 infos,
                 runtime_infos, fetch_shader, modules, sdata, false);
+        }
+        // sotc: SOTC_NB_SCHED: a worker that has not started this key's job skips its build.
+        if (queued && SotcNonBlocking::Sched()) {
+            if (const auto f = queued_graphics.find(graphics_key); f != queued_graphics.end()) {
+                f->second->cancelled.store(true, std::memory_order_release);
+            }
         }
         LogSyncPipeline("graphics",
                         async_workers.empty() ? "async off"
@@ -2505,7 +2701,7 @@ const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
                 std::scoped_lock lock{async_mutex};
                 // Ahead of the graphics jobs, after the older compute ones: the recording
                 // thread binds them in this order.
-                async_queue.insert(async_queue.begin() + async_compute_queued++, std::move(job));
+                PushJobLocked(JobLane::Compute, std::move(job));
             }
             async_cv.notify_one();
         } else {
@@ -4153,7 +4349,7 @@ void PipelineCache::FeedPretranslate() {
     {
         std::scoped_lock lock{async_mutex};
         while (!pre_backlog.empty() && pre_in_flight < limit) {
-            async_queue.push_back(std::move(pre_backlog.front())); // behind every other job
+            PushJobLocked(JobLane::Background, std::move(pre_backlog.front())); // behind every other job
             pre_backlog.pop_front();
             ++pre_in_flight;
         }
@@ -4278,7 +4474,10 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
     pre_builds_pending.fetch_add(1, std::memory_order_relaxed);
     {
         std::scoped_lock lock{async_mutex};
-        async_queue.insert(async_queue.begin() + async_compute_queued++, std::move(job));
+        // sotc: SOTC_NB_SCHED: outside the boot hold a prebuild is background work (a dispatch that binds it before a
+        // worker took it builds it on the recorder, ComputePipeline::BindWhenReady).
+        PushJobLocked(SotcNonBlocking::Sched() && !pre_holding ? JobLane::Background : JobLane::Compute,
+                      std::move(job));
     }
     async_cv.notify_one();
 }

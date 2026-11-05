@@ -484,7 +484,7 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
             job->compute = it.value().get();
             {
                 std::scoped_lock lock{async_mutex};
-                async_queue.insert(async_queue.begin() + async_compute_queued++, std::move(job));
+                PushJobLocked(JobLane::Compute, std::move(job));
             }
             async_cv.notify_one();
             preload_computes.push_back(compute_key);
@@ -1287,7 +1287,7 @@ void PipelineCache::FeedLazyPrefetch() {
     while (lazy_in_flight < kInFlight && !lazy_backlog.empty()) {
         {
             std::scoped_lock lock{async_mutex};
-            async_queue.push_back(std::move(lazy_backlog.front())); // behind the draws' own jobs
+            PushJobLocked(JobLane::Background, std::move(lazy_backlog.front())); // behind the draws' own jobs
         }
         lazy_backlog.pop_front();
         ++lazy_in_flight;

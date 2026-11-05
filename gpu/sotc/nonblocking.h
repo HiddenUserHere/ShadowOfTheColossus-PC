@@ -20,4 +20,12 @@ inline bool Io() {
     return on;
 }
 
+/// P2 (SOTC_NB_SCHED=1): the pipeline workers' job lanes run with the modern rules: graphics jobs ordered by demand
+/// (draws skipped for them) plus age, cancelled when the command processor built the pipeline itself, background
+/// jobs on at most half the workers at below-normal thread priority. Off: the same lanes, FIFO, no cap.
+inline bool Sched() {
+    static const bool on = SwitchOn("SOTC_NB_SCHED");
+    return on;
+}
+
 } // namespace SotcNonBlocking
