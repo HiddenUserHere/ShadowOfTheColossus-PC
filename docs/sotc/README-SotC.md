@@ -163,6 +163,7 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_BACKING_WARM=1` | experimental: uma thread de baixa prioridade toca, na segunda visão da memória, as páginas que o jogo começa a escrever, para os envios à GPU não pagarem a falta de página na thread de desenho (medido em 30/10: sem ganho; prefira `SOTC_COPY_GUEST_VIEW`) |
 | `SOTC_FILL_HLE_GPU=0` | desliga (ligado por padrão desde 30/10): as tabelas que o shader de preenchimento (HLE) escreve chegam à GPU por preenchimento ou cópia na própria GPU, em vez de serem copiadas de novo pela memória do jogo na varredura DMA (uma tabela de 8 MiB, ~33 vezes por carga de área) |
 | `SOTC_WAIT_MARKER=1/2` | esperas pela GPU consultam um marcador escrito por ela (experimental) |
+| `SOTC_SPV_PROGRAM_IDS=1` | põe o hash do programa do jogo em cada shader SPIR-V (e nos registros de verificação do `SOTC_HEAP` e do `SOTC_SHADER_ADDR`). Desligado por padrão desde 4/11: shaders de programas diferentes que viram o mesmo código saem idênticos, e o cache de pipelines do driver monta cada pipeline repetido uma vez só. Ligue só para saber qual programa gerou um registro |
 | `SOTC_CMD_STATS=1/2` | draws e dispatches por quadro (2: shaders de compute mais usados) |
 | `SOTC_TSC=qpc/native` | relógio do jogo: `qpc` sempre usa o QPC do Windows, `native` sempre o TSC do processador (padrão: QPC só quando os núcleos discordam no TSC) |
 | `SOTC_UI_HIRES=0` | com DLSS, a interface (textos, logos, HUD) volta a ser desenhada na resolução de renderização e ampliada, em vez de na resolução de saída |

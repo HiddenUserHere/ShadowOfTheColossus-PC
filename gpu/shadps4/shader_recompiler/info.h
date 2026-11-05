@@ -122,6 +122,18 @@ inline uint32_t SpvSalt() {
     return salt;
 }
 
+/// sotc: SOTC_SPV_PROGRAM_IDS=1 (diagnostic, default off): every module carries its program hash (an OpString, and the
+/// first field of the SOTC_HEAP / SOTC_SHADER_ADDR verify records). Off, two programs whose translation is the same
+/// code give byte-identical SPIR-V, so the driver's pipeline cache builds their pipelines once (pipeline-content
+/// dedup, docs/re-stutters/native/re-pipelines/README.md step 1). The records then carry 0 as the program.
+inline bool SpvProgramIds() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_SPV_PROGRAM_IDS");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
 /// sotc: SOTC_GCN_MISS_EMIT=0 (diagnostic): table-mode loads do not emit the S2 page-miss record (gcn_layout.h).
 /// Only to measure the driver compile cost of that code; a page that is not resident then reads zero unrecorded.
 inline bool GcnMissEmit() {

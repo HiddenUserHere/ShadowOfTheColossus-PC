@@ -42,6 +42,27 @@ Key facts:
 ## Implementation plan (in order)
 1. Content dedupe: one shader module per normalized SPIR-V (without the per-program OpString hash), so one
    pipeline per distinct (modules, state) combination. Big win for vertex shaders; no image change.
+   **Done (4 Nov 2026), first form:** the emitted SPIR-V no longer carries the program hash (the OpString, and the
+   first field of the SOTC_HEAP / SOTC_SHADER_ADDR verify records); `SOTC_SPV_PROGRAM_IDS=1` puts it back
+   (`shader_recompiler/info.h`, `spirv_emit_context.cpp`; cache version 43/140). Equal code is now equal bytes, so the
+   driver's pipeline cache builds each repeated pipeline once. Offline, on pack `v13272bcc`: dropping that one
+   OpString gives the same counts as the full normalization (vertex 9,085 -> 1,363, pixel 9,962 -> 7,708, compute
+   4,253 -> 3,240), and the stored keys of that session repeat by content (graphics 980 -> 710, largest group 107;
+   compute 4,335 -> 3,322). Script: `raw_dupes.py`, `pipe_dupes.py` (session scratchpad, not kept).
+   Cold A/B on the Lab test route, one round each (`user/dedup1/dd_old.log` with the ids, `dd_new.log` without;
+   new salts 61/62, SOTC_PIPE_FEEDBACK=1, SOTC_PRETRANSLATE_COMPUTE=1):
+
+   | | old (ids) | new |
+   |---|---|---|
+   | compute pipelines / driver cache hits / driver time | 4,270 / 0 / 679.6 s | 4,270 / 1,013 / 634.9 s (-6.6%) |
+   | graphics pipelines / driver cache hits / driver time | 811 / 10 / 121.5 s | 814 / 216 / 100.9 s (-17%) |
+   | recorder waits on pipelines | 11 (1,872 ms) | 12 (987 ms) |
+   | route p99 / max / hitches > 100 ms | 242.6 ms / 961.6 ms / 8 | 192.0 ms / 905.3 ms / 6 |
+
+   Driver time is summed over worker threads. The route numbers are one round each, so take them as a direction,
+   not a measure. Not done yet: the port still creates one VkPipeline object per (program, perm) key (the driver
+   answers the repeats from its cache: 216 hits, and 214 graphics pipelines took under 1 ms), and the pretranslate pack still stores
+   every copy (272 MB of vertex SPIR-V, ~57 MB distinct).
 2. Remove the port-side key multipliers above: unexported color formats, unused step rates and SGPR offsets, and
    dynamic write masks.
 3. Load-time prebuild from game data:

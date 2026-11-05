@@ -164,7 +164,10 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
     }
-    String(fmt::format("{:#x}", info.pgm_hash));
+    // sotc: no per-program bytes by default, so equal code is equal SPIR-V (SpvProgramIds, info.h).
+    if (SpvProgramIds()) {
+        String(fmt::format("{:#x}", info.pgm_hash));
+    }
     if (const u32 salt = SpvSalt(); salt != 0) { // sotc: SOTC_SPV_SALT (info.h)
         String(fmt::format("sotc salt {}", salt));
     }
@@ -1325,7 +1328,7 @@ Id EmitContext::ShaderAddrVerifyLoad(u32 handle, Id index, u32 elem_size, Pointe
             OpStore(BdaPointer(OpIAdd(U64, record, Constant(U64, static_cast<u64>(offset))), type),
                     value, spv::MemoryAccessMask::Aligned, size);
         };
-        field(0, Constant(U64, info.pgm_hash), U64, 8);
+        field(0, Constant(U64, SpvProgramIds() ? info.pgm_hash : u64{0}), U64, 8);
         field(8, Constant(U64, ~0ULL), U64, 8);
         field(16, guest_base, U64, 8);
         field(24, OpUConvert(U64, block_size), U64, 8);
@@ -1371,7 +1374,7 @@ Id EmitContext::ShaderAddrVerifyLoad(u32 handle, Id index, u32 elem_size, Pointe
             OpStore(BdaPointer(OpIAdd(U64, record, Constant(U64, static_cast<u64>(offset))), type),
                     value, spv::MemoryAccessMask::Aligned, size);
         };
-        field(0, Constant(U64, info.pgm_hash), U64, 8);
+        field(0, Constant(U64, SpvProgramIds() ? info.pgm_hash : u64{0}), U64, 8);
         field(8, elem_address, U64, 8);
         field(16, guest_base, U64, 8);
         field(24, OpUConvert(U64, block_size), U64, 8);
@@ -2103,7 +2106,7 @@ void EmitContext::HeapRecord(Id bad, u32 kind, u32 number, Id classic, Id raw, u
         OpStore(BdaPointer(OpIAdd(U64, record, Constant(U64, static_cast<u64>(offset))), type), value,
                 spv::MemoryAccessMask::Aligned, size);
     };
-    field(0, Constant(U64, info.pgm_hash), U64, 8);
+    field(0, Constant(U64, SpvProgramIds() ? info.pgm_hash : u64{0}), U64, 8);
     field(8,
           OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), push_data_block,
                                     ConstU32(HeapTableMember(info, profile)))),

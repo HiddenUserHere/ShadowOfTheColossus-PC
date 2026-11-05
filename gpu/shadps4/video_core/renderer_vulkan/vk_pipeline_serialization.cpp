@@ -72,12 +72,14 @@ static bool AddrTableRequested() {
 // back binaries written by older recompiler builds under the same number (wrong vertices, dark
 // trees): everything is translated again once.
 // 42/139 (4 Nov 2026): SOTC_SPV_FUNCS on by default, the generic buffer decode is a DontInline function.
+// 43/140 (4 Nov 2026): no program hash in the SPIR-V (SOTC_SPV_PROGRAM_IDS, info.h): equal code is equal bytes, so the
+// driver's pipeline cache shares the pipelines of programs that translate to the same shader.
 // 41 (from 40): early fragment tests on the LOD feedback shaders (emit_spirv.cpp, upstream
 // 0.70's 38); the non-feedback binaries are unchanged.
 // sotc: SOTC_PRETRANSLATE / SOTC_PRECOMPILE (+128000): those caches held permutations whose resources differed from
 // their program's Info (a layout variant without the flat buffer, then draws' translations with it, recorded under
 // the variant's Info): the device lost of 4 Nov. Their caches are made again; the others are unchanged.
-static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 42u : 139u) +
+static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 43u : 140u) +
                                        (Shader::StageBindingsEnabled() ? 1000u : 0u) +
                                        (BindlessSamplersRequested() ? 2000u : 0u) +
                                        (SrtPhiDisabled() ? 4000u : 0u) +
@@ -96,7 +98,9 @@ static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 42u : 139
                                        Shader::SpvSalt() * 4096000u + (Shader::GcnMissEmit() ? 0u : 2048000u) +
                                        // sotc: SOTC_SPV_FUNCS (on by default): the generic buffer decode and the table
                                        // loads are DontInline functions (first-run compile cost); 0 keeps them inline.
-                                       (Shader::SpvFuncs() ? 0u : 512u);
+                                       (Shader::SpvFuncs() ? 0u : 512u) +
+                                       // sotc: SOTC_SPV_PROGRAM_IDS=1 (info.h): modules with the program hash, apart.
+                                       (Shader::SpvProgramIds() ? 256u : 0u);
 // sotc: 22 (from 21): the record ends with the stage variant (SOTC_HEAP). Without it a cached Plain or Heap
 // program came back as Default, so its layout disagreed with its binary (slot-word assert, device lost).
 // 23: a variant's pgm_hash is the game's hash again (Info::CacheHash keys the caches), so 22's variant records differ.
