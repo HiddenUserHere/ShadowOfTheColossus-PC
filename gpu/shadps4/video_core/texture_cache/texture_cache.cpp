@@ -353,7 +353,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     }
     // sotc: SOTC_NATIVE=1 (native.h): GPU-written texels are not copied to guest memory. The image
     // stops being GPU-modified, so the collector and the next use do not wait for a copy.
-    if (!SotcNative::TracksGuestPages()) {
+    if (SotcNative::SkipsReadbacks()) {
         SotcNative::NoteSkippedReadback(image.info.guest_address, image.info.guest_size);
         image.flags &= ~ImageFlagBits::GpuModified;
         NoteGpuFlagChange(image); // sotc: SOTC_BIND_CACHE_CONTENT
@@ -489,6 +489,16 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_writt
     std::scoped_lock lock{mutex};
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         if (keep_gpu_written && True(image.flags & ImageFlagBits::GpuModified)) {
+            // sotc: SOTC_NATIVE: the announce is remembered on the image (FindImage decides at its next lookup
+            // whether the CPU rewrote it), and the lookup memo of its range forgets it.
+            if (image.Overlaps(addr, size)) {
+                const u64 now = scheduler.CurrentTick();
+                image.sotc_native_cpu_touch = now;
+                // Only an idle image can be found rewritten (FindImage): a render target in use keeps its memo.
+                if (now - image.tick_accessed_last >= 60) {
+                    GenBumpImage(image);
+                }
+            }
             // sotc: SOTC_NATIVE aging rule. A GPU-written image is kept while announces cover it: an
             // announce over a per-frame chunk covers a render target the CPU never wrote. Once the
             // image has been idle for a while and an announce covers its whole range, the game has
@@ -496,8 +506,15 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_writt
             // from guest memory like a CPU-written one (mode 0 gets the same result through its readback).
             constexpr u64 native_reuse_idle_ticks = 120;
             const u64 idle = scheduler.CurrentTick() - image.tick_accessed_last;
-            const bool covers = addr <= image.info.guest_address &&
-                                addr + size >= image.info.guest_address + image.info.guest_size;
+            // sotc: SOTC_NATIVE_REUSE_PARTIAL=1: any announce over an idle GPU-written image counts. New contents
+            // usually arrive in pieces (file reads in blocks, one mip at a time), none of which covers the whole
+            // image, so the image kept a picture of the old contents (no Shrine terrain after the opening).
+            static const bool reuse_partial = [] {
+                const char* v = std::getenv("SOTC_NATIVE_REUSE_PARTIAL");
+                return v && v[0] == '1';
+            }();
+            const bool covers = reuse_partial || (addr <= image.info.guest_address &&
+                                                  addr + size >= image.info.guest_address + image.info.guest_size);
             if (!covers || idle < native_reuse_idle_ticks) {
                 return;
             }
@@ -1364,6 +1381,75 @@ ImageId TextureCache::ExpandRt(const ImageInfo& info, ImageId image_id) {
     return expanded;
 }
 
+// sotc: SOTC_NATIVE=1 image verify. Without page tracking, a CPU write no announce covers never reaches the texture
+// cache: an image keeps its old picture when the game loads another texture into the same slot of its texture pool
+// with the same size and format (no Shrine terrain after the opening cinematic, whose terrain textures held those
+// slots; page tracking caught the write). The hash of a guest sample (the first and last 4 KiB) is taken at each
+// upload and compared at a texture lookup, at most every kNativeVerifyTicks per image: a different sample means new
+// contents, and the image is uploaded again from guest memory. SOTC_NATIVE_IMAGE_VERIFY=0: off.
+namespace {
+constexpr u64 kNativeVerifyTicks = 120;
+bool NativeImageVerifyOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_NATIVE_IMAGE_VERIFY");
+        return !v || v[0] != '0';
+    }();
+    return on && SotcNative::On() && !SotcNative::TracksGuestPages();
+}
+u64 GuestSampleHash(VAddr addr, u64 size) {
+    constexpr u64 kPart = 4096;
+    thread_local std::vector<u8> buf;
+    const u64 head = std::min<u64>(size, kPart);
+    const u64 tail = size > 2 * kPart ? kPart : (size > kPart ? size - kPart : 0);
+    buf.resize(head + tail);
+    if (!Core::Memory::Instance()->TryReadBacking(addr, buf.data(), head)) {
+        return 0;
+    }
+    if (tail != 0 && !Core::Memory::Instance()->TryReadBacking(addr + size - tail, buf.data() + head, tail)) {
+        return 0;
+    }
+    return XXH3_64bits(buf.data(), buf.size()) | 1; // never 0 (0: no sample)
+}
+std::atomic<u64> g_verify_checks{0};
+std::atomic<u64> g_verify_stale{0};
+} // namespace
+
+void TextureCache::NativeVerifyImage(ImageId image_id) {
+    if (NativeImageVerifyOn()) {
+        Image& checked = slot_images[image_id];
+        const u64 now = scheduler.CurrentTick();
+        if (checked.sotc_guest_hash != 0 && False(checked.flags & ImageFlagBits::GpuModified) &&
+            False(checked.flags & ImageFlagBits::CpuDirty) && now - checked.sotc_hash_tick >= kNativeVerifyTicks) {
+            checked.sotc_hash_tick = now;
+            g_verify_checks.fetch_add(1, std::memory_order_relaxed);
+            const u64 h = GuestSampleHash(checked.info.guest_address, checked.info.guest_size);
+            if (h != 0 && h != checked.sotc_guest_hash) {
+                const u64 n = g_verify_stale.fetch_add(1, std::memory_order_relaxed);
+                if (n < 40) {
+                    std::fprintf(stderr, "SOTC NATIVE IMAGE STALE %#llx+%#x %ux%u %s mips %u: guest contents changed "
+                                 "with no announce, uploaded again\n",
+                                 static_cast<unsigned long long>(checked.info.guest_address),
+                                 checked.info.guest_size, checked.info.size.width, checked.info.size.height,
+                                 vk::to_string(checked.info.pixel_format).c_str(), checked.info.resources.levels);
+                }
+                checked.sotc_guest_hash = h;
+                checked.flags |= ImageFlagBits::CpuDirty;
+                checked.sotc_upload_from_guest = true;
+                PostBindSet(image_id, SotcArch::BindSet::Cause::ImageDirty);
+                UntrackImage(image_id);
+            }
+        }
+        static auto last_report = std::chrono::steady_clock::now();
+        const auto t = std::chrono::steady_clock::now();
+        if (t - last_report >= std::chrono::seconds(5)) {
+            last_report = t;
+            std::fprintf(stderr, "SOTC NATIVE IMAGE VERIFY (5 s): %llu checks, %llu stale images uploaded again\n",
+                         static_cast<unsigned long long>(g_verify_checks.exchange(0)),
+                         static_cast<unsigned long long>(g_verify_stale.exchange(0)));
+        }
+    }
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     // sotc: SOTC_TRACE (kept when over 20 us: a new image, a resolve, an overlap)
@@ -1384,6 +1470,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // sotc: thousands of lookups per frame find the same images; a perfect match stays one
     // until an image is registered or unregistered (SOTC_FIND_MEMO=0: always search).
     if (const ImageId memo_id = MemoLookup(info, exact_fmt, memo_writer)) {
+        if (!writer) {
+            NativeVerifyImage(memo_id); // sotc: SOTC_NATIVE=1 image verify (a same-size texture in the same slot)
+        }
         Image& image = slot_images[memo_id];
         image.tick_prev_accessed = image.tick_accessed_last;
         image.tick_accessed_last = scheduler.CurrentTick();
@@ -1426,6 +1515,53 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     for (const ImageId tail_id : tails) {
         FreeRebased(tail_id, SotcStats::rebase_writer_freed);
     }
+    // sotc: SOTC_NATIVE=1 (no write faults). A GPU-written image whose memory the CPU wrote after the GPU last used
+    // it, and that has been idle since, holds the game's new contents in guest memory: a texture lookup treats it as
+    // a CPU-rewritten image (CpuDirty, no longer GPU-written), as a write fault makes it in mode 0. Without this the
+    // lookup reused the old GPU picture: after the opening cinematic, the Shrine terrain's textures were drawn from
+    // render targets of the opening that had held their memory (no terrain with SOTC_NATIVE=1, fine with page
+    // tracking). A render target in use is accessed every frame, after any announce over it, so it never qualifies.
+    // SOTC_NATIVE_IMAGE_REWRITE=0: off.
+    if (!writer && SotcNative::On() && !SotcNative::TracksGuestPages()) {
+        static const bool image_rewrite = [] {
+            const char* v = std::getenv("SOTC_NATIVE_IMAGE_REWRITE");
+            return !v || v[0] != '0';
+        }();
+        constexpr u64 kRewriteIdleTicks = 60;
+        const u64 now = scheduler.CurrentTick();
+        for (const ImageId cache_id : image_ids) {
+            Image& cached = slot_images[cache_id];
+            if (!image_rewrite || False(cached.flags & ImageFlagBits::GpuModified) ||
+                now - cached.tick_accessed_last < kRewriteIdleTicks) {
+                continue;
+            }
+            // Rewritten: an announce reached it after its last use, or a texture of another size or format is asked
+            // at its address (a reused slot of the texture pool whose new contents no announce covered; a live view of
+            // a GPU-written image, such as the grass atlas, is in use every frame and never idle).
+            const bool touched = cached.sotc_native_cpu_touch > cached.tick_accessed_last;
+            const bool other_texture = cached.info.guest_address == info.guest_address &&
+                                       (cached.info.size.width != info.size.width ||
+                                        cached.info.size.height != info.size.height ||
+                                        cached.info.pixel_format != info.pixel_format);
+            if (!touched && !other_texture) {
+                continue;
+            }
+            cached.flags &= ~(ImageFlagBits::GpuModified | ImageFlagBits::GpuDirty);
+            cached.flags |= ImageFlagBits::CpuDirty;
+            // The upload reads guest memory, not the buffer cache's copy of the range (still the old GPU bytes there,
+            // as for the F9 reload).
+            cached.sotc_upload_from_guest = true;
+            // The buffer cache may hold the range as GPU-written too (the opening used it as a buffer): a new image
+            // over it would upload from that copy, so its GPU state is dropped as well.
+            buffer_cache.NativeForgetGpuWrites(cached.info.guest_address, cached.info.guest_size);
+            PostBindSet(cache_id, SotcArch::BindSet::Cause::ImageDirty);
+            UntrackImage(cache_id);
+            NoteGpuFlagChange(cached); // sotc: SOTC_BIND_CACHE_CONTENT
+            SotcArch::BindSet::PostRange(cached.info.guest_address - cached.info.sotc_dropped_bytes,
+                                         cached.info.guest_address + cached.info.guest_size);
+            SotcNative::NoteImageReused(); // counter for the report ("images reused")
+        }
+    }
 
     ImageId image_id{};
 
@@ -1434,6 +1570,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (IsPerfectMatch(slot_images[cache_id].info, info, exact_fmt)) {
             image_id = cache_id;
         }
+    }
+    if (image_id && !writer) {
+        NativeVerifyImage(image_id); // sotc: SOTC_NATIVE=1 image verify
     }
     if (image_id && !(slot_images[image_id].info.resources < info.resources)) {
         MemoSlot(info, exact_fmt, memo_writer) = FindMemo{
@@ -2555,6 +2694,10 @@ void TextureCache::RefreshImage(Image& image) {
     {
         const SotcStats::SplitTimer record_split{SotcStats::SplitTexRecord};
         runtime.UploadImage(&image, buffer, image_copies);
+        if (NativeImageVerifyOn() && False(image.flags & ImageFlagBits::GpuModified)) {
+            image.sotc_guest_hash = GuestSampleHash(image.info.guest_address, image.info.guest_size);
+            image.sotc_hash_tick = scheduler.CurrentTick();
+        }
     }
     // sotc: the MaybeCpuDirty check compares against image.hash, which only that branch used to
     // set: after any other upload (CpuDirty, first upload) it described older contents, and a

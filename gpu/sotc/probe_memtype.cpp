@@ -32,6 +32,7 @@ void NoteHeapAlloc(uint32_t slot, uint64_t addr, uint64_t size);
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -270,6 +271,10 @@ struct GranuleEntry {
     std::atomic<uint64_t> word{0};
     std::atomic<uint64_t> foreign{0};
     std::atomic<uint64_t> label{0}; // hash of the slot label the pool was named with (0 = not registered yet)
+    // sotc: SOTC_FAULT_OWNERS. The last allocation that touched the granule: slot << 56 | caller (image offset, or
+    // the low 48 bits of kOutside), and its size.
+    std::atomic<uint64_t> last_owner{0};
+    std::atomic<uint64_t> last_size{0};
 };
 std::array<GranuleEntry, kGranuleTable> g_granules{};
 std::atomic<uint64_t> g_granule_claims{0};              // claimed granules (table fill, <= kMaxGranules)
@@ -284,6 +289,7 @@ struct PendingAlloc {
     uint64_t size = 0;
     uint32_t slot = 0;
     int32_t prev_heap = -1;
+    uint64_t caller = 0; // sotc: SOTC_FAULT_OWNERS: the caller key (image offset or kOutside)
 };
 thread_local std::array<PendingAlloc, kPendingDepth> t_pending{};
 thread_local uint32_t t_pending_depth = 0;
@@ -300,12 +306,6 @@ HookAction AllocPre(GuestRegs& regs, void*) {
         idx = kSlots - 1;
         g_slot_clamped.fetch_add(1, std::memory_order_relaxed);
     }
-    if (g_post_on) {
-        // sotc: SOTC_PC_PLACE: this call is the heap context of every pool block its refill hands out.
-        const int32_t prev = SotcPcPlaceGlue::PushHeapSlot(static_cast<int32_t>(idx));
-        t_pending[t_pending_depth % kPendingDepth] = PendingAlloc{size, static_cast<uint32_t>(idx), prev};
-        ++t_pending_depth;
-    }
     // At a wrap's pre phase rsp points at the return address; the guest stack is host memory and
     // committed, so it is read directly (as probe_dt.cpp reads its stack window).
     uint64_t ret = 0;
@@ -314,6 +314,12 @@ HookAction AllocPre(GuestRegs& regs, void*) {
     uint64_t off = 0;
     if (ImageOffset(ret, &off)) {
         key = off;
+    }
+    if (g_post_on) {
+        // sotc: SOTC_PC_PLACE: this call is the heap context of every pool block its refill hands out.
+        const int32_t prev = SotcPcPlaceGlue::PushHeapSlot(static_cast<int32_t>(idx));
+        t_pending[t_pending_depth % kPendingDepth] = PendingAlloc{size, static_cast<uint32_t>(idx), prev, key};
+        ++t_pending_depth;
     }
     SlotStats& s = g_slots[idx];
     s.calls.fetch_add(1, std::memory_order_relaxed);
@@ -418,7 +424,7 @@ void RelabelResolved() {
 
 // One granule touched by a call of slot. Lock-free unless the granule is new (then one CAS, and the
 // owner registration of the claim path).
-void NoteGranule(uint64_t gidx, uint32_t slot) {
+void NoteGranule(uint64_t gidx, uint32_t slot, uint64_t owner, uint64_t size) {
     const size_t start = static_cast<size_t>((gidx * 0x9E3779B97F4A7C15ull) >> (64 - kGranuleTableBits)) & (kGranuleTable - 1);
     const uint64_t want = ((gidx + 1) << 8) | slot;
     for (size_t probe = 0; probe < kGranuleTable; ++probe) {
@@ -433,6 +439,8 @@ void NoteGranule(uint64_t gidx, uint32_t slot) {
             }
             uint64_t expected = 0;
             if (e.word.compare_exchange_strong(expected, want, std::memory_order_acq_rel)) {
+                e.last_owner.store(owner, std::memory_order_relaxed);
+                e.last_size.store(size, std::memory_order_relaxed);
                 g_slot_granules[slot].fetch_add(1, std::memory_order_relaxed);
                 RegisterGranuleOwner(e, gidx << kGranuleShift, slot);
                 return;
@@ -441,8 +449,10 @@ void NoteGranule(uint64_t gidx, uint32_t slot) {
             w = expected;
         }
         if ((w >> 8) == gidx + 1) {
-            const uint32_t owner = static_cast<uint32_t>(w & 0xff);
-            if (owner != slot) {
+            e.last_owner.store(owner, std::memory_order_relaxed); // sotc: SOTC_FAULT_OWNERS
+            e.last_size.store(size, std::memory_order_relaxed);
+            const uint32_t owner_slot = static_cast<uint32_t>(w & 0xff);
+            if (owner_slot != slot) {
                 const uint64_t bit = uint64_t{1} << slot;
                 if ((e.foreign.load(std::memory_order_relaxed) & bit) == 0) {
                     const uint64_t prev = e.foreign.fetch_or(bit, std::memory_order_relaxed);
@@ -462,7 +472,7 @@ void NoteGranule(uint64_t gidx, uint32_t slot) {
 }
 
 // The granules of one returned allocation. Spans past the claim cap are counted as overflow in O(1).
-void NoteAllocGranules(uint64_t base, uint64_t size, uint32_t slot) {
+void NoteAllocGranules(uint64_t base, uint64_t size, uint32_t slot, uint64_t caller) {
     // Guest addresses below 2^48 and sizes below 2^48 (the bounds of SotcMemClasses::OnGranule).
     if (base == 0 || size == 0 || (base >> 48) != 0 || (size >> 48) != 0) {
         return;
@@ -471,8 +481,9 @@ void NoteAllocGranules(uint64_t base, uint64_t size, uint32_t slot) {
     const uint64_t last = (base + size - 1) >> kGranuleShift;
     const uint64_t span = last - first + 1;
     const uint64_t walk = span < kMaxGranules ? span : kMaxGranules;
+    const uint64_t owner = (uint64_t{slot} << 56) | (caller & ((uint64_t{1} << 48) - 1));
     for (uint64_t i = 0; i < walk; ++i) {
-        NoteGranule(first + i, slot);
+        NoteGranule(first + i, slot, owner, size);
     }
     if (span > walk) {
         g_granule_overflow.fetch_add(span - walk, std::memory_order_relaxed);
@@ -488,7 +499,7 @@ void AllocPost(GuestRegs& regs, void*) {
     const PendingAlloc call = t_pending[t_pending_depth % kPendingDepth];
     SotcPcPlaceGlue::PopHeapSlot(call.prev_heap); // sotc: SOTC_PC_PLACE heap context ends with the call
     if (g_post_granules) {
-        NoteAllocGranules(regs.rax, call.size, call.slot);
+        NoteAllocGranules(regs.rax, call.size, call.slot, call.caller);
     }
     // sotc: SOTC_NATIVE: a RenderSingleFrameCPU block is announced PerFrame at the next submit.
     if (SotcNative::On() && static_cast<int64_t>(call.slot) == kRenderSingleFrameCpuSlot && regs.rax != 0) {
@@ -532,6 +543,55 @@ void ReportGranules(std::string& out) {
     out += head;
     out += per_slot.empty() ? std::string("none") : per_slot;
     out += tail;
+}
+
+// sotc: SOTC_FAULT_OWNERS=1 (with SOTC_HOOK_MEMTYPE_PROBE=1 SOTC_MEMTYPE_CLASSES=1 and SOTC_NATIVE_TRACK=3).
+// Every write fault on a GPU-written page is charged to the last allocation that touched its 64 KiB granule
+// (heap slot and the allocation's caller), to tell which allocations hold data both the GPU and the CPU write.
+struct FaultOwnerBin {
+    std::atomic<uint64_t> key{0}; // owner + 1 (0 = empty)
+    std::atomic<uint64_t> faults{0};
+    std::atomic<uint64_t> size{0};
+    std::atomic<uint64_t> addr{0}; // the last fault address
+    // Age of the page's GPU-written mark at the fault: < 100 ms, < 1 s, < 10 s, >= 10 s, unknown (no stamp).
+    std::array<std::atomic<uint64_t>, 5> age{};
+};
+
+// Per 4 KiB page, the time (ms) of the last GPU write that marked it (direct-mapped by page; a collision loses
+// the older page, which then reads as "unknown").
+constexpr size_t kStampBits = 22;
+struct PageStamp {
+    std::atomic<uint64_t> page{0}; // page index + 1
+    std::atomic<uint64_t> ms{0};
+};
+std::array<PageStamp, size_t{1} << kStampBits> g_stamps{};
+uint64_t NowMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
+size_t StampSlot(uint64_t page) {
+    return static_cast<size_t>((page * 0x9E3779B97F4A7C15ull) >> (64 - kStampBits));
+}
+constexpr size_t kFaultOwnerBins = 1024;
+std::array<FaultOwnerBin, kFaultOwnerBins> g_fault_owners{};
+std::atomic<uint64_t> g_fault_owner_total{0};
+std::atomic<uint64_t> g_fault_owner_unclaimed{0};
+std::atomic<uint64_t> g_fault_owner_overflow{0};
+
+const GranuleEntry* FindGranule(uint64_t gidx) {
+    const size_t start = static_cast<size_t>((gidx * 0x9E3779B97F4A7C15ull) >> (64 - kGranuleTableBits)) & (kGranuleTable - 1);
+    for (size_t probe = 0; probe < kGranuleTable; ++probe) {
+        const GranuleEntry& e = g_granules[(start + probe) & (kGranuleTable - 1)];
+        const uint64_t w = e.word.load(std::memory_order_acquire);
+        if (w == 0) {
+            return nullptr;
+        }
+        if ((w >> 8) == gidx + 1) {
+            return &e;
+        }
+    }
+    return nullptr;
 }
 
 std::string CallerText(uint64_t key) {
@@ -597,6 +657,70 @@ void ReportMemtype(std::string& out, double seconds) {
     EnsureGlobals();
     if (g_classes_on) {
         RelabelResolved(); // granules claimed before the heap-id globals were set take their name now
+    }
+    // sotc: SOTC_FAULT_OWNERS: the top owners of the window's write faults.
+    if (const uint64_t total = g_fault_owner_total.exchange(0, std::memory_order_relaxed); total != 0) {
+        struct Row {
+            uint64_t owner;
+            uint64_t faults;
+            uint64_t size;
+            uint64_t addr;
+            std::array<uint64_t, 5> age;
+        };
+        std::vector<Row> rows;
+        std::array<uint64_t, 5> age_total{};
+        for (FaultOwnerBin& b : g_fault_owners) {
+            const uint64_t k = b.key.load(std::memory_order_relaxed);
+            const uint64_t n = b.faults.exchange(0, std::memory_order_relaxed);
+            std::array<uint64_t, 5> age{};
+            for (size_t i = 0; i < 5; ++i) {
+                age[i] = b.age[i].exchange(0, std::memory_order_relaxed);
+                age_total[i] += age[i];
+            }
+            if (k != 0 && n != 0) {
+                rows.push_back(Row{k - 1, n, b.size.load(std::memory_order_relaxed),
+                                   b.addr.load(std::memory_order_relaxed), age});
+            }
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.faults > b.faults; });
+        std::string text;
+        for (size_t i = 0; i < rows.size() && i < 16; ++i) {
+            const uint64_t slot = rows[i].owner >> 56;
+            const uint64_t caller = rows[i].owner & ((uint64_t{1} << 48) - 1);
+            const std::string who = caller == (kOutside & ((uint64_t{1} << 48) - 1)) ? std::string{"outside"}
+                                                                                      : CallerText(caller);
+            char item[320];
+            std::snprintf(item, sizeof item,
+                          "%s%s %s x%llu (last alloc 0x%llx, fault 0x%llx; mark age <0.1s %llu <1s %llu <10s %llu "
+                          ">=10s %llu ? %llu)",
+                          text.empty() ? "" : "; ", SlotLabel(slot).c_str(), who.c_str(),
+                          static_cast<unsigned long long>(rows[i].faults),
+                          static_cast<unsigned long long>(rows[i].size),
+                          static_cast<unsigned long long>(rows[i].addr),
+                          static_cast<unsigned long long>(rows[i].age[0]),
+                          static_cast<unsigned long long>(rows[i].age[1]),
+                          static_cast<unsigned long long>(rows[i].age[2]),
+                          static_cast<unsigned long long>(rows[i].age[3]),
+                          static_cast<unsigned long long>(rows[i].age[4]));
+            text += item;
+        }
+        char head[192];
+        std::snprintf(head, sizeof head,
+                      "SOTC FAULT OWNERS (window): %llu write faults, %llu outside claimed granules, %llu owners not "
+                      "counted (table full); ",
+                      static_cast<unsigned long long>(total),
+                      static_cast<unsigned long long>(g_fault_owner_unclaimed.exchange(0, std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(g_fault_owner_overflow.exchange(0, std::memory_order_relaxed)));
+        out += head;
+        char ages[160];
+        std::snprintf(ages, sizeof ages,
+                      "mark age of all: <0.1s %llu, <1s %llu, <10s %llu, >=10s %llu, unknown %llu; ",
+                      static_cast<unsigned long long>(age_total[0]), static_cast<unsigned long long>(age_total[1]),
+                      static_cast<unsigned long long>(age_total[2]), static_cast<unsigned long long>(age_total[3]),
+                      static_cast<unsigned long long>(age_total[4]));
+        out += ages;
+        out += text;
+        out += "\n";
     }
     ReportGranules(out); // cumulative, printed every window while SOTC_MEMTYPE_CLASSES=1
 
@@ -756,6 +880,70 @@ void ReportMemtype(std::string& out, double seconds) {
                       static_cast<unsigned long long>(frames), items.c_str());
         out += line;
     }
+}
+
+bool FaultOwnersOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_FAULT_OWNERS");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+void NoteGpuWriteStamp(uint64_t addr, uint64_t size) {
+    if (size == 0) {
+        return;
+    }
+    const uint64_t now = NowMs();
+    const uint64_t first = addr >> 12;
+    const uint64_t last = (addr + size - 1) >> 12;
+    const uint64_t pages = std::min<uint64_t>(last - first + 1, 4096); // 16 MiB at most per write
+    for (uint64_t p = first; p < first + pages; ++p) {
+        PageStamp& st = g_stamps[StampSlot(p)];
+        st.page.store(p + 1, std::memory_order_relaxed);
+        st.ms.store(now, std::memory_order_relaxed);
+    }
+}
+
+void NoteFaultOwner(uint64_t addr) {
+    g_fault_owner_total.fetch_add(1, std::memory_order_relaxed);
+    const GranuleEntry* e = FindGranule(addr >> kGranuleShift);
+    if (!e) {
+        g_fault_owner_unclaimed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const uint64_t owner = e->last_owner.load(std::memory_order_relaxed);
+    const uint64_t key = owner + 1;
+    size_t age_bucket = 4;
+    {
+        const uint64_t page = addr >> 12;
+        const PageStamp& st = g_stamps[StampSlot(page)];
+        if (st.page.load(std::memory_order_relaxed) == page + 1) {
+            const uint64_t age = NowMs() - st.ms.load(std::memory_order_relaxed);
+            age_bucket = age < 100 ? 0 : age < 1000 ? 1 : age < 10000 ? 2 : 3;
+        }
+    }
+    const size_t start = static_cast<size_t>((owner * 0x9E3779B97F4A7C15ull) >> 54) & (kFaultOwnerBins - 1);
+    for (size_t probe = 0; probe < kFaultOwnerBins; ++probe) {
+        FaultOwnerBin& b = g_fault_owners[(start + probe) & (kFaultOwnerBins - 1)];
+        uint64_t k = b.key.load(std::memory_order_acquire);
+        if (k == 0) {
+            uint64_t expected = 0;
+            if (b.key.compare_exchange_strong(expected, key, std::memory_order_acq_rel)) {
+                k = key;
+            } else {
+                k = expected;
+            }
+        }
+        if (k == key) {
+            b.faults.fetch_add(1, std::memory_order_relaxed);
+            b.age[age_bucket].fetch_add(1, std::memory_order_relaxed);
+            b.size.store(e->last_size.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            b.addr.store(addr, std::memory_order_relaxed);
+            return;
+        }
+    }
+    g_fault_owner_overflow.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace SotcProbes

@@ -240,6 +240,14 @@ public:
     }
     u64 lru_id{};
     u64 tick_accessed_last{};
+    /// sotc: SOTC_NATIVE=1: the tick of the latest announce (CPU write) over this image while it was GPU-written
+    /// (TextureCache::InvalidateMemory keeps such an image). Later than tick_accessed_last: the CPU wrote its
+    /// memory after the GPU last used it (FindImage then treats it as rewritten, as a write fault does in mode 0).
+    u64 sotc_native_cpu_touch{};
+    /// sotc: SOTC_NATIVE=1 image verify (TextureCache::NativeImageStale): a hash of a guest sample (head and tail
+    /// 4 KiB) taken at the last upload, and the tick of the last check.
+    u64 sotc_guest_hash{};
+    u64 sotc_hash_tick{};
     /// sotc: tick_accessed_last before its latest update (the use before the current one). The
     /// host image copy (SOTC_HOST_IMAGE_COPY) needs the last use before the current submit.
     u64 tick_prev_accessed{};

@@ -621,6 +621,29 @@ void VerifyTakeUploads(const std::vector<PendingUpload>& snapshot, const std::ve
     }
 }
 
+namespace {
+std::atomic<void*> g_free_ctx{nullptr};
+std::atomic<void (*)(void*, uint64_t, uint64_t)> g_free_fn{nullptr};
+} // namespace
+
+void SetFreeDiscard(void* ctx, void (*fn)(void* ctx, uint64_t addr, uint64_t size)) {
+    g_free_ctx.store(ctx, std::memory_order_relaxed);
+    g_free_fn.store(fn, std::memory_order_release);
+}
+
+void DiscardFreed(uint64_t addr, uint64_t size) {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_NATIVE_FREE_DISCARD");
+        return v && v[0] == '1';
+    }();
+    if (!on || g_mode == 0 || addr == 0 || size == 0) {
+        return;
+    }
+    if (auto* fn = g_free_fn.load(std::memory_order_acquire)) {
+        fn(g_free_ctx.load(std::memory_order_relaxed), addr, size);
+    }
+}
+
 void SetFrameBackend(const FrameBackend& backend) {
     std::scoped_lock lock{g_mutex};
     g_backend_set.store(false, std::memory_order_release);

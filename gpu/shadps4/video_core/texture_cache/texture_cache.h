@@ -988,6 +988,8 @@ private:
 
     /// Stop tracking CPU reads and writes for image
     void UntrackImage(ImageId image_id);
+    /// sotc: SOTC_NATIVE=1 image verify at a texture lookup (texture_cache.cpp, GuestSampleHash). Under `mutex`.
+    void NativeVerifyImage(ImageId image_id);
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
 

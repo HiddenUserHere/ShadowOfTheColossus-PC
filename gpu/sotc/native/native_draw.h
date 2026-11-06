@@ -47,6 +47,12 @@ struct FrameBackend {
 };
 void SetFrameBackend(const FrameBackend& backend);
 
+/// sotc: SOTC_NATIVE_FREE_DISCARD=1. The buffer cache's handler for a block the game freed (pool_free_block): its
+/// GPU-written state is forgotten as at an unmap (SOTC_DROP_NATIVE), so the memory's next contents upload from guest
+/// memory. DiscardFreed calls it (any thread; no-op until registered or with the switch off).
+void SetFreeDiscard(void* ctx, void (*fn)(void* ctx, uint64_t addr, uint64_t size));
+void DiscardFreed(uint64_t addr, uint64_t size);
+
 /// Counters (draw thread or any thread, relaxed).
 void NoteUploaded(uint64_t bytes);     ///< a persistent range uploaded by the draw thread (0: already clean)
 void NoteMarked(uint64_t bytes);       ///< a per-frame range marked CPU-modified (fallback)

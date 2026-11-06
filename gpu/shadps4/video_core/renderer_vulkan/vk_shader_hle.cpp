@@ -571,7 +571,16 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     if (src_stride != 4 || dst_stride != 4 || ctl.GetSize() < 8) {
         return false;
     }
-    if (buffer_cache.IsRegionGpuModified(ctl.base_address, 8)) {
+    // sotc: SOTC_NATIVE=1: the GPU-written test is the precise one. The page bits are rounded to 4 KiB and, without
+    // readbacks, a page keeps its bit after the CPU rewrote the bytes the fill reads (NativeExactUpload clears the
+    // precise ranges only): the control and source words the CPU wrote then refused the fill, the GPU ran it and the
+    // guest copy of the table stayed old for the bind path that reads it (no Shrine terrain after the opening).
+    const bool native_precise = !SotcNative::TracksGuestPages();
+    const auto gpu_written = [&](VAddr addr, u64 bytes) {
+        return native_precise ? buffer_cache.IsRangeGpuWrittenPrecise(addr, bytes)
+                              : buffer_cache.IsRegionGpuModified(addr, bytes);
+    };
+    if (gpu_written(ctl.base_address, 8)) {
         return false;
     }
     const u32* control = std::bit_cast<const u32*>(ctl.base_address);
@@ -583,8 +592,7 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         return true;
     }
     const u64 src_count = m ? std::min<u64>(m, count) : count;
-    if (src_count * 4 > src.GetSize() ||
-        buffer_cache.IsRegionGpuModified(src.base_address, src_count * 4)) {
+    if (src_count * 4 > src.GetSize() || gpu_written(src.base_address, src_count * 4)) {
         return false;
     }
     const u32* source = std::bit_cast<const u32*>(src.base_address);

@@ -47,6 +47,13 @@ bool BlockExtentOn() noexcept;
 /// tracked block holds addr.
 bool BlockRemaining(uint64_t addr, uint64_t* remaining) noexcept;
 void RegisterCvars();
+/// sotc: SOTC_FAULT_OWNERS=1 (probe_memtype.cpp): a write fault on a GPU-written page is charged to the last
+/// allocation (heap slot and caller) that touched its 64 KiB granule; the top owners are in the memtype report.
+bool FaultOwnersOn();
+void NoteFaultOwner(uint64_t addr);
+/// sotc: SOTC_FAULT_OWNERS: a GPU write marked [addr, addr + size) GPU-written now (the buffer cache's
+/// AddGpuModified). Stamps the time per 4 KiB page, so a later write fault reports the age of the mark.
+void NoteGpuWriteStamp(uint64_t addr, uint64_t size);
 void RegisterArea();
 void RegisterPass(); // sotc: SOTC_PASS_PROBE (probe_pass.cpp), observe only; prints its own 5 s summary
 // sotc: SOTC_CALL_PROBE (probe_calls.cpp), observe only; prints its own 5 s summary. RegisterCalls installs the

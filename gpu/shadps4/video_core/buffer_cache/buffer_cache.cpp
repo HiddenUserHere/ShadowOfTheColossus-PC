@@ -31,6 +31,8 @@
 #include "../../../sotc/mem_classes.h"  // sotc: SOTC_CLASS_TRACK (plan step 6)
 #include "../../../sotc/pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE bind evidence
 #include "../../../sotc/pc_ring.h"      // sotc: SOTC_PC_RING shadow
+#include "../../../sotc/native/fault_emu.h" // sotc: SOTC_NATIVE_TRACK_EMU
+#include "../../../sotc/probes.h"           // sotc: SOTC_FAULT_OWNERS (GPU write stamps)
 #include "../../../sotc/native/native.h"       // sotc: SOTC_NATIVE (windows, announces, frame ticket)
 #include "../../../sotc/cmd_counters.h"        // sotc: SOTC_CMD_COUNTERS (unique-bytes spans, see PcHostRecordBind)
 #include "../../../sotc/native/native_draw.h" // sotc: SOTC_NATIVE draw-thread side
@@ -558,6 +560,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         SotcNative::SetFrameBackend(SotcNative::FrameBackend{
             this, &BufferCache::NativeFrameSubmitted, &BufferCache::NativeFrameWait,
             &BufferCache::NativeFrameCompleted});
+        SotcNative::SetFreeDiscard(this, &BufferCache::NativeDiscardFreed);
     }
     // sotc: SOTC_HRR dry run (see hrr.h).
     if (HostResidentRanges::Enabled()) {
@@ -1193,11 +1196,145 @@ void ReportReadbackRips(std::string& out, double seconds) {
     }
 }
 
+namespace {
+// sotc: SOTC_GPUPAGE_WRITERS=1 with SOTC_NATIVE_TRACK=1, diagnostic: the guest instructions whose write faults land on
+// pages the GPU wrote (the writes mode 1 cannot see unless announced), per 5 s, eboot offsets. Run with and without
+// the opening cinematic: a writer only the opening's run shows is a write mode 1 loses.
+struct GpuPageWriters {
+    std::mutex mu;
+    std::unordered_map<u64, std::pair<u64, u64>> rows; // eboot offset -> (faults, bytes)
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+void NoteGpuPageWrite(u64 rip, u64 size) {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_GPUPAGE_WRITERS");
+        return v && v[0] == '1';
+    }();
+    if (!on) {
+        return;
+    }
+    static GpuPageWriters t;
+    const u64 base = SotcTrace::ImageBase();
+    const u64 offset = (rip && base && rip >= base && rip - base < SotcTrace::ImageSize()) ? rip - base : ~u64{0};
+    std::scoped_lock lock{t.mu};
+    auto& row = t.rows[offset];
+    row.first += 1;
+    row.second += size;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - t.last < std::chrono::seconds(5)) {
+        return;
+    }
+    t.last = now;
+    std::vector<std::pair<u64, std::pair<u64, u64>>> rows(t.rows.begin(), t.rows.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    std::string text;
+    for (size_t i = 0; i < rows.size() && i < 25; ++i) {
+        char item[64];
+        if (rows[i].first == ~u64{0}) {
+            std::snprintf(item, sizeof item, " host:%llu", (unsigned long long)rows[i].second.first);
+        } else {
+            std::snprintf(item, sizeof item, " 0x%llx:%llu", (unsigned long long)rows[i].first,
+                          (unsigned long long)rows[i].second.first);
+        }
+        text += item;
+    }
+    std::fprintf(stderr, "SOTC GPUPAGE WRITERS (5 s):%s\n", text.c_str());
+    t.rows.clear();
+}
+} // namespace
+
+namespace {
+// sotc: SOTC_RB_CHANGED=1 with SOTC_NATIVE_TRACK=1: write-fault readbacks (the GPU bytes of a page brought in before a
+// CPU write lands) that changed guest bytes, per guest writer instruction and per 64 KiB granule, every 5 s. The CPU
+// later reads the other bytes of those pages without a fault; mode 1 never brings them.
+struct WriteRbChanged {
+    std::mutex mu;
+    std::unordered_map<u64, u64> by_rip;
+    std::unordered_map<u64, u64> by_granule;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+void NoteWriteRbChanged(u64 rip, VAddr addr) {
+    static WriteRbChanged t;
+    const u64 base = SotcTrace::ImageBase();
+    const u64 offset = (rip && base && rip >= base && rip - base < SotcTrace::ImageSize()) ? rip - base : ~u64{0};
+    std::scoped_lock lock{t.mu};
+    ++t.by_rip[offset];
+    ++t.by_granule[addr >> 16];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - t.last < std::chrono::seconds(5)) {
+        return;
+    }
+    t.last = now;
+    const auto top = [](const std::unordered_map<u64, u64>& m, bool rips) {
+        std::vector<std::pair<u64, u64>> rows(m.begin(), m.end());
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string text;
+        for (size_t i = 0; i < rows.size() && i < 20; ++i) {
+            char item[64];
+            if (rips && rows[i].first == ~u64{0}) {
+                std::snprintf(item, sizeof item, " host:%llu", (unsigned long long)rows[i].second);
+            } else {
+                std::snprintf(item, sizeof item, rips ? " 0x%llx:%llu" : " %#llx0000:%llu",
+                              (unsigned long long)rows[i].first, (unsigned long long)rows[i].second);
+            }
+            text += item;
+        }
+        return text;
+    };
+    std::fprintf(stderr, "SOTC WRITE RB CHANGED (5 s) writers:%s\n", top(t.by_rip, true).c_str());
+    std::fprintf(stderr, "SOTC WRITE RB CHANGED (5 s) granules:%s\n", top(t.by_granule, false).c_str());
+    t.by_rip.clear();
+    t.by_granule.clear();
+}
+bool WriteRbChangedOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_RB_CHANGED");
+        return v && v[0] == '1';
+    }();
+    return on && (SotcNative::TrackMode() == 1 || SotcNative::TrackMode() == 3);
+}
+} // namespace
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    // sotc: SOTC_NATIVE_UNIFIED=2: a CPU write into GPU-written memory makes its granules unified (the merge below
+    // still runs for this page; the draw thread copies the rest of the granule's GPU bytes at its next bind).
+    if (is_write && SotcNative::TrackMode() == 3 && IsRegionGpuModified(device_addr, size)) {
+        NativeUnifiedNoteFault(device_addr, size);
+    }
+    if (is_write && (SotcNative::TrackMode() == 1 || SotcNative::TrackMode() == 3) && IsRegionGpuModified(device_addr, size)) {
+        NoteGpuPageWrite(SotcFaultRip::current, size);
+    }
+    // sotc: SOTC_RB_CHANGED (write faults, see NoteWriteRbChanged): the readback below runs synchronously; the
+    // fault page's bytes are compared before and after it.
+    std::vector<u8> wrb_before;
+    VAddr wrb_page = 0;
+    if (is_write && WriteRbChangedOn() && IsRegionGpuModified(device_addr, size)) {
+        wrb_page = device_addr & ~VAddr{0xfff};
+        wrb_before.resize(0x1000);
+        if (!Core::Memory::Instance()->TryReadBacking(wrb_page, wrb_before.data(), 0x1000)) {
+            wrb_before.clear();
+        }
+    }
+    struct WrbCompare {
+        std::vector<u8>& before;
+        VAddr page;
+        ~WrbCompare() {
+            if (before.empty()) {
+                return;
+            }
+            std::vector<u8> after(0x1000);
+            if (Core::Memory::Instance()->TryReadBacking(page, after.data(), 0x1000) &&
+                std::memcmp(before.data(), after.data(), 0x1000) != 0) {
+                NoteWriteRbChanged(SotcFaultRip::current, page);
+            }
+        }
+    } const wrb_compare{wrb_before, wrb_page};
     // sotc: SOTC_NATIVE=1 (native.h): no page is tracked, so this is a readback the native model
     // does not make. A CPU write (a fault's InvalidateRegion) makes the GPU bytes stale: they are
     // dropped, the write itself is announced. A read is not served (no read protection exists).
-    if (!SotcNative::TracksGuestPages()) {
+    // sotc: SOTC_NATIVE_TRACK=2 tracks pages but still skips readbacks, except a write fault's (the GPU bytes of the
+    // page are read back before the CPU write lands, as with tracking).
+    if (SotcNative::SkipsReadbacks() && !(is_write && (SotcNative::TrackMode() == 2 || SotcNative::TrackMode() == 3))) {
         SotcNative::NoteSkippedReadback(device_addr, size);
         if (is_write) {
             DiscardGpuModified(device_addr, size);
@@ -1420,6 +1557,27 @@ bool BufferCache::NativeExactUpload(VAddr addr, u64 size) {
     runtime.CopyBuffer(staging.buffer, arena, copies);
     RecordCurrentWrite(addr, size);
     SotcFrameRings::NoteCpuPath(addr, size); // sotc: SOTC_FRAME_RINGS (this record is CPU-origin)
+    // sotc: the CPU rewrote these bytes and the arena now holds them: they are no longer GPU-written. Without this
+    // the GPU-written state was sticky in mode 1 (only an unmap cleared it): after the opening cinematic, pages the
+    // CPU reused kept it, the replicate-fill HLE refused tables whose control and source the CPU wrote (the GPU
+    // filled them, the guest copy the bind path reads stayed old) and the Shrine terrain was drawn from them.
+    // Whole 4 KiB pages inside the range also lose the tracker's GPU bit (every byte of them was rewritten).
+    // SOTC_NATIVE_EXACT_CLEAR=0: off.
+    static const bool exact_clear = [] {
+        const char* v = std::getenv("SOTC_NATIVE_EXACT_CLEAR");
+        return !v || v[0] != '0';
+    }();
+    if (exact_clear) {
+        {
+            std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+            gpu_modified_ranges.Subtract(addr, size);
+        }
+        const VAddr page_lo = (addr + 4095) & ~VAddr{4095};
+        const VAddr page_hi = (addr + size) & ~VAddr{4095};
+        if (page_hi > page_lo) {
+            memory_tracker->UnmarkRegionAsGpuModified(page_lo, page_hi - page_lo, false);
+        }
+    }
     // sotc: the exact copy sets no CPU bit, so the memory tracker's counters (mem_epoch, SotcGen,
     // sync generations) would not see this CPU write; move them as a fault would.
     memory_tracker->NoteCpuBytesChanged(addr, size);
@@ -5100,10 +5258,16 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
     }
 }
 
+namespace {
+// sotc: SOTC_NATIVE_UNIFIED: set while NativeUnifiedFlush copies GPU-only bytes to guest memory (the one readback
+// the native model makes, see NativeUnifiedBind).
+thread_local bool tl_unified_flush = false;
+} // namespace
+
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
     // sotc: SOTC_NATIVE=1: GPU-written bytes are not copied to guest memory (see ReadMemory), so the
     // range keeps its GPU bits (nothing was copied, nothing is clean).
-    if (!SotcNative::TracksGuestPages()) {
+    if (SotcNative::SkipsReadbacks() && !tl_unified_flush) {
         SotcNative::NoteSkippedReadback(device_addr, size);
         return;
     }
@@ -5674,7 +5838,9 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                     SotcStats::rb_hot_late_skipped.fetch_add(skipped, std::memory_order_relaxed);
                 }
             };
-            write_pages(dst_addr, copy.size, [&](VAddr part_addr, u64 part_size) {
+            // sotc: SOTC_NATIVE_TRACK_EMU: the bytes of emulated stores not yet in the arena are not overwritten
+            // (fault_emu.h, ForEachNotPending).
+            const auto apply_part = [&](VAddr part_addr, u64 part_size) {
             if (rb_prev_env) {
                 // sotc: SOTC_RB_PREV: only the parts written (hot items skip guest-written pages)
                 PrevNoteApplied(part_addr, part_size);
@@ -5743,6 +5909,9 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr), size,
                                         1);
             });
+            };
+            write_pages(dst_addr, copy.size, [&](VAddr part_addr, u64 part_size) {
+                SotcFaultEmu::ForEachNotPending(part_addr, part_size, apply_part);
             });
         }
     }
@@ -5920,10 +6089,108 @@ BindMemoSlot& BindMemoSlotFor(VAddr addr, u32 size) {
 }
 } // namespace
 
+namespace {
+// sotc: SOTC_NATIVE_BUFFER_VERIFY=1 (needs the write generations: SOTC_GEN_DMA=2 keeps the DMA path as it is and turns
+// them on), diagnostic and repair for mode 1. A read bind of a range that is neither CPU- nor GPU-written in the
+// tracker holds, in the GPU copy, what guest memory held at its last upload. Each such range keeps a hash of a guest
+// sample (the first and last 32 KiB) and the generation sum of its granules; at a later bind (at most every 30 ticks)
+// the same generation with another hash means the CPU wrote the range with no announce and no mark: the GPU would
+// read stale bytes. The range is marked CPU-written (uploaded at this bind) and logged.
+struct BufVerifyEntry {
+    u64 hash{};
+    u64 gen{};
+    u64 tick{};
+};
+struct BufVerify {
+    std::mutex mu;
+    std::unordered_map<u64, BufVerifyEntry> entries; // key: addr << 20 ^ size
+    u64 checks{}, stale{}, stale_bytes{};
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+BufVerify& BufVerifyState() {
+    static BufVerify v;
+    return v;
+}
+bool BufVerifyOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_NATIVE_BUFFER_VERIFY");
+        return v && v[0] == '1';
+    }();
+    return on && SotcNative::On() && !SotcNative::TracksGuestPages() && SotcGen::Bumps();
+}
+u64 BufSampleHash(VAddr addr, u64 size) {
+    constexpr u64 kPart = 32_KB;
+    thread_local std::vector<u8> buf;
+    const u64 head = std::min<u64>(size, kPart);
+    const u64 tail = size > 2 * kPart ? kPart : (size > kPart ? size - kPart : 0);
+    buf.resize(head + tail);
+    if (!Core::Memory::Instance()->TryReadBacking(addr, buf.data(), head)) {
+        return 0;
+    }
+    if (tail != 0 && !Core::Memory::Instance()->TryReadBacking(addr + size - tail, buf.data() + head, tail)) {
+        return 0;
+    }
+    return XXH3_64bits(buf.data(), buf.size()) | 1;
+}
+} // namespace
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer,
                                                         u32 mark_offset, u32 mark_size) {
     SotcLoadWarm::NoteBind(device_addr, size); // sotc: SOTC_LOAD_WARM (no-op when off)
+    // sotc: SOTC_NATIVE_BUFFER_VERIFY (see BufVerifyEntry), per 64 KiB granule of the bind (at most 64).
+    if (!is_written && size != 0 && BufVerifyOn()) {
+        const u64 now = scheduler.CurrentTick();
+        auto& v = BufVerifyState();
+        const VAddr first = device_addr & ~VAddr{0xffff};
+        const VAddr end = std::min<VAddr>(device_addr + size, first + (VAddr{64} << 16));
+        for (VAddr g0 = first; g0 < end; g0 += 0x10000) {
+            bool check = false;
+            {
+                std::scoped_lock lock{v.mu};
+                auto& e = v.entries[g0 >> 16];
+                check = e.tick == 0 || now - e.tick >= 30;
+                if (check) {
+                    e.tick = now;
+                }
+            }
+            if (!check || memory_tracker->IsRegionCpuModified(g0, 0x10000) || IsRegionGpuModified(g0, 0x10000)) {
+                continue;
+            }
+            const u64 h = BufSampleHash(g0, 0x10000);
+            const u64 g = SotcGen::Sum(g0, 0x10000);
+            bool stale = false;
+            {
+                std::scoped_lock lock{v.mu};
+                auto& e = v.entries[g0 >> 16];
+                ++v.checks;
+                if (h != 0 && e.hash != 0 && e.gen == g && e.hash != h) {
+                    stale = true;
+                    ++v.stale;
+                    v.stale_bytes += 0x10000;
+                    if (v.stale <= 60) {
+                        std::fprintf(stderr, "SOTC NATIVE BUFFER STALE granule %#llx (bind %#llx+%#x%s): guest bytes "
+                                     "changed with no mark, uploaded again\n", static_cast<unsigned long long>(g0),
+                                     static_cast<unsigned long long>(device_addr), size,
+                                     is_texel_buffer ? " texel" : "");
+                    }
+                }
+                e.hash = h;
+                e.gen = g;
+                const auto t = std::chrono::steady_clock::now();
+                if (t - v.last >= std::chrono::seconds(5)) {
+                    v.last = t;
+                    std::fprintf(stderr, "SOTC NATIVE BUFFER VERIFY (5 s): %llu granule checks, %llu stale (%llu KiB)\n",
+                                 static_cast<unsigned long long>(v.checks), static_cast<unsigned long long>(v.stale),
+                                 static_cast<unsigned long long>(v.stale_bytes >> 10));
+                    v.checks = v.stale = v.stale_bytes = 0;
+                }
+            }
+            if (stale) {
+                memory_tracker->MarkRegionAsCpuModified(g0, 0x10000);
+            }
+        }
+    }
     if (SotcN1Verify::On() && SotcStats::t_draw_thread) { // sotc: SOTC_VERIFY=n1: the GPU binds this range
         SotcN1Verify::NoteBind(device_addr, size, false);
     }
@@ -5960,6 +6227,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         if (auto host = PcHostBind(device_addr, size, is_written)) {
             return *host;
         }
+    }
+    // sotc: SOTC_NATIVE_UNIFIED (see NativeUnifiedBind).
+    if (auto unified = NativeUnifiedBind(device_addr, size, is_written)) {
+        return *unified;
     }
     if (hrr && hrr->NoteBinding(device_addr, size, is_written)) { // sotc: SOTC_HRR dry run
         hrr->NoteImageOverlap(device_addr, size, texture_cache.HasImageInRange(device_addr, size));
@@ -6114,6 +6385,9 @@ u64 BufferCache::AddGpuModified(VAddr addr, u64 size) {
     // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA: a GPU write invalidates the bind memo of its range (the
     // memo never reads GPU bits, so this is conservative). Before any early return below.
     SotcGen::Bump(addr, size);
+    if (SotcProbes::FaultOwnersOn()) { // sotc: SOTC_FAULT_OWNERS: the age of the mark at a later write fault
+        SotcProbes::NoteGpuWriteStamp(addr, size);
+    }
     // sotc: SOTC_PC_RING=4/5 coverage input: every GPU write into the arena, before any early
     // return below (the range may already be marked). Lock-free; no-op in the other modes.
     if ((SotcPcRing::FullRingMode() == 4 || SotcPcRing::FullRingMode() == 5) &&
@@ -6697,6 +6971,11 @@ void BufferCache::NoteWriteAgainstXferReads(VAddr addr, u64 size) {
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainGuestCopyForImage(VAddr device_addr, u32 size) {
+    // sotc: SOTC_NATIVE_UNIFIED: the GPU writes these bytes in guest memory, possibly in work not run yet: a CPU copy
+    // now could read them before the write. The GPU reads them in order instead (the served bind).
+    if (IsNativeUnified(device_addr, size)) {
+        return ObtainBuffer(device_addr, size, false);
+    }
     const auto staging = [&] {
         const SotcStats::SplitTimer staging_split{SotcStats::SplitTexStaging};
         // sotc: SOTC_STAGING_CACHED picks the type (StagingBufferPool::UploadType)
@@ -6711,7 +6990,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainGuestCopyForImage(VAddr device_
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size,
                                                                 bool pages_protected) {
-    if (IsRegionGpuModified(device_addr, size)) {
+    // sotc: SOTC_NATIVE_UNIFIED: as ObtainGuestCopyForImage.
+    if (IsRegionGpuModified(device_addr, size) || IsNativeUnified(device_addr, size)) {
         const SotcStats::SplitTimer copy_split{SotcStats::SplitTexCopy};
         return ObtainBuffer(device_addr, size, false);
     }
@@ -6973,6 +7253,14 @@ void BufferCache::ForEachDeclarableRun(VAddr addr, size_t size, void (*fn)(void*
     memory_tracker->ForEachDeclarableRun(addr, size, [fn, ctx](VAddr run, u64 run_size) {
         fn(ctx, run, run_size);
     });
+}
+
+bool BufferCache::IsRangeGpuWrittenPrecise(VAddr addr, size_t size) {
+    if (rbx_owed_count.load(std::memory_order_relaxed) != 0 && RbxOwedIntersects(addr, size)) {
+        return true;
+    }
+    std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+    return gpu_modified_ranges.Intersects(addr, size);
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
@@ -8086,6 +8374,375 @@ u64 BufferCache::PcHostClipLimited(VAddr addr, u64 size) {
     return run_end - addr;
 }
 
+// sotc: SOTC_NATIVE_UNIFIED=1 (SOTC_NATIVE=1 without page tracking). Unified memory for what the GPU writes.
+// In the native model the GPU writes into the arena (a device copy) and never into guest memory, while the CPU
+// writes guest memory and announces it. A page that holds both, GPU-written bytes and CPU writes no announce covers,
+// has no right copy anywhere: the arena lacks the CPU bytes, guest memory lacks the GPU bytes, and an upload of the
+// page puts the old guest bytes over the GPU's (no Shrine terrain after the opening cinematic; page tracking fixed it
+// by reading the GPU bytes back at the CPU write fault). Here a written bind makes the 2 MiB granules it touches
+// unified: their guest memory is imported (VK_EXT_external_memory_host, as the ring8 arena blocks) and every bind
+// that touches them is served from it, so the GPU reads and writes the one copy the CPU writes too, as on the PS4.
+// No fault, no hook per writer, no readback. On the transition the arena's GPU-only bytes of the granule are copied
+// to guest memory once (NativeUnifiedFlush). Device-local copies stay for the ranges the GPU only reads.
+// A bind that cannot be served (its span crosses two imported runs, or the import is refused) takes the normal path:
+// its unified bytes are marked CPU-modified first, so the arena gets the guest bytes; a written one is counted.
+namespace {
+constexpr u64 kUnifiedShift = 21; // 2 MiB granules
+constexpr u64 kUnifiedMaxBind = 64_MB;
+struct UnifiedGranule {
+    u64 verified_tick{}; // the tick of the last ImportGuestRange check of the backing
+    bool pending{};      // =2: made unified by a CPU write fault, its arena GPU bytes not copied to guest memory yet
+    // =2, migration back (see NativeUnifiedMaintain): served binds since the last scan, when it became unified, and
+    // the revert in progress (served until the GPU finished revert_tick, then device-local again).
+    std::atomic<u64> binds{0};
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    bool reverting{};
+    u64 revert_tick{};
+};
+struct UnifiedState {
+    std::shared_mutex mu;
+    std::unordered_map<u64, UnifiedGranule> granules; // key: addr >> kUnifiedShift
+    std::atomic<u64> count{0};
+    std::atomic<u64> served{0}, served_written{0}, made{0}, flushed{0}, fb_read{0}, fb_written{0};
+    std::atomic<u64> fb_big{0};
+    std::atomic<u64> owed_count{0}; // nonzero while owed holds a range (lock-free look)
+    RangeSet owed; // under mu: GPU bytes of unified granules that a written fallback left in the arena only
+    std::atomic<u64> fb_logged{0};
+    std::atomic<u64> faults{0}; // =2: CPU write faults that made granules unified
+    std::unordered_map<u64, u32> reverts; // under mu: =2, migrations back per granule (2 at most, then it stays)
+    std::atomic<u64> reverted{0};
+    std::chrono::steady_clock::time_point last_scan = std::chrono::steady_clock::now();
+    std::string top; // under report_mu: the hottest granules of the last scan
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    std::mutex report_mu;
+};
+UnifiedState& Unified() {
+    static UnifiedState u;
+    return u;
+}
+// SOTC_NATIVE_UNIFIED, read once: 1 = a written bind makes its granules unified; 2 = migration on the first CPU
+// write (with SOTC_NATIVE_TRACK=3, the GPU-written pages write-protected): what the GPU only writes and reads stays in
+// device-local memory, and the first CPU write fault on a GPU-written granule makes it unified for good (no more GPU
+// marks there, so no more protection and no more faults). The model of on-demand migration in unified-memory drivers.
+int UnifiedMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_NATIVE_UNIFIED");
+        return v && v[0] == '1' ? 1 : (v && v[0] == '2' ? 2 : 0);
+    }();
+    return mode;
+}
+bool UnifiedOn() {
+    return UnifiedMode() != 0 && SotcNative::On() && SotcNative::SkipsReadbacks();
+}
+} // namespace
+
+bool BufferCache::IsNativeUnified(VAddr addr, u64 size) {
+    if (size == 0 || !UnifiedOn()) {
+        return false;
+    }
+    auto& u = Unified();
+    if (u.count.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::shared_lock lock{u.mu};
+    for (u64 g = addr >> kUnifiedShift; g <= (addr + size - 1) >> kUnifiedShift; ++g) {
+        if (u.granules.contains(g)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void BufferCache::NativeUnifiedNoteFault(VAddr addr, u64 size) {
+    if (size == 0 || UnifiedMode() != 2 || !UnifiedOn()) {
+        return;
+    }
+    auto& u = Unified();
+    std::unique_lock lock{u.mu};
+    for (u64 g = addr >> kUnifiedShift; g <= (addr + size - 1) >> kUnifiedShift; ++g) {
+        const auto [it, fresh] = u.granules.try_emplace(g);
+        if (fresh) {
+            it->second.pending = true;
+            it->second.since = std::chrono::steady_clock::now();
+            u.count.fetch_add(1, std::memory_order_relaxed);
+            u.faults.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+// sotc: SOTC_NATIVE_UNIFIED=2, migration back. The GPU reads unified memory over the bus: a granule the GPU binds
+// often (SOTC_NATIVE_UNIFIED_HOT binds per second, default 200) goes back to device-local memory. It is served from
+// guest memory until the GPU finished every bind of it (revert_tick), then dropped from the set and marked
+// CPU-modified, so the arena takes the guest bytes (the truth) at its next bind. The GPU writes there are marked
+// again, the pages protected again, and the next CPU write fault merges and migrates it again (pending). After two
+// migrations back a granule stays unified (it is written by both sides all the time). Draw thread, every 2 s.
+void BufferCache::NativeUnifiedMaintain() {
+    auto& u = Unified();
+    const auto t = std::chrono::steady_clock::now();
+    if (t - u.last_scan < std::chrono::seconds(2)) {
+        return;
+    }
+    u.last_scan = t;
+    static const u64 hot = [] {
+        const char* v = std::getenv("SOTC_NATIVE_UNIFIED_HOT");
+        return v ? std::strtoull(v, nullptr, 10) : 200ULL;
+    }();
+    const u64 now = scheduler.CurrentTick();
+    std::vector<u64> done;
+    std::vector<std::pair<u64, u64>> heat; // binds, granule
+    {
+        std::unique_lock lock{u.mu};
+        for (auto& [g, e] : u.granules) {
+            const u64 binds = e.binds.exchange(0, std::memory_order_relaxed);
+            heat.emplace_back(binds, g);
+            if (e.pending) {
+                continue;
+            }
+            if (e.reverting) {
+                if (scheduler.IsFree(e.revert_tick)) {
+                    done.push_back(g);
+                }
+                continue;
+            }
+            if (hot != 0 && binds >= hot * 2 && t - e.since >= std::chrono::seconds(2)) {
+                u32& n = u.reverts[g];
+                if (n < 2) {
+                    ++n;
+                    e.reverting = true;
+                    e.revert_tick = now;
+                }
+            }
+        }
+        for (const u64 g : done) {
+            u.granules.erase(g);
+            u.count.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+    for (const u64 g : done) {
+        const VAddr lo = g << kUnifiedShift;
+        const u64 len = u64{1} << kUnifiedShift;
+        SotcGen::Bump(lo, len);
+        memory_tracker->MarkRegionAsCpuModified(lo, len);
+        u.reverted.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::partial_sort(heat.begin(), heat.begin() + std::min<size_t>(heat.size(), 5), heat.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string top;
+    for (size_t k = 0; k < std::min<size_t>(heat.size(), 5); ++k) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%s%#llx %llu/s", k ? ", " : "",
+                      static_cast<unsigned long long>(heat[k].second << kUnifiedShift),
+                      static_cast<unsigned long long>(heat[k].first / 2));
+        top += buf;
+    }
+    std::scoped_lock lock{u.report_mu};
+    u.top = std::move(top);
+}
+
+void BufferCache::NativeUnifiedFlush(VAddr addr, u64 size) {
+    if (!IsRangeGpuWrittenPrecise(addr, size) && !IsRegionGpuModified(addr, size)) {
+        return;
+    }
+    Unified().flushed.fetch_add(1, std::memory_order_relaxed);
+    const u32 first_block = addr >> block_shift;
+    const u32 last_block = (addr + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    if (arena) {
+        tl_unified_flush = true;
+        DownloadMemory(arena, addr, size);
+        tl_unified_flush = false;
+    }
+    DiscardGpuModified(addr, size);
+}
+
+std::optional<std::pair<const Buffer*, u64>> BufferCache::NativeUnifiedBind(VAddr device_addr, u32 size,
+                                                                            bool is_written) {
+    if (size == 0 || !UnifiedOn()) {
+        return std::nullopt;
+    }
+    auto& u = Unified();
+    if ((!is_written || UnifiedMode() == 2) && u.count.load(std::memory_order_relaxed) == 0) {
+        return std::nullopt;
+    }
+    if (UnifiedMode() == 2 && SotcStats::t_draw_thread) {
+        NativeUnifiedMaintain();
+    }
+    const u64 g0 = device_addr >> kUnifiedShift;
+    const u64 g1 = (device_addr + size - 1) >> kUnifiedShift;
+    // The normal path will read the arena: its copy of the unified bytes of the bind is old (the GPU and the CPU
+    // wrote guest memory), so those bytes are marked for upload. Only the unified granules, never the whole bind.
+    const auto mark_unified_parts = [&] {
+        std::shared_lock lock{u.mu};
+        for (u64 g = g0; g <= g1; ++g) {
+            // A pending granule's arena still holds its GPU bytes (they are not in guest memory yet): not marked.
+            if (const auto it = u.granules.find(g); it != u.granules.end() && !it->second.pending) {
+                const VAddr lo = std::max<VAddr>(device_addr, g << kUnifiedShift);
+                const VAddr hi = std::min<VAddr>(device_addr + size, (g + 1) << kUnifiedShift);
+                memory_tracker->MarkRegionAsCpuModified(lo, hi - lo);
+            }
+        }
+    };
+    if (size > kUnifiedMaxBind) {
+        // An unbounded V# cut to the window, not a game range: the normal path, with its unified parts uploaded.
+        u.fb_big.fetch_add(1, std::memory_order_relaxed);
+        mark_unified_parts();
+        return std::nullopt;
+    }
+    const u64 now = scheduler.CurrentTick();
+    bool any = false;
+    bool all = true;
+    bool pending = false;
+    bool verify = false;
+    {
+        std::shared_lock lock{u.mu};
+        for (u64 g = g0; g <= g1; ++g) {
+            const auto it = u.granules.find(g);
+            if (it == u.granules.end()) {
+                all = false;
+            } else {
+                any = true;
+                pending |= it->second.pending;
+                it->second.binds.fetch_add(1, std::memory_order_relaxed);
+                verify |= it->second.verified_tick != now;
+            }
+        }
+    }
+    if (!any && (!is_written || UnifiedMode() == 2)) {
+        return std::nullopt;
+    }
+    if (!all || pending) {
+        // A written bind, or a read that touches a unified granule: every granule of the bind becomes unified (a read
+        // is served whole from guest memory, so none of its bytes may live only in the arena).
+        const VAddr lo = g0 << kUnifiedShift;
+        const VAddr hi = (g1 + 1) << kUnifiedShift;
+        for (u64 g = g0; g <= g1; ++g) {
+            bool fresh = false;
+            {
+                std::unique_lock lock{u.mu};
+                const auto [it, added] = u.granules.try_emplace(g);
+                if (added) {
+                    u.count.fetch_add(1, std::memory_order_relaxed);
+                }
+                fresh = added || it->second.pending; // a pending granule is flushed here, on the draw thread
+                it->second.pending = false;
+            }
+            if (fresh) {
+                u.made.fetch_add(1, std::memory_order_relaxed);
+                NativeUnifiedFlush(g << kUnifiedShift, u64{1} << kUnifiedShift);
+            }
+        }
+        // Import the whole granule span when its backing allows; ImportGuestRange splits it where the backing is
+        // not contiguous (the bind may then cross two runs, see below).
+        Vulkan::SotcGuestMemory::ImportGuestRange(lo, hi - lo);
+        verify = true;
+    }
+    if (verify) {
+        // The backing of the bind's run is checked once per tick (a remapped range is imported again).
+        const VAddr page_lo = device_addr & ~VAddr{0x3fff};
+        const VAddr page_hi = (device_addr + size + 0x3fff) & ~VAddr{0x3fff};
+        Vulkan::SotcGuestMemory::ImportGuestRange(page_lo, page_hi - page_lo);
+        std::unique_lock lock{u.mu};
+        for (u64 g = g0; g <= g1; ++g) {
+            if (const auto it = u.granules.find(g); it != u.granules.end()) {
+                it->second.verified_tick = now;
+            }
+        }
+    }
+    Vulkan::SotcGuestMemory::GuestView view{};
+    bool ok = Vulkan::SotcGuestMemory::LookupGuestView(device_addr, size, &view);
+    if (!ok) {
+        // The span crosses two runs: a run of its own, starting at the bind's first page (ImportGuestRange keys a
+        // run by its first page, and the lookup takes the run starting closest below the address).
+        const VAddr page_lo = device_addr & ~VAddr{0x3fff};
+        const VAddr page_hi = (device_addr + size + 0x3fff) & ~VAddr{0x3fff};
+        ok = Vulkan::SotcGuestMemory::ImportGuestRange(page_lo, page_hi - page_lo) &&
+             Vulkan::SotcGuestMemory::LookupGuestView(device_addr, size, &view);
+    }
+    const auto report = [&u] {
+        std::scoped_lock lock{u.report_mu};
+        const auto t = std::chrono::steady_clock::now();
+        if (t - u.last < std::chrono::seconds(5)) {
+            return;
+        }
+        u.last = t;
+        std::fprintf(stderr,
+                     "SOTC NATIVE UNIFIED (5 s): %llu granules (%llu MiB), %llu made, %llu flushed, %llu binds served "
+                     "(%llu written), fallbacks %llu read / %llu written / %llu over 64 MiB, %llu by CPU write faults, "
+                     "%llu back to device memory; hottest: %s" "\n",
+                     static_cast<unsigned long long>(u.count.load()),
+                     static_cast<unsigned long long>(u.count.load() << kUnifiedShift >> 20),
+                     static_cast<unsigned long long>(u.made.exchange(0)),
+                     static_cast<unsigned long long>(u.flushed.exchange(0)),
+                     static_cast<unsigned long long>(u.served.exchange(0)),
+                     static_cast<unsigned long long>(u.served_written.exchange(0)),
+                     static_cast<unsigned long long>(u.fb_read.exchange(0)),
+                     static_cast<unsigned long long>(u.fb_written.exchange(0)),
+                     static_cast<unsigned long long>(u.fb_big.exchange(0)),
+                     static_cast<unsigned long long>(u.faults.exchange(0)),
+                     static_cast<unsigned long long>(u.reverted.exchange(0)), u.top.c_str());
+    };
+    if (!ok) {
+        (is_written ? u.fb_written : u.fb_read).fetch_add(1, std::memory_order_relaxed);
+        if (u.fb_logged.fetch_add(1, std::memory_order_relaxed) < 30) {
+            Vulkan::SotcGuestMemory::GuestView first{};
+            const bool head = Vulkan::SotcGuestMemory::LookupGuestView(device_addr, 1, &first);
+            std::fprintf(stderr, "SOTC NATIVE UNIFIED FALLBACK %#llx+%#x %s: %s" "\n",
+                         static_cast<unsigned long long>(device_addr), size, is_written ? "written" : "read",
+                         head ? "crosses a run end" : "first byte not imported (unmapped or refused)");
+        }
+        mark_unified_parts();
+        if (is_written) {
+            // The GPU bytes of this bind go to the arena only: owed to guest memory before a served bind reads them.
+            std::unique_lock lock{u.mu};
+            u.owed.Add(device_addr, size);
+            u.owed_count.store(1, std::memory_order_relaxed);
+        }
+        report();
+        return std::nullopt;
+    }
+    // After a written fallback the arena may hold GPU-only bytes of a unified range: copied to guest memory before
+    // a served bind reads them.
+    if (u.owed_count.load(std::memory_order_relaxed) != 0) {
+        std::vector<std::pair<VAddr, u64>> due;
+        {
+            std::unique_lock lock{u.mu};
+            u.owed.ForEachInRange(device_addr, size, [&](VAddr a, VAddr b) { due.emplace_back(a, b - a); });
+            for (const auto& [a, n] : due) {
+                u.owed.Subtract(a, n);
+            }
+            u.owed_count.store(u.owed.Empty() ? 0 : 1, std::memory_order_relaxed);
+        }
+        for (const auto& [a, n] : due) {
+            NativeUnifiedFlush(a, n);
+        }
+    }
+    u.served.fetch_add(1, std::memory_order_relaxed);
+    if (is_written) {
+        u.served_written.fetch_add(1, std::memory_order_relaxed);
+        SotcGen::Bump(device_addr, size); // the bind memo of the range is void (its arena copy is old)
+        if (UnifiedMode() == 2) { // a reverting granule waits for this write too
+            std::unique_lock lock{u.mu};
+            for (u64 g = g0; g <= g1; ++g) {
+                if (const auto it = u.granules.find(g); it != u.granules.end() && it->second.reverting) {
+                    it->second.revert_tick = now;
+                }
+            }
+        }
+        // No upload mark: every bind touching a unified granule comes here, and the normal-path readers that remain
+        // (a fallback, a bind over 64 MiB) mark the unified parts they read (mark_unified_parts).
+    }
+    report();
+    // sotc: SOTC_NATIVE_UNIFIED_LABELS=1: a served write defers the labels after it until the GPU ran it (the ring8
+    // rule, HostWriteSeq), so the CPU never sees a label before the GPU bytes. Off by default: with it every label
+    // of a frame waited for the GPU (CP spin 28 -> 71 ms/frame, 28 -> 12 FPS at the Shrine). Without it the labels
+    // land early as in the native model, and the CPU sees the GPU bytes when the GPU writes them (never, before).
+    static const bool defer_labels = [] {
+        const char* v = std::getenv("SOTC_NATIVE_UNIFIED_LABELS");
+        return v && v[0] == '1';
+    }();
+    return PcHostServe(device_addr, size, is_written && defer_labels, view);
+}
+
 std::optional<std::pair<const Buffer*, u64>> BufferCache::PcHostBind(VAddr device_addr, u32 size,
                                                                       bool is_written) {
     const int relation = SotcPcRing::ArenaRelation(device_addr, size);
@@ -8453,14 +9110,54 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
         // sotc: without tracking, GPU-written bytes are never read back into guest memory, so a page
         // mark over them would upload stale guest bytes over the GPU's (1 Nov: garbage geometry and
         // textures after area loads). Only the announced bytes go up then.
-        if (!SotcNative::TracksGuestPages() && IsRegionGpuModified(r.addr, r.size) &&
+        // sotc: SOTC_NATIVE_EXACT=0, diagnostic: the page-mark path even over GPU-written bytes (as with tracking).
+        static const bool native_exact = [] {
+            const char* v = std::getenv("SOTC_NATIVE_EXACT");
+            return !v || v[0] != '0';
+        }();
+        // sotc: SOTC_NATIVE_TRACK_EMU: mode 3 with emulated stores (no merge) needs the exact copy too, and the
+        // emulated stores it copies are no longer protected from readbacks once that copy ran (NoteDrained).
+        const bool emu_on = SotcFaultEmu::On();
+        const int64_t copy_ns = emu_on ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count()
+                                       : 0;
+        if (emu_on) {
+            static const bool tick_query_set = [this] {
+                SotcFaultEmu::SetTickQuery(
+                    [](void* ctx, u64 tick) { return static_cast<Vulkan::Scheduler*>(ctx)->IsFree(tick); },
+                    &scheduler);
+                return true;
+            }();
+            (void)tick_query_set;
+        }
+        if (native_exact && (!SotcNative::TracksGuestPages() || emu_on) &&
+            IsRegionGpuModified(r.addr, r.size) &&
             NativeExactUpload(r.addr, r.size)) {
+            if (emu_on) {
+                SotcFaultEmu::NoteDrained(r.addr, r.size, scheduler.CurrentTick(), copy_ns);
+            }
             SotcNative::NoteExactUpload(r.size);
             SotcN1Verify::NoteDrain(r.addr, r.size, true); // sotc: SOTC_VERIFY=n1 (announce record check)
             spent += r.size;
             continue;
         }
         SotcN1Verify::NoteDrain(r.addr, r.size, false); // sotc: SOTC_VERIFY=n1
+        // sotc: SOTC_NATIVE_GPUMARK_SKIP=1, diagnostic: an announce over GPU-written bytes that the exact copy could
+        // not serve is not page-marked (a page mark uploads stale guest bytes over the GPU's neighbours).
+        static const bool gpumark_skip = [] {
+            const char* v = std::getenv("SOTC_NATIVE_GPUMARK_SKIP");
+            return v && v[0] == '1';
+        }();
+        if (gpumark_skip && !SotcNative::TracksGuestPages() && IsRegionGpuModified(r.addr, r.size)) {
+            static std::atomic<u64> skipped{0};
+            if (skipped.fetch_add(1, std::memory_order_relaxed) % 4096 == 0) {
+                std::fprintf(stderr, "SOTC NATIVE GPUMARK SKIP: %llu skipped (last %#llx +%#llx)\n",
+                             (unsigned long long)skipped.load(), (unsigned long long)r.addr,
+                             (unsigned long long)r.size);
+            }
+            continue;
+        }
         memory_tracker->MarkRegionAsCpuModified(r.addr, r.size);
         pages += ((r.addr + r.size - 1) >> 12) - (r.addr >> 12) + 1;
         if (r.kind == SotcNative::Kind::PerFrame) {
@@ -8544,6 +9241,33 @@ void BufferCache::NativeFrameWait(void* ctx, u64 frame) {
 }
 
 // The newest recorded frame whose tick the GPU has triggered (0: none yet).
+// sotc: SOTC_NATIVE_FREE_DISCARD=1: a block the game freed forgets its GPU-written state as an unmap does under
+// SOTC_DROP_NATIVE (here and again at this point of the command stream), so its next contents upload from guest
+// memory. Command buffers still in use keep it.
+void BufferCache::NativeDiscardFreed(void* ctx, u64 addr, u64 size) {
+    auto* self = static_cast<BufferCache*>(ctx);
+    {
+        std::shared_lock lock{self->gpu_modified_mutex};
+        if (!self->gpu_modified_ranges.Intersects(addr, size)) {
+            return;
+        }
+    }
+    if (self->liverpool->CmdRangeInUse(addr, size)) {
+        return;
+    }
+    self->DiscardGpuModified(addr, size);
+    self->memory_tracker->MarkRegionAsCpuModified(addr, size);
+    self->liverpool->SendOrderedCommand([self, addr, size] {
+        self->DiscardGpuModified(addr, size);
+        self->memory_tracker->MarkRegionAsCpuModified(addr, size);
+    });
+    static std::atomic<u64> count{0};
+    if (count.fetch_add(1, std::memory_order_relaxed) < 8) {
+        std::fprintf(stderr, "SOTC NATIVE FREE DISCARD: %#llx +%#llx\n", (unsigned long long)addr,
+                     (unsigned long long)size);
+    }
+}
+
 u64 BufferCache::NativeFrameCompleted(void* ctx) {
     auto* self = static_cast<BufferCache*>(ctx);
     std::scoped_lock lock{self->pc_host_frames_mutex};

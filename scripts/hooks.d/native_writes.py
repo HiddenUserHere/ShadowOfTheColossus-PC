@@ -49,6 +49,14 @@ NATIVE_SUNSHADOW_AFCC0 / _B0100  Site, ResolveSunShadows and its twin: the 0x10-
                       bind block and the 0x60-byte constants chunk, PerFrame (counter sun).
 NATIVE_UDATA_85ECD0 / _85E5D0  Wrap, user-data packets written into the command buffer at [rdi+0x90] (the packet
                       writer 0x884240 itself cannot be hooked: jump table). Pre/post cursor delta, PerFrame (pkt).
+NATIVE_UDATA_884349    Site 0x884349, the end of the packet writer 0x884240 itself (every path through the jump
+                      table falls through here): the whole packet [rcx - 8, rcx + edx * 4), PerFrame (pkt). Covers
+                      its 17 other callers (Material_BindGraphicsShaders_A, 0x861ce0 ...), reached after the opening
+                      cinematic has played: their packets went to the GPU stale (no grass at the Shrine).
+NATIVE_INST_STAGE_F9C40  Wrap, sub_f9c40 (callers 0xfb1e0 / 0xfb2d0): copies 32 bytes (+0xc4..+0xe3) of each dirty
+                      object into the instance staging array [rdi+0x580] + ([rdi+0x478] - [rdi+0x470]); count = the
+                      high dword of [rdi+0x5b0]. PerFrame (inst). Not announced before: after the opening cinematic
+                      the Shrine terrain instances were drawn from stale bytes (no terrain with SOTC_NATIVE=1).
 NATIVE_PALETTE_A3EE50 Wrap, cloth skeleton matrix palette (joints * 0x40 bytes from 0x12820), PerFrame (pal).
 
 Resource and texture hooks of the first batch (NATIVE_RES_COPY, NATIVE_TEX_COPY, NATIVE_TEX_TAIL_COPY,
@@ -415,6 +423,27 @@ HOOKS = [
         # at [rdi+0x90]). Same cursor contract as NATIVE_UDATA_85ECD0.
         pattern='55 48 89 e5 41 57 41 56 41 54 53 49 89 fc 41 80 bc 24 b0 18',
         expected={EU_FINGERPRINT: 0x85e5d0},
+    ),
+    dict(
+        name='NATIVE_INST_STAGE_F9C40',
+        switch='SOTC_NATIVE',
+        group='native_inst_stage',
+        mode='wrap',
+        # sub_f9c40 (76 bytes, leaf): mov rax,[rdi+0x5b0]; test eax,eax ... vmovups [rdx],ymm0 per object. Pre reads
+        # the destination and the count, post announces the 32-byte records written.
+        pattern='48 8b 87 b0 05 00 00 85',
+        expected={EU_FINGERPRINT: 0xf9c40},
+    ),
+    dict(
+        name='NATIVE_UDATA_884349',
+        switch='SOTC_NATIVE',
+        group='native_pkt_end',
+        mode='site',
+        # mov eax,edx; lea rax,[rcx+rax*4]; mov [r14+0x10],rax: the cursor update at the end of the packet writer
+        # 0x884240, after every word of the packet is written. rcx = packet start + 8, edx = the words after those 8
+        # bytes (count + 2). Its own group: a refusal leaves NATIVE_UDATA_85ECD0 / _85E5D0 on.
+        pattern='89 d0 48 8d 04 81 49 89 46 10 5b 41',
+        expected={EU_FINGERPRINT: 0x884349},
     ),
     dict(
         name='NATIVE_PALETTE_A3EE50',

@@ -520,6 +520,11 @@ void InstallDetour(size_t index) {
     Core::DetourResult result;
     if (Core::InstallGuestDetour(request, &result) && result.installed) {
         rec.installed = true;
+        // sotc: SOTC_RB_CHANGED diagnostic: the stub's image offset, to name the hook of a trampoline return address.
+        if (std::getenv("SOTC_RB_CHANGED")) {
+            std::fprintf(stderr, "SOTC HOOK STUB %s at image offset %#llx\n", rec.name.c_str(),
+                         static_cast<unsigned long long>(result.stub - static_cast<uint64_t>(g_image)));
+        }
         return;
     }
     rec.off_reason = std::string("detour: ") + (result.reason && *result.reason ? result.reason : "refused");
@@ -679,7 +684,21 @@ bool InstallHooks(const char* hooks_path, void* image, uint64_t module_size, Ins
             rec.switch_value = 1;
         }
         rec.enabled = !master_off && rec.switch_value != 0 && (!timed || SotcTrace::kOn);
-        if (master_off) {
+        // sotc: SOTC_HOOKS_DISABLE=<name or group>[,...]: diagnostic, turns those hooks off while their switch stays on
+        // (e.g. one native group at a time; the switch alone covers every group of a feature).
+        const bool disabled_by_list = [&rec] {
+            const char* list = std::getenv("SOTC_HOOKS_DISABLE");
+            if (!list || !*list) {
+                return false;
+            }
+            std::string all = std::string(",") + list + ",";
+            return all.find("," + rec.name + ",") != std::string::npos ||
+                   (!rec.group.empty() && all.find("," + rec.group + ",") != std::string::npos);
+        }();
+        if (rec.enabled && disabled_by_list) {
+            rec.enabled = false;
+            rec.off_reason = "SOTC_HOOKS_DISABLE";
+        } else if (master_off) {
             rec.off_reason = "SOTC_HOOKS=0";
         } else if (!rec.enabled) {
             rec.off_reason = rec.switch_value != 0 ? "SOTC_TRACE off" : "switch";

@@ -33,6 +33,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h> // sotc: live store hooks pause the other threads (LivePatchWrite)
 #else
 #if defined(__FreeBSD__)
 #include <machine/npx.h>
@@ -557,6 +558,10 @@ static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches =
 
 static std::once_flag init_flag;
 
+namespace {
+struct DecodedFunction; // sotc: defined below (guest detours keep a decode per function)
+} // namespace
+
 struct PatchModule {
     /// Mutex controlling access to module code regions.
     std::mutex mutex{};
@@ -586,8 +591,20 @@ struct PatchModule {
     /// sotc: [begin, end) image ranges written by any CPU patch, for the detour overlap check.
     std::vector<std::pair<uintptr_t, uintptr_t>> patched_ranges;
 
+    /// sotc: [begin, end) of the guest detours (their displaced spans hold no control flow and end in a jump back
+    /// to the continuation), and the decode of each function made before its first detour. A later detour in the
+    /// same function reuses that decode: the earlier detours hide no branch of the function.
+    std::vector<std::pair<uintptr_t, uintptr_t>> detour_ranges;
+    std::unordered_map<uintptr_t, std::shared_ptr<const DecodedFunction>> detour_decodes;
+
     /// sotc: [begin, end) of functions that PatchRedZoneMemoryInstructions protected.
     std::vector<std::pair<uintptr_t, uintptr_t>> red_zone_ranges;
+
+    /// sotc: SOTC_NATIVE_TRACK_EMU=2: the trampoline area (made writable around a live install) and the functions
+    /// relocated for store hooks.
+    u8* trampoline_start{};
+    u64 trampoline_size{};
+    std::set<uintptr_t> relocated_functions;
 
     /// sotc: the shared time-mode thunks (DetourMode::Time), emitted by the first time detour.
     u8* time_enter{};
@@ -596,7 +613,8 @@ struct PatchModule {
     PatchModule(u8* module_ptr, const u64 module_size, u8* trampoline_ptr,
                 const u64 trampoline_size)
         : start(module_ptr), end(module_ptr + module_size), patch_gen(module_size, module_ptr),
-          trampoline_gen(trampoline_size, trampoline_ptr) {}
+          trampoline_gen(trampoline_size, trampoline_ptr), trampoline_start(trampoline_ptr),
+          trampoline_size(trampoline_size) {}
 };
 static std::map<u64, PatchModule> modules;
 
@@ -1216,7 +1234,7 @@ std::optional<std::vector<uintptr_t>> ResolveBoundedJumpTable(
         load->second.operands[1].mem.scale != sizeof(s32)) {
         return std::nullopt;
     }
-    const ZydisRegister index_reg = load->second.operands[1].mem.index;
+    ZydisRegister index_reg = load->second.operands[1].mem.index;
 
     constexpr size_t MaxPatternInstructions = 64;
     std::optional<size_t> table_size;
@@ -1233,10 +1251,19 @@ std::optional<std::vector<uintptr_t>> ResolveBoundedJumpTable(
             IsSameRegister(decoded.operands[0].reg.value, index_reg) &&
             decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
             const uintptr_t next_address = decoded.address + decoded.instruction.length;
-            const auto bounds_branch = function.instructions.find(next_address);
+            // sotc: the bounds branch may follow a few MOVs (they leave the flags alone), e.g. 0x884240:
+            // cmp ebx,0x10; mov [rax+8],esi; mov esi,ebx; mov [rax+0xc],r12d; ja.
+            auto bounds_branch = function.instructions.find(next_address);
+            for (size_t movs = 0; movs < 4 && bounds_branch != function.instructions.end() &&
+                                  bounds_branch->second.instruction.mnemonic == ZYDIS_MNEMONIC_MOV;
+                 ++movs) {
+                bounds_branch = function.instructions.find(bounds_branch->first +
+                                                           bounds_branch->second.instruction.length);
+            }
             if (bounds_branch == function.instructions.end()) {
                 return std::nullopt;
             }
+            const uintptr_t bounds_next = bounds_branch->first + bounds_branch->second.instruction.length;
             const s64 bound = decoded.operands[1].imm.is_signed
                                   ? decoded.operands[1].imm.value.s
                                   : static_cast<s64>(decoded.operands[1].imm.value.u);
@@ -1250,8 +1277,16 @@ std::optional<std::vector<uintptr_t>> ResolveBoundedJumpTable(
             } else {
                 return std::nullopt;
             }
-            guarded_path_start = next_address + bounds_branch->second.instruction.length;
+            guarded_path_start = bounds_next;
             break;
+        }
+        // sotc: the index may be a 32-bit copy of the compared register (mov esi,ebx zero-extends rsi): follow it.
+        if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+            decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            IsSameRegister(decoded.operands[0].reg.value, index_reg) && decoded.operands[0].size >= 32 &&
+            decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER && decoded.operands[1].size >= 32) {
+            index_reg = decoded.operands[1].reg.value;
+            continue;
         }
         if (WritesRegister(decoded, index_reg)) {
             return std::nullopt;
@@ -2495,7 +2530,7 @@ constexpr int DetourGuestRspDelta = static_cast<int>(GuestRedZoneSize) + 16;
 
 // Entered with rsp = the guest rsp at the hook (E). Leaves rsp at the frame base with every
 // register saved, rbx = E - 144 and the HookAction in eax.
-void EmitDetourSave(Xbyak::CodeGenerator& c, u32 hook_id, u32 phase) {
+void EmitDetourSave(Xbyak::CodeGenerator& c, u32 hook_id, u32 phase, const void* dispatch = nullptr) {
     c.lea(rsp, ptr[rsp - GuestRedZoneSize]); // skip the red zone
     c.pushfq();
     c.push(rbx);
@@ -2533,7 +2568,8 @@ void EmitDetourSave(Xbyak::CodeGenerator& c, u32 hook_id, u32 phase) {
     c.mov(r8d, phase);
     c.sub(rsp, 32); // Win64 shadow space; rsp stays 16-byte aligned at the call
     c.cld();        // Win64 requires DF clear at a call; rflags are restored from the save
-    c.mov(rax, reinterpret_cast<uintptr_t>(&sotc_hook_dispatch));
+    c.mov(rax, dispatch ? reinterpret_cast<uintptr_t>(dispatch)
+                        : reinterpret_cast<uintptr_t>(&sotc_hook_dispatch)); // sotc: store hooks pass theirs
     c.call(rax);
     c.add(rsp, 32);
 }
@@ -2942,10 +2978,51 @@ bool EnsureTimeThunks(PatchModule* module) {
 // Emits one detour into c. For Wrap the original comes first: the relocated span and a jump
 // back into the body. *stub receives the address the image jumps to. Returns false when a
 // displaced instruction cannot be relocated. time_enter/time_leave are used by DetourMode::Time.
+// sotc: SOTC_NATIVE_TRACK_EMU=2. A store hook: save, call handler(GuestRegs*, site_id, 0); kStoreHookDone means the
+// handler did the store: restore and run skip(), else restore and run normal() (the store itself, then the rest).
+// Both paths restore every register and the flags before any guest instruction, then only jump.
+template <typename Normal, typename Skip>
+bool EmitStoreStub(Xbyak::CodeGenerator& c, u32 site_id, const void* handler, Normal&& normal, Skip&& skip) {
+    Xbyak::Label skip_label;
+    EmitDetourSave(c, site_id, 0, handler);
+    c.cmp(eax, kStoreHookDone);
+    c.je(skip_label, Xbyak::CodeGenerator::T_NEAR);
+    EmitDetourRestore(c);
+    if (!normal()) {
+        return false;
+    }
+    c.L(skip_label);
+    EmitDetourRestore(c);
+    return skip();
+}
+
 bool EmitGuestDetour(Xbyak::CodeGenerator& c, const DetourRequest& request,
                      const std::vector<const DecodedCodeInstruction*>& span,
                      uintptr_t continuation, u8** stub, const u8* time_enter,
                      const u8* time_leave) {
+    if (request.store_handler && request.mode == DetourMode::Site) { // sotc: SOTC_NATIVE_TRACK_EMU=2
+        *stub = const_cast<u8*>(c.getCurr());
+        return EmitStoreStub(
+            c, request.hook_id, request.store_handler,
+            [&] {
+                for (const auto* decoded : span) {
+                    if (!EncodeRelocatedInstruction(*decoded, c)) {
+                        return false;
+                    }
+                }
+                c.jmp(reinterpret_cast<void*>(continuation));
+                return true;
+            },
+            [&] {
+                for (size_t i = 1; i < span.size(); ++i) {
+                    if (!EncodeRelocatedInstruction(*span[i], c)) {
+                        return false;
+                    }
+                }
+                c.jmp(reinterpret_cast<void*>(continuation));
+                return true;
+            });
+    }
     if (request.mode == DetourMode::Time) {
         *stub = const_cast<u8*>(c.getCurr());
         EmitTimeStub(c, request.hook_id, time_enter, time_leave);
@@ -3016,6 +3093,72 @@ bool EmitGuestDetour(Xbyak::CodeGenerator& c, const DetourRequest& request,
 
 } // namespace
 
+// sotc: SOTC_NATIVE_TRACK_EMU=2. Writes [lo, hi) of guest code while the other threads of the process are paused:
+// refused (nothing written) when one of them is stopped inside it. No heap use while they are paused (one of them
+// may hold the heap lock): fixed arrays, and write() must only store bytes. Caller holds the module mutex.
+template <typename Write>
+bool LivePatchWrite(uintptr_t lo, uintptr_t hi, Write&& write, bool (*busy_fn)(u64, u64) = nullptr) {
+    constexpr size_t kMaxThreads = 4096;
+    static DWORD tids[kMaxThreads];
+    static HANDLE handles[kMaxThreads];
+    const DWORD self = GetCurrentThreadId();
+    const DWORD pid = GetCurrentProcessId();
+    size_t n = 0;
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid && te.th32ThreadID != self && n < kMaxThreads) {
+                tids[n++] = te.th32ThreadID;
+            }
+            te.dwSize = sizeof(te);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    size_t m = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, tids[i]);
+        if (!h) {
+            continue;
+        }
+        if (SuspendThread(h) == static_cast<DWORD>(-1)) {
+            CloseHandle(h);
+            continue;
+        }
+        handles[m++] = h;
+    }
+    bool busy = false;
+    for (size_t i = 0; i < m && !busy; ++i) {
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL; // also waits for the suspension to complete
+        if (GetThreadContext(handles[i], &ctx) && ctx.Rip >= lo && ctx.Rip < hi) {
+            busy = true;
+        }
+    }
+    // Threads inside a fault handler resume at the RIP of their saved context, not their current one: the caller
+    // knows those (and its own). No heap use: the callback reads a fixed table.
+    if (!busy && busy_fn && busy_fn(lo, hi)) {
+        busy = true;
+    }
+    if (!busy) {
+        DWORD old = 0;
+        VirtualProtect(reinterpret_cast<void*>(lo), hi - lo, PAGE_EXECUTE_READWRITE, &old);
+        write();
+        DWORD ignored = 0;
+        VirtualProtect(reinterpret_cast<void*>(lo), hi - lo, old, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(lo), hi - lo);
+    }
+    for (size_t i = 0; i < m; ++i) {
+        ResumeThread(handles[i]);
+        CloseHandle(handles[i]);
+    }
+    return !busy;
+}
+
 bool InstallGuestDetour(const DetourRequest& request, DetourResult* result) {
     DetourResult scratch{};
     if (result == nullptr) {
@@ -3080,7 +3223,31 @@ bool InstallGuestDetour(const DetourRequest& request, DetourResult* result) {
     // Branch targets and control flow come from the same analysis as the other passes. Targets
     // of branches from other functions are not seen (the same limit as the SSE4a and rdtsc
     // passes).
-    const auto function = DecodeFunction(function_start, function_end, module_start, module_end);
+    // sotc: a function whose only patches are earlier guest detours is analysed as it was before them (two hooks
+    // of one group in one function, e.g. NATIVE_TEX_COPY and NATIVE_TEX_TAIL_COPY in 0x96680).
+    bool function_patched = false;
+    bool only_detours = true;
+    for (const auto& range : module->patched_ranges) {
+        if (range.first < function_end && function_start < range.second) {
+            function_patched = true;
+            if (std::find(module->detour_ranges.begin(), module->detour_ranges.end(), range) ==
+                module->detour_ranges.end()) {
+                only_detours = false;
+            }
+        }
+    }
+    std::shared_ptr<const DecodedFunction> function_decode;
+    if (function_patched && only_detours) {
+        if (const auto it = module->detour_decodes.find(function_start); it != module->detour_decodes.end()) {
+            function_decode = it->second;
+        }
+    }
+    const bool reuse_decode = function_decode != nullptr;
+    if (!reuse_decode) {
+        function_decode = std::make_shared<const DecodedFunction>(
+            DecodeFunction(function_start, function_end, module_start, module_end));
+    }
+    const DecodedFunction& function = *function_decode;
     if (function.has_indirect_branch) {
         return refuse("function has an unresolved indirect branch");
     }
@@ -3099,7 +3266,7 @@ bool InstallGuestDetour(const DetourRequest& request, DetourResult* result) {
     // Bytes rewritten by an earlier pass hide the branches they relocated, so branch targets and
     // paths in this function are no longer complete.
     for (const auto& [begin, end] : module->patched_ranges) {
-        if (begin < function_end && function_start < end) {
+        if (!reuse_decode && begin < function_end && function_start < end) {
             return refuse("the function has other CPU patches (its branch targets are unknown)");
         }
     }
@@ -3202,18 +3369,344 @@ bool InstallGuestDetour(const DetourRequest& request, DetourResult* result) {
     auto& patch_gen = module->patch_gen;
     patch_gen.reset();
     patch_gen.setSize(address - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
-    patch_gen.jmp(stub, Xbyak::CodeGenerator::LabelType::T_NEAR);
-    patch_gen.nop(span_bytes - NearJumpSize);
+    const auto write_jump = [&] {
+        patch_gen.jmp(stub, Xbyak::CodeGenerator::LabelType::T_NEAR);
+        patch_gen.nop(span_bytes - NearJumpSize);
+    };
+    if (request.live) { // sotc: SOTC_NATIVE_TRACK_EMU=2
+        if (!LivePatchWrite(address, continuation, write_jump, request.live_busy)) {
+            trampoline_gen.setSize(trampoline_offset);
+            return refuse("a thread is inside the displaced span");
+        }
+    } else {
+        write_jump();
+    }
     for (const auto* decoded : span) {
         module->patched.insert(reinterpret_cast<u8*>(decoded->address));
     }
     module->patched_ranges.emplace_back(address, continuation);
+    module->detour_ranges.emplace_back(address, continuation);
+    if (!function_patched) {
+        module->detour_decodes.emplace(function_start, function_decode);
+    }
 
     result->installed = true;
     result->displaced_bytes = span_bytes;
+    result->stub = reinterpret_cast<u64>(stub);
     LOG_DEBUG(Core, "Guest detour at {:#x} (hook {}, mode {}, {} bytes)", address, request.hook_id,
               static_cast<u32>(request.mode), span_bytes);
     return true;
+}
+
+namespace {
+
+// sotc: SOTC_NATIVE_TRACK_EMU=2. A branch of the relocated copy to a label of the copy (rel32 forms; the short-only
+// jrcxz/jecxz/loop forms jump to a local far jump).
+bool EmitBranchToLabel(Xbyak::CodeGenerator& c, ZydisMnemonic mnemonic, const Xbyak::Label& target) {
+    constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
+    switch (mnemonic) {
+    case ZYDIS_MNEMONIC_JMP: c.jmp(target, Near); return true;
+    case ZYDIS_MNEMONIC_JO: c.jo(target, Near); return true;
+    case ZYDIS_MNEMONIC_JNO: c.jno(target, Near); return true;
+    case ZYDIS_MNEMONIC_JB: c.jb(target, Near); return true;
+    case ZYDIS_MNEMONIC_JNB: c.jnb(target, Near); return true;
+    case ZYDIS_MNEMONIC_JZ: c.jz(target, Near); return true;
+    case ZYDIS_MNEMONIC_JNZ: c.jnz(target, Near); return true;
+    case ZYDIS_MNEMONIC_JBE: c.jbe(target, Near); return true;
+    case ZYDIS_MNEMONIC_JNBE: c.jnbe(target, Near); return true;
+    case ZYDIS_MNEMONIC_JS: c.js(target, Near); return true;
+    case ZYDIS_MNEMONIC_JNS: c.jns(target, Near); return true;
+    case ZYDIS_MNEMONIC_JP: c.jp(target, Near); return true;
+    case ZYDIS_MNEMONIC_JNP: c.jnp(target, Near); return true;
+    case ZYDIS_MNEMONIC_JL: c.jl(target, Near); return true;
+    case ZYDIS_MNEMONIC_JNL: c.jnl(target, Near); return true;
+    case ZYDIS_MNEMONIC_JLE: c.jle(target, Near); return true;
+    case ZYDIS_MNEMONIC_JNLE: c.jnle(target, Near); return true;
+    case ZYDIS_MNEMONIC_JRCXZ:
+    case ZYDIS_MNEMONIC_JECXZ:
+    case ZYDIS_MNEMONIC_LOOP:
+    case ZYDIS_MNEMONIC_LOOPE:
+    case ZYDIS_MNEMONIC_LOOPNE: {
+        Xbyak::Label take;
+        Xbyak::Label skip;
+        switch (mnemonic) {
+        case ZYDIS_MNEMONIC_JRCXZ: c.jrcxz(take); break;
+        case ZYDIS_MNEMONIC_JECXZ: c.jecxz(take); break;
+        case ZYDIS_MNEMONIC_LOOP: c.loop(take); break;
+        case ZYDIS_MNEMONIC_LOOPE: c.loope(take); break;
+        default: c.loopne(take); break;
+        }
+        c.jmp(skip, Xbyak::CodeGenerator::T_SHORT);
+        c.L(take);
+        c.jmp(target, Near);
+        c.L(skip);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+// A store the relocation instruments: a visible memory destination it writes, not on the stack (rsp, or rbp in a
+// function that keeps its frame there), no fs/gs, no second memory operand.
+bool IsStoreCandidate(const DecodedCodeInstruction& d, bool rbp_frame) {
+    const auto& insn = d.instruction;
+    if (insn.operand_count_visible < 1) {
+        return false;
+    }
+    const auto& op = d.operands[0];
+    if (op.type != ZYDIS_OPERAND_TYPE_MEMORY || !(op.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE)) {
+        return false;
+    }
+    for (u8 i = 1; i < insn.operand_count_visible; ++i) {
+        if (d.operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            return false;
+        }
+    }
+    if (op.mem.segment == ZYDIS_REGISTER_FS || op.mem.segment == ZYDIS_REGISTER_GS) {
+        return false;
+    }
+    const auto base = op.mem.base == ZYDIS_REGISTER_NONE
+                          ? ZYDIS_REGISTER_NONE
+                          : ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, op.mem.base);
+    if (base == ZYDIS_REGISTER_RSP || base == ZYDIS_REGISTER_RIP || (rbp_frame && base == ZYDIS_REGISTER_RBP)) {
+        return false;
+    }
+    return true;
+}
+
+StoreHookKind RelocateForStores(PatchModule* module, uintptr_t function_start, uintptr_t function_end,
+                                const void* handler, StoreSiteRegister register_site, bool live,
+                                const char** reason, bool (*live_busy)(u64, u64)) {
+    const auto refuse = [reason](const char* why) {
+        *reason = why;
+        return StoreHookKind::Refused;
+    };
+    const auto module_start = reinterpret_cast<uintptr_t>(module->start);
+    const auto module_end = reinterpret_cast<uintptr_t>(module->end);
+    const DecodedFunction function = DecodeFunction(function_start, function_end, module_start, module_end);
+    if (function.instructions.empty() || function.instructions.begin()->first != function_start) {
+        return refuse("relocation: the function entry is not decoded");
+    }
+    // The entry span: whole instructions, >= 5 bytes, no branch target after the entry, no other patch, no control
+    // flow before its last instruction.
+    uintptr_t continuation = function_start;
+    while (continuation - function_start < NearJumpSize) {
+        const auto it = function.instructions.find(continuation);
+        if (it == function.instructions.end()) {
+            return refuse("relocation: entry span is not decoded");
+        }
+        if (continuation != function_start && function.branch_targets.contains(continuation)) {
+            return refuse("relocation: branch target inside the entry span");
+        }
+        if (module->patched.contains(reinterpret_cast<u8*>(continuation))) {
+            return refuse("relocation: the entry span holds another CPU patch");
+        }
+        continuation += it->second.instruction.length;
+    }
+    for (const auto& [begin, end] : module->patched_ranges) {
+        if (function_start < end && begin < continuation) {
+            return refuse("relocation: the entry span overlaps another CPU patch");
+        }
+    }
+    bool rbp_frame = false;
+    {
+        int seen = 0;
+        for (const auto& [addr, d] : function.instructions) {
+            if (++seen > 6) {
+                break;
+            }
+            if (d.instruction.mnemonic == ZYDIS_MNEMONIC_MOV && d.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                d.operands[0].reg.value == ZYDIS_REGISTER_RBP && d.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                d.operands[1].reg.value == ZYDIS_REGISTER_RSP) {
+                rbp_frame = true;
+            }
+        }
+    }
+
+    if (module->trampoline_exhausted) {
+        return refuse("trampoline space exhausted");
+    }
+    auto& c = module->trampoline_gen;
+    const size_t trampoline_offset = c.getSize();
+    u8* copy = const_cast<u8*>(c.getCurr());
+    u32 instrumented = 0;
+    try {
+        std::unordered_map<uintptr_t, Xbyak::Label> labels;
+        labels.reserve(function.instructions.size() * 2);
+        for (const auto& [addr, d] : function.instructions) {
+            labels[addr];
+        }
+        const auto jump_to = [&](uintptr_t target) {
+            if (const auto it = labels.find(target); it != labels.end()) {
+                c.jmp(it->second, Xbyak::CodeGenerator::T_NEAR);
+            } else {
+                c.jmp(reinterpret_cast<void*>(target)); // leaves the copy: the original code runs on
+            }
+        };
+        for (auto it = function.instructions.begin(); it != function.instructions.end(); ++it) {
+            const auto& [addr, d] = *it;
+            c.L(labels[addr]);
+            const uintptr_t next = addr + d.instruction.length;
+            const auto category = d.instruction.meta.category;
+            const uintptr_t target =
+                (category == ZYDIS_CATEGORY_COND_BR || category == ZYDIS_CATEGORY_UNCOND_BR) ? GetRelativeTarget(d) : 0;
+            bool emitted = false;
+            if (target != 0 && labels.contains(target)) {
+                emitted = EmitBranchToLabel(c, d.instruction.mnemonic, labels[target]);
+            }
+            if (!emitted && IsStoreCandidate(d, rbp_frame)) {
+                const u32 site_id = register_site(addr, reinterpret_cast<const u8*>(addr), d.instruction.length);
+                if (site_id != ~0u) {
+                    if (!EmitStoreStub(
+                            c, site_id, handler,
+                            [&] {
+                                if (!EncodeRelocatedInstruction(d, c)) {
+                                    return false;
+                                }
+                                jump_to(next);
+                                return true;
+                            },
+                            [&] {
+                                jump_to(next);
+                                return true;
+                            })) {
+                        c.setSize(trampoline_offset);
+                        return refuse("relocation: a store cannot be relocated");
+                    }
+                    ++instrumented;
+                    continue; // both paths ended with a jump
+                }
+            }
+            if (!emitted && !EncodeRelocatedInstruction(d, c)) {
+                c.setSize(trampoline_offset);
+                return refuse("relocation: an instruction cannot be relocated");
+            }
+            // Falls through to an address the copy does not hold at the next position: jump there.
+            const auto following = std::next(it);
+            // An interrupt (the engine's int 0x41 asserts) may come back: never a terminator here.
+            const bool terminator = IsControlFlowTerminator(d.instruction) &&
+                                    d.instruction.meta.category != ZYDIS_CATEGORY_INTERRUPT;
+            if (!terminator && (following == function.instructions.end() || following->first != next)) {
+                jump_to(next);
+            }
+        }
+    } catch (const Xbyak::Error& error) {
+        c.setSize(trampoline_offset);
+        const bool full = HandleTrampolineError(module, error);
+        return refuse(full ? "trampoline space exhausted" : "relocation: emit failed");
+    }
+    if (instrumented == 0) {
+        c.setSize(trampoline_offset);
+        return refuse("relocation: no store to instrument");
+    }
+    const s64 distance = static_cast<s64>(reinterpret_cast<uintptr_t>(copy)) -
+                         static_cast<s64>(function_start + NearJumpSize);
+    if (distance < INT32_MIN || distance > INT32_MAX) {
+        c.setSize(trampoline_offset);
+        return refuse("relocation: copy out of rel32 range");
+    }
+    auto& patch_gen = module->patch_gen;
+    patch_gen.reset();
+    patch_gen.setSize(function_start - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+    const size_t span_bytes = continuation - function_start;
+    const auto write_jump = [&] {
+        patch_gen.jmp(copy, Xbyak::CodeGenerator::LabelType::T_NEAR);
+        patch_gen.nop(span_bytes - NearJumpSize);
+    };
+    if (live) {
+        if (!LivePatchWrite(function_start, continuation, write_jump, live_busy)) {
+            c.setSize(trampoline_offset);
+            return refuse("relocation: a thread is inside the entry span");
+        }
+    } else {
+        write_jump();
+    }
+    for (uintptr_t a = function_start; a < continuation;) {
+        module->patched.insert(reinterpret_cast<u8*>(a));
+        a += function.instructions.at(a).instruction.length;
+    }
+    module->patched_ranges.emplace_back(function_start, continuation);
+    module->relocated_functions.insert(function_start);
+    *reason = "";
+    return StoreHookKind::Relocated;
+}
+
+} // namespace
+
+StoreHookKind InstallStoreHook(u64 site, u32 site_id, const void* handler, StoreSiteRegister register_site,
+                               bool live, const char** reason, bool (*live_busy)(u64 lo, u64 hi)) {
+    static const char* scratch = "";
+    if (!reason) {
+        reason = &scratch;
+    }
+    const auto address = static_cast<uintptr_t>(site);
+    auto* module = GetContainingModule(reinterpret_cast<void*>(address));
+    if (module == nullptr) {
+        *reason = "address is outside the registered module";
+        return StoreHookKind::Refused;
+    }
+    uintptr_t function_start = 0;
+    uintptr_t function_end = 0;
+    {
+        std::unique_lock lock{module->mutex};
+        const auto& starts = module->function_starts;
+        const auto next_start = std::upper_bound(starts.begin(), starts.end(), address);
+        if (starts.empty() || next_start == starts.begin()) {
+            *reason = "no function holds the site";
+            return StoreHookKind::Refused;
+        }
+        function_start = *std::prev(next_start);
+        function_end = next_start != starts.end() ? *next_start : reinterpret_cast<uintptr_t>(module->end);
+        if (module->relocated_functions.contains(function_start)) {
+            *reason = "";
+            return StoreHookKind::AlreadyRelocated;
+        }
+    }
+    // Live: the trampoline area is read-execute after boot; writable while this install emits into it.
+    DWORD old_tramp = 0;
+    if (live) {
+        VirtualProtect(module->trampoline_start, module->trampoline_size, PAGE_EXECUTE_READWRITE, &old_tramp);
+    }
+    StoreHookKind kind = StoreHookKind::Refused;
+    {
+        const u8* bytes = reinterpret_cast<const u8*>(address);
+        DetourRequest request{};
+        request.address = site;
+        request.mode = DetourMode::Site;
+        request.hook_id = site_id;
+        request.pattern = std::span<const u8>(bytes, 1); // the bytes as they are now
+        request.store_handler = handler;
+        request.live = live;
+        request.live_busy = live_busy;
+        DetourResult result{};
+        if (InstallGuestDetour(request, &result)) {
+            kind = StoreHookKind::Detour;
+            *reason = "";
+        } else if (const char* v = std::getenv("SOTC_STORE_HOOK_RELOCATE"); v && v[0] == '0') {
+            // sotc: SOTC_STORE_HOOK_RELOCATE=0, diagnostic: no function relocation (the store keeps faulting).
+            static thread_local std::string detour_only;
+            detour_only = std::string{"detour: "} + result.reason + "; relocation off";
+            *reason = detour_only.c_str();
+        } else {
+            static thread_local std::string detour_reason;
+            detour_reason = result.reason;
+            std::unique_lock lock{module->mutex};
+            kind = RelocateForStores(module, function_start, function_end, handler, register_site, live, reason,
+                                     live_busy);
+            if (kind == StoreHookKind::Refused) {
+                static thread_local std::string both;
+                both = std::string{"detour: "} + detour_reason + "; " + *reason;
+                *reason = both.c_str();
+            }
+        }
+    }
+    if (live) {
+        DWORD ignored = 0;
+        VirtualProtect(module->trampoline_start, module->trampoline_size, old_tramp, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), module->trampoline_start, module->trampoline_size);
+    }
+    return kind;
 }
 
 u64 TrampolineBytesUsed() {
@@ -3267,6 +3760,14 @@ bool InstallGuestDetour(const DetourRequest&, DetourResult* result) {
 
 u64 TrampolineBytesUsed() {
     return 0;
+}
+
+StoreHookKind InstallStoreHook(u64, u32, const void*, StoreSiteRegister, bool, const char** reason,
+                               bool (*)(u64, u64)) {
+    if (reason) {
+        *reason = "store hooks are Windows only";
+    }
+    return StoreHookKind::Refused;
 }
 
 void RegisterFunctionStarts(std::span<const uintptr_t>) {}

@@ -16,6 +16,7 @@
 #include "hooks.h"
 #include "sotc_patches.h"
 #include "../shim/sotc_sampler.h" // sotc: trace v2 continuous sampler (SOTC_TRACE_SAMPLE)
+#include "native/fault_emu.h"     // sotc: SOTC_NATIVE_TRACK_EMU=2 (learned store hooks)
 
 extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult* result) {
     *result = {};
@@ -82,6 +83,7 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
         SotcHooks::InstallHooks(request->hooks_path, request->image, request->module_size,
                                 &hook_stats);
         result->hooks_installed = hook_stats.installed;
+        SotcFaultEmu::InstallLearned(base); // sotc: SOTC_NATIVE_TRACK_EMU=2, the store hooks learned live
         result->hooks_off = hook_stats.off;
     }
     result->trampoline_used = Core::TrampolineBytesUsed();

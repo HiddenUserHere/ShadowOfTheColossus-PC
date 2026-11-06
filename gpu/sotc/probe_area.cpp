@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -263,6 +264,22 @@ HookAction OnLoaderState(GuestRegs& regs, void*) {
     const bool ok = ReadAreaIdentity(static_cast<uintptr_t>(regs.rdi), name, kNameMax, guid);
     if (!ok) {
         g_unknown.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // sotc: SOTC_AREA_TRACE=1, diagnostic: every state request of every area loader, current -> requested
+    // (0 Auto, 1 Unavailable, 2 Unloaded, 3 Loading, 4 Loaded, 5 Creating, 6 Hidden, 7 Fading In, 8 Created,
+    // 9 Fading Out). Needs the hook installed (SOTC_AREA_PREWARM=1).
+    static const bool trace = [] {
+        const char* v = std::getenv("SOTC_AREA_TRACE");
+        return v && v[0] == '1';
+    }();
+    if (trace) {
+        int32_t current = -1;
+        ReadGuest(static_cast<uintptr_t>(regs.rsi), &current, sizeof current);
+        if (current != requested) {
+            std::fprintf(stderr, "SOTC AREA STATE: %s %d -> %d (loader %#llx)\n", ok ? name : "?", current, requested,
+                         static_cast<unsigned long long>(regs.rdi));
+        }
     }
 
     // sotc: SOTC_AREA_PREWARM: once the zone hook has fired it owns the area; this hook only counts.

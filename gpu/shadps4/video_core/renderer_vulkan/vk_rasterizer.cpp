@@ -80,6 +80,7 @@
 #include "video_core/sotc_checkpoints.h"    // sotc: SOTC_GPU_CHECKPOINTS
 #include "../../../sotc/draw_gate.h"            // sotc: SOTC_DRAW_GATE
 #include "../../../sotc/gcn_census.h"           // sotc: SOTC_GCN_CENSUS
+#include "../../../sotc/guest_mem.h"            // sotc: SOTC_RB_CHANGED (backing view)
 
 // sotc: SOTC_PR_RESOLVE. Generation of the runtime memory table (src/runtime_memory.c); odd while
 // a change is in progress. Same declaration as sotc_bininfo.cpp.
@@ -11177,9 +11178,12 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     if (!dst_gds) {
         NoteGuestWrite(dst, num_bytes); // sotc: SOTC_SHADER_ADDR ordering
     }
-    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
+    // sotc: SOTC_NATIVE_UNIFIED: a unified range is written by the GPU in guest memory, possibly by work not run yet:
+    // the copy stays on the GPU, in order.
+    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
+        !buffer_cache.IsNativeUnified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
-            !texture_cache.FindImageFromRange(src, num_bytes)) {
+            !buffer_cache.IsNativeUnified(src, num_bytes) && !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, see FillBuffer
@@ -11279,10 +11283,98 @@ bool Rasterizer::InvalidateMemoryOnGuestFault(VAddr addr, u64 size) {
     return true;
 }
 
+namespace {
+// sotc: SOTC_RB_CHANGED=1, diagnostic: the readbacks that changed the guest bytes (a real GPU result reached the
+// CPU), per guest instruction of the read fault, every 5 s. A readback that copies the bytes the guest already holds
+// only came from page sharing. Compare two sessions to find the consumer one of them needs.
+struct RbChanged {
+    std::mutex mu;
+    std::unordered_map<u64, std::pair<u64, u64>> rows; // eboot offset -> (changed readbacks, readbacks)
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+
+bool RbChangedOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_RB_CHANGED");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+void NoteRbChanged(u64 rip, bool changed) {
+    static RbChanged t;
+    const u64 base = SotcTrace::ImageBase();
+    const u64 offset = (base && rip >= base && rip - base < SotcTrace::ImageSize()) ? rip - base : ~u64{0};
+    std::scoped_lock lock{t.mu};
+    auto& row = t.rows[offset];
+    row.first += changed ? 1 : 0;
+    row.second += 1;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - t.last < std::chrono::seconds(5)) {
+        return;
+    }
+    t.last = now;
+    std::vector<std::pair<u64, std::pair<u64, u64>>> rows(t.rows.begin(), t.rows.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    std::string text;
+    for (size_t i = 0; i < rows.size() && i < 20 && rows[i].second.first > 0; ++i) {
+        char item[64];
+        if (rows[i].first == ~u64{0}) {
+            std::snprintf(item, sizeof item, " ?:%llu/%llu", (unsigned long long)rows[i].second.first,
+                          (unsigned long long)rows[i].second.second);
+        } else {
+            std::snprintf(item, sizeof item, " 0x%llx:%llu/%llu", (unsigned long long)rows[i].first,
+                          (unsigned long long)rows[i].second.first, (unsigned long long)rows[i].second.second);
+        }
+        text += item;
+    }
+    std::fprintf(stderr, "SOTC RB CHANGED (5 s): changed/all readbacks by eboot offset:%s\n", text.c_str());
+    t.rows.clear();
+}
+} // namespace
+
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
+    }
+    if (RbChangedOn() && size <= (u64{16} << 20)) {
+        const u64 rip = VideoCore::SotcFaultRip::current;
+        const unsigned char* backing = SotcGuest::Backing(addr, size);
+        std::vector<unsigned char> before;
+        if (backing) {
+            before.assign(backing, backing + size);
+        }
+        buffer_cache.ReadMemory(addr, size, false, assume_locks);
+        if (backing) {
+            const bool changed = std::memcmp(before.data(), backing, size) != 0;
+            if (rip != 0) {
+                NoteRbChanged(rip, changed);
+            }
+            // sotc: each readback that changed guest bytes, first 80: who read (port thread or guest), where, what.
+            if (changed) {
+                static std::atomic<u32> shown{0};
+                if (shown.fetch_add(1, std::memory_order_relaxed) < 80) {
+                    u64 first = 0, diffs = 0;
+                    for (u64 i = 0; i < size; ++i) {
+                        if (before[i] != backing[i]) {
+                            if (diffs++ == 0) {
+                                first = i;
+                            }
+                        }
+                    }
+                    const u64 base = SotcTrace::ImageBase();
+                    std::fprintf(stderr, "SOTC RB CHANGED DETAIL addr %#llx+%#llx %s rip %#llx: %llu bytes differ, first "
+                                 "at +%#llx (%02x -> %02x)\n",
+                                 static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size),
+                                 IsGpuSideThread() ? "port-thread" : "guest-thread",
+                                 static_cast<unsigned long long>(rip && base && rip > base ? rip - base : rip),
+                                 static_cast<unsigned long long>(diffs), static_cast<unsigned long long>(first),
+                                 before[first], backing[first]);
+                }
+            }
+        }
+        return true;
     }
     buffer_cache.ReadMemory(addr, size, false, assume_locks);
     return true;

@@ -221,6 +221,22 @@ public:
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+    /// sotc: SOTC_NATIVE=1. The byte ranges the GPU wrote (the written binds), without the page rounding of the
+    /// tracker's GPU bits: bytes the CPU rewrote and announced since are not in them (NativeExactUpload).
+    [[nodiscard]] bool IsRangeGpuWrittenPrecise(VAddr addr, size_t size);
+    /// sotc: SOTC_NATIVE_UNIFIED. True when [addr, +size) touches a unified granule (its GPU writes are in guest
+    /// memory and may still be pending on the GPU: a CPU copy of it must not run ahead of the GPU).
+    [[nodiscard]] bool IsNativeUnified(VAddr addr, u64 size);
+    /// sotc: SOTC_NATIVE=1. The CPU replaced the contents of [addr, addr + size) (TextureCache::FindImage found a
+    /// rewritten image there): its GPU-written state is forgotten as at an unmap, so its copies come from guest memory.
+    /// sotc: SOTC_TRACK_IGNORE_RIPS: the GPU-written state of [addr, addr + size) is dropped and nothing is marked
+    /// CPU-written (the GPU copy stays as it is, as after a write mode 1 does not see).
+    void DropGpuWrittenState(VAddr addr, u64 size) {
+        DiscardGpuModified(addr, size);
+    }
+    void NativeForgetGpuWrites(VAddr addr, u64 size) {
+        NativeDiscardFreed(this, addr, size);
+    }
 
     /// sotc: SOTC_ADDR_TABLE written fast path (addr_table.cpp). True when a GPU write of [addr, addr + size)
     /// adds no GPU-modified state: native mode (SOTC_NATIVE=1), no readback switch on, and the range is already
@@ -916,8 +932,21 @@ private:
     /// base, the ring8 counters and the served-write record). Used by PcHostBind.
     [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> PcHostServe(
         VAddr device_addr, u32 size, bool is_written, const Vulkan::SotcGuestMemory::GuestView& view);
+    /// sotc: SOTC_NATIVE_UNIFIED (buffer_cache.cpp, before NativeUnifiedBind). A bind of a unified range is served
+    /// from the imported guest memory; a written bind makes its 2 MiB granules unified first. nullopt: the normal path.
+    [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> NativeUnifiedBind(VAddr device_addr, u32 size,
+                                                                                 bool is_written);
+    /// sotc: SOTC_NATIVE_UNIFIED. Copies the GPU-only bytes of [addr, +size) (the arena's GPU-written ranges) into
+    /// guest memory once, then drops their GPU-written state. Draw thread.
+    void NativeUnifiedFlush(VAddr addr, u64 size);
+    /// sotc: SOTC_NATIVE_UNIFIED=2. A CPU write fault on GPU-written memory: its granules become unified (pending: the
+    /// next bind copies their arena GPU bytes to guest memory). Any thread.
+    void NativeUnifiedNoteFault(VAddr addr, u64 size);
+    /// sotc: SOTC_NATIVE_UNIFIED=2: migration back of the granules the GPU binds often (draw thread, every 2 s).
+    void NativeUnifiedMaintain();
     /// sotc: SOTC_NATIVE frame ticket backend (SotcNative::SetFrameBackend), set in the constructor.
     static u64 NativeFrameSubmitted(void* ctx);
+    static void NativeDiscardFreed(void* ctx, u64 addr, u64 size); ///< sotc: SOTC_NATIVE_FREE_DISCARD
     static void NativeFrameWait(void* ctx, u64 frame);
     static u64 NativeFrameCompleted(void* ctx);
     /// sotc: SOTC_PC_RING=8. Marks CPU-modified the part of [addr, addr + size) that lies in an

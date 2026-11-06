@@ -36,8 +36,30 @@ bool Verify();
 /// no fault is handled as a tracker fault, and GPU-written bytes are never copied back to guest memory.
 /// CPU writes then reach the port only through Announce (and the ring8 host imports). Mode 0 (today's UMA
 /// emulation) and mode 2 (verify, the tracker still runs underneath) keep the tracking.
+inline int TrackMode();
+
 inline bool TracksGuestPages() {
-    return Mode() != 1;
+    // sotc: SOTC_NATIVE_TRACK=1, diagnostic: mode 1 keeps the page protection of mode 2 (without its verify), so a
+    // stale-memory cause (a write no announce covers) and a behaviour cause of a mode-1 bug can be told apart.
+    // =2 keeps the protection but still skips the readbacks: a stale CPU write (fixed by =2) and a missing readback
+    // (fixed by =1 only) are told apart too.
+    // =3 keeps mode 1 as it is (announces, no readbacks) and only adds the protection of SOTC_NATIVE_TRACK_RANGE
+    // (page_manager.cpp Protect): a write there that no announce covers is caught by its fault.
+    return Mode() != 1 || TrackMode() == 1 || TrackMode() == 2;
+}
+
+/// sotc: SOTC_NATIVE_TRACK (0, 1, 2), see TracksGuestPages.
+inline int TrackMode() {
+    static const int track = [] {
+        const char* v = std::getenv("SOTC_NATIVE_TRACK");
+        return v == nullptr ? 0 : v[0] == '1' ? 1 : v[0] == '2' ? 2 : v[0] == '3' ? 3 : 0;
+    }();
+    return track;
+}
+
+/// sotc: the GPU-to-guest copies (readbacks) are skipped: mode 1, unless SOTC_NATIVE_TRACK=1.
+inline bool SkipsReadbacks() {
+    return Mode() == 1 && TrackMode() != 1;
 }
 
 /// What an announced range holds (decides the mechanism).

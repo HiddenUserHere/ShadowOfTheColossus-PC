@@ -929,6 +929,55 @@ void UdataPost(GuestRegs&, void*) {
     }
 }
 
+// 0x884349, the end of the packet writer 0x884240 (site; the jump table rules out a wrap): the packet is complete,
+// rcx = its start + 8 and edx = the dwords after those 8 bytes. Covers the callers without a cursor hook (17 of 19;
+// after the opening cinematic the game binds through them and their packets reached the GPU stale: no grass).
+// 0xf9c40, the instance staging copy (callers 0xfb1e0 and 0xfb2d0): 32 bytes per dirty object into
+// [rdi+0x580] + ([rdi+0x478] - [rdi+0x470]); the count is the high dword of [rdi+0x5b0] (none when its low dword is 0).
+// Pre reads the destination and count, post announces the records, PerFrame. Unannounced before: after the opening
+// cinematic the Shrine terrain was drawn from stale instance bytes.
+struct StageCall {
+    uint64_t begin;
+    uint64_t end;
+};
+thread_local StageCall t_stage{};
+
+HookAction InstStagePre(GuestRegs& regs, void*) {
+    t_stage = StageCall{};
+    if (!SotcNative::On() || regs.rdi == 0) {
+        return HookAction::Continue;
+    }
+    const uint64_t obj = regs.rdi;
+    const uint64_t word = GuestU64(obj + 0x5b0);
+    const auto count = static_cast<int32_t>(word >> 32);
+    if (static_cast<uint32_t>(word) == 0 || count <= 0 || count > (1 << 20)) {
+        return HookAction::Continue;
+    }
+    const uint64_t dest = GuestU64(obj + 0x580) + (GuestU64(obj + 0x478) - GuestU64(obj + 0x470));
+    t_stage = StageCall{dest, dest + uint64_t{0x20} * static_cast<uint64_t>(count)};
+    return HookAction::Continue;
+}
+
+void InstStagePost(GuestRegs&, void*) {
+    const StageCall call = t_stage;
+    t_stage = StageCall{};
+    if (call.begin != 0 && call.end > call.begin) {
+        AnnounceRange(call.begin, call.end, SotcNative::Kind::PerFrame, g_window.pkt);
+    }
+}
+
+HookAction UdataPacketEnd(GuestRegs& regs, void*) {
+    if (!SotcNative::On() || regs.rcx < 8) {
+        return HookAction::Continue;
+    }
+    const uint64_t start = regs.rcx - 8;
+    const uint64_t end = regs.rcx + (regs.rdx & 0xffffffffull) * 4;
+    if (end > start && end - start <= 0x100) {
+        AnnounceRange(start, end, SotcNative::Kind::PerFrame, g_window.pkt);
+    }
+    return HookAction::Continue;
+}
+
 // 0xa3ee50, the cloth skeleton matrix palette builder (callers sub_a3e170 and sub_a3fa30; the result is stored at
 // object+0xe0 or passed to the buffer creator). The index vector at param_1+0x90..0x98 holds 4-byte joint indices;
 // the block returned by 0x12820 is (bytes * 16) = joints * 0x40 bytes, every 0x40 bytes a 4x4 matrix written by plain
@@ -1125,6 +1174,8 @@ void Register() {
     SotcHooks::RegisterHandler("NATIVE_SUNSHADOW_B0100", Handler{SunShadowB0100, nullptr, nullptr});
     SotcHooks::RegisterHandler("NATIVE_UDATA_85ECD0", Handler{UdataPre, UdataPost, nullptr});
     SotcHooks::RegisterHandler("NATIVE_UDATA_85E5D0", Handler{UdataPre, UdataPost, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_UDATA_884349", Handler{UdataPacketEnd, nullptr, nullptr});
+    SotcHooks::RegisterHandler("NATIVE_INST_STAGE_F9C40", Handler{InstStagePre, InstStagePost, nullptr});
     SotcHooks::RegisterHandler("NATIVE_PALETTE_A3EE50", Handler{PalettePre, PalettePost, nullptr});
 }
 

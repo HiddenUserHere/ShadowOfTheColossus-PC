@@ -46,6 +46,13 @@ def main():
     parser.add_argument('--timeout', type=float, default=330, help='give up after this many seconds')
     parser.add_argument('--log', default='out/run.txt')
     parser.add_argument('--env', action='append', default=[])
+    parser.add_argument('--via-sotc', action='store_true',
+                        help='launch through sotc.py with sotc.ini, as a player does (its hooks file, the switches it '
+                             'sets with others, the session log); the saves stay in out/user, the shader and '
+                             'pipeline caches are those of ./user. --modes and --cvars replace --patches/--cmdline')
+    parser.add_argument('--modes', default='fps60,af16', help='SOTC_MODES with --via-sotc')
+    parser.add_argument('--cvars', default='doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0',
+                        help='SOTC_CVARS with --via-sotc (the opening logos stay on: the route skips them by time)')
     parser.add_argument('--patches', default='out/bench.patches')
     parser.add_argument('--cmdline', default='out/bench.cmdline')
     parser.add_argument('--shots', type=int, default=3, help='frames dumped during the measurement')
@@ -104,6 +111,15 @@ def main():
     command = [str(out / 'bb-probe.exe'), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--app0', GAME, '--user', str(out / 'user'),
                '--patches', args.patches, '--sotc-cmdline', args.cmdline]
+    if args.via_sotc:
+        # sotc.py reads sotc.ini for every setting the environment does not give and writes the patches and hooks.
+        user = ROOT / 'user'
+        env.update(SOTC_GAME_DIR=GAME, SOTC_USER_DIR=str((out / 'user').resolve()), BB_GPU_USER_DIR=str(user),
+                   SOTC_MODES=args.modes, SOTC_CVARS=args.cvars,
+                   SOTC_PREDICT_TABLE=str(user / 'shader_predict' / 'predict_table.tsv'),
+                   SOTC_PREDICT_LAYOUTS=str(user / 'shader_predict' / 'pass_layouts.txt'))
+        env.pop('SOTC_LAUNCHER_SETTINGS', None)
+        command = [sys.executable, str(ROOT / 'sotc.py')]
     log = open(args.log, 'wb')
     process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
     start = time.monotonic()
@@ -227,7 +243,12 @@ def main():
         time.sleep(0.1)
     state['stop'] = True
     if process.poll() is None:
-        process.kill()
+        if args.via_sotc and os.name == 'nt':
+            # sotc.py runs the game as its child: end the whole tree.
+            subprocess.run(['taskkill', '/T', '/F', '/PID', str(process.pid)], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        else:
+            process.kill()
         process.wait()
     log.close()
     raws = sorted((out / 'dump').glob('output_*.raw'))

@@ -70,6 +70,7 @@
 
 #include <emmintrin.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -1300,7 +1301,70 @@ void Dispatch(const GuestRegs& regs) {
     RunDispatch(owner, st, frame, count, in, h[1], recs, ud.known, ud.value, kind, pipe, t_start);
 }
 
+// sotc: SOTC_LOD_TRACE=1, diagnostic: the LOD pre-shader dispatches per 5 s by set model count (u16 at
+// [owner+0x18]+0x64, the same set in every session) and distinct owners. Two sessions (e.g. with and without the
+// opening cinematic) are compared by their model-count lists: the sets one of them stops dispatching.
+struct OwnerTrace {
+    const char* label;
+    std::mutex mu;
+    std::unordered_map<uint32_t, uint64_t> by_count;
+    std::unordered_map<uint64_t, uint32_t> owners;
+    uint64_t null_set = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+
+    void Note(uint64_t owner) {
+        uint64_t set = 0;
+        uint16_t n = 0;
+        const bool has_set = owner != 0 && SotcGuest::Read(owner + kOwnerSet, &set) && set != 0;
+        if (has_set) {
+            SotcGuest::Read(set + 0x64, &n);
+        }
+        std::lock_guard lock{mu};
+        if (!has_set) {
+            ++null_set;
+        }
+        ++by_count[n];
+        owners[owner] = n;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds(5)) {
+            return;
+        }
+        last = now;
+        std::vector<std::pair<uint32_t, uint64_t>> rows(by_count.begin(), by_count.end());
+        std::sort(rows.begin(), rows.end());
+        std::string text;
+        for (const auto& [count, calls] : rows) {
+            text += " " + std::to_string(count) + ":" + std::to_string(calls);
+        }
+        std::fprintf(stderr, "SOTC %s (5 s): %zu owners, %llu calls with no set record; calls by set model count:%s\n",
+                     label, owners.size(), static_cast<unsigned long long>(null_set), text.c_str());
+        by_count.clear();
+        owners.clear();
+        null_set = 0;
+    }
+};
+
+void TraceDispatch(const GuestRegs& regs) {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_LOD_TRACE");
+        return v && v[0] == '1';
+    }();
+    if (!on) {
+        return;
+    }
+    static OwnerTrace trace{"LOD TRACE"};
+    trace.Note(regs.r15);
+}
+
+// sotc: SOTC_SETENTRY_PROBE (scripts/hooks.d/setentry_probe.py): every BPXPR_BuildSetEntry call, owner = rdi.
+HookAction OnSetEntry(GuestRegs& regs, void*) {
+    static OwnerTrace trace{"SETENTRY TRACE"};
+    trace.Note(regs.rdi);
+    return HookAction::Continue;
+}
+
 HookAction OnDispatch(GuestRegs& regs, void*) {
+    TraceDispatch(regs);
     if (!SotcNativeMasks::Cpu() || !SotcNative::On()) {
         return HookAction::Continue;
     }
@@ -1414,6 +1478,11 @@ void RegisterLod() {
     handler.post = nullptr;
     handler.user = nullptr;
     SotcHooks::RegisterHandler(kLodHook, handler);
+    SotcHooks::Handler entry;
+    entry.pre = &OnSetEntry;
+    entry.post = nullptr;
+    entry.user = nullptr;
+    SotcHooks::RegisterHandler("SETENTRY_PROBE", entry);
 }
 
 void DrainLodVerify(size_t limit) {
