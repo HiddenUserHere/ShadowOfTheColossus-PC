@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <string>
 #include <type_traits>
@@ -22,6 +23,7 @@
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/serdes.h" // sotc: SOTC_PIPE_MANIFEST (specialization bytes)
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -57,6 +59,68 @@
 extern "C" uint64_t runtime_memory_generation(void);
 
 namespace Vulkan {
+
+// sotc: SOTC_PIPE_MANIFEST state (gpu/sotc/pipe_manifest.h; the steps are at the end of this file). Command processor
+// only, except the counters the workers and the report read (g_manifest_stats).
+struct PipelineCache::ManifestState {
+    enum class St : u8 { Pending, Waiting, Queued, Ready, Failed };
+    struct StageRt {
+        SotcPipeManifest::Stage rec;
+        Shader::StageSpecialization spec; ///< the draw's specialization (info set to the program's when compared)
+        SotcPretranslate::HintPtr hint;
+        u64 cache_hash{};                 ///< the program cache key (the variant mixed in)
+        St state{St::Pending};
+        bool late{};                      ///< its code did not come with an earlier boot load: the hold does not wait
+        Program* program{};
+        u32 perm{};
+        const char* reason{};             ///< why it failed
+    };
+    enum class Ps : u8 { Waiting, Queued, Done, Skipped };
+    struct PipeRt {
+        bool compute{};
+        GraphicsPipelineKey key{};             ///< stage hashes zero (set from the stages' permutations)
+        std::vector<std::pair<u8, u32>> stages; ///< (slot, index in stages)
+        Ps state{Ps::Waiting};
+    };
+    SotcPipeManifest::Header header;
+    std::vector<StageRt> stages;
+    std::vector<PipeRt> pipes;
+    /// Translations the workers finished, installed by the next pump (never in the middle of a lookup).
+    std::vector<std::unique_ptr<AsyncPipelineJob::Translate>> finished;
+    u32 translating{};       ///< translations queued and not installed
+    u32 graphics_building{}; ///< graphics builds queued and not collected
+    u32 libs_building{};     ///< sotc: SOTC_GPL_NODROP library jobs queued and not collected
+    u64 libs_queued{};       ///< sotc: SOTC_GPL_NODROP library jobs queued in all
+    /// sotc: SOTC_GPL_LIB_PHASE: the library jobs of the first boot window, queued by the hold once the translations and
+    /// pipelines are done (ManifestFlushLibraries), and the process private bytes at that point (0: not sampled).
+    std::vector<std::unique_ptr<AsyncPipelineJob>> lib_backlog;
+    bool lib_phase_done{};
+    u64 private_mid{};
+    u32 start_rebased{};     ///< sotc: SOTC_STAGE_BINDINGS: stage records whose start binding was read as 0
+    u64 compute_queued{};    ///< compute builds queued (g_manifest_stats.compute_built counts the built ones)
+    u64 seen_arrivals{~u64{0}};
+    bool dirty{true};        ///< a stage changed since the last pass over the pipelines
+    bool hold_done{};        ///< the boot window is over
+    bool held_once{};        ///< the first boot hold ran (later holds only for a burst of new code)
+    bool boot_lanes{true};   ///< jobs go to the boot lanes, uncapped (else background, two translations at a time)
+    std::chrono::steady_clock::time_point loaded{}, window_start{}, hold_start{}, last_pump{}, last_progress{};
+    std::chrono::steady_clock::duration held{}; ///< the boot holds' time so far
+    u64 built_graphics{}, refused{}, from_disk{};
+    u64 saved_built{}; ///< pipelines built when the driver cache was last saved
+    u32 stage_cached{}, stage_translated{};
+    std::map<std::string, u32> skipped; ///< reason -> pipelines skipped
+};
+
+namespace {
+// sotc: SOTC_PIPE_MANIFEST counters the workers and the 5 s report read.
+struct ManifestStats {
+    std::atomic<u64> compute_built{};          ///< manifest compute builds done (workers)
+    std::atomic<u64> late_graphics{}, late_compute{}; ///< pipelines queued after the boot hold
+    std::atomic<u32> waiting_code{};           ///< stages whose program code has not come
+    std::atomic<bool> boot_done{};
+};
+ManifestStats g_manifest_stats;
+} // namespace
 
 // sotc: SOTC CACHE DIAG (vk_pipeline_serialization.cpp): 6 new programs, 7 unused (was: meta on disk; the disk read
 // on the command processor was a diagnostic only), 8 new permutations, 9 of them queued to a worker.
@@ -627,6 +691,19 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .gcn_buf = SotcGcn::Buf::ProfileValue(),
         .gcn_tex = SotcGcn::Tex::ProfileValue(),
     };
+    // sotc: SOTC_ADDR_FALLBACK. The descriptor-mode profile: what a run without SOTC_SHADER_ADDR builds (gcn_buf is 0
+    // there: Buf::ProfileValue needs the table mode). Unused in descriptor mode, where every stage takes `profile`.
+    desc_profile = profile;
+    desc_profile.shader_addr = 0;
+    desc_profile.gcn_buf = 0;
+    addr_fallback = profile.shader_addr != 0 && [] {
+        const char* v = std::getenv("SOTC_ADDR_FALLBACK");
+        return v && v[0] == '1'; // sotc: default off: the 7 Nov cold run broke the image (dark terrain, ghosting)
+    }();
+    if (addr_fallback) {
+        std::fprintf(stderr, "SOTC ADDR FALLBACK: on (table-variant pipelines are built on the workers; their ops take "
+                             "the descriptor pipeline meanwhile)\n");
+    }
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
     // the loading screen on meanwhile.
 
@@ -669,6 +746,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
     saved_driver_cache_size = driver_cache_data.size();
+    driver_cache_loaded = !driver_cache_data.empty(); // sotc: SOTC_GPL_PACK_LIBS (the list of compiled libraries)
     if (!driver_cache_data.empty()) {
         std::fprintf(stderr, "SOTC driver cache: %zu KB loaded\n", driver_cache_data.size() >> 10);
     }
@@ -863,6 +941,37 @@ struct TinyGplStats {
 };
 TinyGplStats g_tiny_gpl;
 
+// sotc: SOTC_GPL_NODROP counters (command processor), printed by ReportPipeGpl.
+struct NoDropStats {
+    std::atomic<u64> links{};          ///< pipelines fast-linked for a draw that found none built
+    std::atomic<u64> sync_lib_draws{}; ///< of those, links that built libraries on the command processor
+    std::atomic<u64> sync_libs{};      ///< libraries built on the command processor
+    std::atomic<u64> sync_lib_ns{};    ///< their time (the link time excluded)
+    std::atomic<u64> link_refused{};   ///< linkable draws whose libraries or link the driver refused
+    std::atomic<u64> sync_full{};      ///< full pipelines built on the command processor (never a drop)
+    std::atomic<u64> sync_full_ns{};
+    std::atomic<u64> sync_full_unlinkable{}; ///< of those: the fast link does not cover the state
+    std::atomic<u64> sync_xlate{};     ///< lookups whose pending stage translations were made on the command processor
+    std::atomic<u64> sync_xlate_ns{};
+    std::atomic<u64> drop_translate{}; ///< drops: a stage translation still pending (table mode, or refused)
+    std::atomic<u64> boot_libs_queued{}, boot_libs_done{}; ///< manifest library jobs
+    // sotc: SOTC_GPL_PREDICT (PredictLibraries).
+    std::atomic<u64> pred_slots{};        ///< material pass slots read (new VS+PS pairs)
+    std::atomic<u64> pred_jobs{};         ///< predicted library jobs queued
+    std::atomic<u64> pred_no_template{};  ///< slot checks put back: no pass state known yet
+    std::atomic<u64> pred_no_program{};   ///< slot checks put back: a program not in the program cache yet
+    std::atomic<u64> pred_pack_loads{};   ///< pack loads queued for a predicted program
+    std::atomic<u64> pred_promoted{};     ///< pack translations of a predicted program moved to the front
+    std::atomic<u64> pred_dropped{};      ///< slots given up (programs never came, or the state cannot be linked)
+    std::atomic<u64> pred_waiting{};      ///< slots waiting now (a gauge)
+    std::atomic<u64> pre_deferred{};      ///< pack translation feeds held back while library jobs run
+    // sotc: SOTC_GPL_PARALLEL_LIBS (BuildLibrariesParallel).
+    std::atomic<u64> par_waits{};         ///< draws that waited for their two library jobs
+    std::atomic<u64> par_wait_ns{};       ///< their time on the command processor (jobs it took included)
+    std::atomic<u64> par_taken{};         ///< of those jobs, the ones the command processor ran itself
+};
+NoDropStats g_nodrop;
+
 // sotc: SOTC_PIPE_GPL. A fast-linked pipeline replaced by its optimized build is kept alive until the
 // process ends, never destroyed. A BackOp holds a raw pointer to the pipeline it was captured with
 // (Liverpool::CaptureBackOp) and the back thread records it later, so a delete scheduled for the
@@ -962,6 +1071,18 @@ static void LogSyncPipeline(const char* kind, const char* reason,
                  kind, reason, ms, static_cast<unsigned long long>(hash_a),
                  static_cast<unsigned long long>(hash_b), at);
 }
+
+namespace {
+// sotc: SOTC_ADDR_FALLBACK counters, printed by ReportAddrFallback.
+struct AddrFallbackStats {
+    std::atomic<bool> on{};
+    std::atomic<u64> draws{};      ///< draws recorded with a descriptor-mode pipeline
+    std::atomic<u64> dispatches{}; ///< dispatches recorded with a descriptor-mode pipeline
+    std::atomic<s64> pending{};    ///< table pipelines queued and not built yet
+    std::atomic<u64> ready{};      ///< table pipelines built (installed for the next op of their key)
+};
+AddrFallbackStats g_addr_fb;
+} // namespace
 
 bool PipelineCache::AsyncPipelineEligible() const {
     return AsyncIneligibleReason() == nullptr;
@@ -1071,6 +1192,9 @@ void PipelineCache::PredictPipelines() {
     // New materials (one per draw: TakeSlots reads guest memory).
     st.scratch.clear();
     SotcPipePredict::TakeSlots(st.scratch, 1);
+    if (SotcNonBlocking::GplPredict()) {
+        PredictLibraries(&st.scratch); // sotc: SOTC_GPL_PREDICT, the same slots
+    }
     for (const auto& s : st.scratch) {
         const auto [it, fresh] = st.pair_k.try_emplace(PredictPairKey(s.vs, s.ps), s.k);
         if (!fresh) {
@@ -1294,6 +1418,444 @@ void PipelineCache::NotePredictDraw(bool is_new, bool built) {
     st.blocked[k].clear();
 }
 
+// sotc: SOTC_GPL_PREDICT. The state a pre-rasterization library is made of besides its stage and layout (pre_key in
+// the GraphicsPipeline constructor), and the one of a per-shader fragment library (fs_key; the sample shading comes
+// from the pixel program itself).
+static u64 LibPreState(const GraphicsPipelineKey& k) {
+    return u64{static_cast<u32>(k.prim_type)} | (u64{static_cast<u32>(k.polygon_mode)} << 8) |
+           (u64{static_cast<u32>(k.provoking_vtx_last)} << 12) | (u64{k.depth_clamp_enable} << 16) |
+           (u64{k.depth_clip_enable} << 17) | (u64{static_cast<u32>(k.clip_space)} << 18) |
+           (u64{k.patch_control_points} << 32);
+}
+static u64 LibFsState(const GraphicsPipelineKey& k) {
+    return u64{k.num_samples} | (u64{static_cast<u32>(k.z_format)} << 8) |
+           (u64{static_cast<u32>(k.stencil_format)} << 12) | (u64{1} << 63);
+}
+
+// sotc: SOTC_GPL_PREDICT (nonblocking.h). Command processor only.
+struct LibPredictState {
+    /// The rest of a key (stage hashes zeroed), and the pixel layout of the draw it came from.
+    struct Template {
+        bool valid{};
+        GraphicsPipelineKey rest{};
+        std::array<Shader::PsColorBuffer, Shader::MaxColorBuffers> color_buffers{};
+        u32 mrtz_mask{};
+        u32 num_samples{};
+    };
+    /// The last new key of a draw of each material pass slot k.
+    std::array<Template, 16> by_slot{};
+    /// The pre-rasterization and fragment states of the new keys and of the manifest's VS+PS pipelines, counted; the
+    /// most common of each serves a slot whose pass gave no key yet. Node-based maps: the top pointers stay valid.
+    struct Tally {
+        u64 count{};
+        GraphicsPipelineKey rest{};
+    };
+    std::unordered_map<u64, Tally> pre_tally, fs_tally;
+    const Tally* pre_top{};
+    const Tally* fs_top{};
+    /// (VS hash, PS hash) of every material slot read -> its pass slot k.
+    std::unordered_map<u64, u8> pair_k;
+    /// Slots whose library jobs are not queued yet (a program not loaded, or no state known).
+    struct Want {
+        SotcPipePredict::Slot slot;
+        std::chrono::steady_clock::time_point since;
+    };
+    std::deque<Want> waiting;
+    /// Library jobs queued so far: HashCombine(stage hash, LibPreState / LibFsState).
+    std::unordered_set<u64> queued;
+    std::vector<SotcPipePredict::Slot> scratch;
+    u64 calls{};
+
+    void Note(const GraphicsPipelineKey& rest) {
+        const auto bump = [&rest](std::unordered_map<u64, Tally>& map, u64 id, const Tally*& top) {
+            Tally& t = map[id];
+            if (t.count++ == 0) {
+                t.rest = rest;
+            }
+            if (!top || t.count > top->count) {
+                top = &t;
+            }
+        };
+        bump(pre_tally, LibPreState(rest), pre_top);
+        bump(fs_tally, LibFsState(rest), fs_top);
+    }
+};
+
+void PipelineCache::NoteLibraryTemplate() {
+    auto& st = *lib_predict;
+    const auto* vs = infos[u32(Shader::SwStage::Vertex)];
+    const auto* ps = infos[u32(Shader::SwStage::Fragment)];
+    if (!vs || !ps) {
+        return;
+    }
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        if (i != u32(Shader::SwStage::Vertex) && i != u32(Shader::SwStage::Fragment) && infos[i]) {
+            return; // VS+PS pipelines only (the materials' slots)
+        }
+    }
+    GraphicsPipelineKey rest = graphics_key;
+    rest.stage_hashes.fill(0);
+    st.Note(rest);
+    const auto found = st.pair_k.find(PredictPairKey(vs->pgm_hash, ps->pgm_hash));
+    if (found == st.pair_k.end() || found->second >= st.by_slot.size()) {
+        return;
+    }
+    auto& tpl = st.by_slot[found->second];
+    const auto& fs = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+    tpl.rest = rest;
+    std::copy(fs.color_buffers.begin(), fs.color_buffers.end(), tpl.color_buffers.begin());
+    tpl.mrtz_mask = fs.mrtz_mask;
+    tpl.num_samples = fs.num_samples;
+    tpl.valid = true;
+}
+
+// sotc: SOTC_GPL_DYN_STATE / SOTC_GPL_PACK_LIBS. The id of one stage library: program (CacheHash), permutation, part.
+static u64 PackLibraryId(u64 program, size_t perm, u32 part) {
+    return HashCombine(HashCombine(program, u64{perm}), u64{0x9000u + part});
+}
+
+// sotc: SOTC_GPL_DYN_STATE. The rest of a key for a library job that has no draw to take it from. With shader-only
+// library keys none of it reaches the shader libraries; it only has to make a valid pipeline description.
+static GraphicsPipelineKey DefaultLibraryRest() {
+    GraphicsPipelineKey k;
+    k.prim_type = AmdGpu::PrimitiveType::TriangleList;
+    k.num_samples = 1;
+    k.depth_samples = 1;
+    k.z_format = AmdGpu::DepthBuffer::ZFormat::Z32Float;
+    return k;
+}
+
+std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::MakeStageLibraryJob(const GraphicsPipelineKey& rest,
+                                                                                    Program& vs, size_t vs_perm,
+                                                                                    Program& ps, size_t ps_perm,
+                                                                                    u32 parts, u8 origin) {
+    const auto vs_slot = u32(Shader::SwStage::Vertex);
+    const auto ps_slot = u32(Shader::SwStage::Fragment);
+    if (vs.info.sw_stage != Shader::SwStage::Vertex || ps.info.sw_stage != Shader::SwStage::Fragment ||
+        &StageProfile(vs.info.variant) != &StageProfile(ps.info.variant) || vs_perm >= vs.modules.size() ||
+        ps_perm >= ps.modules.size() || !vs.modules[vs_perm].module || !ps.modules[ps_perm].module) {
+        return {};
+    }
+    for (const Program* p : {&vs, &ps}) {
+        for (const auto& image : p->info.images) {
+            if (image.array_size == 0 && image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                return {}; // its pipelines read draw state (AsyncIneligibleReason)
+            }
+        }
+    }
+    auto job = std::make_unique<AsyncPipelineJob>();
+    job->key = rest;
+    job->key.stage_hashes = {};
+    job->key.stage_hashes[vs_slot] = HashCombine(vs.info.CacheHash(), u64{vs_perm});
+    job->key.stage_hashes[ps_slot] = HashCombine(ps.info.CacheHash(), u64{ps_perm});
+    job->hash = std::hash<GraphicsPipelineKey>{}(job->key);
+    job->infos.fill(nullptr);
+    job->modules.fill(vk::ShaderModule{});
+    job->runtime_infos = runtime_infos;
+    job->infos[vs_slot] = &vs.info;
+    job->infos[ps_slot] = &ps.info;
+    job->modules[vs_slot] = vs.modules[vs_perm].module;
+    job->modules[ps_slot] = ps.modules[ps_perm].module;
+    job->runtime_infos[vs_slot] = vs.modules[vs_perm].spec.runtime_info;
+    job->runtime_infos[ps_slot] = ps.modules[ps_perm].spec.runtime_info;
+    if (const auto& fetch = vs.modules[vs_perm].spec.fetch_shader_data; !fetch.Empty()) {
+        job->fetch_shader = fetch;
+    }
+    if (!GraphicsPipeline::FastLinkable(job->key, job->infos, job->runtime_infos, StagesProfile(job->infos))) {
+        return {};
+    }
+    job->link_only = true;
+    job->warm_lib = true;
+    job->lib_parts = static_cast<u8>(parts);
+    job->lib_origin = origin;
+    return job;
+}
+
+void PipelineCache::PredictLibraries(const std::vector<SotcPipePredict::Slot>* slots) {
+    if (!instance.IsGraphicsPipelineLibrary() || instance.IsDescriptorHeapEnabled() ||
+        !instance.IsVertexInputDynamicState() || EmulatorSettings.IsShaderCollect()) {
+        return; // the library jobs read no draw state: only with dynamic vertex input, never with heap pipelines
+    }
+    if (!lib_predict) {
+        lib_predict = std::make_shared<LibPredictState>();
+    }
+    auto& st = *lib_predict;
+    ++st.calls;
+    const auto now = std::chrono::steady_clock::now();
+    if (!slots && SotcPipePredict::HasQueued()) {
+        st.scratch.clear();
+        SotcPipePredict::TakeSlots(st.scratch, 4);
+        slots = &st.scratch;
+    }
+    bool fresh = false;
+    if (slots) {
+        for (const auto& s : *slots) {
+            if (!st.pair_k.try_emplace(PredictPairKey(s.vs, s.ps), s.k).second) {
+                continue; // a pair another material named first
+            }
+            g_nodrop.pred_slots.fetch_add(1, std::memory_order_relaxed);
+            if (st.waiting.size() >= 8192) {
+                st.waiting.pop_front();
+                g_nodrop.pred_dropped.fetch_add(1, std::memory_order_relaxed);
+            }
+            st.waiting.push_back({s, now});
+            fresh = true;
+        }
+    }
+    // Pack translations held back while library jobs ran (FeedPretranslate) go on once they are done.
+    if ((st.calls & 63) == 0 && !pre_backlog.empty() && lib_jobs_pending.load(std::memory_order_relaxed) == 0) {
+        FeedPretranslate();
+    }
+    // sotc: SOTC_GPL_DYN_STATE: with shader-only library keys a slot needs no pass state (a library is the same for
+    // every draw of its stage permutation), and during a manifest hold every waiting slot is looked at on each call.
+    const bool shader_keys = SotcNonBlocking::GplShaderKeys();
+    if (st.waiting.empty() || (!fresh && (st.calls & 15) != 0 && !manifest_holding)) {
+        g_nodrop.pred_waiting.store(st.waiting.size(), std::memory_order_relaxed);
+        return;
+    }
+    // A few slots per call: each queues its jobs, goes back to the end of the line, or is given up.
+    for (size_t n = std::min<size_t>(st.waiting.size(), manifest_holding ? st.waiting.size() : 4); n > 0; --n) {
+        const LibPredictState::Want w = st.waiting.front();
+        st.waiting.pop_front();
+        const auto& s = w.slot;
+        const auto retry = [&] {
+            if (now - w.since > std::chrono::seconds{60}) {
+                g_nodrop.pred_dropped.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                st.waiting.push_back(w);
+            }
+        };
+        const LibPredictState::Template* tpl =
+            s.k < st.by_slot.size() && st.by_slot[s.k].valid ? &st.by_slot[s.k] : nullptr;
+        if (!tpl && (!st.pre_top || !st.fs_top) && !shader_keys) {
+            g_nodrop.pred_no_template.fetch_add(1, std::memory_order_relaxed);
+            retry();
+            continue;
+        }
+        // Both programs in the program cache: a program still in the pack is loaded by a worker, a pack translation
+        // still waiting goes to the front of its backlog.
+        bool ready = true;
+        for (const u64 h : {s.vs, s.ps}) {
+            if (program_cache.contains(h)) {
+                continue;
+            }
+            ready = false;
+            if (lazy_programs.contains(h)) {
+                if (QueueLazyPrefetch(h)) {
+                    g_nodrop.pred_pack_loads.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else if (pre_pending.contains(h)) {
+                const auto f = std::find_if(pre_backlog.begin(), pre_backlog.end(), [h](const auto& job) {
+                    return job->translate && job->translate->hash == h;
+                });
+                if (f != pre_backlog.end() && f != pre_backlog.begin()) {
+                    auto job = std::move(*f);
+                    pre_backlog.erase(f);
+                    pre_backlog.push_front(std::move(job));
+                    g_nodrop.pred_promoted.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (!ready) {
+            g_nodrop.pred_no_program.fetch_add(1, std::memory_order_relaxed);
+            retry();
+            continue;
+        }
+        Program& vs = *program_cache.find(s.vs)->second;
+        Program& ps = *program_cache.find(s.ps)->second;
+        bool linkable = vs.info.sw_stage == Shader::SwStage::Vertex && ps.info.sw_stage == Shader::SwStage::Fragment &&
+                        &StageProfile(vs.info.variant) == &StageProfile(ps.info.variant);
+        for (const Program* p : {&vs, &ps}) {
+            for (const auto& image : p->info.images) {
+                linkable &= !(image.array_size == 0 &&
+                              image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex);
+            }
+        }
+        const auto first_perm = [](const Program& p) {
+            for (size_t i = 0; i < p.modules.size(); ++i) {
+                if (p.modules[i].module) {
+                    return i;
+                }
+            }
+            return p.modules.size();
+        };
+        const size_t vs0 = first_perm(vs), ps0 = first_perm(ps);
+        if (!linkable || vs0 == vs.modules.size() || ps0 == ps.modules.size()) {
+            g_nodrop.pred_dropped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const GraphicsPipelineKey default_rest = DefaultLibraryRest();
+        const GraphicsPipelineKey& pre_rest = tpl ? tpl->rest : st.pre_top ? st.pre_top->rest : default_rest;
+        const GraphicsPipelineKey& fs_rest = tpl ? tpl->rest : st.fs_top ? st.fs_top->rest : default_rest;
+        // One job per permutation and part: the vertex permutations with the slot's first pixel permutation (their
+        // pre-rasterization library), the pixel permutations with the first vertex one (their fragment library). A
+        // library is keyed by its stage hash, so a draw of another permutation (another specialization) never finds it.
+        const auto queue = [&](const GraphicsPipelineKey& rest, size_t vs_perm, size_t ps_perm, u32 parts, u64 id) {
+            if (!st.queued.insert(id).second) {
+                return; // queued before (another material of the same program, same state)
+            }
+            auto job = MakeStageLibraryJob(rest, vs, vs_perm, ps, ps_perm, parts, GplLibraryCache::OriginPredicted);
+            if (!job) {
+                g_nodrop.pred_dropped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            lib_jobs_pending.fetch_add(1, std::memory_order_relaxed);
+            g_nodrop.pred_jobs.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::scoped_lock lock{async_mutex};
+                PushJobLocked(JobLane::Predict, std::move(job));
+            }
+            async_cv.notify_one();
+        };
+        using L = GplLibraryCache;
+        // sotc: SOTC_GPL_DYN_STATE: with shader-only keys only the shader part is built (the vertex input and output
+        // libraries hold draw state; they are cheap and built at the first link), and a job is one per stage permutation.
+        for (size_t i = 0; i < vs.modules.size(); ++i) {
+            if (vs.modules[i].module) {
+                queue(pre_rest, i, ps0,
+                      shader_keys ? (1u << L::PreRaster) : (1u << L::PreRaster) | (1u << L::VertexInput),
+                      shader_keys ? PackLibraryId(vs.info.CacheHash(), i, L::PreRaster)
+                                  : HashCombine(HashCombine(s.vs, u64{i}), LibPreState(pre_rest)));
+            }
+        }
+        // The pixel permutations translated for the pass's render-target layout when its pass is known (all when none
+        // matches, or the pass gave no key yet).
+        std::vector<size_t> ps_perms;
+        for (size_t j = 0; j < ps.modules.size(); ++j) {
+            const auto& fs = ps.modules[j].spec.runtime_info.hw.fs;
+            if (ps.modules[j].module && tpl && !shader_keys && std::ranges::equal(fs.color_buffers, tpl->color_buffers) &&
+                fs.mrtz_mask == tpl->mrtz_mask && fs.num_samples == tpl->num_samples) {
+                ps_perms.push_back(j);
+            }
+        }
+        if (ps_perms.empty()) {
+            for (size_t j = 0; j < ps.modules.size(); ++j) {
+                if (ps.modules[j].module) {
+                    ps_perms.push_back(j);
+                }
+            }
+        }
+        for (const size_t j : ps_perms) {
+            queue(fs_rest, vs0, j,
+                  shader_keys ? (1u << L::Fragment) : (1u << L::Fragment) | (1u << L::FragmentOutput),
+                  shader_keys ? PackLibraryId(ps.info.CacheHash(), j, L::Fragment)
+                              : HashCombine(HashCombine(s.ps, u64{j}), LibFsState(fs_rest)));
+        }
+    }
+    g_nodrop.pred_waiting.store(st.waiting.size(), std::memory_order_relaxed);
+}
+
+std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::MakeLibraryJob(const GraphicsPipelineKey& key,
+                                                                               u32 parts, u8 origin) {
+    auto job = std::make_unique<AsyncPipelineJob>();
+    job->key = key;
+    job->hash = std::hash<GraphicsPipelineKey>{}(key);
+    job->infos = infos;
+    job->runtime_infos = runtime_infos;
+    job->modules = modules;
+    if (fetch_shader && !fetch_shader->Empty()) {
+        job->fetch_shader = *fetch_shader;
+    }
+    job->link_only = true;
+    job->warm_lib = true;
+    job->lib_parts = static_cast<u8>(parts);
+    job->lib_origin = origin;
+    return job;
+}
+
+void PipelineCache::RunLibraryJob(AsyncPipelineJob& job) {
+    // sotc: SOTC_GPL_PACK_LIBS: a pack job's library is compiled into the driver cache and destroyed.
+    const bool pack = job.lib_origin == GplLibraryCache::OriginPack;
+    const u64 built0 = GplLibraryCache::ThreadBuilt(), found0 = GplLibraryCache::ThreadFound(),
+              failed0 = GplLibraryCache::ThreadFailed();
+    GplLibraryCache::SetDiscard(pack);
+    GplLibraryCache::SetLibrariesOnly(true);
+    GplLibraryCache::SetLibraryParts(job.lib_parts);
+    GplLibraryCache::SetOrigin(static_cast<GplLibraryCache::Origin>(job.lib_origin));
+    // The constructor builds the parts of the mask, looks the others up and stops before the link (no handle).
+    job.pipeline = std::make_unique<GraphicsPipeline>(
+        instance, scheduler, desc_heap, layout_cache, StagesProfile(job.infos), job.key, *pipeline_cache, job.infos,
+        job.runtime_infos, job.fetch_shader ? &*job.fetch_shader : nullptr, job.modules, job.sdata, false, true,
+        &gpl_libs);
+    job.pipeline.reset();
+    GplLibraryCache::SetOrigin(GplLibraryCache::OriginDefault);
+    GplLibraryCache::SetLibraryParts(0);
+    GplLibraryCache::SetLibrariesOnly(false);
+    GplLibraryCache::SetDiscard(false);
+    if (pack) {
+        // Compiled (or already stored, hence in the driver cache too) when a part was built or found and none refused.
+        const bool ok = GplLibraryCache::ThreadFailed() == failed0 &&
+                        (GplLibraryCache::ThreadBuilt() != built0 || GplLibraryCache::ThreadFound() != found0);
+        if (ok) {
+            std::scoped_lock lock{pack_mutex};
+            pack_compiled.push_back(job.pack_id);
+        } else {
+            pack_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    lib_jobs_pending.fetch_sub(1, std::memory_order_relaxed);
+    if (job.lib_wait) {
+        {
+            std::scoped_lock lock{async_mutex};
+            job.lib_wait->remaining.fetch_sub(1, std::memory_order_relaxed);
+        }
+        lib_wait_cv.notify_all();
+    }
+}
+
+bool PipelineCache::BuildLibrariesParallel(u32 missing) {
+    using L = GplLibraryCache;
+    constexpr u32 pre = 1u << L::PreRaster;
+    constexpr u32 fs = 1u << L::Fragment;
+    if ((missing & pre) == 0 || (missing & fs) == 0 || async_workers.empty()) {
+        return false; // one shader library (or none) missing: the link builds it on this thread
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const auto group = std::make_shared<AsyncPipelineJob::LibWait>();
+    group->remaining.store(2, std::memory_order_relaxed);
+    auto vs_job = MakeLibraryJob(graphics_key, pre | (missing & (1u << L::VertexInput)), L::OriginUrgent);
+    auto fs_job = MakeLibraryJob(graphics_key, fs | (missing & (1u << L::FragmentOutput)), L::OriginUrgent);
+    vs_job->lib_wait = group;
+    fs_job->lib_wait = group;
+    lib_jobs_pending.fetch_add(2, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{async_mutex};
+        auto& q = job_queues[JobLane::Urgent];
+        q.push_front(std::move(fs_job));
+        q.push_front(std::move(vs_job));
+    }
+    async_cv.notify_all();
+    // A job no worker has taken yet is run here (every worker may be in a long build).
+    for (;;) {
+        std::unique_ptr<AsyncPipelineJob> mine;
+        {
+            std::scoped_lock lock{async_mutex};
+            auto& q = job_queues[JobLane::Urgent];
+            const auto f = std::find_if(q.begin(), q.end(), [&group](const auto& j) { return j->lib_wait == group; });
+            if (f != q.end()) {
+                mine = std::move(*f);
+                q.erase(f);
+            }
+        }
+        if (!mine) {
+            break;
+        }
+        RunLibraryJob(*mine);
+        g_nodrop.par_taken.fetch_add(1, std::memory_order_relaxed);
+    }
+    {
+        std::unique_lock lock{async_mutex};
+        lib_wait_cv.wait_for(lock, std::chrono::seconds{10},
+                             [&group] { return group->remaining.load(std::memory_order_relaxed) <= 0; });
+    }
+    g_nodrop.par_waits.fetch_add(1, std::memory_order_relaxed);
+    g_nodrop.par_wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                        std::chrono::steady_clock::now() - start)
+                                                        .count()),
+                                   std::memory_order_relaxed);
+    return true;
+}
+
 u64 SotcJobClockNs() noexcept {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -1377,8 +1939,9 @@ void ReportJobs() {
 
 void PipelineCache::QueueAsyncPipeline(u64 hash,
                                        const GraphicsPipeline::SerializationSupport* preloaded,
-                                       bool priority, bool background) {
+                                       bool priority, bool background, bool addr_table, bool front) {
     auto job = std::make_unique<AsyncPipelineJob>();
+    job->addr_table = addr_table; // sotc: SOTC_ADDR_FALLBACK
     job->key = graphics_key;
     job->hash = hash;
     if (preloaded) {
@@ -1403,8 +1966,12 @@ void PipelineCache::QueueAsyncPipeline(u64 hash,
         std::scoped_lock lock{async_mutex};
         // sotc: shadow (depth-only) pipelines go ahead of the other graphics pipelines (after the compute and
         // translation jobs, which the recorder or a draw waits for); predicted ones go to the background.
-        PushJobLocked(priority ? JobLane::Shadow : background ? JobLane::Background : JobLane::Graphics,
-                      std::move(job));
+        const JobLane lane = priority ? JobLane::Shadow : background ? JobLane::Background : JobLane::Graphics;
+        if (front) {
+            job_queues[lane].push_front(std::move(job)); // sotc: a draw waits for it (ahead of the preload)
+        } else {
+            PushJobLocked(lane, std::move(job));
+        }
     }
     async_cv.notify_one();
 }
@@ -1622,6 +2189,11 @@ void PipelineCache::FeedWarmLibraries() {
         Program& ps = stage == Shader::SwStage::Fragment ? program : *tpl_ps.value();
         const size_t vs_perm = stage == Shader::SwStage::Vertex ? perm : warm_template.vs_perm;
         const size_t ps_perm = stage == Shader::SwStage::Fragment ? perm : warm_template.ps_perm;
+        // sotc: SOTC_ADDR_FALLBACK: a table stage and a descriptor-mode stage never share a pipeline (StagesProfile).
+        if (&StageProfile(vs.info.variant) != &StageProfile(ps.info.variant)) {
+            ++warm_skipped;
+            continue;
+        }
         auto job = std::make_unique<AsyncPipelineJob>();
         job->key = warm_template.key;
         job->key.stage_hashes[u32(Shader::SwStage::Vertex)] = HashCombine(vs.info.CacheHash(), u64{vs_perm});
@@ -1668,8 +2240,8 @@ u32 PipelineCache::BackgroundCap() const {
 
 u32 PipelineCache::CappedCap() const {
     // sotc: SOTC_NB_WORKER_CAP: the capped lanes (CappedLane) run on a quarter of the hardware threads, at least 2.
-    // The boot hold waits for them, so it gives them every worker.
-    if (!SotcNonBlocking::WorkerCap() || pre_holding) {
+    // The boot holds (SOTC_PRETRANSLATE, SOTC_PIPE_MANIFEST) wait for them, so they give them every worker.
+    if (!SotcNonBlocking::WorkerCap() || pre_holding || manifest_holding) {
         return std::numeric_limits<u32>::max();
     }
     return std::max<u32>(2, std::thread::hardware_concurrency() / 4);
@@ -1866,10 +2438,18 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         if (job->compute) {
             const auto start = std::chrono::steady_clock::now();
             job->compute->Build();
+            if (job->addr_table) { // sotc: SOTC_ADDR_FALLBACK: its dispatches take it from now on (IsReady)
+                g_addr_fb.pending.fetch_sub(1, std::memory_order_relaxed);
+                g_addr_fb.ready.fetch_add(1, std::memory_order_relaxed);
+            }
             if (job->pre_compute) { // sotc: SOTC_PRETRANSLATE_COMPUTE: done when the pipeline is built (or refused)
                 job->compute->WaitBuilt();
                 SotcPretranslate::NoteBuilt(2, job->compute->Handle() != vk::Pipeline{});
                 pre_builds_pending.fetch_sub(1, std::memory_order_relaxed);
+            }
+            if (job->manifest) { // sotc: SOTC_PIPE_MANIFEST: the hold counts it as done (built or refused)
+                job->compute->WaitBuilt();
+                g_manifest_stats.compute_built.fetch_add(1, std::memory_order_relaxed);
             }
             SotcStats::async_compute_built.fetch_add(1, std::memory_order_relaxed);
             SotcStats::async_compute_build_ns.fetch_add(
@@ -1880,15 +2460,19 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             note_job();
             continue;
         }
-        if (job->cancelled.load(std::memory_order_acquire)) {
+        if (job->lib_parts != 0) {
+            RunLibraryJob(*job); // sotc: SOTC_GPL_PREDICT / SOTC_GPL_PARALLEL_LIBS library job
+        } else if (job->cancelled.load(std::memory_order_acquire)) {
             // sotc: SOTC_NB_SCHED: the command processor built this pipeline itself; nothing to build.
             g_sched_cancelled.fetch_add(1, std::memory_order_relaxed);
         } else {
+            GplLibraryCache::SetLibrariesOnly(job->manifest_libs); // sotc: SOTC_GPL_NODROP boot libraries, no link
             job->pipeline = std::make_unique<GraphicsPipeline>(
-                instance, scheduler, desc_heap, layout_cache, profile, job->key, *pipeline_cache,
+                instance, scheduler, desc_heap, layout_cache, StagesProfile(job->infos), job->key, *pipeline_cache,
                 job->infos,
                 job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
                 job->sdata, job->preloaded, true, job->link_only ? &gpl_libs : nullptr);
+            GplLibraryCache::SetLibrariesOnly(false);
             SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         }
         note_job();
@@ -1903,9 +2487,9 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
     }
 }
 
-bool PipelineCache::TryFastLink(std::unique_ptr<GraphicsPipeline>& slot, bool allow_build) {
+bool PipelineCache::TryFastLink(std::unique_ptr<GraphicsPipeline>& slot, bool allow_build, bool probe) {
     const N5Clock::time_point link_start = N5Clock::now(); // sotc: N5
-    if (!GraphicsPipeline::FastLinkable(graphics_key, infos, runtime_infos, profile)) {
+    if (!GraphicsPipeline::FastLinkable(graphics_key, infos, runtime_infos, StagesProfile(infos))) {
         g_gpl_counters.unlinkable.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -1914,10 +2498,11 @@ bool PipelineCache::TryFastLink(std::unique_ptr<GraphicsPipeline>& slot, bool al
     // (QueueLinkJob).
     // allow_build: a tiny full-screen draw (never skipped) builds its missing libraries here, ~17 ms each, instead of
     // a whole pipeline.
-    const bool lookup_only = SotcNonBlocking::Gpl() && !allow_build;
+    // sotc: SOTC_GPL_PARALLEL_LIBS: a probe links only what exists (GplLibraryCache::Missing tells what does not).
+    const bool lookup_only = probe || (SotcNonBlocking::Gpl() && !allow_build);
     GplLibraryCache::SetLookupOnly(lookup_only);
     auto pipe = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, layout_cache, profile, graphics_key, *pipeline_cache,
+        instance, scheduler, desc_heap, layout_cache, StagesProfile(infos), graphics_key, *pipeline_cache,
         infos, runtime_infos, fetch_shader, modules, sdata, false, false, &gpl_libs);
     GplLibraryCache::SetLookupOnly(false);
     if (!pipe->IsLinked()) {
@@ -1926,6 +2511,63 @@ bool PipelineCache::TryFastLink(std::unique_ptr<GraphicsPipeline>& slot, bool al
     N5NoteSyncCompile(N5Kind::Link, link_start); // sotc: N5
     slot = std::move(pipe);
     return true;
+}
+
+// sotc: SOTC_GPL_NODROP. A linked pipeline is only taken when its optimized build can follow on a worker (else the
+// linked one would serve its draws for good): workers, a pipeline built from no draw state, no descriptor heap (heap
+// pipelines are never linked, the constructor would build the full pipeline), and a state the libraries cover.
+bool PipelineCache::NoDropLinkable() {
+    return SotcNonBlocking::GplNoDrop() && instance.IsGraphicsPipelineLibrary() && !async_workers.empty() &&
+           !instance.IsDescriptorHeapEnabled() && AsyncPipelineEligible() &&
+           GraphicsPipeline::FastLinkable(graphics_key, infos, runtime_infos, StagesProfile(infos));
+}
+
+// sotc: SOTC_GPL_NODROP. TryFastLink with the missing libraries built here (a library is far cheaper than the full
+// pipeline; the manifest's boot hold built those of every known stage), counted and timed apart from the link.
+bool PipelineCache::NoDropLink(std::unique_ptr<GraphicsPipeline>& slot) {
+    const auto start = std::chrono::steady_clock::now();
+    const u64 libs_before = GplLibraryCache::ThreadBuilt();
+    const u64 link_before = g_gpl_counters.link_ns.load(std::memory_order_relaxed);
+    GplLibraryCache::SetDrawUse(true); // sotc: SOTC_GPL_PREDICT: predicted libraries found here count as used
+    bool ok = false;
+    // sotc: SOTC_GPL_PARALLEL_LIBS: a link of the libraries that exist first; when the vertex and the pixel library
+    // are both missing, two urgent jobs build them at once (counted apart: parallel waits), and the link below finds
+    // them. Any other missing library is built here, as before.
+    u64 par_ns = 0, par_libs = 0;
+    if (SotcNonBlocking::GplParallelLibs()) {
+        GplLibraryCache::ResetMissing();
+        ok = TryFastLink(slot, false, true);
+        if (!ok) {
+            const auto par_start = std::chrono::steady_clock::now();
+            const u64 par_before = GplLibraryCache::ThreadBuilt();
+            if (BuildLibrariesParallel(GplLibraryCache::Missing())) {
+                par_libs = GplLibraryCache::ThreadBuilt() - par_before;
+                par_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - par_start)
+                                              .count());
+            }
+        }
+    }
+    if (!ok) {
+        ok = TryFastLink(slot, true);
+    }
+    GplLibraryCache::SetDrawUse(false);
+    const u64 libs = GplLibraryCache::ThreadBuilt() - libs_before - par_libs;
+    if (libs != 0) {
+        const u64 elapsed_ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        const u64 total_ns = elapsed_ns > par_ns ? elapsed_ns - par_ns : 0;
+        const u64 link_ns = g_gpl_counters.link_ns.load(std::memory_order_relaxed) - link_before;
+        g_nodrop.sync_libs.fetch_add(libs, std::memory_order_relaxed);
+        g_nodrop.sync_lib_ns.fetch_add(total_ns > link_ns ? total_ns - link_ns : 0, std::memory_order_relaxed);
+        g_nodrop.sync_lib_draws.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (ok) {
+        g_nodrop.links.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_nodrop.link_refused.fetch_add(1, std::memory_order_relaxed);
+    }
+    return ok;
 }
 
 void PipelineCache::CollectAsyncPipelines() {
@@ -1947,6 +2589,23 @@ void PipelineCache::CollectAsyncPipelines() {
             InstallLazyLoad(*job->lazy);
             continue;
         }
+        if (job->lib_parts != 0) { // sotc: SOTC_GPL_PREDICT / SOTC_GPL_PARALLEL_LIBS: only its libraries mattered
+            continue;
+        }
+        if (job->addr_table && !job->compute) { // sotc: SOTC_ADDR_FALLBACK: installed below for the next draw
+            g_addr_fb.pending.fetch_sub(1, std::memory_order_relaxed);
+            g_addr_fb.ready.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (job->manifest && !job->compute && manifest) { // sotc: SOTC_PIPE_MANIFEST: installed below, as a draw's
+            if (manifest->graphics_building > 0) {
+                --manifest->graphics_building;
+            }
+            if (job->pipeline && job->pipeline->Handle()) {
+                ++manifest->built_graphics;
+            } else {
+                ++manifest->refused;
+            }
+        }
         if (pipe_predict && !job->compute) { // sotc: SOTC_PIPE_PREDICT throttle
             pipe_predict->inflight.erase(job->key);
         }
@@ -1956,6 +2615,13 @@ void PipelineCache::CollectAsyncPipelines() {
             }
         }
         const auto it = graphics_pipelines.find(job->key);
+        if (job->manifest_libs) { // sotc: SOTC_GPL_NODROP: the libraries of a manifest pipeline (no pipeline)
+            if (manifest && manifest->libs_building > 0) {
+                --manifest->libs_building;
+            }
+            g_nodrop.boot_libs_done.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         if (job->warm_lib) { // sotc: SOTC_NB_GPL (P4): only its library mattered; the linked pipeline was never bound
             ++warm_built;
             continue;
@@ -1975,14 +2641,33 @@ void PipelineCache::CollectAsyncPipelines() {
             // sotc: SOTC_PIPE_GPL: the optimized build replaces the fast-linked pipeline the draws
             // were using. The linked one is retired, not destroyed (RetireLinkedPipeline): back-thread
             // ops may still hold it.
-            if (!job->preloaded && job->pipeline && it.value()->IsLinked()) {
+            // sotc: SOTC_GPL_NODROP: a boot preload's build replaces it too (a draw linked while the preload was
+            // queued; it was kept for good before). A preloaded pipeline is in the cache already: not registered.
+            if (job->pipeline && job->pipeline->Handle() && it.value()->IsLinked()) {
                 auto linked = std::move(it.value());
                 it.value() = std::move(job->pipeline);
                 last_graphics_pipeline = nullptr; // the memo may point at the replaced one
-                RegisterPipelineData(job->key, job->hash, job->sdata);
-                ++num_new_pipelines;
+                if (job->preloaded) {
+                    it.value()->use_count = job->uses + linked->use_count; // sotc: N5
+                    it.value()->saved_use_count = job->uses;
+                } else {
+                    RegisterPipelineData(job->key, job->hash, job->sdata);
+                    ++num_new_pipelines;
+                }
                 g_gpl_counters.replaced.fetch_add(1, std::memory_order_relaxed);
                 RetireLinkedPipeline(std::move(linked));
+                continue;
+            }
+            // sotc: SOTC_GPL_NODROP: a preload the driver refused, under a linked pipeline: built again as a draw's
+            // pipeline (as the next draw of an erased entry would), so the linked one is still replaced.
+            if (job->preloaded && it.value()->IsLinked()) {
+                job->preloaded = false;
+                job->pipeline.reset();
+                {
+                    std::scoped_lock lock{async_mutex};
+                    PushJobLocked(JobLane::Graphics, std::move(job));
+                }
+                async_cv.notify_one();
                 continue;
             }
             // A full-screen pass built it on the command processor meanwhile (that one may be
@@ -2159,7 +2844,8 @@ void PipelineCache::WaitPendingTranslation(u64 hash) {
         std::scoped_lock lock{async_mutex};
         auto& lane = job_queues[JobLane::Translate];
         const auto it = std::find_if(lane.begin(), lane.end(), [hash](const auto& job) {
-            return !job->translate->program && job->translate->hash == hash;
+            // sotc: never a SOTC_PIPE_MANIFEST translation (the manifest waits for its own jobs).
+            return !job->translate->program && job->translate->hash == hash && job->translate->manifest_stage < 0;
         });
         if (it != lane.end()) {
             lane.erase(it);
@@ -2236,10 +2922,27 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
                                       Shader::RuntimeInfo& runtime_info,
                                       Shader::Pools& worker_pools) {
     if (!t.program) {
-        // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS: a compute prebuild takes the fields its program's last miss recorded.
-        SotcPretranslate::HintScope hint_scope{t.pretranslate && t.sw_stage == SwStage::Compute
-                                                   ? SotcPretranslate::AcquireHint(t.hash)
-                                                   : SotcPretranslate::HintPtr{}};
+        // sotc: SOTC_PIPE_MANIFEST: a manifest stage is translated with its draw's sharp fields (hint), its draw's
+        // fetch shader data, and user data pointing at a table of its fetch attributes' V#.
+        const bool manifest_job = t.manifest_stage >= 0;
+        if (manifest_job) {
+            ManifestUserData(t);
+        }
+        struct FetchScope {
+            explicit FetchScope(const Shader::Gcn::FetchShaderData* data) {
+                Shader::Gcn::SetSyntheticFetchShader(data);
+            }
+            ~FetchScope() {
+                Shader::Gcn::SetSyntheticFetchShader(nullptr);
+            }
+        } fetch_scope{manifest_job && t.manifest_fetch ? &*t.manifest_fetch : nullptr};
+        // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS: a compute prebuild takes the fields its program's last miss recorded,
+        // looked up by the game's hash (a variant's job carries it in guest_hash).
+        SotcPretranslate::HintScope hint_scope{
+            manifest_job ? t.manifest_hint
+            : t.pretranslate && t.sw_stage == SwStage::Compute
+                ? SotcPretranslate::AcquireHint(t.guest_hash != 0 ? t.guest_hash : t.hash)
+                : SotcPretranslate::HintPtr{}};
         t.new_program = std::make_unique<Program>(t.hw_stage, t.sw_stage, params);
         t.new_program->info.sotc_synthetic = t.pretranslate; // sotc: SOTC_PRETRANSLATE
         t.new_program->info.sotc_synthetic_variant = t.synthetic_variant;
@@ -2261,6 +2964,14 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
 }
 
 void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
+    if (t.manifest_stage >= 0) { // sotc: SOTC_PIPE_MANIFEST: installed by the next pump, outside any lookup
+        if (manifest) {
+            manifest->finished.push_back(std::make_unique<AsyncPipelineJob::Translate>(std::move(t)));
+        } else if (t.module) {
+            instance.GetDevice().destroyShaderModule(t.module);
+        }
+        return;
+    }
     if (!t.program && t.pretranslate && t.sw_stage == SwStage::Compute) {
         InstallComputePrebuild(t); // sotc: SOTC_PRETRANSLATE_COMPUTE
         return;
@@ -2665,10 +3376,102 @@ bool PipelineCache::IsDepthOnlyDraw() const {
     return true;
 }
 
+// sotc: SOTC_ADDR_FALLBACK, the 5 s report line: window counts of the fallback ops and the table pipelines built, and
+// the table pipelines still pending. Nothing while the fallback is off or the window had nothing.
+void ReportAddrFallback(std::string& out, double seconds) {
+    (void)seconds;
+    if (!g_addr_fb.on.load(std::memory_order_relaxed)) {
+        return;
+    }
+    static u64 prev_draws{}, prev_dispatches{}, prev_ready{};
+    const u64 draws = g_addr_fb.draws.load(std::memory_order_relaxed);
+    const u64 dispatches = g_addr_fb.dispatches.load(std::memory_order_relaxed);
+    const u64 ready = g_addr_fb.ready.load(std::memory_order_relaxed);
+    const s64 pending = std::max<s64>(0, g_addr_fb.pending.load(std::memory_order_relaxed));
+    const u64 d_draws = draws - prev_draws, d_dispatches = dispatches - prev_dispatches, d_ready = ready - prev_ready;
+    prev_draws = draws;
+    prev_dispatches = dispatches;
+    prev_ready = ready;
+    if (d_draws == 0 && d_dispatches == 0 && d_ready == 0 && pending == 0) {
+        return;
+    }
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "SOTC ADDR FALLBACK: draws %llu, dispatches %llu (pending table pipelines %lld), table ready %llu "
+                  "(total %llu)\n",
+                  static_cast<unsigned long long>(d_draws), static_cast<unsigned long long>(d_dispatches),
+                  static_cast<long long>(pending), static_cast<unsigned long long>(d_ready),
+                  static_cast<unsigned long long>(ready));
+    out += line;
+}
+
+bool PipelineCache::AddrFallbackOn() const {
+    return addr_fallback && !async_workers.empty();
+}
+
+bool PipelineCache::AddrFallbackComputeOn() const {
+    // sotc: the table compute pipeline is built on a worker and bound only once built; without deferred compute builds
+    // (no record thread, shader collect) dispatches are as without the switch.
+    return AddrFallbackOn() && AsyncComputeEnabled() && scheduler.HasRecordThread() &&
+           !EmulatorSettings.IsShaderCollect();
+}
+
+bool PipelineCache::AddrTableGraphicsReady() {
+    g_addr_fb.on.store(true, std::memory_order_relaxed);
+    // The previous draw's pipeline (the key memo's test, without the probe): non-null only while it is that key's.
+    if (last_graphics_pipeline && std::memcmp(&graphics_key, &last_graphics_key, sizeof(graphics_key)) == 0) {
+        return true;
+    }
+    if (const auto it = graphics_pipelines.find(graphics_key); it != graphics_pipelines.end()) {
+        return it->second != nullptr; // null: queued on a worker (a draw's, a preload's, or ours)
+    }
+    // sotc: a pipeline whose construction reads this draw's state cannot be built on a worker: its key keeps the
+    // descriptor-mode pipeline (built as a descriptor-mode run builds it), never a table build here.
+    if (!AsyncPipelineEligible()) {
+        return false;
+    }
+    graphics_pipelines.try_emplace(graphics_key); // the null entry marks it queued, as QueueAsyncPipeline's callers do
+    QueueAsyncPipeline(std::hash<GraphicsPipelineKey>{}(graphics_key), nullptr, false, true, true);
+    g_addr_fb.pending.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+bool PipelineCache::AddrTableComputeReady() {
+    g_addr_fb.on.store(true, std::memory_order_relaxed);
+    if (const auto it = compute_pipelines.find(compute_key); it != compute_pipelines.end()) {
+        return it->second && it->second->IsReady();
+    }
+    if (!infos[0]) {
+        return false;
+    }
+    // sotc: made here (its layouts are CP-only) and built by a worker in the background lane. No dispatch binds it
+    // before it is built, so the recorder never waits for it (BindWhenReady).
+    ComputePipeline::SerializationSupport sdata{};
+    auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
+    it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache,
+                                                   StageProfile(infos[0]->variant), *pipeline_cache, compute_key,
+                                                   *infos[0], modules[0], sdata, false, true);
+    auto job = std::make_unique<AsyncPipelineJob>();
+    job->compute = it.value().get();
+    job->addr_table = true;
+    {
+        std::scoped_lock lock{async_mutex};
+        PushJobLocked(JobLane::Background, std::move(job));
+    }
+    async_cv.notify_one();
+    RegisterPipelineData(compute_key, sdata);
+    ++num_new_pipelines;
+    g_addr_fb.pending.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
 // sotc: N5. Counts the draws that bind each pipeline (its use count, saved at teardown).
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     const GraphicsPipeline* pipeline = GetGraphicsPipelineLookup(params);
     if (pipeline) {
+        if (addr_fallback && &pipeline->GetProfile() == &desc_profile) { // sotc: SOTC_ADDR_FALLBACK
+            g_addr_fb.draws.fetch_add(1, std::memory_order_relaxed);
+        }
         ++pipeline->use_count;
         if (!pipeline->recent_noted && SotcNonBlocking::LazyPso()) { // sotc: once per pipeline object
             pipeline->recent_noted = true;
@@ -2681,13 +3484,20 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 // sotc: SOTC_PIPE_FAST: the full lookup; GetGraphicsPipelineLookup runs it unless a record applies.
 const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawIndirectParams params) {
     draw_indirect_params = params;
-    // sotc: SOTC_DEPTH_SYNC_PIPE=1 builds depth-only (shadow) pipelines on this thread so their
-    // draws are never skipped. Off by default since 2026-10-27: each build took ~36 ms and an
-    // area change built several (hitches of 0.4-3.8 s). By default they are queued ahead of the
-    // other pipelines instead (QueueAsyncPipeline priority), which shortens the blink.
+    // sotc: SOTC_PIPE_MANIFEST: the boot hold (once), then the manifest stages whose code came since. Before the key
+    // is built: installs change the program cache.
+    if (SotcPipeManifest::On()) {
+        MaybeHoldForManifest();
+    }
+    // sotc: SOTC_DEPTH_SYNC_PIPE (default on since SOTC_PIPE_MANIFEST; =0 off) builds depth-only (shadow) pipelines
+    // on this thread so their draws are never skipped (a skipped depth-only draw leaves its pass without shadows or
+    // its depth pre-pass missing: dark scene, fog at full strength). It was off from 2026-10-27 to the manifest (each
+    // build took ~36 ms and an area change built several, hitches of 0.4-3.8 s): the manifest builds the known ones at
+    // the boot hold, so only keys it does not hold are built here. =0 queues them ahead of the other pipelines
+    // instead (QueueAsyncPipeline priority) and skips their draws meanwhile.
     static const bool depth_sync = [] {
         const char* v = std::getenv("SOTC_DEPTH_SYNC_PIPE");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     const bool depth_draw = !depth_sync && IsDepthOnlyDraw();
     // sotc: shadow casters are depth-only geometry draws. Skipping them while their pipeline is
@@ -2704,6 +3514,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
     if (SotcPipePredict::On() && !async_workers.empty()) {
         PredictPipelines();
     }
+    // sotc: SOTC_GPL_PREDICT: the libraries of the materials' programs, queued before their first draw (with
+    // SOTC_PIPE_PREDICT on, PredictPipelines hands its slots on instead).
+    if (SotcNonBlocking::GplPredict() && !SotcPipePredict::On() && !async_workers.empty()) {
+        PredictLibraries(nullptr);
+    }
     // sotc: SOTC_NB_GPL (P4): libraries of new shaders, built before their first draw.
     if (SotcNonBlocking::Gpl() && SotcNonBlocking::Warm() && !async_workers.empty()) {
         FeedWarmLibraries();
@@ -2714,9 +3529,54 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
                          liverpool->regs.num_indices > 6 && instance.IsVertexInputDynamicState() &&
                          !EmulatorSettings.IsShaderCollect() && !depth_only;
     translation_pending = false;
-    if (!RefreshGraphicsKey()) {
+    // sotc: SOTC_ADDR_FALLBACK. The table key first. Its stages are never translated here (a stage not translated yet
+    // goes to a worker, for every draw kind), and when its pipeline is not ready (AddrTableGraphicsReady queues it),
+    // the key is made again with the descriptor-mode stages, which the rest of this lookup builds or finds by the rules
+    // of a descriptor-mode run (the same async_translate_ok, skips, tiny and depth builds).
+    addr_fallback_draw = false;
+    bool keyed;
+    if (AddrFallbackOn()) {
+        const bool draw_async_ok = async_translate_ok;
+        async_translate_ok = AsyncTranslateEnabled() && instance.IsVertexInputDynamicState() &&
+                             !EmulatorSettings.IsShaderCollect();
+        keyed = RefreshGraphicsKey();
+        const bool table_pending = !keyed && translation_pending;
+        if (table_pending || (keyed && !AddrTableGraphicsReady())) {
+            addr_fallback_draw = true;
+            async_translate_ok = draw_async_ok;
+            translation_pending = false;
+            keyed = RefreshGraphicsKey();
+        } else {
+            async_translate_ok = draw_async_ok;
+        }
+    } else {
+        keyed = RefreshGraphicsKey();
+    }
+    // sotc: SOTC_GPL_NODROP: the stages still on a translation worker (or queued there by this lookup) are translated
+    // here instead of dropping the draw, as a tiny or depth-only draw's always were; the worker's copy is dropped when
+    // installed (InstallTranslation finds the program or permutation made). Not in table mode (SOTC_ADDR_FALLBACK has
+    // its own descriptor-mode fallback).
+    const bool nodrop = SotcNonBlocking::GplNoDrop();
+    if (!keyed && translation_pending && nodrop && !AddrFallbackOn()) {
+        const auto xlate_start = std::chrono::steady_clock::now();
+        async_translate_ok = false;
+        translation_pending = false;
+        keyed = RefreshGraphicsKey();
+        g_nodrop.sync_xlate.fetch_add(1, std::memory_order_relaxed);
+        g_nodrop.sync_xlate_ns.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - xlate_start)
+                                 .count()),
+            std::memory_order_relaxed);
+        LogSyncPipeline("stages", "translation pending", xlate_start, infos[3] ? infos[3]->pgm_hash : 0,
+                        infos[0] ? infos[0]->pgm_hash : 0);
+    }
+    if (!keyed) {
         if (translation_pending) {
             SotcStats::async_translate_skips.fetch_add(1, std::memory_order_relaxed);
+            if (nodrop) {
+                g_nodrop.drop_translate.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         return nullptr;
     }
@@ -2744,6 +3604,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
     if (pipe_predict) { // sotc: SOTC_PIPE_PREDICT: templates and hits
         NotePredictDraw(is_new, !is_new && it->second != nullptr);
     }
+    if (is_new && lib_predict) { // sotc: SOTC_GPL_PREDICT: the pass state of the predicted library jobs
+        NoteLibraryTemplate();
+    }
     if (is_new && SotcNonBlocking::Gpl() && SotcNonBlocking::Warm()) { // sotc: SOTC_NB_WARM (P4): the template
         NoteWarmTemplate();
     }
@@ -2770,7 +3633,19 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
             g_sched_demand.fetch_add(1, std::memory_order_relaxed);
         }
     };
-    if (queued && liverpool->regs.num_indices > 6 && !depth_only) {
+    // sotc: SOTC_GPL_NODROP: a queued geometry draw is linked (missing libraries built here); when the link cannot
+    // serve it, the full pipeline is built below on this thread. Never skipped.
+    const bool nodrop_queued_linked =
+        nodrop && queued && liverpool->regs.num_indices > 6 && !depth_only && NoDropLinkable() &&
+        NoDropLink(it.value());
+    if (nodrop_queued_linked) {
+        std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
+        last_graphics_pipeline = it->second.get();
+        last_graphics_size = graphics_pipelines.size();
+        g_gpl_counters.linked_served.fetch_add(1, std::memory_order_relaxed);
+        return it->second.get();
+    }
+    if (!nodrop && queued && liverpool->regs.num_indices > 6 && !depth_only) {
         // sotc: SOTC_PIPE_GPL: the draw runs on a fast-linked pipeline; the queued build replaces it
         // when it is collected (CollectAsyncPipelines).
         if (!gpl_on || !TryFastLink(it.value())) {
@@ -2778,6 +3653,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
                 QueueLinkJob(); // sotc: SOTC_NB_GPL, the libraries are built off the command processor
             }
             note_skip_demand();
+            SotcStats::pipeline_pending_drops.fetch_add(1, std::memory_order_relaxed); // sotc: the 5 s line
             return nullptr;
         }
         std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
@@ -2792,7 +3668,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         // skipping one leaves a black or stale frame, so by default they still build here (see
         // TinyAsyncMode for when mode 1 defers them).
         const bool tiny_draw = liverpool->regs.num_indices <= 6;
-        const int tiny_mode = tiny_draw && !depth_only ? TinyAsyncMode() : 0;
+        // sotc: SOTC_GPL_NODROP: no tiny draw is deferred (the skips of SOTC_TINY_ASYNC are off).
+        const int tiny_mode = tiny_draw && !depth_only && !nodrop ? TinyAsyncMode() : 0;
         const bool tiny_can_defer = tiny_mode != 0 && !async_workers.empty() && eligible;
         // sotc: a color target lies in a display buffer (a presentation pass): never deferred.
         const auto tiny_writes_display = [this] {
@@ -2838,11 +3715,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         // sotc: SOTC_TINY_GPL=1 (TinyGplOn). A tiny draw is served by a fast-linked pipeline now, and the
         // optimized build follows on a worker. Its time is counted in g_tiny_gpl.
         // Descriptor heap pipelines are never linked (GraphicsPipeline ctor): they would be built twice.
-        if (tiny_draw && !depth_only && (TinyGplOn() || SotcNonBlocking::Gpl()) && gpl_on && eligible &&
+        // sotc: SOTC_GPL_NODROP takes this path too (NoDropLink: the same link, counted in its line).
+        if (tiny_draw && !depth_only && (TinyGplOn() || SotcNonBlocking::Gpl() || nodrop) && gpl_on && eligible &&
             !async_workers.empty() && !instance.IsDescriptorHeapEnabled()) {
             const auto fast_start = std::chrono::steady_clock::now();
             const u64 link_before = g_gpl_counters.link_ns.load(std::memory_order_relaxed);
-            if (TryFastLink(it.value(), true)) {
+            if (nodrop ? NoDropLinkable() && NoDropLink(it.value()) : TryFastLink(it.value(), true)) {
                 if (SotcNonBlocking::Gpl()) {
                     RecordTinyPipeline(); // sotc: built before the first draw from the next boot hold on
                 }
@@ -2884,15 +3762,37 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
         // Geometry draws are skipped while their pipeline is built (a brief pop-in instead of a
         // freeze on first sight).
-        if (!async_workers.empty() && !tiny_draw && !depth_only && eligible && !queued) {
-            QueueAsyncPipeline(pipeline_hash, nullptr, depth_draw);
+        // sotc: SOTC_GPL_NODROP: only a draw the link covers is queued here; any other builds below on this thread.
+        if (!async_workers.empty() && !tiny_draw && !depth_only && eligible && !queued &&
+            (!nodrop || NoDropLinkable())) {
+            // sotc: at the front of its lane: a draw waits for it, ahead of the background builds (the boot preload,
+            // the manifest's late pipelines) queued in the same lane.
+            QueueAsyncPipeline(pipeline_hash, nullptr, depth_draw, false, false, true);
             // sotc: SOTC_PIPE_GPL: the draw runs on a fast-linked pipeline now (not registered here:
             // the optimized build registers when it replaces it).
-            if (!gpl_on || !TryFastLink(it.value())) {
+            // sotc: SOTC_GPL_NODROP: a refused link builds the full pipeline below (registered there; the copy of the
+            // worker is dropped when collected, as for a full-screen pass).
+            const bool linked_now = nodrop ? NoDropLink(it.value()) : gpl_on && TryFastLink(it.value());
+            if (!linked_now && !nodrop) {
                 if (gpl_on && SotcNonBlocking::Gpl()) {
                     QueueLinkJob(); // sotc: SOTC_NB_GPL, the libraries are built off the command processor
                 }
+                SotcStats::pipeline_pending_drops.fetch_add(1, std::memory_order_relaxed); // sotc: the 5 s line
                 return nullptr; // the draws that need it are skipped until it is ready
+            }
+            if (linked_now) {
+                std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
+                last_graphics_pipeline = it->second.get();
+                last_graphics_size = graphics_pipelines.size();
+                g_gpl_counters.linked_served.fetch_add(1, std::memory_order_relaxed);
+                return it->second.get();
+            }
+        }
+        // sotc: SOTC_GPL_NODROP: a depth-only draw is linked when it can be (its optimized build queued at the front
+        // of the shadow lane) instead of the full build below (SOTC_DEPTH_SYNC_PIPE, kept for the rest).
+        if (nodrop && depth_only && NoDropLinkable() && NoDropLink(it.value())) {
+            if (!queued) {
+                QueueAsyncPipeline(pipeline_hash, nullptr, true, false, false, true);
             }
             std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
             last_graphics_pipeline = it->second.get();
@@ -2938,8 +3838,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         {
             const SotcBlockLedger::Scope ledger{SotcBlockLedger::PipeBuild};
             it.value() = std::make_unique<GraphicsPipeline>(
-                instance, scheduler, desc_heap, layout_cache, profile, graphics_key, *pipeline_cache,
-                infos,
+                instance, scheduler, desc_heap, layout_cache, StagesProfile(infos), graphics_key,
+                *pipeline_cache, infos,
                 runtime_infos, fetch_shader, modules, sdata, false);
         }
         // sotc: SOTC_NB_SCHED: a worker that has not started this key's job skips its build.
@@ -2948,11 +3848,29 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
                 f->second->cancelled.store(true, std::memory_order_release);
             }
         }
+        // sotc: SOTC_GPL_NODROP: whether the fast link covers this state (the counters and the reason of the log).
+        const bool linkable =
+            nodrop && GraphicsPipeline::FastLinkable(graphics_key, infos, runtime_infos, StagesProfile(infos));
+        if (nodrop) {
+            g_nodrop.sync_full.fetch_add(1, std::memory_order_relaxed);
+            g_nodrop.sync_full_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - sync_start)
+                                     .count()),
+                std::memory_order_relaxed);
+            if (!linkable) {
+                g_nodrop.sync_full_unlinkable.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         LogSyncPipeline("graphics",
-                        async_workers.empty() ? "async off"
-                        : tiny_draw           ? "tiny draw"
-                        : depth_only          ? "depth only"
+                        async_workers.empty()     ? "async off"
+                        : nodrop && !linkable     ? (tiny_draw    ? "tiny draw, not linkable"
+                                                     : depth_only ? "depth only, not linkable"
+                                                                  : "not linkable")
+                        : tiny_draw               ? "tiny draw"
+                        : depth_only              ? "depth only"
                         : AsyncIneligibleReason() ? AsyncIneligibleReason()
+                        : nodrop                  ? "link refused"
                                                   : "not eligible",
                         sync_start, infos[3] ? infos[3]->pgm_hash : 0, // vertex
                         infos[0] ? infos[0]->pgm_hash : 0);              // fragment
@@ -2983,6 +3901,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
     last_graphics_pipeline = it->second.get();
     last_graphics_size = graphics_pipelines.size();
+    // sotc: SOTC_PIPE_MANIFEST: the pipeline's first full lookup this session: recorded when no manifest holds it.
+    if (manifest && it->second && !it->second->manifest_noted) {
+        it->second->manifest_noted = true;
+        CaptureManifestGraphics();
+    }
     return it->second.get();
 }
 
@@ -2990,6 +3913,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     const ComputePipeline* pipeline = GetComputePipelineLookup();
     if (pipeline) {
+        if (addr_fallback && &pipeline->GetProfile() == &desc_profile) { // sotc: SOTC_ADDR_FALLBACK
+            g_addr_fb.dispatches.fetch_add(1, std::memory_order_relaxed);
+        }
         ++pipeline->use_count;
         if (!pipeline->recent_noted && SotcNonBlocking::LazyPso()) { // sotc: once per pipeline object
             pipeline->recent_noted = true;
@@ -3082,7 +4008,30 @@ void PipelineCache::NoteRecentPipeline(u64 id) {
 
 // sotc: SOTC_PIPE_FAST: the full lookup; GetComputePipelineLookup runs it unless a record applies.
 const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
-    if (!RefreshComputeKey()) {
+    if (SotcPipeManifest::On()) { // sotc: SOTC_PIPE_MANIFEST (see GetGraphicsPipelineLookupSlow)
+        MaybeHoldForManifest();
+    }
+    // sotc: SOTC_ADDR_FALLBACK. The table key first (RefreshComputeKey queues a missing table translation on a worker);
+    // when its stage is pending or its pipeline not ready (AddrTableComputeReady queues it), the dispatch takes the
+    // descriptor-mode stage and pipeline, found or built below as a descriptor-mode run does.
+    addr_fallback_draw = false;
+    if (AddrFallbackComputeOn()) {
+        // Finished table translations are installed here too, or a stretch of dispatches without draws would keep the
+        // descriptor pipeline. As WaitPendingTranslation does: a refused preloaded pipeline may be erased, and the
+        // graphics record may point into a program whose permutations move.
+        if (async_done_count.load(std::memory_order_acquire) != 0) {
+            last_graphics_pipeline = nullptr;
+            pipe_fast_gfx.valid = false;
+            CollectAsyncPipelines();
+        }
+        translation_pending = false;
+        RefreshComputeKey();
+        if (translation_pending || !AddrTableComputeReady()) {
+            addr_fallback_draw = true;
+            translation_pending = false;
+            RefreshComputeKey();
+        }
+    } else if (!RefreshComputeKey()) {
         return nullptr;
     }
     // sotc: SOTC_PIPE_MEMO=1/2: the key of the last lookup and its pipeline. Same key, same map
@@ -3120,7 +4069,8 @@ const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
         {
             const SotcBlockLedger::Scope ledger{SotcBlockLedger::ComputeBuild};
             it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap,
-                                                           layout_cache, profile, *pipeline_cache,
+                                                           layout_cache, StageProfile(infos[0]->variant),
+                                                           *pipeline_cache,
                                                            compute_key, *infos[0],
                                                            modules[0], sdata, false, deferred);
         }
@@ -3155,6 +4105,11 @@ const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
         last_compute_pipeline = result;
         last_compute_key = compute_key;
         last_compute_size = compute_pipelines.size();
+    }
+    // sotc: SOTC_PIPE_MANIFEST: the pipeline's first full lookup this session: recorded when no manifest holds it.
+    if (manifest && result && !result->manifest_noted) {
+        result->manifest_noted = true;
+        CaptureManifestCompute();
     }
     return result;
 }
@@ -3521,6 +4476,11 @@ bool PipelineCache::ComputeFastCheck(PipeFastState& out) {
 void PipelineCache::RecordGraphicsFast(const GraphicsPipeline* pipeline) {
     auto& rec = pipe_fast_gfx;
     rec.valid = false;
+    // sotc: SOTC_ADDR_FALLBACK: a fallback lookup is not recorded, or its hits would keep the descriptor pipeline after
+    // the table one is built (the map size does not move when a queued entry is filled).
+    if (&pipeline->GetProfile() == &desc_profile) {
+        return;
+    }
     const auto& regs = liverpool->regs;
     std::array<std::pair<Shader::HwStage, Shader::SwStage>, 5> list{};
     const size_t count = PipeFastStageList(regs, list);
@@ -3562,6 +4522,9 @@ void PipelineCache::RecordGraphicsFast(const GraphicsPipeline* pipeline) {
 void PipelineCache::RecordComputeFast(const ComputePipeline* pipeline) {
     auto& rec = pipe_fast_cs;
     rec.valid = false;
+    if (&pipeline->GetProfile() == &desc_profile) { // sotc: SOTC_ADDR_FALLBACK, as RecordGraphicsFast
+        return;
+    }
     const auto params = AmdGpu::GetParams(liverpool->GetCsRegs());
     const auto it = program_cache.find(params.hash);
     if (it == program_cache.end() || infos[0] != &it.value()->info) {
@@ -3860,8 +4823,10 @@ bool PipelineCache::RefreshGraphicsStages() {
     // addresses cannot share the push bytes (the packet is 56..128), and a bindless stage never takes addresses
     // (ShaderAddrBuffer), so the stages that would have slot words take descriptors instead and their buffers can be
     // addressed. Without the switch this is the default, as before.
-    const u8 non_heap_variant =
-        profile.shader_addr != 0 ? Shader::StageVariantPlain : Shader::StageVariantDefault;
+    // sotc: SOTC_ADDR_FALLBACK: a fallback lookup binds the descriptor-mode stages (default variant, no heap stage).
+    const u8 non_heap_variant = profile.shader_addr != 0 && !addr_fallback_draw ? Shader::StageVariantPlain
+                                                                                : Shader::StageVariantDefault;
+    const bool heap_on = profile.heap_images && profile.support_int64 && !addr_fallback_draw;
     u8 fragment_variant = non_heap_variant;
     u8 other_variant = non_heap_variant;
     // sotc: SOTC_HEAP_VS: the vertex stage's variant (bind_vertex below). Equal to other_variant with the switch off.
@@ -3931,7 +4896,7 @@ bool PipelineCache::RefreshGraphicsStages() {
     // recompiler's static rules and the host's (Heap::StageRefused), and then the other stages are plain. A refused
     // fragment is bound again as today, and the pipeline keeps the bindless path of its other stages.
     const auto binding_before_fragment = binding;
-    if (profile.heap_images && profile.support_int64) {
+    if (heap_on) {
         fragment_variant = Shader::StageVariantHeap;
         bind_stage(HwStage::Fragment, SwStage::Fragment);
         const auto* heap_fs = infos[static_cast<u32>(SwStage::Fragment)];
@@ -3959,7 +4924,7 @@ bool PipelineCache::RefreshGraphicsStages() {
     // with a heap fragment they are plain already; without one, the fragment is bound again as plain when it is the
     // only stage before the vertex, and a hull or eval stage with slot words refuses the vertex. The stages bound after
     // the vertex take the plain variant once it is heap. Switch off: the vertex is bound as the others, as before.
-    const bool heap_vs_on = profile.heap_images != 0 && profile.support_int64 && SotcArch::Heap::VertexOn();
+    const bool heap_vs_on = heap_on && SotcArch::Heap::VertexOn();
     const auto bind_vertex = [&](HwStage stage_in, bool fragment_only_before) -> bool {
         if (!heap_vs_on) {
             vertex_variant = other_variant;
@@ -4112,7 +5077,10 @@ bool PipelineCache::RefreshComputeKey() {
     // sotc: SOTC_HEAP: the compute stage is the heap stage when it qualifies (see RefreshGraphicsStages); otherwise
     // it is compiled as today.
     bool compute_bound = false;
-    if (profile.heap_images && profile.support_int64) {
+    // sotc: SOTC_ADDR_FALLBACK: the table pass queues a missing translation on a worker (the dispatch then takes the
+    // descriptor-mode stage, translated as a descriptor-mode run translates it); the fallback pass binds that stage.
+    const bool table_async = AddrFallbackComputeOn() && !addr_fallback_draw;
+    if (profile.heap_images && profile.support_int64 && !addr_fallback_draw) {
         auto heap_params = cs_params;
         heap_params.variant = Shader::StageVariantHeap;
         heap_params.guest_hash = cs_params.hash;
@@ -4120,7 +5088,7 @@ bool PipelineCache::RefreshComputeKey() {
         // sotc: a candidate refused before (heap_refused) is not translated again.
         if (!heap_refused.contains(heap_params.hash)) {
             std::tie(infos[0], modules[0], compute_key.value) =
-                GetProgram(HwStage::Compute, SwStage::Compute, heap_params, binding);
+                GetProgram(HwStage::Compute, SwStage::Compute, heap_params, binding, table_async);
             // A refused candidate is compiled again as today; a pending one answers on a later call.
             compute_bound = !infos[0] || !SotcArch::Heap::StageRefused(*infos[0]);
             if (!compute_bound) {
@@ -4133,13 +5101,13 @@ bool PipelineCache::RefreshComputeKey() {
         // sotc: SOTC_SHADER_ADDR: without the heap the compute stage is plain, as the graphics stages are (see
         // RefreshGraphicsStages). Its variant is mixed into the hash like the heap variant above.
         auto plain_params = cs_params;
-        if (profile.shader_addr != 0) {
+        if (profile.shader_addr != 0 && !addr_fallback_draw) {
             plain_params.variant = Shader::StageVariantPlain;
             plain_params.guest_hash = cs_params.hash;
             plain_params.hash = HashCombine(cs_params.hash, plain_params.variant);
         }
         std::tie(infos[0], modules[0], compute_key.value) =
-            GetProgram(HwStage::Compute, SwStage::Compute, plain_params, binding);
+            GetProgram(HwStage::Compute, SwStage::Compute, plain_params, binding, table_async);
         if (!pre_compute_pred.empty()) {
             NoteComputeDispatch(cs_pgm, cs_params.hash); // sotc: SOTC_PRETRANSLATE_COMPUTE (verify, once)
         }
@@ -4182,9 +5150,10 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         }
     };
     const auto ir_program = Shader::TranslateProgram(code, worker_pools ? *worker_pools : pools,
-                                                     info, runtime_info, profile);
+                                                     info, runtime_info, StageProfile(info.variant));
     phase(0);
-    auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    // sotc: SOTC_ADDR_FALLBACK: a default-variant stage of table mode is translated as descriptor mode translates it.
+    auto spv = Shader::Backend::SPIRV::EmitSPIRV(StageProfile(info.variant), runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
     phase(1);
 
@@ -4776,6 +5745,13 @@ void PipelineCache::FeedPretranslate() {
     if (pre_backlog.empty() || pre_in_flight >= limit) {
         return;
     }
+    // sotc: SOTC_GPL_PREDICT: during play a pack translation waits while library jobs are queued or running (they are
+    // for programs a material named; PredictLibraries feeds the backlog again once they are done).
+    if (SotcNonBlocking::GplPredict() && !pre_holding && !SotcPretranslate::Precompile() &&
+        lib_jobs_pending.load(std::memory_order_relaxed) != 0) {
+        g_nodrop.pre_deferred.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     {
         std::scoped_lock lock{async_mutex};
         while (!pre_backlog.empty() && pre_in_flight < limit) {
@@ -4885,7 +5861,8 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
     // The ComputePipeline is made on the command processor (its layouts and the heap state are CP-only); a worker
     // builds it (Build). Ordinary pipeline: SerializationSupport, RegisterPipelineData, the same as a draw's.
     ComputePipeline::SerializationSupport sdata{};
-    auto pipe = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache, profile,
+    auto pipe = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache,
+                                                  StageProfile(program->info.variant),
                                                   *pipeline_cache, key, program->info, program->modules[0].module,
                                                   sdata, false, true);
     ComputePipeline* raw = pipe.get();
@@ -4939,6 +5916,239 @@ void PipelineCache::NoteComputeDispatch(const AmdGpu::ComputeProgram& cs, u64 ha
                      real[1], nx, ny, nz, p.raw[0], p.raw[1], p.raw[2], p.raw[3], p.raw[4], p.raw[5], p.raw[6],
                      p.raw[7]);
     }
+}
+
+namespace {
+// sotc: SOTC_GPL_PACK_LIBS. sotc_pack_libraries.bin in the versioned cache folder (so a shader cache version change
+// voids it): a header with the driver identity, then the ids (PackLibraryId) of the stage libraries whose compiled code
+// the saved driver cache holds. Bump kPackLibVersion when the library create infos change.
+constexpr u32 kPackLibMagic = 0x42494C50; // "PLIB"
+constexpr u32 kPackLibVersion = 1;
+struct PackLibHeader {
+    u32 magic{kPackLibMagic};
+    u32 version{kPackLibVersion};
+    u32 vendor{};
+    u32 device{};
+    u32 driver{};
+    u32 dyn_bits{};
+    std::array<u8, VK_UUID_SIZE> uuid{};
+    u64 count{};
+};
+std::filesystem::path PackLibListPath() {
+    return Storage::DataBase::Instance().CachePath() / "sotc_pack_libraries.bin";
+}
+PackLibHeader PackLibIdentity(const Instance& instance) {
+    PackLibHeader h;
+    h.vendor = instance.GetVendorID();
+    h.device = instance.GetDeviceID();
+    h.driver = instance.GetDriverVersion();
+    const auto& kd = instance.KeyDynamic();
+    h.dyn_bits = u32{kd.topology} | (u32{kd.polygon_mode} << 1) | (u32{kd.depth_clamp} << 2) |
+                 (u32{kd.depth_clip} << 3) | (u32{kd.provoking} << 4) | (u32{kd.clip_negative} << 5) |
+                 (u32{kd.samples} << 6) | (u32{instance.IsDescriptorBufferEnabled()} << 7);
+    const auto& uuid = instance.GetPipelineCacheUUID();
+    std::copy(uuid.begin(), uuid.end(), h.uuid.begin());
+    return h;
+}
+} // namespace
+
+void PipelineCache::BuildPackLibraries() {
+    using Clock = std::chrono::steady_clock;
+    using L = GplLibraryCache;
+    if (!SotcNonBlocking::GplPackLibs() || !DriverCacheEnabled() || async_workers.empty() ||
+        instance.IsDescriptorHeapEnabled() || !instance.IsVertexInputDynamicState() ||
+        EmulatorSettings.IsShaderCollect()) {
+        return;
+    }
+    const auto start = Clock::now();
+    const uint64_t private_start = SotcPipeManifest::ProcessPrivateBytes();
+    // The list is trusted only with the driver cache it describes (loaded and accepted at startup) and the same driver.
+    const PackLibHeader identity = PackLibIdentity(instance);
+    std::unordered_set<u64> listed;
+    bool list_void = !driver_cache_loaded;
+    if (!list_void) {
+        if (std::FILE* f = _wfopen(PackLibListPath().c_str(), L"rb")) {
+            PackLibHeader h;
+            if (std::fread(&h, sizeof h, 1, f) == 1 && h.magic == identity.magic && h.version == identity.version &&
+                h.vendor == identity.vendor && h.device == identity.device && h.driver == identity.driver &&
+                h.dyn_bits == identity.dyn_bits && h.uuid == identity.uuid) {
+                std::vector<u64> ids(static_cast<size_t>(std::min<u64>(h.count, u64{1} << 22)));
+                if (!ids.empty() && std::fread(ids.data(), sizeof(u64), ids.size(), f) == ids.size()) {
+                    listed.insert(ids.begin(), ids.end());
+                }
+            } else {
+                list_void = true;
+            }
+            std::fclose(f);
+        }
+    }
+    // A partner per stage variant for the other stage of each job: a vertex and a pixel program that a per-shader link
+    // can take (no bindless samplers). Its own libraries are only looked up.
+    struct Partner {
+        Program* program{};
+        size_t perm{};
+    };
+    std::unordered_map<u32, std::array<Partner, 2>> partners; // variant -> {vertex, pixel}
+    const auto usable = [](const Program& p, size_t& perm) {
+        // Hardware VS and PS only: an export/local vertex stage is linked with geometry or tessellation stages, which a
+        // pack job does not have (its library would never match a draw's).
+        const bool vs = p.info.sw_stage == Shader::SwStage::Vertex && p.info.hw_stage == Shader::HwStage::Vertex;
+        const bool ps = p.info.sw_stage == Shader::SwStage::Fragment && p.info.hw_stage == Shader::HwStage::Fragment;
+        if ((!vs && !ps) || Shader::UsesBindlessSamplers(p.info)) {
+            return false;
+        }
+        for (size_t i = 0; i < p.modules.size(); ++i) {
+            if (p.modules[i].module) {
+                perm = i;
+                return true;
+            }
+        }
+        return false;
+    };
+    for (auto it = program_cache.begin(); it != program_cache.end(); ++it) {
+        Program& p = *it.value();
+        size_t perm = 0;
+        if (!usable(p, perm)) {
+            continue;
+        }
+        auto& slot = partners[u32{p.info.variant}][p.info.sw_stage == Shader::SwStage::Vertex ? 0 : 1];
+        if (!slot.program) {
+            slot = Partner{&p, perm};
+        }
+    }
+    const GraphicsPipelineKey rest = DefaultLibraryRest();
+    u64 queued = 0, skipped = 0, no_partner = 0, unlinkable = 0, queued_vs = 0;
+    {
+        std::scoped_lock lock{pack_mutex};
+        pack_compiled.clear();
+    }
+    pack_failed.store(0, std::memory_order_relaxed);
+    const u32 pending_before = lib_jobs_pending.load(std::memory_order_relaxed);
+    for (auto it = program_cache.begin(); it != program_cache.end(); ++it) {
+        Program& p = *it.value();
+        size_t first = 0;
+        if (!usable(p, first)) {
+            continue;
+        }
+        const bool vertex = p.info.sw_stage == Shader::SwStage::Vertex;
+        const auto found = partners.find(u32{p.info.variant});
+        const Partner* partner = found == partners.end() ? nullptr : &found->second[vertex ? 1 : 0];
+        for (size_t perm = 0; perm < p.modules.size(); ++perm) {
+            if (!p.modules[perm].module) {
+                continue;
+            }
+            const u32 part = vertex ? L::PreRaster : L::Fragment;
+            const u64 id = PackLibraryId(p.info.CacheHash(), perm, part);
+            if (listed.contains(id)) {
+                ++skipped;
+                continue;
+            }
+            if (!partner || !partner->program) {
+                ++no_partner;
+                continue;
+            }
+            auto job = vertex ? MakeStageLibraryJob(rest, p, perm, *partner->program, partner->perm, 1u << part,
+                                                    L::OriginPack)
+                              : MakeStageLibraryJob(rest, *partner->program, partner->perm, p, perm, 1u << part,
+                                                    L::OriginPack);
+            if (!job) {
+                ++unlinkable;
+                continue;
+            }
+            job->pack_id = id;
+            ++queued;
+            queued_vs += vertex;
+            lib_jobs_pending.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::scoped_lock lock{async_mutex};
+                PushJobLocked(JobLane::Predict, std::move(job));
+            }
+        }
+    }
+    async_cv.notify_all();
+    // The loading screen stays up until every job ran (they hold the modules the eviction destroys).
+    SotcStats::prep_total.store(static_cast<u32>(queued), std::memory_order_relaxed);
+    auto last_log = start;
+    while (lib_jobs_pending.load(std::memory_order_relaxed) > pending_before &&
+           Clock::now() - start < std::chrono::minutes{30}) {
+        if (async_done_count.load(std::memory_order_acquire) != 0) {
+            CollectAsyncPipelines();
+        }
+        const u64 left = lib_jobs_pending.load(std::memory_order_relaxed) - pending_before;
+        SotcStats::prep_done.store(static_cast<u32>(queued - std::min<u64>(queued, left)), std::memory_order_relaxed);
+        if (Clock::now() - last_log > std::chrono::seconds{5}) {
+            last_log = Clock::now();
+            std::fprintf(stderr, "SOTC GPL PACK LIBS: compiling %.1f s, %llu of %llu left\n",
+                         std::chrono::duration<double>(last_log - start).count(), static_cast<unsigned long long>(left),
+                         static_cast<unsigned long long>(queued));
+        }
+        std::unique_lock lock{async_mutex};
+        translate_done_cv.wait_for(lock, std::chrono::milliseconds{20},
+                                   [this] { return async_done_count.load(std::memory_order_relaxed) != 0; });
+    }
+    if (async_done_count.load(std::memory_order_acquire) != 0) {
+        CollectAsyncPipelines();
+    }
+    const auto compiled_end = Clock::now();
+    std::vector<u64> compiled;
+    {
+        std::scoped_lock lock{pack_mutex};
+        compiled.swap(pack_compiled);
+    }
+    // The driver cache is written now (synchronously: the list may only name code the file holds), then the list.
+    bool list_written = false;
+    size_t cache_kb = saved_driver_cache_size >> 10;
+    if (!compiled.empty() || (list_void && !listed.empty())) {
+        // The size with every pack library in it; a save from here on holds them (other pipelines built meanwhile
+        // only make it larger).
+        size_t size = 0;
+        const bool sized = instance.GetDevice().getPipelineCacheData(*pipeline_cache, &size, nullptr) ==
+                           vk::Result::eSuccess;
+        SaveDriverCache(true);
+        const bool saved = sized && size != 0 && saved_driver_cache_size >= size;
+        cache_kb = saved_driver_cache_size >> 10;
+        if (saved) {
+            if (list_void) {
+                listed.clear();
+            }
+            listed.insert(compiled.begin(), compiled.end());
+            PackLibHeader h = identity;
+            h.count = listed.size();
+            std::vector<u64> ids(listed.begin(), listed.end());
+            const auto path = PackLibListPath();
+            auto tmp = path;
+            tmp += ".tmp";
+            if (std::FILE* f = _wfopen(tmp.c_str(), L"wb")) {
+                const bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
+                                (ids.empty() || std::fwrite(ids.data(), sizeof(u64), ids.size(), f) == ids.size());
+                std::fclose(f);
+                std::error_code ec;
+                if (ok) {
+                    std::filesystem::rename(tmp, path, ec);
+                    list_written = !ec;
+                } else {
+                    std::filesystem::remove(tmp, ec);
+                }
+            }
+        }
+    }
+    const uint64_t private_end = SotcPipeManifest::ProcessPrivateBytes();
+    std::fprintf(stderr,
+                 "SOTC GPL PACK LIBS: %llu stage libraries compiled into the driver cache (vertex %llu, pixel %llu) in "
+                 "%.1f s, failed %llu; already compiled (listed) %llu%s; skipped: no partner %llu, not linkable %llu; "
+                 "kept in memory 0 (destroyed after compile, made again from the cache when their area loads); driver "
+                 "cache %zu MB, list %s; process private %.0f MB (%+.0f MB); total %.1f s\n",
+                 static_cast<unsigned long long>(compiled.size()),
+                 static_cast<unsigned long long>(queued_vs), static_cast<unsigned long long>(queued - queued_vs),
+                 std::chrono::duration<double>(compiled_end - start).count(),
+                 static_cast<unsigned long long>(pack_failed.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(skipped),
+                 list_void ? " (no valid list: driver cache missing, rejected or another driver)" : "",
+                 static_cast<unsigned long long>(no_partner), static_cast<unsigned long long>(unlinkable),
+                 cache_kb >> 10, list_written ? "written" : "unchanged",
+                 static_cast<double>(private_end) / 1048576.0,
+                 (static_cast<double>(private_end) - static_cast<double>(private_start)) / 1048576.0,
+                 std::chrono::duration<double>(Clock::now() - start).count());
 }
 
 void PipelineCache::MaybeHoldForPretranslate() {
@@ -5000,6 +6210,9 @@ void PipelineCache::MaybeHoldForPretranslate() {
     if (SotcNonBlocking::Gpl()) {
         BuildTinyLibraries();
     }
+    // sotc: SOTC_GPL_PACK_LIBS: the stage libraries of every translated program, compiled into the driver cache while
+    // the screen is still up and the modules are resident (the eviction below destroys them).
+    BuildPackLibraries();
     pre_holding = false;
     PrePackFinish(); // the variants of the hold, in one file; read back for their first draws
     // sotc: the driver's pipelines of the hold are written now, not at the 60 s timer. SOTC_NB_IO: by the saver
@@ -5014,7 +6227,14 @@ void PipelineCache::MaybeHoldForPretranslate() {
     // The programs no draw used yet leave memory: their modules are destroyed and they go back to the index on disk,
     // so this session runs as the next ones (LoadLazyProgram at the first draw). With ~19,000 programs and their
     // modules resident, every thread of the port ran ~40% slower.
-    {
+    // sotc: SOTC_GPL_PREDICT: a library job holds pointers to its programs' Info and modules, so none may be queued or
+    // running across the eviction (the command processor queues none while it holds here); after 30 s, no eviction.
+    const auto lib_wait_start = Clock::now();
+    while (lib_jobs_pending.load(std::memory_order_relaxed) != 0 &&
+           Clock::now() - lib_wait_start < std::chrono::seconds{30}) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    if (lib_jobs_pending.load(std::memory_order_relaxed) == 0) {
         size_t evicted = 0;
         for (auto it = program_cache.begin(); it != program_cache.end();) {
             Program& program = *it.value();
@@ -5557,7 +6777,8 @@ void ReportPipeGpl(std::string& out, double seconds) {
         const char* v = std::getenv("SOTC_PIPE_GPL");
         return v && v[0] == '1';
     }();
-    if (!enabled) {
+    // sotc: SOTC_GPL_NODROP prints this line and its own (below) too.
+    if (!enabled && !SotcNonBlocking::GplNoDrop()) {
         return;
     }
     using L = GplLibraryCache;
@@ -5567,6 +6788,97 @@ void ReportPipeGpl(std::string& out, double seconds) {
         prev = now;
         return d;
     };
+    // sotc: SOTC_GPL_NODROP, same window. Printed when a draw found no built pipeline or a boot library job ran.
+    if (SotcNonBlocking::GplNoDrop()) {
+        static u64 p_links{}, p_lib_draws{}, p_libs{}, p_lib_ns{}, p_refused{}, p_full{}, p_full_ns{}, p_full_unl{},
+            p_xlate{}, p_xlate_ns{}, p_drop_x{}, p_drops{}, p_repl{}, p_served{}, p_boot_q{}, p_boot_d{};
+        const u64 links = take(g_nodrop.links, p_links);
+        const u64 lib_draws = take(g_nodrop.sync_lib_draws, p_lib_draws);
+        const u64 libs = take(g_nodrop.sync_libs, p_libs);
+        const u64 lib_ns = take(g_nodrop.sync_lib_ns, p_lib_ns);
+        const u64 refused = take(g_nodrop.link_refused, p_refused);
+        const u64 full = take(g_nodrop.sync_full, p_full);
+        const u64 full_ns = take(g_nodrop.sync_full_ns, p_full_ns);
+        const u64 full_unl = take(g_nodrop.sync_full_unlinkable, p_full_unl);
+        const u64 xlate = take(g_nodrop.sync_xlate, p_xlate);
+        const u64 xlate_ns = take(g_nodrop.sync_xlate_ns, p_xlate_ns);
+        const u64 drop_x = take(g_nodrop.drop_translate, p_drop_x);
+        // Drops at the pending-pipeline sites (expected 0 with the switch on), on top of the translation ones.
+        const u64 drops = take(SotcStats::pipeline_pending_drops, p_drops);
+        // The pipe gpl line below takes its own deltas of these two (its own previous values).
+        const u64 repl = take(g_gpl_counters.replaced, p_repl);
+        const u64 served = take(g_gpl_counters.linked_served, p_served);
+        const u64 boot_q = take(g_nodrop.boot_libs_queued, p_boot_q);
+        const u64 boot_d = take(g_nodrop.boot_libs_done, p_boot_d);
+        // sotc: SOTC_GPL_PREDICT / SOTC_GPL_PARALLEL_LIBS / pack translation deltas of the same window; the predicted
+        // library totals (built, used by a draw, never used so far) are since the start.
+        static u64 p_pslots{}, p_pjobs{}, p_pnotpl{}, p_pnoprog{}, p_ppack{}, p_pprom{}, p_pdrop{}, p_pdefer{}, p_pwait{},
+            p_pwait_ns{}, p_ptaken{}, p_urgent{};
+        const u64 pslots = take(g_nodrop.pred_slots, p_pslots);
+        const u64 pjobs = take(g_nodrop.pred_jobs, p_pjobs);
+        const u64 pnotpl = take(g_nodrop.pred_no_template, p_pnotpl);
+        const u64 pnoprog = take(g_nodrop.pred_no_program, p_pnoprog);
+        const u64 ppack = take(g_nodrop.pred_pack_loads, p_ppack);
+        const u64 pprom = take(g_nodrop.pred_promoted, p_pprom);
+        const u64 pdrop = take(g_nodrop.pred_dropped, p_pdrop);
+        const u64 pdefer = take(g_nodrop.pre_deferred, p_pdefer);
+        const u64 pwait = take(g_nodrop.par_waits, p_pwait);
+        const u64 pwait_ns = take(g_nodrop.par_wait_ns, p_pwait_ns);
+        const u64 ptaken = take(g_nodrop.par_taken, p_ptaken);
+        const u64 urgent = take(g_gpl_counters.urgent_built, p_urgent);
+        const u64 pbuilt = g_gpl_counters.predicted_built.load(std::memory_order_relaxed);
+        const u64 pused = g_gpl_counters.predicted_used.load(std::memory_order_relaxed);
+        if (links != 0 || full != 0 || xlate != 0 || drop_x != 0 || drops != 0 || repl != 0 || served != 0 ||
+            boot_d != 0 || refused != 0 || pslots != 0 || pjobs != 0 || pwait != 0 || pdefer != 0) {
+            char nline[1400];
+            std::snprintf(
+                nline, sizeof(nline),
+                "SOTC gpl nodrop: linked draws %llu (new links %llu, refused %llu), sync stage libraries %llu in %llu "
+                "draws (%.1f ms), sync full builds %llu (%.1f ms; not linkable %llu), sync translations %llu "
+                "(%.1f ms), linked->optimized %llu, drops %llu (translation pending %llu, pipeline pending %llu); "
+                "boot library jobs %llu/%llu; parallel library waits %llu (%.1f ms, libraries %llu, jobs run by the "
+                "command processor %llu); predicted: material slots %llu, library jobs queued %llu, libraries built "
+                "%llu / used by a draw %llu / never used %llu (since start), waiting %llu (no pass state %llu, program "
+                "not loaded %llu, pack loads %llu, pack translations moved up %llu), given up %llu; pack translations "
+                "deferred %llu; process private %.0f MB\n",
+                static_cast<unsigned long long>(served), static_cast<unsigned long long>(links),
+                static_cast<unsigned long long>(refused), static_cast<unsigned long long>(libs),
+                static_cast<unsigned long long>(lib_draws), static_cast<double>(lib_ns) / 1e6,
+                static_cast<unsigned long long>(full), static_cast<double>(full_ns) / 1e6,
+                static_cast<unsigned long long>(full_unl), static_cast<unsigned long long>(xlate),
+                static_cast<double>(xlate_ns) / 1e6, static_cast<unsigned long long>(repl),
+                static_cast<unsigned long long>(drop_x + drops), static_cast<unsigned long long>(drop_x),
+                static_cast<unsigned long long>(drops), static_cast<unsigned long long>(boot_d),
+                static_cast<unsigned long long>(boot_q), static_cast<unsigned long long>(pwait),
+                static_cast<double>(pwait_ns) / 1e6, static_cast<unsigned long long>(urgent),
+                static_cast<unsigned long long>(ptaken), static_cast<unsigned long long>(pslots),
+                static_cast<unsigned long long>(pjobs), static_cast<unsigned long long>(pbuilt),
+                static_cast<unsigned long long>(pused),
+                static_cast<unsigned long long>(pbuilt > pused ? pbuilt - pused : 0),
+                static_cast<unsigned long long>(g_nodrop.pred_waiting.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(pnotpl), static_cast<unsigned long long>(pnoprog),
+                static_cast<unsigned long long>(ppack), static_cast<unsigned long long>(pprom),
+                static_cast<unsigned long long>(pdrop), static_cast<unsigned long long>(pdefer),
+                static_cast<double>(SotcPipeManifest::ProcessPrivateBytes()) / 1048576.0);
+            out += nline;
+            // sotc: SOTC_GPL_DYN_STATE / SOTC_GPL_PACK_LIBS: the libraries built before any draw (boot manifest,
+            // predicted materials) and how many a draw's link found, the pack libraries compiled for the driver cache
+            // (destroyed), the libraries held now, and the command processor's library waits of this window (target 0).
+            const size_t held = static_cast<size_t>(g_gpl_counters.held.load(std::memory_order_relaxed));
+            char lline[512];
+            std::snprintf(lline, sizeof(lline),
+                          "SOTC gpl libraries: shader-only keys %s; built ahead of draws %llu, used by a draw %llu "
+                          "(since start); pack compiled for the driver cache %llu; held %zu; command processor "
+                          "library waits %llu (%.1f ms), stage libraries built for a draw %llu (%.1f ms)\n",
+                          SotcNonBlocking::GplShaderKeys() ? "on" : "off",
+                          static_cast<unsigned long long>(g_gpl_counters.prebuilt_built.load(std::memory_order_relaxed)),
+                          static_cast<unsigned long long>(g_gpl_counters.prebuilt_used.load(std::memory_order_relaxed)),
+                          static_cast<unsigned long long>(g_gpl_counters.pack_discarded.load(std::memory_order_relaxed)),
+                          held, static_cast<unsigned long long>(pwait), static_cast<double>(pwait_ns) / 1e6,
+                          static_cast<unsigned long long>(libs), static_cast<double>(lib_ns) / 1e6);
+            out += lline;
+        }
+    }
     static u64 p_cold{}, p_unlink{}, p_served{}, p_links{}, p_failed{}, p_link_ns{}, p_repl{};
     static u64 p_built[L::NumParts]{}, p_reused[L::NumParts]{};
     const u64 cold = take(g_gpl_counters.cold_misses, p_cold);
@@ -5677,6 +6989,930 @@ void ReportN5Pso(std::string& out, double seconds) {
         seconds > 0.0 ? static_cast<double>(window_total) / seconds : 0.0,
         static_cast<double>(window_ns) / 1e6, static_cast<double>(max_ns) / 1e6,
         static_cast<unsigned long long>(window_grace));
+    out += line;
+}
+
+
+// sotc: SOTC_PIPE_MANIFEST (gpu/sotc/pipe_manifest.h). The steps below run on the command processor, at the start of
+// a full lookup (never in the middle of one: they install programs and permutations).
+namespace {
+// The permutation of program whose specialization equals the draw's (spec), as GetProgram finds it.
+std::optional<u32> ManifestFindPerm(const Program& program, Shader::StageSpecialization& spec) {
+    spec.info = &program.info;
+    for (size_t p = 0; p < program.modules.size(); ++p) {
+        if (program.modules[p].module && program.modules[p].spec == spec) {
+            return static_cast<u32>(p);
+        }
+    }
+    return std::nullopt;
+}
+
+bool ManifestStageSupported(const Shader::RuntimeInfo& rt) {
+    return (rt.hw_stage == Shader::HwStage::Fragment && rt.sw_stage == Shader::SwStage::Fragment) ||
+           (rt.hw_stage == Shader::HwStage::Vertex && rt.sw_stage == Shader::SwStage::Vertex) ||
+           (rt.hw_stage == Shader::HwStage::Compute && rt.sw_stage == Shader::SwStage::Compute);
+}
+
+std::vector<u8> ManifestSpecBytes(const Shader::StageSpecialization& spec) {
+    Serialization::Archive ar;
+    spec.Serialize(ar);
+    return ar.TakeOff();
+}
+
+// Words of one fetch-attribute table segment (dword offsets are u8; a V# is 4 dwords).
+constexpr size_t kManifestUdSegment = 260;
+} // namespace
+
+SotcPipeManifest::Header PipelineCache::ManifestHeader() const {
+    SotcPipeManifest::Header h;
+    h.game = std::string{Common::ElfInfo::Instance().GameSerial()};
+    h.variant = cache_variant_key;
+    h.key_size = static_cast<u32>(sizeof(GraphicsPipelineKey));
+    h.rt_size = static_cast<u32>(sizeof(Shader::RuntimeInfo));
+    h.meta_version = SotcShaderMetaVersion();
+    return h;
+}
+
+void PipelineCache::LoadManifest() {
+    using Clock = std::chrono::steady_clock;
+    manifest = std::make_unique<ManifestState>();
+    auto& m = *manifest;
+    m.header = ManifestHeader();
+    m.loaded = m.last_pump = Clock::now();
+    if (!Common::ElfInfo::Instance().IsSotc() || async_workers.empty() || !Storage::DataBase::Instance().IsOpened()) {
+        std::fprintf(stderr, "SOTC PIPE MANIFEST: off (%s)\n",
+                     !Common::ElfInfo::Instance().IsSotc() ? "not the game's eboot"
+                     : async_workers.empty()               ? "no pipeline workers"
+                                                           : "no shader cache");
+        m.hold_done = true;
+        g_manifest_stats.boot_done.store(true, std::memory_order_relaxed);
+        return;
+    }
+    std::string log;
+    auto data = SotcPipeManifest::Load(m.header, log);
+    std::fputs(log.c_str(), stderr);
+    SotcPipeManifest::LoadSkips(m.header.variant);
+    std::unordered_map<u64, u32> index_of;
+    u32 unreadable = 0;
+    const bool throws = Common::g_assert_throws;
+    Common::g_assert_throws = true;
+    for (auto& rec : data.stages) {
+        ManifestState::StageRt st;
+        try {
+            Serialization::Archive ar{std::vector<u8>(rec.spec)};
+            if (!st.spec.Deserialize(ar)) {
+                ++unreadable;
+                continue;
+            }
+        } catch (const Serialization::CorruptedData&) {
+            ++unreadable;
+            continue;
+        } catch (const Common::AssertFailure&) {
+            ++unreadable;
+            continue;
+        }
+        // sotc: SOTC_STAGE_BINDINGS (on with SOTC_GPL_NODROP): every stage numbers its descriptors from 0 in its own
+        // set, so a draw's start binding is 0 where a record made without the switch holds the count of the stages
+        // bound before (the pixel stage's resources, for a vertex stage). That count is the only part of a
+        // specialization the switch changes (the buffer slot count is shared by the stages either way): the record
+        // is read as the draw makes it now. Its id stays the recorded one; a capture of the same stage under the
+        // switch has another id and is appended once.
+        if (profile.stage_bindings && st.spec.start.unified != 0) {
+            st.spec.start.unified = 0;
+            ++m.start_rebased;
+        }
+        st.hint = std::make_shared<const SotcPretranslate::Hint>(rec.hint);
+        st.cache_hash = rec.variant == Shader::StageVariantDefault ? rec.hash : HashCombine(rec.hash, u64{rec.variant});
+        st.late = SotcPipeManifest::Skipped(rec.id, SotcPipeManifest::SkipKind::Late);
+        st.rec = std::move(rec);
+        index_of.emplace(st.rec.id, static_cast<u32>(m.stages.size()));
+        m.stages.push_back(std::move(st));
+    }
+    Common::g_assert_throws = throws;
+    u32 graphics = 0, compute = 0;
+    for (const auto& rec : data.pipes) {
+        ManifestState::PipeRt p;
+        p.compute = rec.compute;
+        bool ok = true;
+        for (const auto& [slot, id] : rec.stages) {
+            const auto it = index_of.find(id);
+            if (it == index_of.end() || slot >= MaxShaderStages) {
+                ok = false;
+                break;
+            }
+            p.stages.emplace_back(slot, it->second);
+        }
+        if (!ok) {
+            continue;
+        }
+        if (!p.compute) {
+            std::memcpy(&p.key, rec.key.data(), sizeof(p.key));
+            p.key.stage_hashes = {};
+        }
+        (p.compute ? compute : graphics)++;
+        m.pipes.push_back(std::move(p));
+    }
+    // sotc: SOTC_GPL_PREDICT: the manifest's VS+PS pipelines give the most common pre-rasterization and fragment
+    // states before any draw (the predicted library jobs of a pass whose draws gave no key yet).
+    if (SotcNonBlocking::GplPredict()) {
+        if (!lib_predict) {
+            lib_predict = std::make_shared<LibPredictState>();
+        }
+        for (const auto& p : m.pipes) {
+            const bool vs_ps = !p.compute && p.stages.size() == 2 &&
+                               std::ranges::all_of(p.stages, [](const auto& st) {
+                                   return st.first == u32(Shader::SwStage::Vertex) ||
+                                          st.first == u32(Shader::SwStage::Fragment);
+                               });
+            if (vs_ps) {
+                lib_predict->Note(p.key);
+            }
+        }
+    }
+    std::vector<u64> wanted;
+    wanted.reserve(m.stages.size());
+    for (const auto& st : m.stages) {
+        wanted.push_back(st.rec.hash);
+    }
+    SotcPipeManifest::SetWanted(wanted);
+    std::fprintf(stderr,
+                 "SOTC PIPE MANIFEST: %zu pipelines (%u graphics, %u compute), %zu stages; shipped %zu, user %zu; "
+                 "unreadable stages %u%s; start bindings rebased for the stage sets %u\n",
+                 m.pipes.size(), graphics, compute, m.stages.size(), data.shipped_pipes, data.user_pipes, unreadable,
+                 data.variant_differs ? "; recorded under another shader cache variant (accepted)" : "",
+                 m.start_rebased);
+    if (m.pipes.empty()) {
+        m.hold_done = true;
+        g_manifest_stats.boot_done.store(true, std::memory_order_relaxed);
+        SotcPipeManifest::SetWanted({});
+        SotcPipeManifest::DropCode();
+    }
+}
+
+void PipelineCache::ManifestUserData(AsyncPipelineJob::Translate& t) {
+    if (!t.manifest_fetch || !t.manifest_hint) {
+        return;
+    }
+    // One table segment per SGPR pair that holds a V# table pointer; each V# at its dword offset, synthetic but for the
+    // fields its draw had (as the resource pass builds a buffer's synthetic sharp).
+    std::array<s32, Shader::ShaderParams::NumShaderUserData> segment{};
+    segment.fill(-1);
+    s32 segments = 0;
+    for (const auto& attrib : t.manifest_fetch->attributes) {
+        if (attrib.sgpr_base + 1u < segment.size() && segment[attrib.sgpr_base] < 0) {
+            segment[attrib.sgpr_base] = segments++;
+        }
+    }
+    t.manifest_ud_table.assign(static_cast<size_t>(segments) * kManifestUdSegment, 0u);
+    for (const auto& h : t.manifest_hint->attribs) {
+        const u32 sgpr = static_cast<u32>(h.key >> 8), dword = static_cast<u32>(h.key & 0xFF);
+        if (sgpr >= segment.size() || segment[sgpr] < 0) {
+            continue;
+        }
+        AmdGpu::Buffer vsharp{};
+        vsharp.base_address = 0x100000;
+        vsharp.num_records = 0x10000;
+        vsharp.stride = h.stride;
+        vsharp.swizzle_enable = h.swizzle;
+        vsharp.index_stride = h.index_stride;
+        vsharp.element_size = h.element_size;
+        vsharp.num_format = h.num_format;
+        vsharp.data_format = h.data_format;
+        vsharp.dst_sel_x = h.dst_sel[0];
+        vsharp.dst_sel_y = h.dst_sel[1];
+        vsharp.dst_sel_z = h.dst_sel[2];
+        vsharp.dst_sel_w = h.dst_sel[3];
+        std::memcpy(t.manifest_ud_table.data() + static_cast<size_t>(segment[sgpr]) * kManifestUdSegment + dword,
+                    &vsharp, sizeof(vsharp));
+    }
+    for (u32 sgpr = 0; sgpr < segment.size(); ++sgpr) {
+        if (segment[sgpr] < 0) {
+            continue;
+        }
+        const u64 address = reinterpret_cast<uintptr_t>(t.manifest_ud_table.data() +
+                                                        static_cast<size_t>(segment[sgpr]) * kManifestUdSegment);
+        t.user_data[sgpr] = static_cast<u32>(address);
+        t.user_data[sgpr + 1] = static_cast<u32>(address >> 32);
+    }
+}
+
+void PipelineCache::ManifestQueueTranslate(u32 index, const std::vector<u32>& code, bool holding) {
+    auto& m = *manifest;
+    auto& st = m.stages[index];
+    auto job = std::make_unique<AsyncPipelineJob>();
+    auto& t = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
+    t.hw_stage = st.spec.runtime_info.hw_stage;
+    t.sw_stage = st.spec.runtime_info.sw_stage;
+    t.hash = st.cache_hash;
+    t.variant = st.rec.variant;
+    t.guest_hash = st.rec.variant == Shader::StageVariantDefault ? 0 : st.rec.hash;
+    t.owned_code = code;
+    t.code = t.owned_code;
+    t.runtime_info = st.spec.runtime_info;
+    t.start = st.spec.start;
+    t.pretranslate = true; // synthetic sharps: there is no draw
+    t.manifest_stage = static_cast<s32>(index);
+    t.manifest_hint = st.hint;
+    if (!st.spec.fetch_shader_data.Empty()) {
+        t.manifest_fetch = st.spec.fetch_shader_data;
+    }
+    st.state = ManifestState::St::Queued;
+    ++m.translating;
+    {
+        std::scoped_lock lock{async_mutex};
+        PushJobLocked(holding ? JobLane::Translate : JobLane::Background, std::move(job));
+    }
+    async_cv.notify_one();
+}
+
+bool PipelineCache::ManifestResolveStage(u32 index, bool may_translate) {
+    auto& m = *manifest;
+    auto& st = m.stages[index];
+    const auto fail = [&](const char* reason, bool remember) {
+        st.state = ManifestState::St::Failed;
+        st.reason = reason;
+        if (remember) {
+            SotcPipeManifest::NoteSkip(st.rec.id, SotcPipeManifest::SkipKind::Failed, reason);
+        }
+        m.dirty = true;
+        return true;
+    };
+    if (pending_programs.contains(st.cache_hash)) {
+        return false; // a draw's translation of the program is on a worker: looked at again later
+    }
+    auto found = program_cache.find(st.cache_hash);
+    if (found == program_cache.end() && lazy_programs.contains(st.cache_hash)) {
+        LoadLazyProgram(st.cache_hash); // its permutations from the disk
+        last_graphics_pipeline = nullptr;
+        pipe_fast_gfx.valid = false;
+        pipe_fast_cs.valid = false;
+        found = program_cache.find(st.cache_hash);
+    }
+    if (found != program_cache.end()) {
+        Program& program = *found.value();
+        if (const auto perm = ManifestFindPerm(program, st.spec)) {
+            st.state = ManifestState::St::Ready;
+            st.program = &program;
+            st.perm = *perm;
+            ++m.stage_cached;
+            m.dirty = true;
+            return true;
+        }
+        if (std::ranges::find(program.pending_specs, st.spec) != program.pending_specs.end()) {
+            return false; // a draw's permutation of it is on a worker
+        }
+    }
+    if (SotcPipeManifest::Skipped(st.rec.id, SotcPipeManifest::SkipKind::Failed)) {
+        return fail("failed before", false);
+    }
+    if (!ManifestStageSupported(st.spec.runtime_info)) {
+        return fail("stage kind", true);
+    }
+    // A vertex stage with a fetch shader: every attribute's V# must have come with the record.
+    for (const auto& attrib : st.spec.fetch_shader_data.attributes) {
+        const u64 key = (u64{attrib.sgpr_base} << 8) | attrib.dword_offset;
+        if (attrib.sgpr_base + 1u >= Shader::ShaderParams::NumShaderUserData ||
+            std::ranges::find(st.hint->attribs, key, &SotcPretranslate::HintBuffer::key) == st.hint->attribs.end()) {
+            return fail("fetch attributes", true);
+        }
+    }
+    const auto code = SotcPipeManifest::Code(st.rec.hash);
+    if (!code) {
+        if (st.state != ManifestState::St::Waiting) {
+            st.state = ManifestState::St::Waiting;
+        }
+        return false;
+    }
+    if (!may_translate) {
+        st.state = ManifestState::St::Pending; // its code is here: translated when a slot frees
+        return false;
+    }
+    ManifestQueueTranslate(index, *code, m.boot_lanes);
+    return true;
+}
+
+void PipelineCache::ManifestInstallStage(AsyncPipelineJob::Translate& t) {
+    auto& m = *manifest;
+    if (m.translating > 0) {
+        --m.translating;
+    }
+    auto& st = m.stages[static_cast<u32>(t.manifest_stage)];
+    m.dirty = true;
+    const auto destroy = [&] {
+        if (t.module) {
+            instance.GetDevice().destroyShaderModule(t.module);
+            t.module = vk::ShaderModule{};
+        }
+    };
+    const auto fail = [&](const char* reason) {
+        destroy();
+        st.state = ManifestState::St::Failed;
+        st.reason = reason;
+        SotcPipeManifest::NoteSkip(st.rec.id, SotcPipeManifest::SkipKind::Failed, reason);
+    };
+    if (t.failed || !t.new_program || !t.spec || !t.module) {
+        fail("translation failed");
+        return;
+    }
+    // The check that makes the stage the draw's: the translation's specialization (made from the synthetic sharps with
+    // the draw's fields) equals the recorded one, both ways (the operator walks the left side's lists).
+    st.spec.info = &t.new_program->info;
+    if (!(*t.spec == st.spec) || !(st.spec == *t.spec)) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::fprintf(stderr,
+                         "SOTC PIPE MANIFEST: stage %016llx (program %#llx, sw stage %u) not rebuilt: its translation's "
+                         "specialization differs from the draw's (buffers %zu/%zu, images %zu/%zu, samplers %zu/%zu, "
+                         "fetch %d)\n",
+                         static_cast<unsigned long long>(st.rec.id), static_cast<unsigned long long>(st.rec.hash),
+                         static_cast<u32>(t.sw_stage), t.spec->buffers.size(), st.spec.buffers.size(),
+                         t.spec->images.size(), st.spec.images.size(), t.spec->samplers.size(),
+                         st.spec.samplers.size(), int{t.spec->fetch_shader_data == st.spec.fetch_shader_data});
+        }
+        fail("specialization differs");
+        return;
+    }
+    // The program's permutations on disk first: loaded later, they would take their indices over ours.
+    if (lazy_programs.contains(st.cache_hash)) {
+        LoadLazyProgram(st.cache_hash);
+    }
+    auto [it, is_new] = program_cache.try_emplace(st.cache_hash);
+    Program* program = nullptr;
+    u32 perm = 0;
+    if (is_new) {
+        it.value() = std::move(t.new_program);
+        program = it.value().get();
+        RegisterShaderBinary(std::move(t.spv), st.cache_hash, 0);
+        RegisterShaderMeta(program->info, t.spec->fetch_shader_data, *t.spec, HashCombine(st.cache_hash, u64{0}), 0);
+        t.spec->info = &program->info;
+        program->AddPermut(t.module, std::move(*t.spec));
+        program->info.UserData() = {}; // pointed into the job (its draws set their own)
+    } else {
+        program = it.value().get();
+        if (const auto found = ManifestFindPerm(*program, st.spec)) {
+            destroy(); // a draw (or another record of the same key) made it meanwhile
+            perm = *found;
+        } else if (!SameBindingLayout(program->info, t.new_program->info)) {
+            fail("resources differ from the program's");
+            return;
+        } else {
+            perm = static_cast<u32>(program->modules.size());
+            Shader::CombineBindlessCache(program->info.bindless, t.new_program->info.bindless);
+            RegisterShaderBinary(std::move(t.spv), st.cache_hash, perm);
+            RegisterShaderMeta(program->info, t.spec->fetch_shader_data, *t.spec,
+                               HashCombine(st.cache_hash, u64{perm}), perm);
+            t.spec->info = &program->info;
+            program->AddPermut(t.module, std::move(*t.spec));
+        }
+    }
+    t.module = vk::ShaderModule{};
+    st.state = ManifestState::St::Ready;
+    st.program = program;
+    st.perm = perm;
+    ++m.stage_translated;
+    // The program's permutations moved: no record may keep a pointer into them.
+    last_graphics_pipeline = nullptr;
+    pipe_fast_gfx.valid = false;
+    pipe_fast_cs.valid = false;
+}
+
+void PipelineCache::ManifestSchedulePipes(bool holding) {
+    auto& m = *manifest;
+    for (auto& p : m.pipes) {
+        if (p.state != ManifestState::Ps::Waiting) {
+            continue;
+        }
+        bool ready = true;
+        const char* failed = nullptr;
+        for (const auto& [slot, si] : p.stages) {
+            auto& st = m.stages[si];
+            if (st.state == ManifestState::St::Failed) {
+                failed = st.reason ? st.reason : "stage failed";
+                break;
+            }
+            // The program is looked up again: a program may have left the cache since the stage was resolved (the
+            // eviction at the end of the SOTC_PRETRANSLATE hold); the stage is then resolved again.
+            if (st.state == ManifestState::St::Ready) {
+                const auto found = program_cache.find(st.cache_hash);
+                if (found == program_cache.end() || st.perm >= found.value()->modules.size() ||
+                    !found.value()->modules[st.perm].module) {
+                    st.state = ManifestState::St::Pending;
+                    st.program = nullptr;
+                } else {
+                    st.program = found.value().get();
+                }
+            }
+            ready = ready && st.state == ManifestState::St::Ready;
+        }
+        if (failed) {
+            p.state = ManifestState::Ps::Skipped;
+            ++m.skipped[failed];
+            continue;
+        }
+        if (!ready) {
+            continue;
+        }
+        if (p.compute) {
+            const auto& st = m.stages[p.stages[0].second];
+            Program& program = *st.program;
+            const ComputePipelineKey key{HashCombine(program.info.CacheHash(), u64{st.perm})};
+            if (compute_pipelines.contains(key)) {
+                p.state = ManifestState::Ps::Done;
+                ++m.from_disk;
+                continue;
+            }
+            ComputePipeline::SerializationSupport sdata{};
+            auto pipe = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache,
+                                                          StageProfile(program.info.variant), *pipeline_cache, key,
+                                                          program.info, program.modules[st.perm].module, sdata,
+                                                          false, true);
+            ComputePipeline* raw = pipe.get();
+            compute_pipelines.try_emplace(key).first.value() = std::move(pipe);
+            last_compute_pipeline = nullptr;
+            RegisterPipelineData(key, sdata);
+            ++num_new_pipelines;
+            auto job = std::make_unique<AsyncPipelineJob>();
+            job->compute = raw;
+            job->manifest = true;
+            ++m.compute_queued;
+            if (!holding) {
+                g_manifest_stats.late_compute.fetch_add(1, std::memory_order_relaxed);
+            }
+            {
+                std::scoped_lock lock{async_mutex};
+                PushJobLocked(holding ? JobLane::Compute : JobLane::Background, std::move(job));
+            }
+            async_cv.notify_one();
+            p.state = ManifestState::Ps::Queued;
+            continue;
+        }
+        GraphicsPipelineKey key = p.key;
+        std::array<const Shader::Info*, MaxShaderStages> stage_infos{};
+        std::array<vk::ShaderModule, MaxShaderStages> stage_modules{};
+        std::array<Shader::RuntimeInfo, MaxShaderStages> stage_runtime = runtime_infos;
+        std::optional<Shader::Gcn::FetchShaderData> stage_fetch;
+        bool dynamic_mip = false;
+        for (const auto& [slot, si] : p.stages) {
+            const auto& st = m.stages[si];
+            Program& program = *st.program;
+            const auto& module = program.modules[st.perm];
+            key.stage_hashes[slot] = HashCombine(program.info.CacheHash(), u64{st.perm});
+            stage_infos[slot] = &program.info;
+            stage_modules[slot] = module.module;
+            stage_runtime[slot] = module.spec.runtime_info;
+            if (!module.spec.fetch_shader_data.Empty()) {
+                stage_fetch = module.spec.fetch_shader_data;
+            }
+            for (const auto& image : program.info.images) {
+                dynamic_mip |= image.array_size == 0 &&
+                               image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
+            }
+        }
+        // sotc: SOTC_GPL_NODROP: the libraries of the pipeline (vertex input, both shader stages, fragment output),
+        // for the draws whose key no manifest holds: a key made of known stages and a known output state then only
+        // links. Built for pipelines found on disk too (a library is not saved with the pipeline). Without the link
+        // (SetLibrariesOnly); the libraries are deduplicated by their state (GplLibraryCache).
+        if (SotcNonBlocking::GplNoDrop() && instance.IsGraphicsPipelineLibrary() &&
+            !instance.IsDescriptorHeapEnabled() && instance.IsVertexInputDynamicState() &&
+            !EmulatorSettings.IsShaderCollect() && !dynamic_mip &&
+            GraphicsPipeline::FastLinkable(key, stage_infos, stage_runtime, StagesProfile(stage_infos))) {
+            auto job = std::make_unique<AsyncPipelineJob>();
+            job->key = key;
+            job->hash = std::hash<GraphicsPipelineKey>{}(key);
+            job->infos = stage_infos;
+            job->runtime_infos = stage_runtime;
+            job->fetch_shader = stage_fetch;
+            job->modules = stage_modules;
+            job->link_only = true;
+            job->warm_lib = true;
+            job->manifest_libs = true;
+            ++m.libs_building;
+            ++m.libs_queued;
+            g_nodrop.boot_libs_queued.fetch_add(1, std::memory_order_relaxed);
+            // sotc: SOTC_GPL_LIB_PHASE: in the first boot window the libraries wait for the hold's library phase.
+            if (SotcNonBlocking::GplLibPhase() && !m.held_once && !m.hold_done && !m.lib_phase_done) {
+                m.lib_backlog.push_back(std::move(job));
+            } else {
+                {
+                    std::scoped_lock lock{async_mutex};
+                    PushJobLocked(holding ? JobLane::Graphics : JobLane::Background, std::move(job));
+                }
+                async_cv.notify_one();
+            }
+        }
+        if (graphics_pipelines.contains(key)) {
+            p.state = ManifestState::Ps::Done;
+            ++m.from_disk;
+            continue;
+        }
+        // Only pipelines whose construction reads no draw state (AsyncIneligibleReason's rules).
+        if (!instance.IsVertexInputDynamicState() || EmulatorSettings.IsShaderCollect() || dynamic_mip) {
+            p.state = ManifestState::Ps::Skipped;
+            ++m.skipped["needs draw state"];
+            continue;
+        }
+        graphics_pipelines.try_emplace(key); // null until collected, as a draw's queued pipeline
+        auto job = std::make_unique<AsyncPipelineJob>();
+        job->key = key;
+        job->hash = std::hash<GraphicsPipelineKey>{}(key);
+        job->infos = stage_infos;
+        job->runtime_infos = stage_runtime;
+        job->fetch_shader = stage_fetch;
+        job->modules = stage_modules;
+        job->manifest = true;
+        ++m.graphics_building;
+        if (!holding) {
+            g_manifest_stats.late_graphics.fetch_add(1, std::memory_order_relaxed);
+        }
+        {
+            std::scoped_lock lock{async_mutex};
+            PushJobLocked(holding ? JobLane::Graphics : JobLane::Background, std::move(job));
+        }
+        async_cv.notify_one();
+        p.state = ManifestState::Ps::Queued;
+    }
+}
+
+void PipelineCache::ManifestPump(bool holding) {
+    auto& m = *manifest;
+    m.last_pump = std::chrono::steady_clock::now();
+    if (!m.finished.empty()) {
+        auto finished = std::move(m.finished);
+        m.finished.clear();
+        for (auto& t : finished) {
+            ManifestInstallStage(*t);
+        }
+    }
+    // Before and during a boot hold every worker serves the manifest; after the first hold the stages are translated
+    // two at a time on the background lane.
+    m.boot_lanes = manifest_holding || (holding && !m.held_once);
+    const u32 cap = m.boot_lanes ? ~0u : 2u;
+    const u64 arrivals = SotcPipeManifest::CodeArrivals();
+    const bool new_code = arrivals != m.seen_arrivals;
+    m.seen_arrivals = arrivals;
+    u32 waiting = 0;
+    for (u32 i = 0; i < m.stages.size(); ++i) {
+        auto& st = m.stages[i];
+        if (st.state == ManifestState::St::Pending ||
+            (st.state == ManifestState::St::Waiting && new_code)) {
+            ManifestResolveStage(i, m.translating < cap);
+        }
+        waiting += st.state == ManifestState::St::Waiting;
+    }
+    g_manifest_stats.waiting_code.store(waiting, std::memory_order_relaxed);
+    if (m.dirty) {
+        m.dirty = false;
+        ManifestSchedulePipes(m.boot_lanes);
+    }
+}
+
+void PipelineCache::MaybeHoldForManifest() {
+    using Clock = std::chrono::steady_clock;
+    if (!manifest) {
+        if (!warmup_done.load(std::memory_order_acquire)) {
+            return;
+        }
+        LoadManifest();
+    }
+    auto& m = *manifest;
+    const auto now = Clock::now();
+    if (SotcPretranslate::Precompile()) {
+        return; // the shader preparation run: it only records (and exits by itself)
+    }
+    if (m.hold_done) {
+        if (!m.pipes.empty() && (!m.finished.empty() || now - m.last_pump > std::chrono::milliseconds{100})) {
+            ManifestPump(false);
+        }
+        return;
+    }
+    // The boot window: from the first shader file the game loads (the game-start loading screen) for 2 minutes. The
+    // stages found in the caches are resolved and their pipelines queued from the first lookup on.
+    const bool loading = SotcPipeManifest::LastProgramNs() != 0;
+    if (loading && m.window_start == Clock::time_point{}) {
+        m.window_start = now;
+    }
+    if (!m.finished.empty() || now - m.last_pump > std::chrono::milliseconds{50}) {
+        ManifestPump(true);
+    }
+    if (now - (loading ? m.window_start : m.loaded) > std::chrono::minutes{2}) {
+        // The window is over: the stages whose code did not come in it are not waited for by the next boot holds
+        // (they are still made when their code comes, after the boot).
+        u32 late = 0;
+        for (auto& st : m.stages) {
+            if (st.state == ManifestState::St::Waiting) {
+                ++late;
+                if (!st.late) {
+                    st.late = true;
+                    SotcPipeManifest::NoteSkip(st.rec.id, SotcPipeManifest::SkipKind::Late, "code not loaded at boot");
+                }
+            }
+        }
+        m.hold_done = true;
+        g_manifest_stats.boot_done.store(true, std::memory_order_relaxed);
+        ManifestFlushLibraries(JobLane::Background); // sotc: SOTC_GPL_LIB_PHASE, none held back from now on
+        std::fprintf(stderr, "SOTC PIPE MANIFEST: boot window over (%s); stages waiting for their code %u\n",
+                     loading ? "2 minutes after the first shader file" : "no shader file loaded in 2 minutes", late);
+        if (late == 0) {
+            SotcPipeManifest::SetWanted({});
+            SotcPipeManifest::DropCode();
+        }
+        return;
+    }
+    if (!loading) {
+        return;
+    }
+    bool work = false;
+    if (!m.held_once) {
+        // The first hold: as soon as the manifest has work (translations, builds) and the game loads shader files.
+        work = m.translating != 0 || m.graphics_building != 0 || !m.finished.empty() || m.libs_building != 0 ||
+               g_manifest_stats.compute_built.load(std::memory_order_relaxed) < m.compute_queued;
+        for (size_t i = 0; i < m.stages.size() && !work; ++i) {
+            work = m.stages[i].state == ManifestState::St::Pending;
+        }
+    } else {
+        // After it, only a burst of code (another loading screen in the window: 32 stages or more ready to translate);
+        // a trickle is translated in the background, so play is never held.
+        u32 ready = 0;
+        for (const auto& st : m.stages) {
+            ready += st.state == ManifestState::St::Pending;
+        }
+        work = ready >= 32;
+    }
+    if (work) {
+        RunManifestHold();
+    }
+}
+
+void PipelineCache::ManifestFlushLibraries(JobLane lane) {
+    auto& m = *manifest;
+    m.lib_phase_done = true;
+    if (m.lib_backlog.empty()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{async_mutex};
+        for (auto& job : m.lib_backlog) {
+            PushJobLocked(lane, std::move(job));
+        }
+    }
+    m.lib_backlog.clear();
+    async_cv.notify_all();
+}
+
+void PipelineCache::RunManifestHold() {
+    using Clock = std::chrono::steady_clock;
+    auto& m = *manifest;
+    // Every worker translates and builds the manifest's pipelines while the loading screen stays up.
+    const auto start = Clock::now();
+    const uint64_t private_start = SotcPipeManifest::ProcessPrivateBytes(); // sotc: SOTC_GPL_NODROP line below
+    manifest_holding = true;
+    if (m.hold_start == Clock::time_point{}) {
+        m.hold_start = start;
+    }
+    last_graphics_pipeline = nullptr;
+    pipe_fast_gfx.valid = false;
+    pipe_fast_cs.valid = false;
+    SotcStats::prep_start_ms.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(start.time_since_epoch()).count(),
+        std::memory_order_relaxed);
+    SotcStats::prep_total.store(static_cast<u32>(m.pipes.size()), std::memory_order_relaxed);
+    SotcStats::prep_done.store(0, std::memory_order_relaxed);
+    SotcStats::prep_active.store(true, std::memory_order_release);
+    std::fprintf(stderr, "SOTC PIPE MANIFEST: holding the loading screen for %zu pipelines (%zu stages)\n",
+                 m.pipes.size(), m.stages.size());
+    m.last_progress = start;
+    for (;;) {
+        if (async_done_count.load(std::memory_order_acquire) != 0) {
+            CollectAsyncPipelines();
+        }
+        ManifestPump(true);
+        u32 done = 0, waiting_pipes = 0;
+        for (const auto& p : m.pipes) {
+            if (p.state == ManifestState::Ps::Done || p.state == ManifestState::Ps::Skipped) {
+                ++done;
+            } else if (p.state == ManifestState::Ps::Waiting) {
+                // Waiting for a stage. A stage whose code did not come in an earlier boot window is not waited for.
+                bool waits = false;
+                for (const auto& [slot, si] : p.stages) {
+                    const auto& st = m.stages[si];
+                    waits |= (st.state == ManifestState::St::Waiting && !st.late) ||
+                             st.state == ManifestState::St::Pending || st.state == ManifestState::St::Queued;
+                }
+                waiting_pipes += waits;
+            }
+        }
+        const u64 compute_built = g_manifest_stats.compute_built.load(std::memory_order_relaxed);
+        const u64 built = m.built_graphics + m.refused + compute_built;
+        SotcStats::prep_done.store(static_cast<u32>(std::min<u64>(done + built, m.pipes.size())),
+                                   std::memory_order_relaxed);
+        const u32 writes = Storage::DataBase::Instance().PendingWrites();
+        SotcStats::prep_writes.store(writes, std::memory_order_relaxed);
+        // sotc: SOTC_GPL_PREDICT (shader-only keys): the libraries of the materials the game created so far are built
+        // in the hold too (every waiting slot each pass), and the hold waits for their jobs.
+        if (SotcNonBlocking::GplPredict()) {
+            PredictLibraries(nullptr);
+        }
+        const bool predict_busy = SotcNonBlocking::GplPredict() &&
+                                  lib_jobs_pending.load(std::memory_order_relaxed) != 0;
+        const bool busy = m.translating != 0 || m.graphics_building != 0 || compute_built < m.compute_queued ||
+                          !m.finished.empty() || m.libs_building != 0 || // sotc: SOTC_GPL_NODROP libraries
+                          predict_busy;
+        const auto t = Clock::now();
+        const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+        // The game stopped loading shader files for 3 s: the code that has not come belongs to later areas.
+        const bool load_idle = now_ns - SotcPipeManifest::LastProgramNs() > 3'000'000'000LL;
+        // sotc: SOTC_GPL_LIB_PHASE: the translations and pipelines are done (as the end condition below sees them):
+        // the private memory is sampled, then the held-back libraries are queued (the hold waits for them as before).
+        if (!m.lib_phase_done && !m.lib_backlog.empty() && m.translating == 0 && m.graphics_building == 0 &&
+            compute_built >= m.compute_queued && m.finished.empty() && (waiting_pipes == 0 || load_idle)) {
+            m.private_mid = SotcPipeManifest::ProcessPrivateBytes();
+            ManifestFlushLibraries(JobLane::Graphics);
+            continue;
+        }
+        if ((!busy && (waiting_pipes == 0 || load_idle) && writes < 64) || t - start > std::chrono::minutes{45}) {
+            break;
+        }
+        if (t - m.last_progress > std::chrono::seconds{2}) {
+            m.last_progress = t;
+            std::fprintf(stderr,
+                         "SOTC PIPE MANIFEST: holding %.1f s: stages translated %u, from the caches %u, translating "
+                         "%u; pipelines built %llu of %zu (queued graphics %u, compute %llu), waiting for code %u\n",
+                         std::chrono::duration<double>(t - start).count(), m.stage_translated, m.stage_cached,
+                         m.translating, static_cast<unsigned long long>(m.built_graphics + compute_built),
+                         m.pipes.size(), m.graphics_building,
+                         static_cast<unsigned long long>(m.compute_queued - std::min(m.compute_queued, compute_built)),
+                         g_manifest_stats.waiting_code.load(std::memory_order_relaxed));
+        }
+        std::unique_lock lock{async_mutex};
+        translate_done_cv.wait_for(lock, std::chrono::milliseconds{20},
+                                   [this] { return async_done_count.load(std::memory_order_relaxed) != 0; });
+    }
+    ManifestFlushLibraries(JobLane::Background); // sotc: SOTC_GPL_LIB_PHASE (the hold timed out with libraries held)
+    u32 not_done = 0;
+    for (const auto& p : m.pipes) {
+        not_done += p.state == ManifestState::Ps::Waiting;
+    }
+    const u64 compute_built = g_manifest_stats.compute_built.load(std::memory_order_relaxed);
+    const bool built_new = m.built_graphics + compute_built != m.saved_built;
+    m.saved_built = m.built_graphics + compute_built;
+    // Written before play, as the pretranslate hold does: the shader index and the driver's pipelines.
+    SaveShaderIndex();
+    if (built_new) {
+        if (SotcNonBlocking::Io()) {
+            RequestDriverCacheSave();
+        } else {
+            SaveDriverCache();
+        }
+    }
+    SotcPipeManifest::Flush();
+    manifest_holding = false;
+    m.held_once = true;
+    const auto end = Clock::now();
+    m.held += end - start;
+    SotcStats::prep_active.store(false, std::memory_order_release);
+    std::string reasons;
+    u32 skipped = 0;
+    for (const auto& [reason, count] : m.skipped) {
+        skipped += count;
+        reasons += (reasons.empty() ? "" : ", ") + reason + " " + std::to_string(count);
+    }
+    if (not_done != 0) {
+        reasons += (reasons.empty() ? "" : ", ") + std::string{"code not loaded yet (built when it comes) "} +
+                   std::to_string(not_done);
+    }
+    std::fprintf(stderr,
+                 "SOTC PIPE MANIFEST: built %llu graphics + %llu compute in %lld ms (from disk %llu), held loading "
+                 "%lld ms; skipped %u (%s)\n",
+                 static_cast<unsigned long long>(m.built_graphics), static_cast<unsigned long long>(compute_built),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(end - m.loaded).count()),
+                 static_cast<unsigned long long>(m.from_disk),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(m.held).count()),
+                 skipped + not_done, reasons.empty() ? "none" : reasons.c_str());
+    // sotc: SOTC_GPL_NODROP: the libraries the hold built (all kept for the session), and the private memory of the
+    // process across the hold (pipelines, translations and libraries together: an upper bound for the libraries).
+    if (SotcNonBlocking::GplNoDrop()) {
+        using L = GplLibraryCache;
+        const size_t vi = gpl_libs.Count(L::VertexInput), pr = gpl_libs.Count(L::PreRaster),
+                     fs = gpl_libs.Count(L::Fragment), fo = gpl_libs.Count(L::FragmentOutput);
+        const uint64_t private_end = SotcPipeManifest::ProcessPrivateBytes();
+        // sotc: SOTC_GPL_LIB_PHASE: the growth split at the start of the library phase (sampled in this hold only).
+        const auto mb = [](uint64_t a, uint64_t b) {
+            return (static_cast<double>(a) - static_cast<double>(b)) / 1048576.0;
+        };
+        const bool split = m.private_mid != 0 && m.private_mid >= private_start;
+        std::fprintf(stderr,
+                     "SOTC GPL NODROP: boot libraries for %llu manifest pipelines; libraries held %zu (vertex input %zu, "
+                     "pre-rasterization %zu, fragment %zu, fragment output %zu); process private memory %.0f MB "
+                     "(%+.0f MB across the hold%s%.0f MB%s%.0f MB%s)\n",
+                     static_cast<unsigned long long>(m.libs_queued), vi + pr + fs + fo, vi, pr, fs, fo,
+                     static_cast<double>(private_end) / 1048576.0, mb(private_end, private_start),
+                     split ? ": translations + pipelines " : "", split ? mb(m.private_mid, private_start) : 0.0,
+                     split ? ", libraries " : "", split ? mb(private_end, m.private_mid) : 0.0,
+                     split ? "" : "; phases not split");
+        m.private_mid = 0;
+    }
+}
+
+
+void PipelineCache::CaptureManifestGraphics() {
+    SotcPipeManifest::Pipe pipe;
+    pipe.compute = false;
+    GraphicsPipelineKey key = graphics_key;
+    key.stage_hashes = {};
+    pipe.key.resize(sizeof(key));
+    std::memcpy(pipe.key.data(), &key, sizeof(key));
+    const auto& header = manifest->header;
+    std::vector<SotcPipeManifest::Stage> stages;
+    for (u32 slot = 0; slot < MaxShaderStages; ++slot) {
+        const Shader::Info* info = infos[slot];
+        if (!info) {
+            continue;
+        }
+        // Only the stage kinds a manifest translation can make (the others need draw memory: tessellation constants,
+        // geometry copy shaders).
+        const auto found = program_cache.find(info->CacheHash());
+        const auto perm = PermOfStage(graphics_key.stage_hashes[slot], info->CacheHash());
+        if (found == program_cache.end() || !perm || *perm >= found.value()->modules.size()) {
+            return;
+        }
+        const auto& spec = found.value()->modules[*perm].spec;
+        if (!ManifestStageSupported(spec.runtime_info)) {
+            return;
+        }
+        SotcPipeManifest::Stage st;
+        st.hash = info->pgm_hash;
+        st.variant = info->variant;
+        st.spec = ManifestSpecBytes(spec);
+        st.hint = SotcPretranslate::BuildFullHint(
+            *info, spec.fetch_shader_data.Empty() ? nullptr : &spec.fetch_shader_data);
+        st.id = SotcPipeManifest::StageId(st.hash, st.variant, st.spec, st.hint);
+        pipe.stages.emplace_back(static_cast<u8>(slot), st.id);
+        stages.push_back(std::move(st));
+    }
+    if (stages.empty()) {
+        return;
+    }
+    pipe.id = SotcPipeManifest::PipeId(false, pipe.key, pipe.stages);
+    if (SotcPipeManifest::Known(pipe.id)) {
+        return;
+    }
+    for (const auto& st : stages) {
+        SotcPipeManifest::AppendStage(header, st);
+    }
+    SotcPipeManifest::AppendPipe(header, pipe);
+}
+
+void PipelineCache::CaptureManifestCompute() {
+    const Shader::Info* info = infos[0];
+    if (!info || info->sw_stage != Shader::SwStage::Compute) {
+        return;
+    }
+    const auto found = program_cache.find(info->CacheHash());
+    const auto perm = PermOfStage(compute_key.value, info->CacheHash());
+    if (found == program_cache.end() || !perm || *perm >= found.value()->modules.size()) {
+        return;
+    }
+    const auto& spec = found.value()->modules[*perm].spec;
+    SotcPipeManifest::Stage st;
+    st.hash = info->pgm_hash;
+    st.variant = info->variant;
+    st.spec = ManifestSpecBytes(spec);
+    st.hint = SotcPretranslate::BuildFullHint(*info, nullptr);
+    st.id = SotcPipeManifest::StageId(st.hash, st.variant, st.spec, st.hint);
+    SotcPipeManifest::Pipe pipe;
+    pipe.compute = true;
+    pipe.stages.emplace_back(u8{0}, st.id);
+    pipe.id = SotcPipeManifest::PipeId(true, pipe.key, pipe.stages);
+    if (SotcPipeManifest::Known(pipe.id)) {
+        return;
+    }
+    SotcPipeManifest::AppendStage(manifest->header, st);
+    SotcPipeManifest::AppendPipe(manifest->header, pipe);
+}
+
+void ReportPipeManifest(std::string& out, double seconds) {
+    (void)seconds;
+    if (!SotcPipeManifest::On()) {
+        return;
+    }
+    SotcPipeManifest::Flush(); // the records captured in the window (off the command processor)
+    static u64 prev_graphics{}, prev_compute{};
+    const u64 graphics = g_manifest_stats.late_graphics.load(std::memory_order_relaxed);
+    const u64 compute = g_manifest_stats.late_compute.load(std::memory_order_relaxed);
+    if (!g_manifest_stats.boot_done.load(std::memory_order_relaxed) ||
+        (graphics == prev_graphics && compute == prev_compute)) {
+        return;
+    }
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "SOTC PIPE MANIFEST late: queued %llu graphics + %llu compute after the boot hold (total %llu + "
+                  "%llu), stages waiting for code %u, records captured %llu\n",
+                  static_cast<unsigned long long>(graphics - prev_graphics),
+                  static_cast<unsigned long long>(compute - prev_compute), static_cast<unsigned long long>(graphics),
+                  static_cast<unsigned long long>(compute), g_manifest_stats.waiting_code.load(std::memory_order_relaxed),
+                  static_cast<unsigned long long>(SotcPipeManifest::Appended()));
+    prev_graphics = graphics;
+    prev_compute = compute;
     out += line;
 }
 

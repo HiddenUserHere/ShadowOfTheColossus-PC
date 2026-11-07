@@ -1678,6 +1678,37 @@ void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmd
         dirty_state.line_width = false;
         cmdbuf.setLineWidth(line_width);
     }
+    // sotc: SOTC_GPL_DYN_STATE. Only the states the device made dynamic in the pipelines (Instance::KeyDynamic); the
+    // others stay dirty and unused (their commands need the feature).
+    const auto& kd = instance.KeyDynamic();
+    if (dirty_state.primitive_topology && kd.topology) {
+        dirty_state.primitive_topology = false;
+        cmdbuf.setPrimitiveTopology(key_statics.topology);
+    }
+    if (dirty_state.polygon_mode && kd.polygon_mode) {
+        dirty_state.polygon_mode = false;
+        cmdbuf.setPolygonModeEXT(key_statics.polygon_mode);
+    }
+    if (dirty_state.depth_clamp_enable && kd.depth_clamp) {
+        dirty_state.depth_clamp_enable = false;
+        cmdbuf.setDepthClampEnableEXT(key_statics.depth_clamp_enable);
+    }
+    if (dirty_state.depth_clip_enable && kd.depth_clip) {
+        dirty_state.depth_clip_enable = false;
+        cmdbuf.setDepthClipEnableEXT(key_statics.depth_clip_enable);
+    }
+    if (dirty_state.provoking_vertex && kd.provoking) {
+        dirty_state.provoking_vertex = false;
+        cmdbuf.setProvokingVertexModeEXT(key_statics.provoking_vertex);
+    }
+    if (dirty_state.clip_negative_one_to_one && kd.clip_negative) {
+        dirty_state.clip_negative_one_to_one = false;
+        cmdbuf.setDepthClipNegativeOneToOneEXT(key_statics.clip_negative_one_to_one);
+    }
+    if (dirty_state.rasterization_samples && kd.samples) {
+        dirty_state.rasterization_samples = false;
+        cmdbuf.setRasterizationSamplesEXT(key_statics.rasterization_samples);
+    }
     if (dirty_state.feedback_loop_enabled && instance.IsAttachmentFeedbackLoopLayoutSupported()) {
         dirty_state.feedback_loop_enabled = false;
         cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_enabled

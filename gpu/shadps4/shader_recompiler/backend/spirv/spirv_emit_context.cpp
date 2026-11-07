@@ -50,7 +50,7 @@ bool ShaderAddrCandidate(const Info& info, const BufferResource& desc) {
 // sotc: SOTC_GCN_BUF. The profile's share of the candidate rule: formatted buffers take their address from the shader
 // only in table mode with gcn_buf on. Every other buffer is as before.
 static bool ShaderAddrFormattedAllowed(const Profile& profile, const BufferResource& desc) {
-    return !desc.is_formatted || (profile.gcn_buf != 0 && profile.shader_addr >= 3);
+    return !desc.is_formatted || (profile.gcn_buf != 0 && profile.shader_addr >= 3 && GcnBufFormatted());
 }
 
 bool ShaderAddrBuffer(const Profile& profile, const Info& info, const BufferResource& desc) {

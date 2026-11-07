@@ -52,26 +52,26 @@ u8 ProfileValue() {
 }
 
 bool BindAddressed(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size,
-                   bool is_written) {
+                   bool is_written, bool is_texel) {
     if (size == 0) {
         return true;
     }
     if (!On()) {
-        return SotcArch::AddrTable::Touch(cache, scheduler, addr, size, is_written);
+        return SotcArch::AddrTable::Touch(cache, scheduler, addr, size, is_written, is_texel);
     }
     if (Verify()) {
         // Mode 2: Touch always runs, so the answer is the old path's. The fast path's predicate is evaluated first
         // and the entries are compared before and after (Translate of the first and last byte).
         // Limit: Touch does not report whether it synchronized guest bytes; the sync batch (S4) owns that, and a
         // sync-only Touch is not counted as moved.
-        const bool eligible = !is_written && Mem::Placed(addr, size) && Sync::SkipOpSync();
+        const bool eligible = !is_written && !is_texel && Mem::Placed(addr, size) && Sync::SkipOpSync();
         vk::DeviceAddress first_before{};
         vk::DeviceAddress last_before{};
         if (eligible) {
             first_before = SotcArch::AddrTable::Translate(addr);
             last_before = SotcArch::AddrTable::Translate(addr + size - 1);
         }
-        const bool ok = SotcArch::AddrTable::Touch(cache, scheduler, addr, size, is_written);
+        const bool ok = SotcArch::AddrTable::Touch(cache, scheduler, addr, size, is_written, is_texel);
         g_slow.fetch_add(1, std::memory_order_relaxed);
         if (eligible) {
             g_verify_eligible.fetch_add(1, std::memory_order_relaxed);
@@ -84,7 +84,8 @@ bool BindAddressed(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, 
     }
 
     // Mode 1. A read of placed pages whose freshness the submit batch owns is answered by the bit test alone.
-    if (!is_written && Mem::Placed(addr, size) && Sync::SkipOpSync()) {
+    // sotc: a formatted buffer is never answered by the bit test: its read needs ObtainBuffer's image sync.
+    if (!is_written && !is_texel && Mem::Placed(addr, size) && Sync::SkipOpSync()) {
         // The use stamp keeps the blocks out of the idle eviction, as Touch's own fast path does (addr_table.cpp):
         // an evicted block would read as zeros until the miss ring brings it back (D4 forbids that frame).
         cache.NoteBindUse(addr, size);
@@ -95,7 +96,7 @@ bool BindAddressed(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, 
     // fast in native mode) is made by ObtainBuffer with is_written, inside Touch; Touch's own fast path already
     // requires WrittenAlreadyGpuModified, so it is safe to call it for every written bind.
     g_slow.fetch_add(1, std::memory_order_relaxed);
-    return SotcArch::AddrTable::Touch(cache, scheduler, addr, size, is_written);
+    return SotcArch::AddrTable::Touch(cache, scheduler, addr, size, is_written, is_texel);
 }
 
 void OnPageMiss(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr page_addr) {

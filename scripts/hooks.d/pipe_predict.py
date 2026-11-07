@@ -7,6 +7,10 @@ PIPE_PREDICT_MATERIAL: wrap of the material factory build FUN_000f9390 (0xf9390)
   and builds each pass's pipeline before the material's first draw
   (docs/re-stutters/native/re-pipelines/README.md, step 3c).
 
+The loader also turns the hook on, with its switch unset or 0, for the library prediction of SOTC_GPL_NODROP
+(SOTC_GPL_PREDICT, on by default; gpu/sotc/hooks.cpp): the command processor then queues the vertex and pixel
+pipeline libraries of each material's programs before its first draw.
+
 Same signature as RE_MATERIAL_FACTORY (scripts/hooks.d/re.py): with SOTC_RE_PROBE on as well, the later one is
 refused (the same bytes are displaced).
 """

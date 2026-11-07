@@ -120,7 +120,7 @@ u8 ProfileValue();
 /// returns its answer. Mode 2 runs Touch always and counts the cases the fast path would have skipped while Touch
 /// found work to do.
 bool BindAddressed(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size,
-                   bool is_written);
+                   bool is_written, bool is_texel = false);
 /// MissSink::page target: makes the page resident through AddrTable::Touch (counted). Takes no lock itself.
 void OnPageMiss(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr page_addr);
 void Report(char* out, u32 size, double seconds);

@@ -25,6 +25,7 @@
 // One line per stage every 5 s: "SOTC PREDICT <stage>: ...".
 
 #include "predict_probe.h"
+#include "pipe_manifest.h" // sotc: SOTC_PIPE_MANIFEST (the programs' code)
 #include "pretranslate.h"
 
 #include <array>
@@ -114,18 +115,23 @@ uint32_t Dword(const unsigned char* p) {
     return v;
 }
 
-// The pixel program whose footer is at data + footer: its code (marker 0xBEEB03FF, imm, footer at marker +
-// (imm + 1) * 8) and its descriptor (0x2DEC0400 + hash low 32, nearest before the marker). False when not found.
-bool PredictPixel(const unsigned char* data, size_t footer, uint64_t hash, uint32_t length, PsPrediction& out) {
-    size_t marker = SIZE_MAX;
+// The start of the code of the program whose footer is at data + footer (marker 0xBEEB03FF, imm, footer at marker +
+// (imm + 1) * 8), or SIZE_MAX when not found or shorter than length.
+size_t CodeStart(const unsigned char* data, size_t footer, uint32_t length) {
     for (size_t m = footer & ~size_t{3}; m >= 8 && footer - m < (size_t{1} << 20);) {
         m -= 4;
         if (Dword(data + m) == 0xBEEB03FFu && m + (size_t{Dword(data + m + 4)} + 1) * 8 == footer) {
-            marker = m;
-            break;
+            return m + length > footer ? SIZE_MAX : m;
         }
     }
-    if (marker == SIZE_MAX || marker + length > footer) {
+    return SIZE_MAX;
+}
+
+// The pixel program whose footer is at data + footer: its code (CodeStart) and its descriptor (0x2DEC0400 + hash low
+// 32, nearest before the marker). False when not found.
+bool PredictPixel(const unsigned char* data, size_t footer, uint64_t hash, uint32_t length, PsPrediction& out) {
+    const size_t marker = CodeStart(data, footer, length);
+    if (marker == SIZE_MAX) {
         return false;
     }
     size_t desc = SIZE_MAX;
@@ -321,7 +327,8 @@ void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
     const bool probe = On();
     const bool pre = SotcPretranslate::PixelVertexOn();
     const bool cs = SotcPretranslate::ComputeOn(); // sotc: SOTC_PRETRANSLATE_COMPUTE, type 4 programs
-    if (!(probe || pre || cs) || !data || n < 64) {
+    const bool manifest = SotcPipeManifest::On();  // sotc: SOTC_PIPE_MANIFEST, every program's code
+    if (!(probe || pre || cs || manifest) || !data || n < 64) {
         return;
     }
     uint32_t programs = 0;
@@ -359,6 +366,15 @@ void NoteLoadedData(const unsigned char* data, size_t n) noexcept {
         single_hash = hash;
         single_footer = static_cast<size_t>(p - data);
         const uint32_t type = (bits >> 2) & 0xF;
+        if (manifest) { // sotc: SOTC_PIPE_MANIFEST: the code of a program the manifest wants (it keeps what it needs)
+            const size_t start = CodeStart(data, static_cast<size_t>(p - data), bits >> 8);
+            SotcPipeManifest::NoteProgram(hash, start != SIZE_MAX ? data + start : nullptr,
+                                          start != SIZE_MAX ? bits >> 8 : 0);
+        }
+        if (!(probe || pre || cs)) {
+            p += 32;
+            continue;
+        }
         if (type == 0 || (pre && type == 1) || (cs && type == 4)) { // pixel; vertex and compute for the pre-translation
             bool known = false;
             if (type == 0) {

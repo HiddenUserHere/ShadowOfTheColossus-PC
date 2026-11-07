@@ -51,6 +51,11 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       port binary, the GPU driver, the game image or a shader-relevant setting changed since
                       the last run that finished; the launcher shows it as "Preparando shaders". Not for
                       SOTC_DETERMINISTIC runs, boss boots, or runs with neither a console nor the launcher.
+    SOTC_PIPE_MANIFEST  1 (default; 0 off): the pipelines of the manifest (data/pipeline_manifest, shipped, plus
+                      <user>/shader_predict/sotc-pipelines.user.tsv, which every session extends) are translated
+                      from the game's own loaded shaders and built while the game-start loading screen is held
+                      ("SOTC PIPE MANIFEST: built ..." in the log). Turns the resource loader hook on
+                      (SOTC_RES_LOADED). SOTC_PIPE_MANIFEST_DIR: another folder for the shipped manifest.
     --precompile      translates every shader the game loads and exits (the launcher's "Preparar shaders"
                       runs --prepare, the same run with the stamp written)
     --prepare         prepares the shaders now (SOTC_AUTO_PREPARE's run, forced) and exits
@@ -595,6 +600,11 @@ def main():
     if any(on(n) for n in ('SOTC_CSDR_PROBE', 'SOTC_PREDICT_PROBE', 'SOTC_PRETRANSLATE', 'SOTC_PRETRANSLATE_COMPUTE', 'SOTC_RES_DUMP',
                            'SOTC_PRECOMPILE')):
         env.setdefault('SOTC_RES_LOADED', '1')
+    # The pipeline manifest (default on): the loader hook hands the game's own shader code to it; the shipped manifest
+    # is found next to this script (data/pipeline_manifest, copied there by the package too).
+    if env.get('SOTC_PIPE_MANIFEST', '1') not in ('', '0'):
+        env.setdefault('SOTC_RES_LOADED', '1')
+        env.setdefault('SOTC_PIPE_MANIFEST_DIR', str(PORT / 'data' / 'pipeline_manifest'))
     if on('SOTC_PRETRANSLATE') or on('SOTC_PRECOMPILE'):
         predict = user / 'shader_predict'
         predict.mkdir(exist_ok=True)

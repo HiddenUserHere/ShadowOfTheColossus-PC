@@ -16,6 +16,9 @@
 namespace Shader {
 struct Info;
 struct StageSpecialization;
+namespace Gcn {
+struct FetchShaderData;
+} // namespace Gcn
 } // namespace Shader
 
 namespace SotcPretranslate {
@@ -181,9 +184,20 @@ struct HintBuffer {
     std::array<uint8_t, 4> dst_sel{};
     bool operator==(const HintBuffer&) const = default;
 };
+/// sotc: SOTC_PIPE_MANIFEST (pipe_manifest.h): a sampler's specialization fields, keyed as the images.
+struct HintSampler {
+    uint64_t key{};
+    uint8_t force_unnormalized{}, force_degamma{};
+    bool operator==(const HintSampler&) const = default;
+};
 struct Hint {
     std::vector<HintImage> images;
     std::vector<HintBuffer> buffers;
+    /// sotc: SOTC_PIPE_MANIFEST only (the compute hint file never holds them): the samplers, and the V# of each
+    /// vertex fetch attribute keyed (sgpr_base << 8) | dword_offset (the manifest translation serves them from a
+    /// table its user data points to).
+    std::vector<HintSampler> samplers;
+    std::vector<HintBuffer> attribs;
     bool operator==(const Hint&) const = default;
 };
 using HintPtr = std::shared_ptr<const Hint>;
@@ -191,8 +205,12 @@ using HintPtr = std::shared_ptr<const Hint>;
 /// SOTC_PRETRANSLATE_COMPUTE_HINTS (see above): the switch.
 bool HintsOn() noexcept;
 /// Compute prebuild (InstallComputePrebuild's worker job): the hint of a program, or null. Marks the program as
-/// prebuilt with a hint for the report.
+/// prebuilt with a hint for the report. hash is the game's hash of the program (Info::pgm_hash); a hint an older
+/// build wrote under the variant-mixed hash (HashCombine(hash, variant), SOTC_SHADER_ADDR / SOTC_HEAP) is found too.
 HintPtr AcquireHint(uint64_t hash) noexcept;
+/// SOTC_PIPE_MANIFEST: a stage's full hint at its draw or dispatch (images, buffers, samplers, and with fetch the V#
+/// of each vertex fetch attribute, read through the stage's user data).
+Hint BuildFullHint(const Shader::Info& info, const Shader::Gcn::FetchShaderData* fetch);
 /// The hint a worker's translation uses (set by HintScope), or null.
 const Hint* ActiveHint() noexcept;
 /// Sets ActiveHint for the scope of one translation.
@@ -209,6 +227,9 @@ private:
 };
 /// Command processor, a compute program's first draw (its dispatch): the real key (spec, from info's flat buffer)
 /// against the prebuilt one (predicted). Writes the real fields to the hint file on a miss, logs the first 32 misses.
+/// The hint is written under info.pgm_hash (the game's hash, as the prebuild looks it up), not under hash, which is
+/// the variant-mixed lookup hash for a SOTC_SHADER_ADDR / SOTC_HEAP stage: hints written under that hash were never
+/// found by the prebuild ("prebuilt with a hint 0").
 void NoteComputeFirstUse(uint64_t hash, bool hit, const Shader::Info& info, const Shader::StageSpecialization& real,
                          const Shader::StageSpecialization& predicted) noexcept;
 

@@ -170,11 +170,11 @@ static void GcnAfterOp(const Pipeline& pipeline) {
 // sotc: ARCH-GCN-NATIVE S2. The residency call of a shader-addressed range: BindAddressed (placed bits, then Touch)
 // when the buffer stage is on, else AddrTable::Touch as before. Same arguments and answer.
 static bool GcnTouch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size,
-                     bool is_written) {
+                     bool is_written, bool is_texel) {
     if (SotcGcn::Buf::ProfileValue() != 0) { // sotc: SOTC_GCN_BUF
-        return SotcGcn::Buf::BindAddressed(cache, scheduler, addr, size, is_written);
+        return SotcGcn::Buf::BindAddressed(cache, scheduler, addr, size, is_written, is_texel);
     }
-    return SotcArch::AddrTable::Touch(cache, scheduler, addr, size, is_written);
+    return SotcArch::AddrTable::Touch(cache, scheduler, addr, size, is_written, is_texel);
 }
 
 // sotc: ARCH-GCN-NATIVE. Draw thread, at each submit start (see the header).
@@ -4763,6 +4763,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         // reading the globals even after a refusal lowered the stage (its shader would otherwise read address 0).
         const bool gcn_packet = pipeline->GetProfile().gcn_buf != 0 || pipeline->GetProfile().gcn_tex != 0;
         draw_packet.arena_guest_base = gcn_packet ? SotcGcn::Globals::Address() : 0;
+        if (gcn_packet) { // sotc: diagnostic (stderr, once): the globals address the first gcn packet carries.
+            static std::atomic<bool> printed_globals{};
+            if (!printed_globals.exchange(true)) {
+                std::fprintf(stderr, "SOTC GCN PACKET: word 88 (globals) = %#llx%s\n",
+                             static_cast<unsigned long long>(draw_packet.arena_guest_base),
+                             draw_packet.arena_guest_base == 0 ? " (no globals: miss stores would go to address 0)" : "");
+            }
+        }
         draw_packet.arena_device_base = 0;
         draw_packet.arena_size = 0;
     }
@@ -5810,7 +5818,7 @@ void Rasterizer::PacketAddrReplay(const std::vector<PacketAddr>& ranges) {
         const bool touch_ok =
             r.size == 0 ||
             (SotcArch::AddrTable::On()
-                 ? GcnTouch(buffer_cache, scheduler, r.addr, r.size, r.written)
+                 ? GcnTouch(buffer_cache, scheduler, r.addr, r.size, r.written, r.texel)
                  : SotcArch::Mirror::Touch(scheduler, r.addr, r.size));
         if (!touch_ok) {
             static std::atomic<u64> replay_touch_refused{};
@@ -8917,7 +8925,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const bool touch_ok =
                     size == 0 || in_arena ||
                     (SotcArch::AddrTable::On()
-                         ? GcnTouch(buffer_cache, scheduler, vbase, size, desc.is_written)
+                         ? GcnTouch(buffer_cache, scheduler, vbase, size, desc.is_written, desc.is_formatted)
                          : SotcArch::Mirror::Touch(scheduler, vbase, size));
                 if (!touch_ok) {
                     static std::atomic<u64> touch_refused{};
@@ -8936,7 +8944,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // sotc: SOTC_PACKET. A replayed bind (bind cache, fast bind) touches the same range again (PacketAddrReplay).
                 // Only a shader-addressed buffer of a packet op comes here (its profile is the packet's), so this is
                 // always a packet op.
-                packet_addr_rec.push_back({vbase, size, desc.is_written});
+                packet_addr_rec.push_back({vbase, size, desc.is_written, desc.is_formatted});
                 if (bind_cache_recording && size != 0) {
                     bind_cache_ranges_rec.emplace_back(vbase, size); // what a GPU write to the range invalidates
                 }
@@ -11894,6 +11902,9 @@ void Rasterizer::ApplyDynamic(const DynamicValues& values, const GraphicsPipelin
     dynamic_state.SetBlendConstants(values.blend_constants);
     dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
     dynamic_state.SetAttachmentFeedbackLoopEnabled(attachment_feedback_loop);
+    // sotc: SOTC_GPL_DYN_STATE: the key's rasterization state (topology, polygon mode, depth clamp/clip, provoking
+    // vertex, clip space, samples), made from the same registers when the key was built; recorded where dynamic.
+    dynamic_state.SetKeyStatics(pipeline->GetKeyStatics());
 }
 
 void Rasterizer::ComputeViewportScissor(const AmdGpu::Regs& regs, DynamicValues& out) const {

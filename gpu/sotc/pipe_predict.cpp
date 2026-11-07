@@ -15,6 +15,7 @@
 #include <unordered_map>
 
 #include "hooks.h"
+#include "nonblocking.h" // sotc: SOTC_GPL_PREDICT
 
 extern "C" {
 // runtime_memory.c: the unprotected backing view of a guest address, and the mapped region of one.
@@ -120,6 +121,7 @@ struct Pending {
 std::mutex g_mutex;
 std::deque<Pending> g_queue; // guarded by g_mutex
 std::atomic<uint64_t> g_queued{0}, g_read{0}, g_empty{0}, g_slots{0}, g_unreadable{0};
+std::atomic<size_t> g_queue_size{0}; // g_queue.size(), read without the lock (Pending)
 
 // PIPE_PREDICT_MATERIAL: post phase of the factory 0xf9390; rax is the material (0 when the parse failed).
 void PostFactory(SotcHooks::GuestRegs& regs, void*) {
@@ -131,6 +133,7 @@ void PostFactory(SotcHooks::GuestRegs& regs, void*) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_queue.size() < kQueueCap) {
         g_queue.push_back({material, 0});
+        g_queue_size.store(g_queue.size(), std::memory_order_relaxed);
     }
 }
 
@@ -144,6 +147,11 @@ bool On() noexcept {
     return on;
 }
 
+bool MaterialsWanted() noexcept {
+    static const bool on = On() || SotcNonBlocking::GplPredictRequested();
+    return on;
+}
+
 size_t TakeSlots(std::vector<Slot>& out, size_t max_materials) {
     std::vector<Pending> batch;
     {
@@ -151,6 +159,7 @@ size_t TakeSlots(std::vector<Slot>& out, size_t max_materials) {
         const size_t n = std::min(max_materials, g_queue.size());
         batch.assign(g_queue.begin(), g_queue.begin() + static_cast<std::ptrdiff_t>(n));
         g_queue.erase(g_queue.begin(), g_queue.begin() + static_cast<std::ptrdiff_t>(n));
+        g_queue_size.store(g_queue.size(), std::memory_order_relaxed);
     }
     std::vector<Pending> again;
     for (const Pending& m : batch) {
@@ -187,8 +196,13 @@ size_t TakeSlots(std::vector<Slot>& out, size_t max_materials) {
     if (!again.empty()) {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_queue.insert(g_queue.end(), again.begin(), again.end());
+        g_queue_size.store(g_queue.size(), std::memory_order_relaxed);
     }
     return batch.size();
+}
+
+bool HasQueued() noexcept {
+    return g_queue_size.load(std::memory_order_relaxed) != 0;
 }
 
 MaterialStats Stats() noexcept {

@@ -72,4 +72,9 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
 bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data);
 
+/// sotc: SOTC_PIPE_MANIFEST. While set on the calling thread, ParseFetchShader of a synthetic translation
+/// (Info::sotc_synthetic: no guest memory, no fetch shader code) returns this data, recorded at the stage's draw,
+/// instead of parsing the code its user data would point to. Null clears it.
+void SetSyntheticFetchShader(const FetchShaderData* data);
+
 } // namespace Shader::Gcn

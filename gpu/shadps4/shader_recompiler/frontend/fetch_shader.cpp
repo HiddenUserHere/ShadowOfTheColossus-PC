@@ -40,9 +40,20 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
+// sotc: SOTC_PIPE_MANIFEST (SetSyntheticFetchShader).
+static thread_local const FetchShaderData* t_synthetic_fetch = nullptr;
+
+void SetSyntheticFetchShader(const FetchShaderData* data) {
+    t_synthetic_fetch = data;
+}
+
 bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data) {
     if (!info.has_fetch_shader) {
         return false;
+    }
+    if (t_synthetic_fetch && info.sotc_synthetic) { // sotc: SOTC_PIPE_MANIFEST, the fetch data of the stage's draw
+        out_fetch_data = *t_synthetic_fetch;
+        return true;
     }
 
     out_fetch_data.attributes.clear();

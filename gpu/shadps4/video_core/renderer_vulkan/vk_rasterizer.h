@@ -596,6 +596,7 @@ private:
         VAddr addr{};
         u64 size{};    ///< the clamped size BindBuffers used (0: nothing to touch)
         bool written{}; ///< never replayed: a written buffer is not eligible for the caches
+        bool texel{};   ///< a formatted buffer: GcnTouch syncs it from an aliasing image, as ObtainBuffer does
     };
     /// sotc: SOTC_BIND_CACHE_PACKET. Where a PacketAddr of a recorded bind came from: the stage (GetStages index) and
     /// the buffer of its V#, the position of the PacketAddr, of its bind cache range and of its repair (kNoIndex when

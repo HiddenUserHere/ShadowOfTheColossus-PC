@@ -151,6 +151,15 @@ struct DynamicState {
         bool color_write_masks : 1;
         bool line_width : 1;
         bool feedback_loop_enabled : 1;
+
+        // sotc: SOTC_GPL_DYN_STATE (Instance::KeyDynamic), set from the pipeline key.
+        bool primitive_topology : 1;
+        bool polygon_mode : 1;
+        bool depth_clamp_enable : 1;
+        bool depth_clip_enable : 1;
+        bool provoking_vertex : 1;
+        bool clip_negative_one_to_one : 1;
+        bool rasterization_samples : 1;
     } dirty_state{};
 
     Viewports viewports{};
@@ -188,6 +197,18 @@ struct DynamicState {
     ColorWriteMasks color_write_masks{};
     float line_width{};
     bool feedback_loop_enabled{};
+
+    /// sotc: SOTC_GPL_DYN_STATE. The state the pipeline key holds (and a static pipeline bakes), dynamic in every
+    /// graphics pipeline of a device with the feature (Instance::KeyDynamic). Valid defaults until the first draw.
+    struct KeyStatics {
+        vk::PrimitiveTopology topology{vk::PrimitiveTopology::eTriangleList};
+        vk::PolygonMode polygon_mode{vk::PolygonMode::eFill};
+        bool depth_clamp_enable{};
+        bool depth_clip_enable{true};
+        vk::ProvokingVertexModeEXT provoking_vertex{vk::ProvokingVertexModeEXT::eFirstVertex};
+        bool clip_negative_one_to_one{};
+        vk::SampleCountFlagBits rasterization_samples{vk::SampleCountFlagBits::e1};
+    } key_statics{};
 
     /// sotc: advanced by Invalidate(), which BeginSession calls for every new primary command
     /// buffer, and which the blit and shadow paths call after binding their own pipelines. The
@@ -397,6 +418,19 @@ struct DynamicState {
             line_width = width;
             dirty_state.line_width = true;
         }
+    }
+
+    /// sotc: SOTC_GPL_DYN_STATE. Marks the changed fields dirty; Commit records only the ones the device made dynamic.
+    void SetKeyStatics(const KeyStatics& v) {
+        auto& c = key_statics;
+        dirty_state.primitive_topology |= c.topology != v.topology;
+        dirty_state.polygon_mode |= c.polygon_mode != v.polygon_mode;
+        dirty_state.depth_clamp_enable |= c.depth_clamp_enable != v.depth_clamp_enable;
+        dirty_state.depth_clip_enable |= c.depth_clip_enable != v.depth_clip_enable;
+        dirty_state.provoking_vertex |= c.provoking_vertex != v.provoking_vertex;
+        dirty_state.clip_negative_one_to_one |= c.clip_negative_one_to_one != v.clip_negative_one_to_one;
+        dirty_state.rasterization_samples |= c.rasterization_samples != v.rasterization_samples;
+        c = v;
     }
 
     void SetAttachmentFeedbackLoopEnabled(const bool enabled) {

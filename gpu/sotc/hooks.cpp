@@ -22,6 +22,7 @@
 #include "hooks.h"
 #include "video_core/sotc_trace.h" // sotc: time mode spans (Now, PushEvent, InternString)
 #include "arena_attrib.h" // sotc: SOTC_ARENA_ATTRIB shares the PC_RING_HEAP wrap
+#include "pipe_predict.h" // sotc: SOTC_GPL_PREDICT turns the material factory hook on
 
 namespace SotcHooks {
 namespace {
@@ -681,6 +682,11 @@ bool InstallHooks(const char* hooks_path, void* image, uint64_t module_size, Ins
         // sotc: SOTC_ARENA_ATTRIB runs the PC_RING_HEAP wrap (pc_ring.cpp HeapPre/HeapPost) without
         // the ring: the wrap then only records the arena allocations (no declare, no protection).
         if (rec.switch_value == 0 && rec.name == "PC_RING_HEAP" && SotcArenaAttrib::On()) {
+            rec.switch_value = 1;
+        }
+        // sotc: SOTC_GPL_PREDICT (on with SOTC_GPL_NODROP) reads the materials the factory builds (pipe_predict.h)
+        // while SOTC_PIPE_PREDICT, the hook's own switch, stays 0.
+        if (rec.switch_value == 0 && rec.name == "PIPE_PREDICT_MATERIAL" && SotcPipePredict::MaterialsWanted()) {
             rec.switch_value = 1;
         }
         rec.enabled = !master_off && rec.switch_value != 0 && (!timed || SotcTrace::kOn);

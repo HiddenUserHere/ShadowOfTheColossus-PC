@@ -69,7 +69,10 @@ vk::DeviceAddress Base();
 /// still runs the slow path and only counts the fast path it would have taken.
 /// A written range takes the fast path only in native mode (SOTC_NATIVE=1), with its pages placed and clean and
 /// already GPU-modified (BufferCache::WrittenAlreadyGpuModified); then it runs NoteWrittenFast and no sync.
-bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size, bool is_written);
+/// sotc: is_texel (a formatted buffer, DescriptorBinding is_formatted): ObtainBuffer syncs it from an aliasing image as
+/// the descriptor path does, and no fast path skips that.
+bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size, bool is_written,
+           bool is_texel = false);
 
 /// The buffer cache placed [addr, addr+size) at device address device_addr in owner (any thread). Only the shadow
 /// changes; the next Touch uploads it.

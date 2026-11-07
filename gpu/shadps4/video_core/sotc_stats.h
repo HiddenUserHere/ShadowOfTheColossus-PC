@@ -1297,6 +1297,9 @@ inline std::atomic<uint64_t> async_translate_stale{0}; ///< permutations whose t
 inline std::atomic<uint64_t> async_translate_built{0};
 inline std::atomic<uint64_t> async_translate_ns{0};    ///< worker time translating them
 inline std::atomic<uint64_t> async_translate_skips{0}; ///< draws skipped while waiting for one
+/// sotc: draws dropped because their graphics pipeline was queued on a worker and not built yet (the two skips of
+/// GetGraphicsPipelineLookupSlow), total; printed in the SOTC ASYNC TRANSLATE line.
+inline std::atomic<uint64_t> pipeline_pending_drops{0};
 // sotc: SOTC_ASYNC_COMPUTE_XLATE, totals: compute shaders queued ahead of their dispatch, the
 // dispatches that waited for one (and the wait), and those taken back before a worker started.
 inline std::atomic<uint64_t> compute_prefetch_queued{0};

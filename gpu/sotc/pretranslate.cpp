@@ -15,7 +15,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "common/hash.h"
+#include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/params.h"
 #include "shader_recompiler/specialization.h"
 
 namespace SotcPretranslate {
@@ -31,6 +34,7 @@ std::unordered_map<uint64_t, std::shared_ptr<Hint>> g_hints;
 std::unordered_set<uint64_t> g_hinted;  // prebuilt with a hint, first dispatch not seen yet
 std::FILE* g_hint_out = nullptr;
 uint64_t g_hint_applied{}, g_hint_first{}, g_hint_first_hit{}, g_hint_written{}, g_hint_new{}, g_miss_logged{};
+uint64_t g_hint_lookups{}; // sotc: AcquireHint calls (prebuilds that looked for a hint)
 thread_local const Hint* t_active_hint = nullptr;
 std::vector<Request> g_queue;
 std::unordered_set<uint64_t> g_seen;
@@ -276,6 +280,41 @@ Hint BuildHint(const Shader::Info& info) {
     return h;
 }
 
+// sotc: SOTC_PIPE_MANIFEST: BuildHint plus the samplers and the vertex fetch attributes' V#.
+Hint BuildFullHintImpl(const Shader::Info& info, const Shader::Gcn::FetchShaderData* fetch) {
+    Hint h = BuildHint(info);
+    for (const auto& desc : info.samplers) {
+        const AmdGpu::Sampler sharp = desc.GetSharp(info);
+        HintSampler hs;
+        hs.key = HintKeyOf(desc.sharp_fetch);
+        hs.force_unnormalized = static_cast<uint8_t>(sharp.force_unnormalized.Value());
+        hs.force_degamma = static_cast<uint8_t>(sharp.force_degamma.Value());
+        h.samplers.push_back(hs);
+    }
+    if (fetch && !fetch->Empty()) {
+        for (const auto& attrib : fetch->attributes) {
+            const uint64_t key = (uint64_t{attrib.sgpr_base} << 8) | attrib.dword_offset;
+            if (std::ranges::find(h.attribs, key, &HintBuffer::key) != h.attribs.end()) {
+                continue;
+            }
+            // The raw V# (the attribute's format override is applied by its reader, as at the draw).
+            const auto sharp = info.ReadUdReg<AmdGpu::Buffer>(attrib.sgpr_base, attrib.dword_offset);
+            HintBuffer hb;
+            hb.key = key;
+            hb.stride = static_cast<uint16_t>(sharp.stride);
+            hb.swizzle = static_cast<uint8_t>(sharp.swizzle_enable);
+            hb.index_stride = static_cast<uint8_t>(sharp.index_stride);
+            hb.element_size = static_cast<uint8_t>(sharp.element_size);
+            hb.num_format = static_cast<uint8_t>(sharp.num_format);
+            hb.data_format = static_cast<uint8_t>(sharp.data_format);
+            hb.dst_sel = {static_cast<uint8_t>(sharp.dst_sel_x), static_cast<uint8_t>(sharp.dst_sel_y),
+                          static_cast<uint8_t>(sharp.dst_sel_z), static_cast<uint8_t>(sharp.dst_sel_w)};
+            h.attribs.push_back(hb);
+        }
+    }
+    return h;
+}
+
 // Appends a program's hint (a "P" line, then its bindings); the last "P" of a hash wins at the next load.
 void AppendHintLocked(uint64_t hash, const Hint& h) {
     if (!g_hint_out) {
@@ -377,13 +416,25 @@ HintPtr AcquireHint(uint64_t hash) noexcept {
     if (!g_hints_loaded) {
         LoadHintsLocked();
     }
-    const auto it = g_hints.find(hash);
+    ++g_hint_lookups;
+    auto it = g_hints.find(hash);
+    // sotc: a hint an older build wrote under the variant-mixed hash of a SOTC_SHADER_ADDR (plain) or SOTC_HEAP stage
+    // (the dispatch's lookup hash, HashCombine(hash, variant)): the sharps are the game's, whatever the variant.
+    for (const uint64_t variant : {uint64_t{Shader::StageVariantPlain}, uint64_t{Shader::StageVariantHeap}}) {
+        if (it == g_hints.end()) {
+            it = g_hints.find(HashCombine(hash, variant));
+        }
+    }
     if (it == g_hints.end()) {
         return {};
     }
     g_hinted.insert(hash);
     ++g_hint_applied;
     return it->second;
+}
+
+Hint BuildFullHint(const Shader::Info& info, const Shader::Gcn::FetchShaderData* fetch) {
+    return BuildFullHintImpl(info, fetch);
 }
 
 const Hint* ActiveHint() noexcept {
@@ -403,8 +454,11 @@ void NoteComputeFirstUse(uint64_t hash, bool hit, const Shader::Info& info, cons
     if (!ComputeOn()) {
         return;
     }
+    // sotc: the game's hash, as AcquireHint is asked for it (the prebuild's program hash). `hash` is the dispatch's
+    // lookup hash, the variant-mixed one under SOTC_SHADER_ADDR / SOTC_HEAP; the miss log keeps showing it.
+    const uint64_t game_hash = info.pgm_hash;
     std::scoped_lock lock{g_hint_mutex};
-    const bool hinted = g_hinted.erase(hash) != 0;
+    const bool hinted = g_hinted.erase(game_hash) != 0;
     if (hinted) {
         ++g_hint_first;
         g_hint_first_hit += hit;
@@ -423,16 +477,16 @@ void NoteComputeFirstUse(uint64_t hash, bool hit, const Shader::Info& info, cons
         LoadHintsLocked();
     }
     Hint fresh = BuildHint(info);
-    const auto it = g_hints.find(hash);
+    const auto it = g_hints.find(game_hash);
     if (it != g_hints.end() && *it->second == fresh) {
         return;
     }
     if (it == g_hints.end()) {
         ++g_hint_new;
     }
-    AppendHintLocked(hash, fresh);
+    AppendHintLocked(game_hash, fresh);
     ++g_hint_written;
-    g_hints[hash] = std::make_shared<Hint>(std::move(fresh));
+    g_hints[game_hash] = std::make_shared<Hint>(std::move(fresh));
 }
 
 void Report(std::string& out, double) {
@@ -495,14 +549,15 @@ void Report(std::string& out, double) {
     out += '\n';
     // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS counters (one line; the hint file is user/shader_predict/compute_hints.tsv).
     std::scoped_lock hint_lock{g_hint_mutex};
-    char hl[480];
+    char hl[560];
     std::snprintf(hl, sizeof hl,
                   "SOTC PRETRANSLATE compute hints (%s): file %zu programs; prebuilt with a hint %llu, their first "
-                  "dispatches %llu (key hit %llu); misses logged %llu, hint lines written %llu (new programs %llu)\n",
+                  "dispatches %llu (key hit %llu); misses logged %llu, hint lines written %llu (new programs %llu); "
+                  "lookups %llu\n",
                   HintsOn() ? "on" : "off", g_hints.size(), (unsigned long long)g_hint_applied,
                   (unsigned long long)g_hint_first, (unsigned long long)g_hint_first_hit,
                   (unsigned long long)g_miss_logged, (unsigned long long)g_hint_written,
-                  (unsigned long long)g_hint_new);
+                  (unsigned long long)g_hint_new, (unsigned long long)g_hint_lookups);
     out += hl;
 }
 

@@ -65,6 +65,9 @@ void Init(const Vulkan::Instance& instance) {
         return;
     }
     const auto refuse = [buf, tex](const char* reason) {
+        // sotc: diagnostic (stderr, once): LOG_INFO is filtered out of the session log.
+        std::fprintf(stderr, "SOTC GCN GLOBALS: refused (buf %s, tex %s): %s\n", buf ? "on" : "off",
+                     tex ? "on" : "off", reason);
         if (buf) {
             Refuse(Stage::Buf, reason);
         }
@@ -148,6 +151,10 @@ void Init(const Vulkan::Instance& instance) {
 
     LOG_INFO(Render, "SOTC GCN GLOBALS: {} KiB at {:#x} (buffer {}, table {})", bytes >> 10,
              static_cast<u64>(state->address), buf ? "on" : "off", tex ? "on" : "off");
+    // sotc: diagnostic (stderr, once): the address the packet carries as word 88.
+    std::fprintf(stderr, "SOTC GCN GLOBALS: created, address %#llx, %llu bytes (buf %s, tex %s)\n",
+                 static_cast<unsigned long long>(state->address), static_cast<unsigned long long>(bytes),
+                 buf ? "on" : "off", tex ? "on" : "off");
 }
 
 vk::DeviceAddress Address() {

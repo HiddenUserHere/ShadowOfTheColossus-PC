@@ -1449,7 +1449,20 @@ static void SotcFillSyntheticSharps(Shader::Info& info, const ResourceDiscoveryL
                                    SotcPretranslate::HintKeyOf(ConstructSharpFetch<AmdGpu::Image>(usage.sharps[0])));
             }
             WriteSyntheticSharp(info, usage.sharps[0], image);
-            WriteSyntheticSharp(info, usage.sharps[1], sampler);
+            // sotc: SOTC_PIPE_MANIFEST: a manifest translation's hint also holds its samplers' specialization fields.
+            AmdGpu::Sampler hinted_sampler = sampler;
+            if (hint && !hint->samplers.empty()) {
+                const uint64_t skey =
+                    SotcPretranslate::HintKeyOf(ConstructSharpFetch<AmdGpu::Sampler>(usage.sharps[1]));
+                for (const auto& h : hint->samplers) {
+                    if (h.key == skey) {
+                        hinted_sampler.force_unnormalized.Assign(h.force_unnormalized);
+                        hinted_sampler.force_degamma.Assign(h.force_degamma);
+                        break;
+                    }
+                }
+            }
+            WriteSyntheticSharp(info, usage.sharps[1], hinted_sampler);
         }
     }
 }

@@ -13,6 +13,8 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include "../../../sotc/pipe_manifest.h" // sotc: SOTC_PIPE_MANIFEST
+#include "../../../sotc/pipe_predict.h" // sotc: SOTC_GPL_PREDICT
 #include "../../../sotc/pretranslate.h" // sotc: SOTC_PRETRANSLATE
 #include <unordered_set>
 #include <variant>
@@ -452,9 +454,30 @@ private:
         /// sotc: SOTC_NB_GPL (P4): a library warm-up job: a link job whose only purpose is building the new shader's
         /// library ahead of its first draw; its linked pipeline is dropped.
         bool warm_lib{};
+        /// sotc: SOTC_GPL_NODROP: the libraries of a manifest pipeline (with link_only and warm_lib), built without the
+        /// link (GplLibraryCache::SetLibrariesOnly); counted by the manifest hold.
+        bool manifest_libs{};
+        /// sotc: SOTC_GPL_PREDICT / SOTC_GPL_PARALLEL_LIBS: a library job (with link_only and warm_lib): only the parts
+        /// of this mask (a bit per GplLibraryCache::Part) are built, the others only looked up; no link. lib_origin is
+        /// the GplLibraryCache::Origin it counts under; lib_wait, when set, is the group a waiting draw counts down.
+        u8 lib_parts{};
+        u8 lib_origin{};
+        /// sotc: SOTC_GPL_PACK_LIBS: the stage library this job compiles (PackLibraryId); its library is destroyed
+        /// once compiled (GplLibraryCache::SetDiscard).
+        u64 pack_id{};
+        struct LibWait {
+            std::atomic<int> remaining{0};
+        };
+        std::shared_ptr<LibWait> lib_wait;
         ComputePipeline* compute{}; ///< a compute job: only Build() is run
         bool priority{}; ///< sotc: a depth-only (shadow) graphics job queued ahead of the others
         bool pre_compute{}; ///< sotc: SOTC_PRETRANSLATE_COMPUTE: a prebuilt compute pipeline (its build counts as done)
+        /// sotc: SOTC_ADDR_FALLBACK: a table-variant pipeline queued while its draws take the descriptor pipeline
+        /// (counted as pending until built).
+        bool addr_table{};
+        /// sotc: SOTC_PIPE_MANIFEST: a pipeline of the manifest (counted as built when collected, or by the worker
+        /// for a compute pipeline). Built from its stages' recorded state, registered as a draw's.
+        bool manifest{};
         GraphicsPipelineKey key;
         u64 hash{};
         std::array<const Shader::Info*, MaxShaderStages> infos{};
@@ -501,6 +524,13 @@ private:
             std::vector<u32> owned_code;
             u8 synthetic_variant{}; ///< Info::sotc_synthetic_variant of the translation
             bool first_variant{};   ///< the job that may queue the synthetic variant 1
+            /// sotc: SOTC_PIPE_MANIFEST: the manifest stage this synthetic translation rebuilds (-1: none), the raw
+            /// sharp fields of its draw, the fetch shader data of its draw (vertex), and the V# table its user data
+            /// points to for the fetch attributes (ManifestUserData, filled on the worker).
+            s32 manifest_stage{-1};
+            SotcPretranslate::HintPtr manifest_hint;
+            std::optional<Shader::Gcn::FetchShaderData> manifest_fetch;
+            std::vector<u32> manifest_ud_table;
         };
         std::unique_ptr<Translate> translate; ///< a translation job
 
@@ -527,7 +557,10 @@ private:
     };
     /// sotc: the job lanes of the pipeline workers (JobQueues), highest first. A worker takes the first job of the
     /// first lane that has one; Background is capped (SOTC_NB_SCHED) and Graphics is ordered by demand.
-    enum class JobLane : u8 { Compute, Translate, Tiny, Shadow, Graphics, Background, Count };
+    /// sotc: Urgent (SOTC_GPL_PARALLEL_LIBS): library builds a draw waits for, ahead of everything. Predict
+    /// (SOTC_GPL_PREDICT): libraries of a just-created material, after the jobs a recorder or draw waits for (Compute,
+    /// Translate), ahead of the optimized builds, background translations and pack loads.
+    enum class JobLane : u8 { Urgent, Compute, Translate, Predict, Tiny, Shadow, Graphics, Background, Count };
     struct JobQueues {
         std::array<std::deque<std::unique_ptr<AsyncPipelineJob>>, static_cast<size_t>(JobLane::Count)> lanes;
         u32 background_running{}; ///< background jobs taken by workers and not finished
@@ -554,14 +587,43 @@ private:
     u32 BackgroundCap() const;
     /// sotc: the lanes whose jobs no draw or recorder is blocked on right now (SOTC_NB_WORKER_CAP caps them).
     static constexpr bool CappedLane(JobLane lane) {
-        return lane == JobLane::Shadow || lane == JobLane::Graphics || lane == JobLane::Background;
+        return lane == JobLane::Predict || lane == JobLane::Shadow || lane == JobLane::Graphics ||
+               lane == JobLane::Background;
     }
     /// sotc: how many capped-lane jobs may run at once (unlimited when SOTC_NB_WORKER_CAP is off or during the boot hold).
     u32 CappedCap() const;
     bool AsyncPipelineEligible() const;
+    /// sotc: front: the job goes to the front of its lane (a draw's missing pipeline, ahead of the background builds
+    /// queued in the same lane: the boot preload, the manifest's late builds).
     void QueueAsyncPipeline(u64 hash,
                             const GraphicsPipeline::SerializationSupport* preloaded = nullptr,
-                            bool priority = false, bool background = false);
+                            bool priority = false, bool background = false, bool addr_table = false,
+                            bool front = false);
+    /// sotc: SOTC_ADDR_FALLBACK (default on in table mode, SOTC_SHADER_ADDR 3/4; =0 off; no effect otherwise). A draw
+    /// or dispatch whose table-variant pipeline (StageVariantPlain/Heap, translated with `profile`) is not ready queues
+    /// it on the workers and is recorded with the descriptor-mode pipeline instead (StageVariantDefault stages,
+    /// translated with desc_profile, built by the rules a descriptor-mode run uses). The pipeline object carries the
+    /// profile it was built with (Pipeline::GetProfile), and the rasterizer binds from that profile, so a fallback op
+    /// binds every buffer by descriptor. A stage's profile follows from its variant (StageProfile): in table mode a
+    /// default-variant stage is always a descriptor stage.
+    bool AddrFallbackOn() const;
+    bool AddrFallbackComputeOn() const;
+    /// sotc: SOTC_ADDR_FALLBACK. The translation profile of a stage variant, and the profile of a pipeline's stages.
+    const Shader::Profile& StageProfile(u8 variant) const {
+        return profile.shader_addr != 0 && variant == Shader::StageVariantDefault ? desc_profile : profile;
+    }
+    const Shader::Profile& StagesProfile(const std::array<const Shader::Info*, MaxShaderStages>& stages) const {
+        for (const auto* info : stages) {
+            if (info) {
+                return StageProfile(info->variant);
+            }
+        }
+        return profile;
+    }
+    /// sotc: SOTC_ADDR_FALLBACK. With graphics_key / compute_key holding the table key: true when its pipeline is
+    /// ready. Otherwise queues it (unless queued already) and returns false. CP only.
+    bool AddrTableGraphicsReady();
+    bool AddrTableComputeReady();
     bool AsyncPreloadEnabled() const;
     bool IsDepthOnlyDraw() const;
     const char* AsyncIneligibleReason() const;
@@ -637,6 +699,29 @@ private:
     /// the list of the next boot holds (RecordTinyPipeline), which build their libraries before the first draw
     /// (BuildTinyLibraries, at the end of the hold, before the eviction).
     void RecordTinyPipeline();
+    /// sotc: SOTC_PIPE_MANIFEST (gpu/sotc/pipe_manifest.h). State and steps, command processor only (the workers
+    /// translate and build). LoadManifest at the first lookup after the warm-up; MaybeHoldForManifest at the start of
+    /// every full lookup (the boot hold once, then ManifestPump for the stages whose code comes later);
+    /// ManifestPump installs finished translations, resolves stages (a permutation in the program cache or on disk
+    /// with the recorded specialization, or a synthetic translation of the loaded code) and queues the pipelines whose
+    /// stages are ready; the Capture functions append what a draw or dispatch used that no manifest holds.
+    struct ManifestState;
+    std::unique_ptr<ManifestState> manifest;
+    std::atomic<bool> warmup_done{false};  ///< sotc: WarmUp returned (the cache variant key is set)
+    std::string cache_variant_key;         ///< sotc: the shader cache variant key (WarmUp), the manifest header's
+    bool manifest_holding{};               ///< sotc: the manifest's boot hold is running (every worker serves it)
+    void LoadManifest();
+    void MaybeHoldForManifest();
+    void RunManifestHold();
+    void ManifestPump(bool holding);
+    bool ManifestResolveStage(u32 index, bool holding);
+    void ManifestQueueTranslate(u32 index, const std::vector<u32>& code, bool holding);
+    void ManifestInstallStage(AsyncPipelineJob::Translate& t);
+    void ManifestSchedulePipes(bool holding);
+    void ManifestUserData(AsyncPipelineJob::Translate& t);
+    SotcPipeManifest::Header ManifestHeader() const;
+    void CaptureManifestGraphics();
+    void CaptureManifestCompute();
     /// sotc: SOTC_NB_LAZY_PSO: the pipelines used in the last sessions (id -> session of the last use), so the lazy
     /// warm-up still builds what the player is likely to meet. LoadRecentPipelines at the warm-up, NoteRecentPipeline at
     /// a pipeline's first use in the session, saved every 5 s (when changed) by a detached thread.
@@ -661,7 +746,50 @@ private:
     void SaveUseCounts();
     /// sotc: SOTC_PIPE_GPL. Builds the fast-linked pipeline of graphics_key into slot, when its
     /// state can be linked. Returns false (slot untouched) when it cannot. Command processor only.
-    bool TryFastLink(std::unique_ptr<GraphicsPipeline>& slot, bool allow_build = false);
+    /// sotc: probe (SOTC_GPL_PARALLEL_LIBS): links only libraries that exist, builds none.
+    bool TryFastLink(std::unique_ptr<GraphicsPipeline>& slot, bool allow_build = false, bool probe = false);
+    /// sotc: SOTC_GPL_NODROP: whether this draw's pipeline can be fast-linked (and later replaced by its optimized build
+    /// on a worker), and the link itself, building missing libraries on this thread (counted and timed).
+    bool NoDropLinkable();
+    bool NoDropLink(std::unique_ptr<GraphicsPipeline>& slot);
+    /// sotc: SOTC_GPL_PARALLEL_LIBS: the missing vertex and pixel libraries of the current draw (Missing() bits of a
+    /// lookup-only link), built at once by two urgent jobs while the command processor waits (taking a job no worker
+    /// has taken yet). False when nothing was queued (the caller builds them itself).
+    bool BuildLibrariesParallel(u32 missing);
+    /// sotc: a library job for the current stage state (infos, modules, runtime infos, fetch shader) under key.
+    std::unique_ptr<AsyncPipelineJob> MakeLibraryJob(const GraphicsPipelineKey& key, u32 parts, u8 origin);
+    /// sotc: runs a library job on this thread (a worker, or the command processor taking a waited one) and counts it
+    /// done (lib_jobs_pending, its wait group).
+    void RunLibraryJob(AsyncPipelineJob& job);
+    /// sotc: SOTC_GPL_DYN_STATE / SOTC_GPL_PACK_LIBS. A library job that builds only `parts` of one stage permutation
+    /// (vs or ps), the other stage being a partner whose libraries are only looked up. Null when the pair cannot be
+    /// linked. With shader-only library keys the result does not depend on rest or on the partner.
+    std::unique_ptr<AsyncPipelineJob> MakeStageLibraryJob(const GraphicsPipelineKey& rest, Program& vs, size_t vs_perm,
+                                                          Program& ps, size_t ps_perm, u32 parts, u8 origin);
+    /// sotc: SOTC_GPL_PACK_LIBS (sotc/nonblocking.h). At the end of the pretranslate hold, before the eviction: compiles
+    /// the stage library of every translated vertex/pixel permutation that sotc_pack_libraries.bin does not list into
+    /// the driver's pipeline cache (destroyed after), saves that cache and the list. Command processor.
+    void BuildPackLibraries();
+    /// sotc: SOTC_GPL_PACK_LIBS: ids of the pack libraries compiled this session (workers append).
+    std::mutex pack_mutex;
+    std::vector<u64> pack_compiled;
+    std::atomic<u64> pack_failed{0};
+    /// sotc: SOTC_GPL_PACK_LIBS: the saved driver cache was loaded and accepted at startup (else the list is void).
+    bool driver_cache_loaded{};
+    /// sotc: SOTC_GPL_LIB_PHASE: queues the manifest library jobs held back for the library phase of the boot hold.
+    void ManifestFlushLibraries(JobLane lane);
+    /// sotc: SOTC_GPL_PREDICT (gpu/sotc/pipe_predict.h). Command processor, before a draw's key is built: takes the
+    /// queued materials' pass slots (or the ones PredictPipelines read) and queues the library jobs of their programs.
+    void PredictLibraries(const std::vector<SotcPipePredict::Slot>* slots);
+    /// sotc: SOTC_GPL_PREDICT. After a new key: learns the pre-rasterization and fragment state of its pass slot and
+    /// counts the most common ones (the templates of the predicted library jobs).
+    void NoteLibraryTemplate();
+    /// sotc: SOTC_GPL_PREDICT state (vk_pipeline_cache.cpp), command processor only.
+    std::shared_ptr<struct LibPredictState> lib_predict;
+    /// sotc: SOTC_GPL_PREDICT / SOTC_GPL_PARALLEL_LIBS library jobs queued and not finished (workers decrement).
+    std::atomic<u32> lib_jobs_pending{0};
+    /// sotc: SOTC_GPL_PARALLEL_LIBS: notified (under async_mutex) when a waited library job is done.
+    std::condition_variable_any lib_wait_cv;
     /// sotc: SOTC_ASYNC_COMPUTE_XLATE: waits for (or takes back) a prefetched translation.
     void WaitPendingTranslation(u64 hash);
     void AsyncPipelineWorker(std::stop_token token);
@@ -686,6 +814,11 @@ private:
     std::jthread driver_cache_saver;
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
+    /// sotc: SOTC_ADDR_FALLBACK: `profile` without the shader addresses (shader_addr 0, gcn_buf 0): the profile of a
+    /// descriptor-mode run. Declared after `profile` and before the pipelines (which keep a reference to it).
+    Shader::Profile desc_profile{};
+    bool addr_fallback{};      ///< sotc: SOTC_ADDR_FALLBACK resolved (table mode and the switch not 0)
+    bool addr_fallback_draw{}; ///< sotc: the current lookup binds the descriptor-mode stages (CP only)
     Shader::Pools pools;
     DrawIndirectParams draw_indirect_params{};
     /// sotc: SOTC_VS_DRAW_KIND: the vertex stage's user data of an indirect draw, with the start instance SGPR zeroed.
@@ -813,6 +946,15 @@ void ReportPipeFast(std::string& out, double seconds);
 /// sotc: SOTC_PIPE_GPL counters (vk_pipeline_cache.cpp): appends one line for the 5 s report when the
 /// switch is on and the window had cold misses or libraries. Call from one thread.
 void ReportPipeGpl(std::string& out, double seconds);
+
+/// sotc: SOTC_PIPE_MANIFEST (vk_pipeline_cache.cpp): writes the records captured since the last call to the user's
+/// manifest, and appends one "SOTC PIPE MANIFEST late" line when pipelines were built after the boot hold in the
+/// window. Call from one thread.
+void ReportPipeManifest(std::string& out, double seconds);
+
+/// sotc: SOTC_ADDR_FALLBACK counters (vk_pipeline_cache.cpp): appends one "SOTC ADDR FALLBACK" line for the 5 s report
+/// when the fallback is on and the window had fallback ops or table pipelines pending/built. Call from one thread.
+void ReportAddrFallback(std::string& out, double seconds);
 
 /// sotc: N5 (SOTC_N5_PSO=1 with SOTC_NATIVE on). The boot prebuild in WarmUp: every cached pipeline
 /// is built on the workers before the game needs it, in the order of its use count.

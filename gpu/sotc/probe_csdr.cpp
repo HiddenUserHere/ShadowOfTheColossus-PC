@@ -27,6 +27,7 @@
 
 #include "guest_mem.h"
 #include "hooks.h"
+#include "pipe_manifest.h" // sotc: SOTC_PIPE_MANIFEST (RES_LOADED feeds its code store)
 #include "predict_probe.h"
 #include "pretranslate.h"
 #include "probe_dump.h" // sotc: SOTC_RES_DUMP (RES_LOADED feeds it)
@@ -198,7 +199,7 @@ HookAction Site(GuestRegs& regs, void*) {
 // once the resource is built: the GPU bytes are copied out of it (SOTC_PRELOAD_UPLOAD hooks that copy instead).
 HookAction Loaded(GuestRegs& regs, void*) {
     const bool dump = SotcResDump::On(); // sotc: SOTC_RES_DUMP (probe_dump.cpp)
-    if (!SotcPredict::On() && !SotcPretranslate::On() && !dump) {
+    if (!SotcPredict::On() && !SotcPretranslate::On() && !SotcPipeManifest::On() && !dump) {
         return HookAction::Continue;
     }
     const size_t n = static_cast<size_t>(regs.rcx);

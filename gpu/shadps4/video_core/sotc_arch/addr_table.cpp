@@ -394,7 +394,7 @@ vk::DeviceAddress Base() {
 // So a page is clean only while no unsynced guest change and no entry change has happened to it since its last
 // sync, and a bind that finds all its pages placed and clean has nothing to upload.
 bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size,
-           bool is_written) {
+           bool is_written, bool is_texel) {
     State* s = g_state.get();
     if (!s || !On()) {
         return false;
@@ -424,7 +424,8 @@ bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr ad
     });
     const bool placed_clean = all_placed && all_clean;
     const bool native = !SotcNative::TracksGuestPages(); // SOTC_NATIVE=1
-    const bool read_fast = !is_written && placed_clean;
+    // sotc: a formatted (texel) read goes to ObtainBuffer, which syncs it from an aliasing image (as the descriptor path).
+    const bool read_fast = !is_written && placed_clean && !is_texel;
     const bool written_fast = is_written && native && placed_clean && cache.WrittenAlreadyGpuModified(addr, size);
     // SOTC_SHADER_ADDR=2 runs the slow path every time (so the verify measures the real path), and counts the fast
     // path it would have taken and whether the slow path wrote the entries the fast path would have kept.
@@ -464,7 +465,7 @@ bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr ad
     const u64 seq_before = g_dirty_seq.load(std::memory_order_seq_cst); // s1
     // The buffer cache makes the range resident and synchronized, and serves ring-8 binds from their run. Called
     // without g_mutex: ObtainBuffer places blocks, and the placements call OnPlace.
-    const auto [buffer, offset] = cache.ObtainBuffer(addr, static_cast<u32>(size), is_written);
+    const auto [buffer, offset] = cache.ObtainBuffer(addr, static_cast<u32>(size), is_written, is_texel);
     if (!buffer || !buffer->HasBufferDeviceAddress()) {
         g_failed.fetch_add(1, std::memory_order_relaxed);
         return false;

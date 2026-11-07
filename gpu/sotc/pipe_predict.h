@@ -18,6 +18,11 @@ namespace SotcPipePredict {
 /// SOTC_PIPE_PREDICT=1, read once.
 bool On() noexcept;
 
+/// The material factory hook is wanted: SOTC_PIPE_PREDICT=1, or the library prediction of SOTC_GPL_NODROP
+/// (SotcNonBlocking::GplPredictRequested, on by default). hooks.cpp turns PIPE_PREDICT_MATERIAL on for the latter,
+/// whose own switch (SOTC_PIPE_PREDICT) stays 0. Read once.
+bool MaterialsWanted() noexcept;
+
 /// One VS+PS pass slot of a material.
 struct Slot {
     uint8_t k{};      ///< the pass slot index (pass-map.md: 0 shadow, 1 depth, 2/3 gbufferbakedambient, ...)
@@ -29,6 +34,8 @@ struct Slot {
 /// whose slots hold no program yet is read again on a later call (a few times, then dropped). Returns the number
 /// of materials read.
 size_t TakeSlots(std::vector<Slot>& out, size_t max_materials);
+/// Any thread: materials are queued (no lock; TakeSlots may still find none).
+bool HasQueued() noexcept;
 
 /// Counters of the material side, for the report line.
 struct MaterialStats {

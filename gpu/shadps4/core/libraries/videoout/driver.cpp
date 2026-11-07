@@ -142,6 +142,8 @@ void ReportPassStats(std::string& out, double seconds); // sotc: SOTC_PASS_STATS
 void ReportIndexExtent(std::string& out, double seconds); // sotc: SOTC_INDEX_EXTENT
 void ReportSpecMemo(std::string& out, double seconds); // sotc: SOTC_SPEC_MEMO
 void ReportPipeGpl(std::string& out, double seconds); // sotc: SOTC_PIPE_GPL
+void ReportAddrFallback(std::string& out, double seconds); // sotc: SOTC_ADDR_FALLBACK
+void ReportPipeManifest(std::string& out, double seconds); // sotc: SOTC_PIPE_MANIFEST
 void ReportPipeFeedback(std::string& out, double seconds); // sotc: SOTC_PIPE_FEEDBACK / SOTC_PIPE_COMPILE_CHECK
 void ReportHleCopyExact(std::string& out, double seconds); // sotc: SOTC_HLE_COPY_EXACT (vk_shader_hle.cpp)
 } // namespace Vulkan
@@ -2497,6 +2499,8 @@ void VideoOutDriver::Flip(const Request& req) {
             Vulkan::ReportSpecMemo(report, seconds); // SOTC_SPEC_MEMO
             Shader::ReportBindlessCache(report, seconds); // SOTC_BINDLESS_CACHE_VERIFY
             Vulkan::ReportPipeGpl(report, seconds); // SOTC_PIPE_GPL
+            Vulkan::ReportAddrFallback(report, seconds); // sotc: SOTC_ADDR_FALLBACK (prints only in table mode with it on)
+            Vulkan::ReportPipeManifest(report, seconds); // sotc: SOTC_PIPE_MANIFEST (user records, late builds)
             Vulkan::ReportHleCopyExact(report, seconds); // sotc: SOTC_HLE_COPY_EXACT (prints only when on)
             AmdGpu::ReportCpLabelSkip(report, seconds);           // SOTC_CP_LABEL_SKIP
             SotcLabels::ReportLabels(report, seconds);            // SOTC_LABELS_HONEST
@@ -2808,12 +2812,15 @@ void VideoOutDriver::Flip(const Request& req) {
                         SotcStats::async_compute_waits.load(std::memory_order_relaxed)),
                     SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6);
             }
-            // sotc: graphics shaders translated by workers (SOTC_ASYNC_TRANSLATE), totals.
+            // sotc: graphics shaders translated by workers (SOTC_ASYNC_TRANSLATE), totals; and the draws dropped while
+            // their pipeline was queued on a worker (SOTC_PIPE_MANIFEST safety net counter).
             if (const uint64_t built =
-                    SotcStats::async_translate_built.load(std::memory_order_relaxed)) {
+                    SotcStats::async_translate_built.load(std::memory_order_relaxed);
+                built != 0 || SotcStats::pipeline_pending_drops.load(std::memory_order_relaxed) != 0) {
                 std::fprintf(stderr,
                              "SOTC ASYNC TRANSLATE %llu stages (%.0f ms on workers), %llu draws "
-                             "skipped, %llu stale; compute built by the recorder %llu\n",
+                             "skipped, %llu stale; compute built by the recorder %llu; pipeline-pending draws "
+                             "dropped %llu\n",
                              static_cast<unsigned long long>(built),
                              SotcStats::async_translate_ns.load(std::memory_order_relaxed) / 1e6,
                              static_cast<unsigned long long>(
@@ -2821,7 +2828,9 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::async_translate_stale.load(std::memory_order_relaxed)),
                              static_cast<unsigned long long>(SotcStats::async_compute_self_built.load(
-                                 std::memory_order_relaxed)));
+                                 std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::pipeline_pending_drops.load(std::memory_order_relaxed)));
             }
             // sotc: compute shaders translated ahead of their dispatch (SOTC_ASYNC_COMPUTE_XLATE).
             if (const uint64_t queued =

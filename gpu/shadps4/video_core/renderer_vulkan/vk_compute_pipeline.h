@@ -83,6 +83,8 @@ public:
     u32 saved_use_count{};
     /// sotc: SOTC_NB_LAZY_PSO: already noted in the recently used list this session.
     mutable bool recent_noted{};
+    /// sotc: SOTC_PIPE_MANIFEST: already checked against the manifest (captured when it held none) this session.
+    mutable bool manifest_noted{};
     u64 KeyValue() const {
         return compute_key.value;
     }

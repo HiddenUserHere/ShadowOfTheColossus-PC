@@ -27,6 +27,8 @@
 #include "video_core/sotc_stats.h"
 #include "sotc_gpu_trace.h"
 #include "video_core/renderer_vulkan/sotc_pipe_feedback.h" // sotc: SOTC_PIPE_COMPILE_CHECK
+#include "shader_recompiler/info.h"                        // sotc: SOTC_GPL_NODROP log (StageBindingsEnabled)
+#include "../../../sotc/nonblocking.h"                      // sotc: SOTC_GPL_NODROP
 
 #include <vk_mem_alloc.h>
 
@@ -424,12 +426,28 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     // sotc: SOTC_PIPE_GPL=1 (off by default): a cold graphics pipeline is fast-linked from four
     // libraries (vk_graphics_pipeline.cpp). Needs VK_KHR_pipeline_library, added first; nothing
     // is enabled unless the feature is supported.
+    // sotc: SOTC_GPL_NODROP (default on, nonblocking.h) enables the same extensions when the device reports both
+    // graphicsPipelineLibrary and graphicsPipelineLibraryFastLinking (logged once), and is active only then.
     {
         const char* gpl_env = std::getenv("SOTC_PIPE_GPL");
-        const bool gpl_wanted = gpl_env && gpl_env[0] == '1';
         const bool gpl_feature =
             feature_chain.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
                 .graphicsPipelineLibrary;
+        const bool gpl_ext =
+            std::ranges::find(available_extensions, std::string{VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME}) !=
+                available_extensions.end() &&
+            std::ranges::find(available_extensions, std::string{VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME}) !=
+                available_extensions.end();
+        vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gpl_props{};
+        if (gpl_ext) {
+            gpl_props = physical_device
+                            .getProperties2<vk::PhysicalDeviceProperties2,
+                                            vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>()
+                            .get<vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>();
+        }
+        const bool nodrop_wanted = SotcNonBlocking::GplNoDropRequested() && gpl_ext && gpl_feature &&
+                                   gpl_props.graphicsPipelineLibraryFastLinking;
+        const bool gpl_wanted = (gpl_env && gpl_env[0] == '1') || nodrop_wanted;
         graphics_pipeline_library =
             gpl_wanted && gpl_feature && add_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
             add_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
@@ -437,6 +455,17 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
             LOG_WARNING(Render_Vulkan, "SOTC_PIPE_GPL=1 but VK_EXT_graphics_pipeline_library with "
                                        "graphicsPipelineLibrary is not available");
         }
+        const bool nodrop = nodrop_wanted && graphics_pipeline_library;
+        SotcNonBlocking::SetGplNoDrop(nodrop);
+        std::fprintf(stderr,
+                     "SOTC GPL NODROP: %s (extension %d, graphicsPipelineLibrary %d, fastLinking %d, "
+                     "independentInterpolationDecoration %d, stage bindings %s)\n",
+                     nodrop                                   ? "on"
+                     : !SotcNonBlocking::GplNoDropRequested() ? "off (SOTC_GPL_NODROP=0)"
+                                                              : "off (the device does not report fast linking)",
+                     int{gpl_ext}, int{gpl_feature}, int{gpl_props.graphicsPipelineLibraryFastLinking != 0},
+                     int{gpl_props.graphicsPipelineLibraryIndependentInterpolationDecoration != 0},
+                     Shader::StageBindingsEnabled() ? "requested" : "off");
     }
     // Games excessively leave restart enabled with lists when it isn't actually needed, and it
     // slows down KosmicKrisp due to unrolling. Revisit if KosmicKrisp moves this to mesh shaders.
@@ -457,6 +486,38 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
             add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    // sotc: SOTC_GPL_DYN_STATE. The states a pre-rasterization or fragment-shader library would bake become dynamic
+    // where the device has the feature, so a shader library depends on its shader and layout only (GplShaderKeys).
+    {
+        const bool dyn = SotcNonBlocking::DynState();
+        const bool ds3 = dyn && dynamic_state_3;
+        const auto& f3 = dynamic_state_3_features;
+        key_dynamic.topology = dyn;
+        key_dynamic.polygon_mode = ds3 && f3.extendedDynamicState3PolygonMode;
+        key_dynamic.depth_clamp = ds3 && f3.extendedDynamicState3DepthClampEnable && features.depthClamp;
+        key_dynamic.depth_clip = ds3 && depth_clip_enable && f3.extendedDynamicState3DepthClipEnable;
+        key_dynamic.provoking = ds3 && provoking_vertex && f3.extendedDynamicState3ProvokingVertexMode;
+        key_dynamic.clip_negative =
+            ds3 && depth_clip_control && f3.extendedDynamicState3DepthClipNegativeOneToOne;
+        key_dynamic.samples = ds3 && f3.extendedDynamicState3RasterizationSamples;
+        // A state the device never bakes (its extension absent) does not keep draw state in a library either.
+        const bool shader_keys = key_dynamic.polygon_mode && key_dynamic.depth_clamp &&
+                                 (key_dynamic.depth_clip || !depth_clip_enable) &&
+                                 (key_dynamic.provoking || !provoking_vertex) &&
+                                 (key_dynamic.clip_negative || !depth_clip_control) && key_dynamic.samples;
+        SotcNonBlocking::SetGplShaderKeys(shader_keys && graphics_pipeline_library);
+        const auto mode = [dyn](bool on, bool exists) {
+            return on ? "dynamic" : !exists ? "n/a" : dyn ? "static (feature missing)" : "static";
+        };
+        std::fprintf(stderr,
+                     "SOTC DYN STATE: %s; topology %s, polygon mode %s, depth clamp %s, depth clip %s, provoking "
+                     "vertex %s, clip [-1,1] %s, rasterization samples %s; shader libraries keyed by %s\n",
+                     dyn ? "on" : "off (SOTC_GPL_DYN_STATE=0)", mode(key_dynamic.topology, true),
+                     mode(key_dynamic.polygon_mode, true), mode(key_dynamic.depth_clamp, true),
+                     mode(key_dynamic.depth_clip, depth_clip_enable), mode(key_dynamic.provoking, provoking_vertex),
+                     mode(key_dynamic.clip_negative, depth_clip_control), mode(key_dynamic.samples, true),
+                     shader_keys ? "shader and layout only" : "shader, layout and the static states above");
+    }
     shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     image_load_store_lod = add_extension(VK_AMD_SHADER_IMAGE_LOAD_STORE_LOD_EXTENSION_NAME);
     amd_gcn_shader = add_extension(VK_AMD_GCN_SHADER_EXTENSION_NAME);
@@ -1166,8 +1227,15 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
             .customBorderColorWithoutFormat = true,
         },
         vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT{
+            // sotc: SOTC_GPL_DYN_STATE (key_dynamic) enables only the features it uses.
+            .extendedDynamicState3DepthClampEnable = key_dynamic.depth_clamp,
+            .extendedDynamicState3PolygonMode = key_dynamic.polygon_mode,
+            .extendedDynamicState3RasterizationSamples = key_dynamic.samples,
             .extendedDynamicState3ColorWriteMask =
                 dynamic_state_3_features.extendedDynamicState3ColorWriteMask,
+            .extendedDynamicState3DepthClipEnable = key_dynamic.depth_clip,
+            .extendedDynamicState3ProvokingVertexMode = key_dynamic.provoking,
+            .extendedDynamicState3DepthClipNegativeOneToOne = key_dynamic.clip_negative,
         },
         vk::PhysicalDeviceDepthClipControlFeaturesEXT{
             .depthClipControl = true,

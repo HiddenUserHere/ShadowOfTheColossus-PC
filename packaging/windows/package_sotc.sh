@@ -56,6 +56,14 @@ cp scripts/prepare.py scripts/link_libc.py scripts/link_modules.py scripts/conte
 mkdir -p "$dest/scripts/hooks.d"
 cp scripts/hooks.d/*.py "$dest/scripts/hooks.d/"
 cp sotc.py SotC.bat LICENSE CHANGELOG.md "$dest/"
+# The pipeline manifest (hashes and numeric state only, no game data): sotc.py points SOTC_PIPE_MANIFEST_DIR at
+# data/pipeline_manifest next to itself.
+mkdir -p "$dest/data/pipeline_manifest"
+if compgen -G 'data/pipeline_manifest/*' >/dev/null; then
+    cp -r data/pipeline_manifest/. "$dest/data/pipeline_manifest/"
+else
+    echo 'pipeline manifest: data/pipeline_manifest is empty (tools/gen_pipeline_manifest.py makes it)' >&2
+fi
 cp docs/sotc/README-SotC.md "$dest/README.md"
 cat > "$dest/sotc.ini" <<'EOF'
 # Shadow of the Colossus PC - settings (see README.md)
@@ -76,7 +84,7 @@ rm -rf dist/SotC-PC.zip
 python -c 'import shutil, sys; shutil.make_archive("dist/SotC-PC", "zip", "out/stage", "SotC-PC")'
 # The playable copy keeps its settings and saves.
 mkdir -p dist/SotC-PC
-cp -r "$dest/bin" "$dest/scripts" "$dest/launcher" "$dest/_internal" dist/SotC-PC/
+cp -r "$dest/bin" "$dest/scripts" "$dest/launcher" "$dest/_internal" "$dest/data" dist/SotC-PC/
 cp "$dest/SotC.exe" "$dest/sotc.py" "$dest/SotC.bat" "$dest/README.md" "$dest/LICENSE" "$dest/CHANGELOG.md" dist/SotC-PC/
 [[ -f dist/SotC-PC/sotc.ini ]] || cp "$dest/sotc.ini" dist/SotC-PC/
 echo "dist/SotC-PC.zip ($(du -h dist/SotC-PC.zip | cut -f1)) and dist/SotC-PC/"

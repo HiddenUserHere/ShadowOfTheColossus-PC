@@ -15,6 +15,7 @@
 #include "common/logging/classes.h"
 #include "core/memory.h"
 #include "shader_recompiler/info.h"
+#include "../../sotc/nonblocking.h" // sotc: SOTC_GPL_NODROP
 
 namespace Shader {
 
@@ -93,9 +94,15 @@ void SrtTraceTake(std::vector<std::pair<u64, u32>>& out, u64 skip_begin, u64 ski
 }
 
 bool StageBindingsEnabled() {
+    // sotc: SOTC_STAGE_BINDINGS=1 on, =0 off; unset, on with SOTC_GPL_NODROP (default on, nonblocking.h), whose
+    // per-shader pipeline libraries need a set per stage. Read from the environment only: the shader cache version
+    // (ShaderBinaryVersion) is keyed by it at static initialization, before any device is known.
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_STAGE_BINDINGS");
-        return v && v[0] == '1';
+        if (v && v[0] != '\0') {
+            return v[0] == '1';
+        }
+        return SotcNonBlocking::GplNoDropRequested();
     }();
     return enabled;
 }

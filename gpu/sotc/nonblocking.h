@@ -3,6 +3,7 @@
 // phase is off by default until its measurement gate passes; each is read once.
 #pragma once
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -42,6 +43,108 @@ inline bool Sched() {
 /// exist (no library build on it); a missing part goes to a worker link job and the draw is skipped meanwhile.
 inline bool Gpl() {
     static const bool on = SwitchOn("SOTC_NB_GPL");
+    return on;
+}
+
+/// SOTC_GPL_NODROP (on unless set to 0): a draw whose graphics pipeline is not built is never dropped. It is recorded
+/// with a pipeline fast-linked from libraries (vertex input, pre-rasterization, fragment shader, fragment output; a
+/// missing library is built on the command processor, counted); a draw the fast link cannot cover (rect and quad lists,
+/// the discard shader with clip emulation, descriptor heap pipelines) builds its full pipeline there instead. A stage
+/// still on a translation worker is translated on the command processor. The optimized pipeline keeps building on a
+/// worker and replaces the linked one when collected. At the manifest's boot hold the libraries of every manifest
+/// pipeline are built too. Also turns on what it needs: the pipeline library extensions (SOTC_PIPE_GPL) and a
+/// descriptor set per stage (SOTC_STAGE_BINDINGS, unless set to 0), whose per-shader libraries need independent sets.
+/// The request is read from the environment (it decides SOTC_STAGE_BINDINGS, which keys the shader cache before any
+/// device exists); the switch is active only when the device reports graphicsPipelineLibrary and
+/// graphicsPipelineLibraryFastLinking (SetGplNoDrop, from the instance).
+inline bool GplNoDropRequested() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_GPL_NODROP");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+inline std::atomic<bool>& GplNoDropFlag() {
+    static std::atomic<bool> active{false};
+    return active;
+}
+inline void SetGplNoDrop(bool active) {
+    GplNoDropFlag().store(active, std::memory_order_relaxed);
+}
+inline bool GplNoDrop() {
+    return GplNoDropFlag().load(std::memory_order_relaxed);
+}
+/// Per-shader libraries (graphics layouts with independent sets): P3 (SOTC_NB_GPL) or SOTC_GPL_NODROP.
+inline bool GplPerShader() {
+    return Gpl() || GplNoDrop();
+}
+
+/// A switch that is on unless set to 0 (read once by the caller's static).
+inline bool SwitchOnByDefault(const char* name) {
+    const char* v = std::getenv(name);
+    return v == nullptr || v[0] != '0';
+}
+
+/// SOTC_GPL_DYN_STATE (on unless set to 0): every pipeline state a pre-rasterization or fragment-shader library would
+/// bake is dynamic where the device supports it (VK_EXT_extended_dynamic_state3: polygon mode, depth clamp, depth clip,
+/// provoking vertex, clip space [-1,1], rasterization samples; core dynamic primitive topology), set at each draw from
+/// the pipeline key. Logged once at device creation ("SOTC DYN STATE"). 0: the former static state.
+inline bool DynState() {
+    static const bool on = SwitchOnByDefault("SOTC_GPL_DYN_STATE");
+    return on;
+}
+/// Set by the instance when SOTC_GPL_DYN_STATE left no draw state in the shader libraries: a pre-rasterization library
+/// is then keyed by its stages and layout only, a fragment library by its pixel stage, sample shading and layout.
+inline std::atomic<bool>& GplShaderKeysFlag() {
+    static std::atomic<bool> active{false};
+    return active;
+}
+inline void SetGplShaderKeys(bool active) {
+    GplShaderKeysFlag().store(active, std::memory_order_relaxed);
+}
+inline bool GplShaderKeys() {
+    return GplShaderKeysFlag().load(std::memory_order_relaxed);
+}
+
+/// SOTC_GPL_PREDICT (on unless set to 0, with SOTC_GPL_NODROP; active only with shader-only library keys,
+/// GplShaderKeys): the vertex and pixel libraries of the programs a newly created material names (the material factory
+/// hook PIPE_PREDICT_MATERIAL, which this request turns on, gpu/sotc/pipe_predict.h) are built on the workers before the
+/// material's first draw. With shader-only keys a library is keyed by its stage hash (program and permutation) and
+/// layout alone, so any draw of that permutation uses it whatever its state. It was off before shader-only keys (the
+/// 7 Nov cold route: 2,749 predicted libraries under a guessed draw state, none used by a draw, private memory 4.1 ->
+/// 8.3 GB, warm p50 33 -> 41 ms).
+inline bool GplPredictRequested() {
+    static const bool on = GplNoDropRequested() && SwitchOnByDefault("SOTC_GPL_PREDICT");
+    return on;
+}
+inline bool GplPredict() {
+    return GplPredictRequested() && GplNoDrop() && GplShaderKeys();
+}
+
+/// SOTC_GPL_PACK_LIBS (on unless set to 0; with SOTC_GPL_NODROP and shader-only library keys): at the end of the
+/// SOTC_PRETRANSLATE loading hold the pre-rasterization library of every translated vertex program and the fragment
+/// library of every translated pixel program are compiled on all workers into the driver's pipeline cache, then
+/// destroyed (only the material-predicted and manifest libraries stay in memory; they are created again from the cache
+/// when their area loads). The compiled set is listed in sotc_pack_libraries.bin (versioned cache folder, with the
+/// driver identity), so a later launch compiles only what the list lacks.
+inline bool GplPackLibs() {
+    static const bool on = SwitchOnByDefault("SOTC_GPL_PACK_LIBS");
+    return on && GplNoDrop() && GplShaderKeys();
+}
+
+/// SOTC_GPL_PARALLEL_LIBS (on unless set to 0; with SOTC_GPL_NODROP): a draw whose vertex and pixel libraries are both
+/// missing queues the two builds at the front of the workers' urgent lane and waits for them (the command processor
+/// takes a build no worker has taken yet), instead of building them one after the other itself.
+inline bool GplParallelLibs() {
+    static const bool on = SwitchOnByDefault("SOTC_GPL_PARALLEL_LIBS");
+    return on && GplNoDrop();
+}
+
+/// SOTC_GPL_LIB_PHASE (on unless set to 0; with SOTC_GPL_NODROP): the first manifest boot hold builds the libraries
+/// after the translations and pipelines, and samples the process private memory between the two phases, so the
+/// "SOTC GPL NODROP" boot line splits the growth into pipelines + translations and libraries.
+inline bool GplLibPhase() {
+    static const bool on = SwitchOnByDefault("SOTC_GPL_LIB_PHASE");
     return on;
 }
 

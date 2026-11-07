@@ -248,6 +248,22 @@ public:
         return dynamic_state_3 && dynamic_state_3_features.extendedDynamicState3ColorWriteMask;
     }
 
+    /// sotc: SOTC_GPL_DYN_STATE (sotc/nonblocking.h). States that are dynamic in every graphics pipeline, set per draw
+    /// from the pipeline key (DynamicState::SetKeyStatics). Each is false when the switch is off or the device lacks
+    /// the feature; the state is then baked in the pipeline (and in its library key) as before.
+    struct KeyDynamicStates {
+        bool topology{};       ///< primitive topology (core 1.3); the vertex input library keeps the topology class
+        bool polygon_mode{};   ///< extendedDynamicState3PolygonMode
+        bool depth_clamp{};    ///< extendedDynamicState3DepthClampEnable
+        bool depth_clip{};     ///< extendedDynamicState3DepthClipEnable (with VK_EXT_depth_clip_enable)
+        bool provoking{};      ///< extendedDynamicState3ProvokingVertexMode (with VK_EXT_provoking_vertex)
+        bool clip_negative{};  ///< extendedDynamicState3DepthClipNegativeOneToOne (with VK_EXT_depth_clip_control)
+        bool samples{};        ///< extendedDynamicState3RasterizationSamples
+    };
+    const KeyDynamicStates& KeyDynamic() const {
+        return key_dynamic;
+    }
+
     /// Returns true when VK_EXT_vertex_input_dynamic_state is supported.
     bool IsVertexInputDynamicState() const {
         return vertex_input_dynamic_state;
@@ -864,6 +880,7 @@ private:
     bool depth_clip_control{};
     bool depth_clip_enable{};
     bool dynamic_state_3{};
+    KeyDynamicStates key_dynamic{}; // sotc: SOTC_GPL_DYN_STATE, see KeyDynamic()
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};
     bool graphics_pipeline_library{}; // sotc: SOTC_PIPE_GPL

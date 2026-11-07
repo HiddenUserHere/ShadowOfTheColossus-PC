@@ -155,7 +155,18 @@ constexpr uint16_t kVsDrawKindInstanceSgpr = 0x4c + 2;
 inline bool GcnMissEmit() {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_GCN_MISS_EMIT");
-        return !v || v[0] != '0';
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+/// sotc: SOTC_GCN_BUF_FMT=1 (default off): with SOTC_GCN_BUF, formatted buffers are shader-addressed too. Off, they
+/// keep their descriptors (only raw buffers are shader-addressed). On, 7 Nov runs showed horse copies and grass
+/// without alpha (wrong bytes on the address path, cause not found), so it stays off.
+inline bool GcnBufFormatted() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_GCN_BUF_FMT");
+        return v && v[0] == '1';
     }();
     return on;
 }
@@ -167,7 +178,7 @@ inline bool GcnMissEmit() {
 inline bool SpvFuncs() {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_SPV_FUNCS");
-        return !v || v[0] != '0';
+        return v && v[0] == '1';
     }();
     return on;
 }
@@ -504,7 +515,7 @@ u32 DynamicTsharpArraySize();
 bool LodFeedbackEnabled();
 
 /// sotc: SOTC_STAGE_BINDINGS=1 gives each graphics stage its own descriptor set
-/// (Profile::stage_bindings).
+/// (Profile::stage_bindings); =0 never. Unset: on with SOTC_GPL_NODROP (default on).
 bool StageBindingsEnabled();
 
 /// sotc: true when the samplers of this stage come from the bindless heap: SOTC_BINDLESS_SAMP is

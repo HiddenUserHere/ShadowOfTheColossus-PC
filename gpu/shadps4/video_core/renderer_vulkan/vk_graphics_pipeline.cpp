@@ -48,6 +48,15 @@ public:
 
 namespace {
 thread_local bool t_gpl_lookup_only = false; // sotc: SOTC_NB_GPL (GplLibraryCache::SetLookupOnly)
+thread_local bool t_gpl_libraries_only = false; // sotc: SOTC_GPL_NODROP (GplLibraryCache::SetLibrariesOnly)
+thread_local u64 t_gpl_thread_built = 0;        // sotc: SOTC_GPL_NODROP (GplLibraryCache::ThreadBuilt)
+thread_local u32 t_gpl_parts = 0;               // sotc: SOTC_GPL_PREDICT (GplLibraryCache::SetLibraryParts)
+thread_local u8 t_gpl_origin = 0;               // sotc: SOTC_GPL_PREDICT (GplLibraryCache::SetOrigin)
+thread_local bool t_gpl_draw_use = false;       // sotc: SOTC_GPL_PREDICT (GplLibraryCache::SetDrawUse)
+thread_local u32 t_gpl_missing = 0;
+thread_local bool t_gpl_discard = false;        // sotc: SOTC_GPL_PACK_LIBS (GplLibraryCache::SetDiscard)
+thread_local u64 t_gpl_found = 0;               // sotc: SOTC_GPL_PACK_LIBS (GplLibraryCache::ThreadFound)
+thread_local u64 t_gpl_failed = 0;              // sotc: SOTC_GPL_PACK_LIBS (GplLibraryCache::ThreadFailed)             // sotc: SOTC_GPL_PARALLEL_LIBS (GplLibraryCache::Missing)
 } // namespace
 
 void GplLibraryCache::SetLookupOnly(bool lookup_only) {
@@ -56,6 +65,59 @@ void GplLibraryCache::SetLookupOnly(bool lookup_only) {
 
 bool GplLibraryCache::LookupOnly() {
     return t_gpl_lookup_only;
+}
+
+void GplLibraryCache::SetLibrariesOnly(bool libraries_only) {
+    t_gpl_libraries_only = libraries_only;
+}
+
+bool GplLibraryCache::LibrariesOnly() {
+    return t_gpl_libraries_only;
+}
+
+u64 GplLibraryCache::ThreadBuilt() {
+    return t_gpl_thread_built;
+}
+
+void GplLibraryCache::SetLibraryParts(u32 mask) {
+    t_gpl_parts = mask;
+}
+
+bool GplLibraryCache::PartWanted(Part part) {
+    return t_gpl_parts == 0 || (t_gpl_parts & (1u << part)) != 0;
+}
+
+void GplLibraryCache::SetOrigin(Origin origin) {
+    t_gpl_origin = origin;
+}
+
+void GplLibraryCache::SetDrawUse(bool draw_use) {
+    t_gpl_draw_use = draw_use;
+}
+
+void GplLibraryCache::SetDiscard(bool discard) {
+    t_gpl_discard = discard;
+}
+
+u64 GplLibraryCache::ThreadFound() {
+    return t_gpl_found;
+}
+
+u64 GplLibraryCache::ThreadFailed() {
+    return t_gpl_failed;
+}
+
+void GplLibraryCache::ResetMissing() {
+    t_gpl_missing = 0;
+}
+
+u32 GplLibraryCache::Missing() {
+    return t_gpl_missing;
+}
+
+size_t GplLibraryCache::Count(Part part) {
+    std::scoped_lock lock{mutex};
+    return parts[part].size();
 }
 
 vk::Pipeline GplLibraryCache::GetOrBuild(Part part, const std::string& key, bool& built,
@@ -68,13 +130,26 @@ vk::Pipeline GplLibraryCache::GetOrBuild(Part part, const std::string& key, bool
         std::scoped_lock lock{mutex};
         lock_wait.reset();
         auto& map = parts[part];
-        if (const auto it = map.find(key); it != map.end()) {
+        if (auto it = map.find(key); it != map.end()) {
             built = false;
-            return *it->second;
+            ++t_gpl_found;
+            // sotc: SOTC_GPL_PREDICT: the first draw that finds a predicted library.
+            if (t_gpl_draw_use && (it->second.flags & FlagUsed) == 0) {
+                it.value().flags |= FlagUsed;
+                if ((it->second.flags & FlagPredicted) != 0) {
+                    g_gpl_counters.predicted_used.fetch_add(1, std::memory_order_relaxed);
+                }
+                if ((it->second.flags & FlagPrebuilt) != 0) {
+                    g_gpl_counters.prebuilt_used.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            return *it->second.pipe;
         }
     }
-    if (t_gpl_lookup_only) {
+    // sotc: SOTC_GPL_PREDICT / SOTC_GPL_PARALLEL_LIBS: a part outside this thread's mask is only looked up.
+    if (t_gpl_lookup_only || !PartWanted(part)) {
         built = false;
+        t_gpl_missing |= 1u << part;
         return {}; // sotc: SOTC_NB_GPL, built by a worker's link job instead
     }
     vk::UniquePipeline library;
@@ -84,14 +159,61 @@ vk::Pipeline GplLibraryCache::GetOrBuild(Part part, const std::string& key, bool
     }
     if (!library) {
         built = false;
+        ++t_gpl_failed; // sotc: SOTC_GPL_PACK_LIBS
         return {};
+    }
+    ++t_gpl_thread_built; // sotc: SOTC_GPL_NODROP, a library build on this thread (kept or not)
+    if (t_gpl_discard) {
+        // sotc: SOTC_GPL_PACK_LIBS: compiled into the driver's pipeline cache only; destroyed here.
+        built = true;
+        const vk::Pipeline handle = *library;
+        library.reset();
+        g_gpl_counters.pack_discarded.fetch_add(1, std::memory_order_relaxed);
+        return handle;
     }
     std::scoped_lock lock{mutex};
     auto& map = parts[part];
-    const auto [it, inserted] = map.try_emplace(key, std::move(library));
+    auto [it, inserted] = map.try_emplace(key, Entry{std::move(library), 0});
     built = inserted; // a library another thread stored first wins; this copy is destroyed with `library`
-    return *it->second;
+    if (inserted) {
+        // sotc: SOTC_GPL_PREDICT counters (a draw that builds a library uses it at once).
+        u8 flags = t_gpl_draw_use ? u8{FlagUsed} : u8{0};
+        if (t_gpl_origin == OriginPredicted) {
+            flags |= FlagPredicted;
+            g_gpl_counters.predicted_built.fetch_add(1, std::memory_order_relaxed);
+        } else if (t_gpl_origin == OriginUrgent) {
+            g_gpl_counters.urgent_built.fetch_add(1, std::memory_order_relaxed);
+        }
+        // sotc: SOTC_GPL_DYN_STATE: built ahead of any draw (not for a waiting draw).
+        if (!t_gpl_draw_use && t_gpl_origin != OriginUrgent) {
+            flags |= FlagPrebuilt;
+            g_gpl_counters.prebuilt_built.fetch_add(1, std::memory_order_relaxed);
+        }
+        it.value().flags = flags;
+        g_gpl_counters.held.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_GPL_PACK_LIBS report
+    }
+    return *it->second.pipe;
 }
+
+namespace {
+/// sotc: SOTC_GPL_DYN_STATE. A canonical topology of the class of t: with a dynamic topology a pipeline (or vertex
+/// input library) only fixes the class, and the topology a draw sets must be of the same class.
+vk::PrimitiveTopology TopologyClassOf(vk::PrimitiveTopology t) {
+    switch (t) {
+    case vk::PrimitiveTopology::ePointList:
+        return vk::PrimitiveTopology::ePointList;
+    case vk::PrimitiveTopology::eLineList:
+    case vk::PrimitiveTopology::eLineStrip:
+    case vk::PrimitiveTopology::eLineListWithAdjacency:
+    case vk::PrimitiveTopology::eLineStripWithAdjacency:
+        return vk::PrimitiveTopology::eLineList;
+    case vk::PrimitiveTopology::ePatchList:
+        return vk::PrimitiveTopology::ePatchList;
+    default:
+        return vk::PrimitiveTopology::eTriangleList;
+    }
+}
+} // namespace
 
 bool GraphicsPipeline::FastLinkable(const GraphicsPipelineKey& key,
                                     std::span<const Shader::Info*, MaxShaderStages> infos,
@@ -212,6 +334,21 @@ GraphicsPipeline::GraphicsPipeline(
         };
     }
 
+    // sotc: SOTC_GPL_DYN_STATE. The same values as the static state above, set per draw where they are dynamic.
+    const auto& kd = instance.KeyDynamic();
+    key_statics = DynamicState::KeyStatics{
+        .topology = topology,
+        .polygon_mode = raster_chain.get().polygonMode,
+        .depth_clamp_enable = raster_chain.get().depthClampEnable != VK_FALSE,
+        .depth_clip_enable = key.depth_clip_enable != 0,
+        .provoking_vertex = key.provoking_vtx_last == AmdGpu::ProvokingVtxLast::First
+                                ? vk::ProvokingVertexModeEXT::eFirstVertex
+                                : vk::ProvokingVertexModeEXT::eLastVertex,
+        .clip_negative_one_to_one = key.clip_space == AmdGpu::ClipSpace::MinusWToW,
+        .rasterization_samples = LiverpoolToVK::NumSamples(
+            key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
+    };
+
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
         .negativeOneToOne = key.clip_space == AmdGpu::ClipSpace::MinusWToW,
     };
@@ -243,6 +380,29 @@ GraphicsPipeline::GraphicsPipeline(
         dynamic_states.push_back(vk::DynamicState::eVertexInputEXT);
     } else if (!sdata.vertex_bindings.empty()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputBindingStride);
+    }
+    // sotc: SOTC_GPL_DYN_STATE (Instance::KeyDynamic): the same list for every pipeline of the device, so the libraries
+    // of one link always agree. Recorded per draw by DynamicState::Commit from key_statics.
+    if (kd.topology) {
+        dynamic_states.push_back(vk::DynamicState::ePrimitiveTopology);
+    }
+    if (kd.polygon_mode) {
+        dynamic_states.push_back(vk::DynamicState::ePolygonModeEXT);
+    }
+    if (kd.depth_clamp) {
+        dynamic_states.push_back(vk::DynamicState::eDepthClampEnableEXT);
+    }
+    if (kd.depth_clip) {
+        dynamic_states.push_back(vk::DynamicState::eDepthClipEnableEXT);
+    }
+    if (kd.provoking) {
+        dynamic_states.push_back(vk::DynamicState::eProvokingVertexModeEXT);
+    }
+    if (kd.clip_negative) {
+        dynamic_states.push_back(vk::DynamicState::eDepthClipNegativeOneToOneEXT);
+    }
+    if (kd.samples) {
+        dynamic_states.push_back(vk::DynamicState::eRasterizationSamplesEXT);
     }
 
     const vk::PipelineDynamicStateCreateInfo dynamic_info = {
@@ -596,15 +756,13 @@ GraphicsPipeline::GraphicsPipeline(
             k.Add(static_cast<u32>(pipeline_rendering_ci.stencilAttachmentFormat));
             k.Add(static_cast<u32>(mixed_samples.depthStencilAttachmentSamples));
         };
-        const auto stage_module = [&](Shader::SwStage stage) -> VkShaderModule {
-            return infos[u32(stage)] ? static_cast<VkShaderModule>(modules[u32(stage)])
-                                     : VK_NULL_HANDLE;
-        };
-
         // Vertex input interface: the vertex attributes (when not dynamic) and the topology.
         GplKey vi_key;
         add_common_with(vi_key, interface_layout);
-        vi_key.Add(static_cast<u32>(topology));
+        // sotc: SOTC_GPL_DYN_STATE: with a dynamic topology only its class is baked (the library takes a canonical
+        // topology of that class; the draw sets its own).
+        const vk::PrimitiveTopology lib_topology = kd.topology ? TopologyClassOf(topology) : topology;
+        vi_key.Add(static_cast<u32>(lib_topology));
         vi_key.Add(static_cast<u32>(instance.IsVertexInputDynamicState()));
         vi_key.Add(static_cast<u32>(sdata.vertex_attributes.size()));
         for (const auto& attr : sdata.vertex_attributes) {
@@ -623,38 +781,96 @@ GraphicsPipeline::GraphicsPipeline(
         // state, a function of these key fields and of the instance.
         GplKey pre_key;
         add_common_with(pre_key, pre_layout);
+        // sotc: SOTC_GPL_NODROP: a stage is keyed by its stage hash (program and permutation, as the pipeline map
+        // keys it), not by its module handle. A program that leaves memory (the eviction at the end of the pretranslate
+        // hold) comes back with new module handles, which made the libraries built at the boot hold unreachable, and a
+        // destroyed module may give its handle to another one, which could reach a library of other code.
         for (const auto stage : {Shader::SwStage::Vertex, Shader::SwStage::Geometry,
                                  Shader::SwStage::TessellationControl,
                                  Shader::SwStage::TessellationEval}) {
-            pre_key.Add(stage_module(stage));
+            pre_key.Add(infos[u32(stage)] ? key.stage_hashes[u32(stage)] : size_t{0});
         }
-        pre_key.Add(static_cast<u32>(tessellation_state.patchControlPoints));
-        pre_key.Add(static_cast<u32>(key.prim_type));
-        pre_key.Add(static_cast<u32>(key.polygon_mode));
-        pre_key.Add(static_cast<u32>(key.provoking_vtx_last));
-        pre_key.Add(static_cast<u32>(key.depth_clamp_enable));
-        pre_key.Add(static_cast<u32>(key.depth_clip_enable));
-        pre_key.Add(static_cast<u32>(key.clip_space));
+        // sotc: SOTC_GPL_DYN_STATE: the key holds exactly what pre_ci holds besides the stages and layout: the
+        // tessellation state (only read with tessellation stages), and each rasterization / clip state the device keeps
+        // static (a dynamic one is given a canonical value below, so the library bakes no draw state). The topology is
+        // not part of this state (input assembly belongs to the vertex input library; pre_ci has none).
+        const bool has_tess = infos[u32(Shader::SwStage::TessellationControl)] ||
+                              infos[u32(Shader::SwStage::TessellationEval)];
+        pre_key.Add(has_tess ? static_cast<u32>(tessellation_state.patchControlPoints) : 0u);
+        if (!kd.polygon_mode) {
+            pre_key.Add(static_cast<u32>(key.polygon_mode));
+        }
+        if (!kd.provoking) {
+            pre_key.Add(static_cast<u32>(key.provoking_vtx_last));
+        }
+        if (!kd.depth_clamp) {
+            pre_key.Add(static_cast<u32>(key.depth_clamp_enable));
+            pre_key.Add(static_cast<u32>(key.depth_clip_enable)); // the static clamp expression reads it
+        }
+        if (!kd.depth_clip) {
+            pre_key.Add(static_cast<u32>(key.depth_clip_enable));
+        }
+        if (!kd.clip_negative) {
+            pre_key.Add(static_cast<u32>(key.clip_space));
+        }
+        // The library's own copies of that state: canonical values for the dynamic parts.
+        auto lib_raster_chain = raster_chain;
+        {
+            auto& r = lib_raster_chain.get<vk::PipelineRasterizationStateCreateInfo>();
+            if (kd.polygon_mode) {
+                r.polygonMode = vk::PolygonMode::eFill;
+            }
+            if (kd.depth_clamp) {
+                r.depthClampEnable = VK_FALSE;
+            }
+            if (kd.provoking) {
+                lib_raster_chain.get<vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT>()
+                    .provokingVertexMode = vk::ProvokingVertexModeEXT::eFirstVertex;
+            }
+            if (kd.depth_clip) {
+                lib_raster_chain.get<vk::PipelineRasterizationDepthClipStateCreateInfoEXT>().depthClipEnable =
+                    VK_TRUE;
+            }
+        }
+        const vk::PipelineViewportDepthClipControlCreateInfoEXT lib_clip_control = {
+            .negativeOneToOne = kd.clip_negative ? VK_FALSE : clip_control.negativeOneToOne,
+        };
+        const vk::PipelineViewportStateCreateInfo lib_viewport_info = {
+            .pNext = instance.IsDepthClipControlSupported() ? &lib_clip_control : nullptr,
+        };
+        const vk::PipelineInputAssemblyStateCreateInfo lib_input_assembly = {
+            .topology = lib_topology,
+        };
+        // sotc: SOTC_GPL_DYN_STATE: with dynamic rasterization samples the fragment and output libraries take one
+        // canonical multisample state (equal in both, as a link requires); the sample shading comes from the pixel
+        // shader (in both keys).
+        vk::PipelineMultisampleStateCreateInfo lib_multisampling = sdata.multisampling;
+        if (kd.samples) {
+            lib_multisampling.rasterizationSamples = vk::SampleCountFlagBits::e1;
+        }
 
         // Fragment: the fragment module, the multisampling and the depth/stencil formats.
         GplKey fs_key;
         add_common_with(fs_key, fs_layout);
-        fs_key.Add(stage_module(Shader::SwStage::Fragment));
-        fs_key.Add(static_cast<u32>(sdata.multisampling.rasterizationSamples));
-        fs_key.Add(static_cast<u32>(sdata.multisampling.sampleShadingEnable));
-        fs_key.Add(static_cast<u32>(key.z_format));
-        fs_key.Add(static_cast<u32>(key.stencil_format));
+        fs_key.Add(infos[u32(Shader::SwStage::Fragment)] ? key.stage_hashes[u32(Shader::SwStage::Fragment)]
+                                                         : size_t{0}); // sotc: the stage hash, as pre_key
+        fs_key.Add(static_cast<u32>(lib_multisampling.rasterizationSamples));
+        fs_key.Add(static_cast<u32>(lib_multisampling.sampleShadingEnable));
         // sotc: SOTC_NB_GPL: fragment shader state ignores the attachment formats (only the view mask, 0 here), so a
-        // per-shader fragment library serves every render-target set.
+        // per-shader fragment library serves every render-target set. SOTC_GPL_DYN_STATE: a per-shader fragment library
+        // is created without the rendering info (the view mask defaults to 0), so the depth/stencil formats are not
+        // part of it either.
         if (!per_shader) {
+            fs_key.Add(static_cast<u32>(key.z_format));
+            fs_key.Add(static_cast<u32>(key.stencil_format));
             add_render(fs_key);
         }
 
         // Fragment output: the blend state, the multisampling and the rendering info.
         GplKey fo_key;
         add_common_with(fo_key, interface_layout);
-        fo_key.Add(static_cast<u32>(sdata.multisampling.rasterizationSamples));
-        fo_key.Add(static_cast<u32>(sdata.multisampling.sampleShadingEnable));
+        fo_key.Add(static_cast<u32>(lib_multisampling.rasterizationSamples));
+        fo_key.Add(static_cast<u32>(lib_multisampling.sampleShadingEnable));
         fo_key.Add(static_cast<u32>(color_blending.logicOpEnable));
         fo_key.Add(static_cast<u32>(color_blending.logicOp));
         fo_key.Add(color_blending.attachmentCount);
@@ -713,7 +929,7 @@ GraphicsPipeline::GraphicsPipeline(
             .flags = lib_flags,
             .pVertexInputState =
                 !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
-            .pInputAssemblyState = &input_assembly,
+            .pInputAssemblyState = &lib_input_assembly,
             .pDynamicState = &dynamic_info,
             .layout = interface_layout,
         };
@@ -729,8 +945,8 @@ GraphicsPipeline::GraphicsPipeline(
             .stageCount = static_cast<u32>(pre_stages.size()),
             .pStages = pre_stages.data(),
             .pTessellationState = &tessellation_state,
-            .pViewportState = &viewport_info,
-            .pRasterizationState = &raster_chain.get(),
+            .pViewportState = &lib_viewport_info,
+            .pRasterizationState = &lib_raster_chain.get(),
             .pDynamicState = &dynamic_info,
             .layout = pre_layout,
         };
@@ -738,7 +954,7 @@ GraphicsPipeline::GraphicsPipeline(
             get_library(GplLibraryCache::PreRaster, pre_key.bytes, pre_ci);
 
         vk::GraphicsPipelineLibraryCreateInfoEXT fs_lib{
-            .pNext = &pipeline_rendering_ci,
+            .pNext = per_shader ? nullptr : &pipeline_rendering_ci, // sotc: SOTC_GPL_DYN_STATE, see fs_key
             .flags = vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader,
         };
         const vk::GraphicsPipelineCreateInfo fs_ci = {
@@ -746,7 +962,7 @@ GraphicsPipeline::GraphicsPipeline(
             .flags = lib_flags,
             .stageCount = static_cast<u32>(fs_stages.size()),
             .pStages = fs_stages.data(),
-            .pMultisampleState = &sdata.multisampling,
+            .pMultisampleState = &lib_multisampling,
             .pDepthStencilState =
                 !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
             .pDynamicState = &dynamic_info,
@@ -762,7 +978,7 @@ GraphicsPipeline::GraphicsPipeline(
         const vk::GraphicsPipelineCreateInfo fo_ci = {
             .pNext = &fo_lib,
             .flags = lib_flags,
-            .pMultisampleState = &sdata.multisampling,
+            .pMultisampleState = &lib_multisampling,
             .pColorBlendState = &color_blending,
             .pDynamicState = &dynamic_info,
             .layout = interface_layout,
@@ -772,6 +988,20 @@ GraphicsPipeline::GraphicsPipeline(
 
         const std::array<vk::Pipeline, 4> libraries = {vi_handle, pre_handle, fs_handle,
                                                        fo_handle};
+        // sotc: SOTC_GPL_NODROP boot libraries / SOTC_GPL_PREDICT library jobs: only the parts were wanted, no link.
+        // A part outside the job's mask (GplLibraryCache::SetLibraryParts) may be missing; a wanted one that is missing
+        // was refused by the driver.
+        if (GplLibraryCache::LibrariesOnly()) {
+            bool refused = false;
+            for (u32 part = 0; part < GplLibraryCache::NumParts; ++part) {
+                refused |= !libraries[part] && GplLibraryCache::PartWanted(static_cast<GplLibraryCache::Part>(part));
+            }
+            if (refused && !GplLibraryCache::LookupOnly()) {
+                LOG_WARNING(Render_Vulkan, "Pipeline libraries of {} not built", debug_str);
+                g_gpl_counters.link_failed.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
         if (std::ranges::any_of(libraries, [](vk::Pipeline lib) { return !lib; })) {
             if (GplLibraryCache::LookupOnly()) {
                 return; // sotc: SOTC_NB_GPL, a part is not built yet (a worker's link job builds it)
@@ -1082,7 +1312,9 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
     }
     // sotc: SOTC_NB_GPL: per-shader libraries need a layout with independent sets, on every such graphics pipeline
     // (linked or optimized, so both bind their sets the same way): one set per stage, vertex + fragment only.
-    const bool per_shader_gpl = stage_sets && SotcNonBlocking::Gpl() && instance.IsGraphicsPipelineLibrary() &&
+    // sotc: SOTC_GPL_NODROP too (GplPerShader).
+    const bool per_shader_gpl = stage_sets && SotcNonBlocking::GplPerShader() &&
+                                instance.IsGraphicsPipelineLibrary() &&
                                 num_sets == 2 && !uses_bindless_samplers && !uses_slot_words && !packet_range;
     const LayoutCache::Request request{
         .sets = requests,

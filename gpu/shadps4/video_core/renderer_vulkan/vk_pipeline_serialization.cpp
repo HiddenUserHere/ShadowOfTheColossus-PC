@@ -102,6 +102,8 @@ static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 44u : 141
                                        // sotc: SOTC_SPV_FUNCS (on by default): the generic buffer decode and the table
                                        // loads are DontInline functions (first-run compile cost); 0 keeps them inline.
                                        (Shader::SpvFuncs() ? 0u : 512u) +
+                                       // sotc: SOTC_GCN_BUF_FMT=0 (info.h): formatted buffers kept on descriptors, apart.
+                                       (Shader::GcnBufFormatted() ? 0u : 0x40000000u) +
                                        // sotc: SOTC_SPV_PROGRAM_IDS=1 (info.h): modules with the program hash, apart.
                                        (Shader::SpvProgramIds() ? 256u : 0u) +
                                        // sotc: SOTC_VS_DRAW_KIND=1 (info.h): instanced vertex modules shared by both
@@ -321,6 +323,10 @@ std::unordered_map<u64, u32> g_index;
 bool g_index_dirty = false;
 constexpr const char* kShaderIndexName = "sotc_shader_index";
 
+u32 SotcShaderMetaVersion() {
+    return Serialization::ShaderMetaVersion;
+}
+
 // sotc: the bytes of a shader meta (RegisterShaderMeta's record; also what the SOTC_PRETRANSLATE pack stores).
 std::vector<u8> SerializeShaderMeta(const Shader::Info& info, const Shader::StageSpecialization& spec, size_t perm_hash,
                                     size_t perm_idx) {
@@ -476,7 +482,9 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
         WarmUpTimer timer{warmup_times.pipelines};
         // sotc: built by the pipeline workers (SOTC_ASYNC_PRELOAD); WarmUp waits for them.
         const bool deferred = AsyncPreloadEnabled();
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache, profile,
+        // sotc: SOTC_ADDR_FALLBACK: the profile its stage was translated with (StageProfile).
+        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache,
+                                                       StageProfile(infos[0]->variant),
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, true, deferred);
         it.value()->use_count = warm_uses;
@@ -608,7 +616,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     } else {
         WarmUpTimer timer{warmup_times.pipelines};
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, layout_cache, profile, graphics_key, *pipeline_cache, infos,
+            instance, scheduler, desc_heap, layout_cache, StagesProfile(infos), graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, true);
     }
 
@@ -722,6 +730,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 }
 
 void PipelineCache::WarmUp() {
+    // sotc: SOTC_PIPE_MANIFEST loads at the first lookup after this (every return path).
+    struct WarmUpDone {
+        std::atomic<bool>& done;
+        ~WarmUpDone() {
+            done.store(true, std::memory_order_release);
+        }
+    } warmup_done_scope{warmup_done};
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return;
     }
@@ -742,12 +757,19 @@ void PipelineCache::WarmUp() {
                                       Serialization::ShaderBinaryVersion, profile.needs_lds_barriers,
                                       profile.barycentric_via_gs, profile.stage_bindings, profile.bda_buffers,
                                       profile.bindless_images, profile.heap_images, profile.shader_addr);
+        // sotc: SOTC_ADDR_FALLBACK: a table-mode folder of its own. It holds both kinds of programs (the table variants
+        // and the descriptor-mode default variants, each found by its hash), and none of the default-variant programs
+        // an older table run may have translated with the table profile (SOTC_ASYNC_COMPUTE_XLATE prefetch).
+        if (addr_fallback) {
+            key += " addrfb1";
+        }
         for (const char* name : {"SOTC_WQM_COPY", "SOTC_WAVE64_UNIFORM", "SOTC_WAVE64_IDENTITY",
                                  "SOTC_TSHARP_ARRAY", "SHADPS4_IEEE_MINMAX"}) {
             if (const char* v = std::getenv(name); v && *v) {
                 key += fmt::format(" {}={}", name, v);
             }
         }
+        cache_variant_key = key; // sotc: SOTC_PIPE_MANIFEST, the header of the records it captures
         Storage::DataBase::Instance().SetVariant(std::move(key));
         Serialization::g_variant_folder = profile.heap_images != 0 || profile.shader_addr != 0;
     }
@@ -1267,6 +1289,13 @@ bool PipelineCache::InstallLazyPerm(u64 hash, AsyncPipelineJob::LazyLoad::Perm& 
     }
     if (is_new) {
         it_pgm.value() = std::move(perm.program);
+        // sotc: a program of the SOTC_PRETRANSLATE pack counts as pre-translated: its first draw compares the draw's
+        // key with the packed ones (the "first draws / key hit" of the pretranslate report, 0 before: the boot hold
+        // evicts its programs, and they came back from the pack without the mark). Only after that hold: its eviction
+        // takes the marked programs no draw used, and a program loaded for the manifest may still be in a job then.
+        if (pre_hold_done && !pre_holding && g_pack_index.contains(hash)) {
+            it_pgm.value()->sotc_pre = true;
+        }
     } else {
         Shader::CombineBindlessCache(it_pgm.value()->info.bindless, perm.program->info.bindless);
     }
