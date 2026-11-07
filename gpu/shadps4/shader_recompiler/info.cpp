@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdio>
 #include <string>
+#include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/classes.h"
 #include "core/memory.h"
@@ -36,6 +37,59 @@ void Info::RefreshSharpTables() {
             std::memset(dst, 0, size);
         }
     }
+}
+
+// sotc: SOTC_CP_SRT_PLAN=2: the walker's guest reads are recorded (srt.h). Walker code is the same;
+// its page test passes for every page, so each guest load calls TraceClean, which records it and
+// declines (the walker then loads the value itself).
+bool SrtPlanTraceEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_CP_SRT_PLAN");
+        return v && v[0] == '2';
+    }();
+    return enabled;
+}
+
+namespace {
+thread_local std::vector<std::pair<u64, u32>> t_srt_trace;
+
+bool TraceClean(u64 address, u32 size, u64*) {
+    t_srt_trace.emplace_back(address, size);
+    return false;
+}
+} // namespace
+
+const SrtWalkerContext* SrtPlanTraceContext() {
+    static const SrtWalkerContext context = [] {
+        // One bit per 4 KiB page (as WalkerContext), all set: the walker calls TraceClean for every
+        // load below SrtCleanPageLimit. Never freed.
+        constexpr u64 words = SrtCleanPageLimit >> 18;
+        auto* bits = static_cast<u64*>(std::malloc(words * sizeof(u64)));
+        ASSERT_MSG(bits, "No memory for the SRT trace page bitmap");
+        std::memset(bits, 0xFF, words * sizeof(u64));
+        return SrtWalkerContext{bits, &TraceClean};
+    }();
+    return &context;
+}
+
+void SrtCopyWindowTraced(u32* dst, u64 src, u64 bytes) {
+    t_srt_trace.emplace_back(src, static_cast<u32>(bytes));
+    SrtCopyWindow(dst, src, bytes);
+}
+
+void SrtTraceReset() {
+    t_srt_trace.clear();
+}
+
+void SrtTraceTake(std::vector<std::pair<u64, u32>>& out, u64 skip_begin, u64 skip_end) {
+    out.clear();
+    for (const auto& [address, size] : t_srt_trace) {
+        if (address >= skip_begin && address < skip_end) {
+            continue;
+        }
+        out.emplace_back(address, size);
+    }
+    t_srt_trace.clear();
 }
 
 bool StageBindingsEnabled() {

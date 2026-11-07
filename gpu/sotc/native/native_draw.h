@@ -53,6 +53,39 @@ void SetFrameBackend(const FrameBackend& backend);
 void SetFreeDiscard(void* ctx, void (*fn)(void* ctx, uint64_t addr, uint64_t size));
 void DiscardFreed(uint64_t addr, uint64_t size);
 
+/// sotc: SOTC_NATIVE_OWNER_DISCARD=1 (read once; needs SOTC_NATIVE mode != 0). A 4 KiB-aligned or unaligned range
+/// changes owner (a guest allocation or free, or a block the engine hands to new contents): the GPU-written state
+/// of the range is forgotten byte-exactly, as an unmap does (BufferCache::NativeDiscardOwner). Pages that still hold
+/// GPU-written bytes outside the range stay GPU-modified. DiscardOwner calls the handler (any thread; no-op until
+/// registered or with the switch off). OwnerDiscardOn tells the callers whether it would do anything.
+void SetOwnerDiscard(void* ctx, void (*fn)(void* ctx, uint64_t addr, uint64_t size));
+void DiscardOwner(uint64_t addr, uint64_t size);
+bool OwnerDiscardOn();
+/// SOTC_NATIVE_OWNER_DISCARD=2: also at the engine's frees (=1: at allocations only).
+bool OwnerDiscardAtFree();
+/// The same handler regardless of SOTC_NATIVE_OWNER_DISCARD (SOTC_NATIVE on only): the GPU region's quarantine
+/// (gpu_region.h) forgets a freed block's GPU-written state before the block is handed out again.
+void DiscardOwnerForced(uint64_t addr, uint64_t size);
+/// The GPU region's quarantine (SOTC_GPU_PLACE): forgets the GPU-written state at the command processor's point
+/// without marking the range CPU-written (BufferCache::NativeDiscardRegion). SOTC_NATIVE on only.
+void SetRegionDiscard(void* ctx, void (*fn)(void* ctx, uint64_t addr, uint64_t size));
+void DiscardRegion(uint64_t addr, uint64_t size);
+/// Diagnostic tag of the calling thread's next DiscardOwner (the caller's site key; bit 63 = a free), logged with the
+/// first discards.
+void SetOwnerDiscardTag(uint64_t tag);
+uint64_t OwnerDiscardTag();
+/// Counters of the owner discard (any thread, relaxed; reported in the native report window).
+enum class OwnerDiscard : uint8_t {
+    Call,            ///< DiscardOwner calls while the switch is on
+    Discarded,       ///< calls that passed the filters (GPU bits set, no command buffer in the range)
+    Bytes,           ///< bytes of those calls
+    PagesUnprotected,///< 4 KiB pages unmarked GPU-modified and marked CPU-modified
+    SharedPages,     ///< partial boundary pages left GPU-modified (their other bytes are still GPU-written)
+    SkippedClean,    ///< calls with no GPU-modified page in the tracker
+    SkippedCmd,      ///< calls with a command buffer still using the range
+};
+void NoteOwnerDiscard(OwnerDiscard what, uint64_t n = 1);
+
 /// Counters (draw thread or any thread, relaxed).
 void NoteUploaded(uint64_t bytes);     ///< a persistent range uploaded by the draw thread (0: already clean)
 void NoteMarked(uint64_t bytes);       ///< a per-frame range marked CPU-modified (fallback)

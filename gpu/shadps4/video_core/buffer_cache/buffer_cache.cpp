@@ -33,6 +33,7 @@
 #include "../../../sotc/pc_ring.h"      // sotc: SOTC_PC_RING shadow
 #include "../../../sotc/native/fault_emu.h" // sotc: SOTC_NATIVE_TRACK_EMU
 #include "../../../sotc/probes.h"           // sotc: SOTC_FAULT_OWNERS (GPU write stamps)
+#include "../../../sotc/alloc_sites.h"      // sotc: SOTC_ALLOC_SITES
 #include "../../../sotc/native/native.h"       // sotc: SOTC_NATIVE (windows, announces, frame ticket)
 #include "../../../sotc/cmd_counters.h"        // sotc: SOTC_CMD_COUNTERS (unique-bytes spans, see PcHostRecordBind)
 #include "../../../sotc/native/native_draw.h" // sotc: SOTC_NATIVE draw-thread side
@@ -561,6 +562,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
             this, &BufferCache::NativeFrameSubmitted, &BufferCache::NativeFrameWait,
             &BufferCache::NativeFrameCompleted});
         SotcNative::SetFreeDiscard(this, &BufferCache::NativeDiscardFreed);
+        SotcNative::SetOwnerDiscard(this, &BufferCache::NativeDiscardOwner); // sotc: SOTC_NATIVE_OWNER_DISCARD
+        SotcNative::SetRegionDiscard(this, &BufferCache::NativeDiscardRegion); // sotc: SOTC_GPU_PLACE quarantine
+        SotcNative::DrainAheadStart(); // sotc: SOTC_NATIVE_DRAIN_AHEAD (no-op when off): the announce worker
     }
     // sotc: SOTC_HRR dry run (see hrr.h).
     if (HostResidentRanges::Enabled()) {
@@ -677,6 +681,7 @@ BufferCache::~BufferCache() {
     if (SotcNative::On()) {
         SotcNative::SetFrameBackend(SotcNative::FrameBackend{}); // sotc: SOTC_NATIVE, this cache is going
     }
+    SotcNative::DrainAheadStop(); // sotc: SOTC_NATIVE_DRAIN_AHEAD: the worker stops before the caches it may name go
     AsyncUpload::Shutdown(); // sotc: SOTC_ASYNC_UPLOAD
     std::free(block_last_use);
 }
@@ -6138,6 +6143,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                                                         bool is_written, bool is_texel_buffer,
                                                         u32 mark_offset, u32 mark_size) {
     SotcLoadWarm::NoteBind(device_addr, size); // sotc: SOTC_LOAD_WARM (no-op when off)
+    if (SotcAllocSites::On()) { // sotc: SOTC_ALLOC_SITES: every bind, with the shader's own is_written
+        SotcAllocSites::NoteGpuBuffer(device_addr, size, is_written);
+    }
     // sotc: SOTC_NATIVE_BUFFER_VERIFY (see BufVerifyEntry), per 64 KiB granule of the bind (at most 64).
     if (!is_written && size != 0 && BufVerifyOn()) {
         const u64 now = scheduler.CurrentTick();
@@ -8877,6 +8885,15 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
     static thread_local std::vector<u32> inval_order;
     static thread_local std::vector<u8> inval_needed;
     inval.clear();
+    // sotc: SOTC_NATIVE_DRAIN_AHEAD (default off). A worker thread takes the announces as they are queued; this drain
+    // takes what it published (DrainAheadTake waits for the pickup seq) and does the rest of the drain as below. The
+    // worker's ranges replace the inline merge (taken); the mark, invalidation and upload steps are unchanged.
+    const bool drain_ahead = SotcNative::DrainAheadOn();
+    // sotc: the drain-ahead worker's entries and their invalidation groups (DrainAheadTake; native.cpp GroupInval).
+    static thread_local std::vector<SotcNative::PendingUpload> ahead_raw;
+    static thread_local std::vector<SotcNative::PendingUpload> ahead_ranges;
+    static thread_local std::vector<SotcNative::InvalRef> ahead_inval;
+    static thread_local std::vector<SotcNative::InvalGroup> ahead_groups;
     const auto handle = [&](const SotcNative::PendingUpload& u) {
         // sotc: SOTC_MIRROR: served ranges are uploaded too. The packet's arena window is 0 (the ring-8 arena is
         // many imported runs, not one window), so every shader-addressed range is read through the mirror.
@@ -8889,7 +8906,10 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
         // untracked, re-hashed at the next use), and the buffer range is marked CPU-modified. The mark
         // is needed for Persistent too: DrainRange skips a range that is not CPU-modified.
         if (inval_merge) {
-            inval.emplace_back(u.addr, u.size);
+            // sotc: SOTC_NATIVE_DRAIN_AHEAD: the worker grouped the announces (ahead_groups); nothing is collected here.
+            if (!drain_ahead) {
+                inval.emplace_back(u.addr, u.size);
+            }
         } else {
             texture_cache.InvalidateMemory(u.addr, u.size, !SotcNative::TracksGuestPages());
         }
@@ -8898,9 +8918,26 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
             ++served;
             return;
         }
-        taken.push_back(u);
+        if (!drain_ahead) {
+            taken.push_back(u);
+        }
     };
-    if (take_mode == 1) {
+    if (drain_ahead) {
+        // sotc: SOTC_NATIVE_DRAIN_AHEAD: the announces the worker published up to this submit's pickup seq (and any it
+        // published since), in announce order, with their non-served ranges merged per batch. The verify of
+        // SOTC_LEAN_SUBMIT=2 (PeekUploads) is not run in this mode.
+        const size_t ahead =
+            SotcNative::DrainAheadTake(pickup_seq, ahead_raw, ahead_ranges, ahead_inval, ahead_groups);
+        u64 ahead_bytes = 0;
+        for (size_t i = 0; i < ahead_raw.size(); ++i) {
+            if (i < ahead) {
+                ahead_bytes += ahead_raw[i].size;
+            }
+            handle(ahead_raw[i]);
+        }
+        SotcNative::NoteDrainAhead(ahead, ahead_bytes);
+        taken.swap(ahead_ranges);
+    } else if (take_mode == 1) {
         SotcNative::TakeUploads(popped, ~size_t{0});
         for (const auto& u : popped) {
             handle(u);
@@ -8921,7 +8958,24 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
             SotcNative::VerifyTakeUploads(snapshot, popped, version);
         }
     }
-    if (inval_merge && !inval.empty()) {
+    if (drain_ahead && inval_merge) {
+        // sotc: SOTC_NATIVE_DRAIN_AHEAD: the groups come from the worker (sorted and merged there, native.cpp GroupInval),
+        // so there is no sort here. One HasImagesExact per group; the announces of a group with an image page are
+        // invalidated in the order they were taken, as the branch below does for inval.
+        inval_needed.assign(ahead_raw.size(), 0);
+        for (const SotcNative::InvalGroup& g : ahead_groups) {
+            if (texture_cache.HasImagesExact(g.lo, g.hi - g.lo)) {
+                for (uint32_t k = g.begin; k < g.end; ++k) {
+                    inval_needed[ahead_inval[k].index] = 1;
+                }
+            }
+        }
+        for (size_t i = 0; i < ahead_raw.size(); ++i) {
+            if (inval_needed[i]) {
+                texture_cache.InvalidateMemory(ahead_raw[i].addr, ahead_raw[i].size, !SotcNative::TracksGuestPages());
+            }
+        }
+    } else if (inval_merge && !inval.empty()) {
         // Merged groups in address order; a group with an image page marks its announces for invalidation.
         inval_order.resize(inval.size());
         for (u32 i = 0; i < inval_order.size(); ++i) {
@@ -8958,23 +9012,13 @@ void BufferCache::NativeDrain(u64 budget, u64 pickup_seq) {
             }
         }
     }
-    std::sort(taken.begin(), taken.end(), [](const SotcNative::PendingUpload& a, const SotcNative::PendingUpload& b) {
-        return a.kind != b.kind ? a.kind < b.kind : a.addr < b.addr;
-    });
     // One DrainRange call takes at most 64 MiB (kMaxChunk), the same bound an announce entry has.
     constexpr u64 kMaxChunk = u64{64} << 20;
-    for (const auto& e : taken) {
-        if (!merged.empty()) {
-            SotcNative::PendingUpload& r = merged.back();
-            const u64 lo = std::min<u64>(r.addr, e.addr);
-            const u64 hi = std::max<u64>(r.addr + r.size, e.addr + e.size);
-            if (r.kind == e.kind && e.addr <= r.addr + r.size && r.addr <= e.addr + e.size && hi - lo <= kMaxChunk) {
-                r.addr = lo;
-                r.size = hi - lo;
-                continue;
-            }
-        }
-        merged.push_back(e);
+    // sotc: sorted by kind and address and merged (SotcNative::MergeUploads, also the drain-ahead worker's per batch).
+    if (drain_ahead) {
+        merged.swap(taken); // sotc: the worker publishes them sorted and merged across batches (native.cpp Publish)
+    } else {
+        SotcNative::MergeUploads(taken, merged);
     }
     if (mirror_on) {
         // Every announced range goes to the mirror: sorted by address, overlapping or touching ranges merged
@@ -9266,6 +9310,121 @@ void BufferCache::NativeDiscardFreed(void* ctx, u64 addr, u64 size) {
         std::fprintf(stderr, "SOTC NATIVE FREE DISCARD: %#llx +%#llx\n", (unsigned long long)addr,
                      (unsigned long long)size);
     }
+}
+
+// sotc: SOTC_NATIVE_OWNER_DISCARD. Byte-exact forget of GPU-written state for a range that changed owner. Pages
+// fully inside [addr, addr + size) lose their GPU bits. A partly covered page (at most two: the one holding addr and
+// the one holding addr + size - 1) loses them only when gpu_modified_ranges has no byte left on it; otherwise its
+// other bytes are still GPU-written and it stays GPU-modified.
+void BufferCache::NativeOwnerForget(VAddr addr, u64 size, bool mark_cpu) {
+    constexpr u64 Page = 4096;
+    const VAddr end = addr + size;
+    const VAddr inner_lo = (addr + Page - 1) & ~(Page - 1); // first page boundary at or after addr
+    const VAddr inner_hi = end & ~(Page - 1);               // last page boundary at or before end
+    // Partly covered pages: the head page when addr is unaligned, the tail page when end is unaligned.
+    VAddr edge[2]{};
+    int edges = 0;
+    if (addr != inner_lo) {
+        edge[edges++] = addr & ~(Page - 1);
+    }
+    if (end != inner_hi && (edges == 0 || (end & ~(Page - 1)) != edge[0])) {
+        edge[edges++] = end & ~(Page - 1);
+    }
+    bool edge_clear[2]{};
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(addr, size);
+        for (int i = 0; i < edges; ++i) {
+            edge_clear[i] = !gpu_modified_ranges.Intersects(edge[i], Page);
+        }
+    }
+    // The tracker is called after gpu_modified_mutex is released (lock order: set, region, page).
+    u64 unprotected = 0;
+    if (inner_lo < inner_hi) {
+        memory_tracker->UnmarkRegionAsGpuModified(inner_lo, inner_hi - inner_lo, false);
+        if (mark_cpu) {
+            memory_tracker->MarkRegionAsCpuModified(inner_lo, inner_hi - inner_lo);
+        }
+        unprotected += (inner_hi - inner_lo) / Page;
+    }
+    u64 shared = 0;
+    for (int i = 0; i < edges; ++i) {
+        if (edge_clear[i]) {
+            memory_tracker->UnmarkRegionAsGpuModified(edge[i], Page, false);
+            if (mark_cpu) {
+                memory_tracker->MarkRegionAsCpuModified(edge[i], Page);
+            }
+            ++unprotected;
+        } else {
+            ++shared;
+        }
+    }
+    SotcNative::NoteOwnerDiscard(SotcNative::OwnerDiscard::PagesUnprotected, unprotected);
+    SotcNative::NoteOwnerDiscard(SotcNative::OwnerDiscard::SharedPages, shared);
+}
+
+void BufferCache::NativeDiscardOwner(void* ctx, u64 addr, u64 size) {
+    auto* self = static_cast<BufferCache*>(ctx);
+    if (size == 0) {
+        return;
+    }
+    // Prefilter without gpu_modified_mutex: the tracker's GPU bits (the tracker takes its region locks inside).
+    if (!self->memory_tracker->IsRegionGpuModified(addr, size)) {
+        SotcNative::NoteOwnerDiscard(SotcNative::OwnerDiscard::SkippedClean);
+        return;
+    }
+    // A command buffer still in use may read the range: nothing is forgotten (the range keeps faulting).
+    if (self->liverpool->CmdRangeInUse(addr, size)) {
+        SotcNative::NoteOwnerDiscard(SotcNative::OwnerDiscard::SkippedCmd);
+        return;
+    }
+    SotcNative::NoteOwnerDiscard(SotcNative::OwnerDiscard::Discarded);
+    SotcNative::NoteOwnerDiscard(SotcNative::OwnerDiscard::Bytes, size);
+    {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 400) {
+            const u64 tag = SotcNative::OwnerDiscardTag();
+            std::fprintf(stderr, "SOTC OWNER DISCARD: %#llx +%#llx %s site %#llx slot %llu\n",
+                         (unsigned long long)addr, (unsigned long long)size, (tag >> 63) ? "free" : "alloc",
+                         (unsigned long long)(tag & 0xffffffffffull), (unsigned long long)((tag >> 48) & 0x7fff));
+        }
+    }
+    // sotc: SOTC_NATIVE_OWNER_DISCARD_NOW=1 also forgets here, on the engine thread. Off by default: an asynchronous
+    // readback of the old contents still in flight (its in-flight entry is marked stale only on the draw thread,
+    // below) could land after the page is unprotected and overwrite what the new owner wrote (crash at 0xf4f567 in
+    // three runs with the immediate forget).
+    static const bool now = [] {
+        const char* v = std::getenv("SOTC_NATIVE_OWNER_DISCARD_NOW");
+        return v && v[0] == '1';
+    }();
+    if (now) {
+        self->NativeOwnerForget(addr, size);
+    }
+    // A written bind queued before the change can mark the range GPU-written again when it runs, so the forget repeats
+    // at this point of the command stream. The in-flight readbacks, granule snapshots and prefetch dirtying are draw
+    // thread state: they run here too, as the slow drop path does.
+    self->liverpool->SendOrderedCommand([self, addr, size] {
+        self->MarkInflightReadbacksDirty(addr, size, StaleReason::Unmap); // first: no stale readback lands after
+        self->NativeOwnerForget(addr, size);
+        self->EraseGranuleSnapshots(addr, size);
+        self->PrefetchMarkDirty(addr, size);
+    });
+}
+
+void BufferCache::NativeDiscardRegion(void* ctx, u64 addr, u64 size) {
+    auto* self = static_cast<BufferCache*>(ctx);
+    if (size == 0 || !self->memory_tracker->IsRegionGpuModified(addr, size)) {
+        return;
+    }
+    if (self->liverpool->CmdRangeInUse(addr, size)) {
+        return;
+    }
+    self->liverpool->SendOrderedCommand([self, addr, size] {
+        self->MarkInflightReadbacksDirty(addr, size, StaleReason::Unmap);
+        self->NativeOwnerForget(addr, size, false);
+        self->EraseGranuleSnapshots(addr, size);
+        self->PrefetchMarkDirty(addr, size);
+    });
 }
 
 u64 BufferCache::NativeFrameCompleted(void* ctx) {

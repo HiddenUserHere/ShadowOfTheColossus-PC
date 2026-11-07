@@ -902,6 +902,19 @@ private:
     // the ranges the lookup read (CpCollectReads, read after the lookup; a lookup is retried after
     // the wait when it overlapped a pending write). Every publish that writes memory records its
     // range in cp_wr_ring: the range given by NoteBackWriteRange, else unknown (the old wait).
+    /// sotc: SOTC_CP_PRECISE_WAIT: why a lookup waits for the back tail (the old wait when not None).
+    enum class CpUnknown : u8 {
+        None,           // a known range: the wait covers the overlapping write only
+        NullPipeline,   // a stage is still translating: its reads are not known (CpCollectReads)
+        SrtWalker,      // the SRT walker reads at unbounded places (CpCollectReads)
+        TessConsts,     // the tessellation constants are read at a place not recorded (CpCollectReads)
+        RangeTableFull, // more read ranges than CpMaxReadRanges (CpCollectReads)
+        RingOverflow,   // a pending range was overwritten in cp_wr_ring (CpWaitTarget)
+        WriteHeldWd,    // a queued op with held-back WRITE_DATA that may write anything (RecordBackWrite)
+        WriteNoRange,   // a queued publish with no NoteBackWriteRange range (RecordBackWrite)
+        SrtPlanTooBig,  // the SRT walk plan needs more read ranges than CpMaxReadRanges (CpCollectSrtPlan)
+        Count,
+    };
     static constexpr u32 CpWriteRingSize = 256;
     static constexpr u32 CpMaxReadRanges = 48;
     static constexpr u32 CpMaxAttempts = 3;
@@ -911,7 +924,7 @@ private:
         u64 seq{};
         VAddr addr{};
         u64 size{};
-        bool unknown{};
+        CpUnknown why{}; ///< sotc: CpUnknown::None: a known range; otherwise the write is unknown
     };
     struct CpReadSet {
         std::array<std::pair<VAddr, u64>, CpMaxReadRanges> ranges{};
@@ -928,6 +941,20 @@ public:
         static inline std::atomic<u64> verified{};      ///< =2: lookups compared with the old wait
         static inline std::atomic<u64> violations{};    ///< =2: results that differed
         static inline std::atomic<u64> ns_blocked{};    ///< time blocked in the precise waits
+        static constexpr u32 kUnknownReasons = u32(CpUnknown::Count); ///< CpUnknown values, None included
+        static inline std::array<std::atomic<u64>, kUnknownReasons> unknown_n{}; ///< unknown waits by reason
+        static inline std::array<std::atomic<u64>, kUnknownReasons> unknown_ns{}; ///< their blocked time
+        /// sotc: SRT walker programs (pgm_hash) that a lookup hit; the report takes and resets them.
+        static void NoteSrtWalker(u64 pgm_hash);
+        static void TakeSrtWalkers(std::vector<std::pair<u64, u64>>& top, u64& distinct, u64& dropped);
+        // sotc: SOTC_CP_SRT_PLAN: lookups that took a walker program's plan, lookups whose plan was too big,
+        // and (=2) walker reads outside the plan.
+        static inline std::atomic<u64> srt_plan_used{};
+        static inline std::atomic<u64> srt_plan_big{};
+        static inline std::atomic<u64> srt_plan_misses{};
+        /// sotc: SOTC_CP_SRT_PLAN=2: the first programs (pgm_hash) whose walker read outside the plan.
+        static void NoteSrtPlanMiss(u64 pgm_hash);
+        static void TakeSrtPlanMisses(std::vector<u64>& hashes);
     };
 
 private:
@@ -960,13 +987,15 @@ private:
     }
     static constexpr u64 CpNoGuestWrite = ~u64{0};
     void RecordBackWrite(u64 head, bool writes_memory);
-    void PushWriteRange(u64 seq, VAddr addr, u64 size, bool unknown);
+    void PushWriteRange(u64 seq, VAddr addr, u64 size, CpUnknown why);
     /// False when the lookup's reads are not all bounded (or there is no pipeline to read them).
-    bool CpCollectReads(const Vulkan::Pipeline* pipeline, CpReadSet& reads) const;
+    bool CpCollectReads(const Vulkan::Pipeline* pipeline, CpReadSet& reads, CpUnknown& why) const;
+    /// sotc: SOTC_CP_SRT_PLAN: the read ranges of a walker program from its walk plan (CpCollectReads).
+    bool CpCollectSrtPlan(const Shader::Info& info, CpReadSet& reads, CpUnknown& why) const;
     /// The back_tail to wait for before the lookup's result may be used: 0 when no queued write
     /// newer than snap overlaps what the lookup read.
-    u64 CpWaitTarget(const Vulkan::Pipeline* pipeline, u64 snap, bool& unknown);
-    void CpWaitFor(u64 target, bool unknown);
+    u64 CpWaitTarget(const Vulkan::Pipeline* pipeline, u64 snap, CpUnknown& why);
+    void CpWaitFor(u64 target, CpUnknown why);
     void CpDigest(const Vulkan::Pipeline* pipeline, std::vector<u64>& out) const;
     /// The pipeline lookup of a draw or dispatch, after the waits its guest reads need.
     /// looks_up false: no lookup runs (filtered draw), nothing is read.
@@ -988,8 +1017,8 @@ private:
                 CpPreciseStats::retries.fetch_add(1, std::memory_order_relaxed);
             }
             const Vulkan::Pipeline* pipeline = lookup();
-            bool unknown = false;
-            const u64 target = CpWaitTarget(pipeline, snap, unknown);
+            CpUnknown why = CpUnknown::None;
+            const u64 target = CpWaitTarget(pipeline, snap, why);
             if (target == 0) {
                 CpPreciseStats::avoided.fetch_add(1, std::memory_order_relaxed);
                 if (cp_precise != 2) {
@@ -1009,7 +1038,7 @@ private:
                 }
                 return old_pipeline;
             }
-            CpWaitFor(target, unknown); // the lookup may have read a write still pending
+            CpWaitFor(target, why); // the lookup may have read a write still pending
         }
         CpPreciseStats::fallback.fetch_add(1, std::memory_order_relaxed);
         WaitBackWrites();

@@ -264,6 +264,8 @@ struct Info : InfoPersistent {
     /// sotc: SOTC_VSIZE_PROBE provenance of the SRT-flattened dwords (see SotcSrtSource). Empty when the
     /// switch is off or the Info came from the pipeline cache.
     std::vector<SotcSrtSource> sotc_srt_sources;
+    /// sotc: SOTC_CP_SRT_PLAN=2: the guest reads of the last walker run (address, bytes), see RefreshFlatBuf
+    std::vector<std::pair<u64, u32>> sotc_srt_trace;
     /// sotc: SOTC_PREDICT_PROBE step 2b. One entry per image instruction the resource pass bound: image index in
     /// images, the GCN pc of the instruction (TextureInstInfo::pc), the IR opcode and the TextureInstInfo bits.
     /// Not serialized: empty for an Info restored from the pipeline cache.
@@ -444,8 +446,17 @@ struct Info : InfoPersistent {
         }
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
-            srt_info.walker_func(user_data.data(), flattened_ud_buf.data(), &SrtCopyWindow,
-                                 GetSrtWalkerContext());
+            if (SrtPlanTraceEnabled()) { // sotc: SOTC_CP_SRT_PLAN=2 keeps the reads the walker makes
+                SrtTraceReset();
+                srt_info.walker_func(user_data.data(), flattened_ud_buf.data(), &SrtCopyWindowTraced,
+                                     SrtPlanTraceContext());
+                // The root pointers are read from the user data array itself: not guest memory.
+                const u64 ud_begin = reinterpret_cast<uintptr_t>(user_data.data());
+                SrtTraceTake(sotc_srt_trace, ud_begin, ud_begin + user_data.size_bytes());
+            } else {
+                srt_info.walker_func(user_data.data(), flattened_ud_buf.data(), &SrtCopyWindow,
+                                     GetSrtWalkerContext());
+            }
         }
         if (!sharp_tables.empty()) {
             RefreshSharpTables();

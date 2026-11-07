@@ -501,6 +501,22 @@ public:
     /// re-uploads stale guest bytes over the GPU's (1 Nov: Shrine facade missing, black rectangles).
     void InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_written = false);
 
+    /// sotc: SOTC_TC_SINGLE_WRITER=1 (default off; off: InvalidateMemory). The texture part of a guest
+    /// write fault: the range is queued and applied by the draw thread (DrainGuestInvalidations) at its
+    /// next bind pass, so the faulting guest thread does not take `mutex`. Same effect on the images.
+    void InvalidateMemoryGuest(VAddr addr, size_t size);
+
+    /// sotc: SOTC_TC_SINGLE_WRITER. Applies the guest invalidations queued by InvalidateMemoryGuest
+    /// under `mutex`. Lock-free when none is pending. BatchLock calls it on entry.
+    void DrainGuestInvalidations() {
+        if (guest_inval_pending.load(std::memory_order_acquire) != 0) {
+            DrainGuestInvalidationsSlow();
+        }
+    }
+
+    /// sotc: SOTC_TC_SINGLE_WRITER=1 (read once). True when the draw thread is the only writer of the cache.
+    static bool SingleWriter();
+
     /// Marks an image as dirty if it exists at the provided address.
     /// sotc: any_overlap marks every image overlapping the range (DMA copies and fills).
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap = false);
@@ -605,6 +621,11 @@ public:
     /// SOTC_TC_BATCH=0.
     [[nodiscard]] std::unique_lock<ReentrantMutex> BatchLock() {
         mutex.SetFastThread();
+        // sotc: SOTC_TC_SINGLE_WRITER: the guest invalidations queued by faults go first. Skipped
+        // inside a hold (nested batch): the outermost pass drained them already.
+        if (!mutex.HeldByThisThread()) {
+            DrainGuestInvalidations();
+        }
         if (!TextureLockBatching()) {
             return {};
         }
@@ -1087,6 +1108,22 @@ private:
     static constexpr u64 NumImagePages = u64{1} << (Traits::ADDRESS_SPACE_BITS - Traits::PAGE_BITS);
     std::unique_ptr<std::atomic<u32>[]> page_images{new std::atomic<u32>[NumImagePages]()};
     ReentrantMutex mutex;
+    /// sotc: SOTC_TC_SINGLE_WRITER. Guest invalidations waiting for the draw thread (InvalidateMemoryGuest).
+    /// guest_inval_queue is guarded by guest_inval_mutex, a leaf lock (never held while taking `mutex`);
+    /// guest_inval_pending counts its entries and is read without a lock by DrainGuestInvalidations.
+    struct GuestInvalidation {
+        VAddr addr;
+        size_t size;
+    };
+    std::mutex guest_inval_mutex;
+    std::vector<GuestInvalidation> guest_inval_queue;
+    std::atomic<u32> guest_inval_pending{0};
+    /// Out of line part of DrainGuestInvalidations: takes the queue, then `mutex`.
+    void DrainGuestInvalidationsSlow();
+    /// sotc: InvalidateMemory without the skip check: the locked body (caller holds `mutex`).
+    void InvalidateImagesLocked(VAddr addr, size_t size, bool keep_gpu_written);
+    /// sotc: the page check of InvalidateMemory (SOTC_TC_SKIP_EMPTY): false when no image can be over the range.
+    bool PagesMayHoldImage(VAddr addr, size_t size);
     /// sotc: RefreshImage nesting on this thread (it runs under `mutex`).
     static inline thread_local u32 refresh_depth = 0;
     /// sotc: deferred EmergencyCollect level + 1 (0: none).

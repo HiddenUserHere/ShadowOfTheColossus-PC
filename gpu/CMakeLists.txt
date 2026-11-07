@@ -381,7 +381,7 @@ if (WIN32)
     add_executable(hook-detour-test EXCLUDE_FROM_ALL sotc/tests/hook_detour_test.cpp)
     target_include_directories(hook-detour-test PRIVATE shim shadps4 sotc)
     target_compile_options(hook-detour-test PRIVATE -UNDEBUG)
-    target_link_libraries(hook-detour-test PRIVATE bbgpu)
+    target_link_libraries(hook-detour-test PRIVATE bbgpu -pthread) # sotc_trace.cpp uses pthread_getname_np
 
     # sotc: trace v2 unit tests (no game). The copy-based stack unwinder (gpu/sotc/unwind.cpp) and
     # the import-timing thunk (src/runtime_trace_imports.c), each self-contained.
@@ -407,3 +407,9 @@ add_executable(gcn-native-test EXCLUDE_FROM_ALL ../tests/test_gcn_native.cpp ../
 target_include_directories(gcn-native-test PRIVATE shim shadps4 third_party/gcn/include)
 target_compile_options(gcn-native-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -fPIC)
 target_link_libraries(gcn-native-test PRIVATE bbgpu)
+
+# sotc: GPU region allocator unit test (gpu/sotc/gpu_region.cpp with fake host calls; no GPU, no game).
+add_executable(gpu-region-test EXCLUDE_FROM_ALL sotc/tests/gpu_region_test.cpp sotc/gpu_region.cpp)
+target_include_directories(gpu-region-test PRIVATE sotc)
+target_compile_options(gpu-region-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_link_libraries(gpu-region-test PRIVATE -pthread)

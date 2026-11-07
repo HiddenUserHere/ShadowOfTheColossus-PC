@@ -138,3 +138,74 @@ Writers: the allocator header, particle stats (`ParticleSystemPool::ProcessStats
 (`BpeHeap_Link` 0x4949c, `BpeHeap_Free` 0x48f07, the `sub_12820` path 0x128ff), `RenderThread::SubmitJob`
 0xc55c1, `sub_1d750` 0x1d849. At ~81 us per merge this is 5-28 ms of CPU per second spread over the guest
 threads; no single site is worth an allocator change.
+
+## Allocation-site registry: exact GPU/CPU classification (2026-11-06)
+
+The owner tables above charge a fault to the last allocation in its granule. The registry replaces that with
+one record per allocation site. Inputs: the static true-sharing and allocator reports, and one measured run.
+
+### The registry (`SOTC_ALLOC_SITES=1`)
+
+- Code: `gpu/sotc/alloc_sites.{h,cpp}`. Needs `SOTC_HOOK_MEMTYPE_PROBE=1`.
+- Key: each allocation from `sub_12820` is keyed by its three return addresses and its heap slot.
+- Charges to an allocation: buffer binds (with the recompiled shader's `is_written`), image uses, and
+  TRACK=3 write faults.
+- Written binds are "own" when the bind starts at the allocation and fits in it; otherwise "foreign".
+- Output: per-site table `user/alloc_sites.tsv`.
+- Lifetime rules:
+  - An allocation ends at the generic free `0x12af0` (hook MEMTYPE_FREE).
+  - The class frees `0x17e90` (MEMTYPE_FREE_SMALL) and `0x493d0` (MEMTYPE_FREE_BPE) never end an
+    allocation that the generic free did not end.
+  - The realloc `0x12c50` (MEMTYPE_REALLOC) was never called in the measured runs.
+  - An allocation with no free is a ring-heap block; the next allocation over it ends it.
+
+### Measured result (2026-11-06)
+
+- 190 GPU-written sites. 185 have only own written binds.
+- 5 are foreign-only: 4 render-target pool sites (slot 20), and the BuildXPR decal block `0x1b397a`
+  (the written view sits at offset ~0x2350 inside a CPUMemory block).
+
+### Mixed sites: which pass writes them
+
+A site is mixed when some of its allocations are written by the GPU and others are not. "Can the GPU write
+it" is a property of the site. Whether the pass ran for a given object varies.
+
+| Site | Writing pass | Rule |
+|---|---|---|
+| Skin outputs, `sub_192f20` (A[0] / A[1]) | skin compute `0x193810` (variant A) or `0x193aa0` (variant B) | A[0] or A[1] by frame parity; the two are exact complements (measured) |
+| CreateSourceIndices, `obj+0x160` (`sub_193f00` / `sub_194a00`) | `sub_194a00` dispatches | once per rebuild of the object |
+| StaticModelSection, `sub_1af960` | IndexCullObjects | after the section becomes visible |
+| BuildXPR decal, `sub_1b32f0` | decal cull compute `sub_19c7e0` | binds the records as written; only culled sets |
+| InstanceData, `sub_122b70` / `sub_122c30` | "Update GPU Data" compute `sub_123410` | ~2% of objects get own GPU writes (2 of 135 for `sub_122b70`, 7 of 453 for `sub_122c30`); the CPU writes them only at init |
+
+### True sharing
+
+- A static scan of all GPU-written sites (the three static reports) found none. Each CPU write into a
+  GPU-written buffer is either before that buffer's first GPU use, or to other bytes of the same page.
+- Still open in those reports: post-creation writers of the stored fields were not searched across the
+  eboot, and the particle `UpdateSimulation` dispatches were not checked.
+
+### Owner-change discard (`SOTC_NATIVE_OWNER_DISCARD`, `BufferCache::NativeDiscardOwner`)
+
+- Immediate discard on the engine thread crashed 3 of 3 runs at `0xf4f567`: a CPU loop reading index data got
+  `0xfefe` indices. Cause: an asynchronous readback of the old contents was still in flight and landed after
+  the page was unprotected. An in-flight readback can only be marked stale on the draw thread.
+- Deferred discard at the command-processor point (the default now; the immediate path needs
+  `SOTC_NATIVE_OWNER_DISCARD_NOW=1`): no crash, but the faults do not change (390 / 1240 / 2082 per 5 s against
+  326 / 1271 / 2272 baseline). The engine writes a fresh block before the deferred discard runs.
+- Conclusion: stale marks must not arise at all. Next step: GPU-written sites get a port-owned region, and
+  their frees go through a quarantine that discards on the draw thread before the memory is reused.
+
+### Port constraints from the allocator RE (static)
+
+- Pointer bits: `0x17e90` (bucket free) and `0x18160` (bucket realloc) take the chunk base from the pointer
+  with a chunk-end mask and read the descriptor at `[E-0x18]`. A foreign pointer reads and writes at
+  `E-0x38..E-0x10`, so both need an entry hook.
+- Classifier `sub_19a50`: maps a pointer to its owning heap through the pool class tables (64 KiB granules
+  inside the pool window, 1 MiB granules outside). Unknown pointers get 0. Callers: `0x12af0`, `0x12c50`,
+  `0x47840`, `0x47c20`, `0x47f30`. `0x47c20` and `0x47f30` dereference the owner with no NULL check, so a
+  foreign pointer crashes there.
+- Heap-wide release: `0x47620` (free-all) and `0x47740` (deleting dtor) free nodes through `pool_free_block`
+  (`0x1b0e0`) without passing `0x12af0`.
+- No header or footer is read before a user pointer outside the BPE heap (`0x493d0`). No 40-bit pointer
+  packing was found.

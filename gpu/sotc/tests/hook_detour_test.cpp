@@ -1,7 +1,7 @@
 // sotc: hook-detour-test (gpu/CMakeLists.txt, EXCLUDE_FROM_ALL). Checks the guest detour stubs of
 // Core::InstallGuestDetour (gpu/sotc/cpu_patches.cpp, docs/HOOK-DESIGN.md) on hand-assembled SysV
 // functions in a fake module: Entry with a RIP-relative prologue, Entry Return, Wrap (pre and
-// post, Return ignored), Site with register write-back, a red-zone sentinel and live registers and
+// post, Wrap Return skips the original and the post), Site with register write-back, a red-zone sentinel and live registers and
 // flags, the host call alignment, HookAction::CallGuest (Entry and Wrap: a guest callee with six
 // arguments that clobbers the GPRs, flags and xmm0/8/15, while the caller keeps xmm8 live), and the
 // refusals (Wrap stack reads, branch to the entry, the trampoline rollback). Windows only. Prints
@@ -15,9 +15,12 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <span>
+#include <string_view>
 #include <vector>
 
 #include "cpu_patches.h"
+#include "hook_layout.h"
 #include "hooks.h"
 
 namespace {
@@ -49,7 +52,8 @@ int g_host_misaligned = 0;
 int g_guest_misaligned = 0;
 int g_wrap_rsp_changed = 0;
 bool g_entry_return = false;   // Entry handler answers HookAction::Return
-bool g_wrap_pre_return = false; // Wrap pre handler answers HookAction::Return (must be ignored)
+bool g_wrap_pre_return = false; // Wrap pre handler answers HookAction::Return for rdi == g_wrap_return_arg
+uint64_t g_wrap_return_arg = 3;
 bool g_wrap_post_adds = false; // Wrap post handler adds 1000 to rax
 bool g_site_edit = false;      // Site handler sets rsi = 100
 uint64_t g_wrap_entry_rsp = 0;
@@ -169,8 +173,8 @@ extern "C" uint32_t sotc_hook_dispatch(SotcHooks::GuestRegs* regs, uint32_t hook
         if (phase == static_cast<uint32_t>(SotcHooks::Phase::Pre)) {
             ++g_wrap_pre;
             g_wrap_entry_rsp = regs->rsp;
-            if (g_wrap_pre_return) {
-                regs->rax = 777; // Wrap ignores Return: the original overwrites rax
+            if (g_wrap_pre_return && regs->rdi == g_wrap_return_arg) {
+                regs->rax = 0x1234; // Wrap Return: the caller gets this, the original does not run
                 return action_return;
             }
             if (g_wrap_call_enabled) {
@@ -224,6 +228,23 @@ extern "C" uint32_t sotc_trace_funcs_enter(uint64_t, uint64_t, uint32_t, uint64_
 extern "C" uint64_t sotc_trace_funcs_leave(uint64_t rsp_at_return) {
     return rsp_at_return;
 }
+
+// sotc: link-only stubs of the SotcHooks API. Other objects of libbbgpu.a (engine_cmd, the
+// budget and cull objects) reference it, which would pull hooks.cpp in; hooks.cpp defines
+// sotc_hook_dispatch too (a duplicate of this file's stub) and pulls sotc_trace.cpp, which needs
+// pthread_self/pthread_getname_np (bb-probe links -pthread; this target does not). This test never
+// dispatches through the hook table, so the stubs are never called.
+namespace SotcHooks {
+void RegisterHandler(std::string_view, const Handler&) {}
+uintptr_t ImageBase() { return 0; }
+bool IsInstalled(std::string_view) { return false; }
+int HookMode(std::string_view) { return -1; }
+bool Derived(std::string_view, std::string_view, uint64_t*) { return false; }
+bool ResolvedRange(std::string_view, uint64_t*, uint64_t*) { return false; }
+void SetGuestCall(uint64_t, const uint64_t[6]) {}
+bool InstallHooks(const char*, void*, uint64_t, InstallStats*) { return false; }
+void SetCodeLayout(std::span<const CodeRange>, std::span<const uint64_t>) {}
+} // namespace SotcHooks
 
 int main() {
     void* memory = VirtualAlloc(nullptr, kCodeSize + kTrampolineSize, MEM_RESERVE | MEM_COMMIT,
@@ -495,8 +516,9 @@ int main() {
     EXPECT(static_cast<uint32_t>(regs_fn(2, 5)) == regs_fall);
     EXPECT(g_site_regs_pre == 2);
 
-    // Wrap ignores HookAction::Return: the original still runs (8, not 777) and the post handler
-    // sees the original result.
+    // Wrap with HookAction::Return: for rdi == 3 the pre handler answers Return with rax = 0x1234.
+    // The caller gets 0x1234; neither the original (which would give 8) nor the post handler runs.
+    // Other calls (rdi == 5) run normally: the original gives 12 and the post handler sees it.
     const std::vector<uint8_t> wrap_ret_pattern{0x89, 0xF8, 0x01, 0xF0, 0x83, 0xC0, 0x01};
     EXPECT(install(kOffWrapRet, Core::DetourMode::Wrap, kHookWrap, wrap_ret_pattern, &result));
     EXPECT(result.installed && result.displaced_bytes == 7);
@@ -504,10 +526,14 @@ int main() {
     const int wrap_ret_pre = g_wrap_pre;
     const int wrap_ret_post = g_wrap_post;
     g_wrap_pre_return = true;
-    EXPECT(wrap_ret_fn(3, 4) == 8);
+    EXPECT(wrap_ret_fn(3, 4) == 0x1234);
+    EXPECT(g_wrap_pre == wrap_ret_pre + 1 && g_wrap_post == wrap_ret_post);
+    EXPECT(wrap_ret_fn(5, 6) == 12);
+    EXPECT(g_wrap_pre == wrap_ret_pre + 2 && g_wrap_post == wrap_ret_post + 1);
+    EXPECT(g_wrap_post_rax == 12);
     g_wrap_pre_return = false;
-    EXPECT(g_wrap_pre == wrap_ret_pre + 1 && g_wrap_post == wrap_ret_post + 1);
-    EXPECT(g_wrap_post_rax == 8);
+    EXPECT(wrap_ret_fn(3, 4) == 8);
+    EXPECT(g_wrap_post == wrap_ret_post + 2 && g_wrap_post_rax == 8);
 
     // CallGuest on Entry. The handler asks for a six-argument call; the callee clobbers every
     // register and the flags, and the hooked function still returns 3 + 4 + 1 with the driver's

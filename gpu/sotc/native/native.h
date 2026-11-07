@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 namespace SotcNative {
 
@@ -80,6 +81,44 @@ uint64_t AnnounceSeq();
 /// was found changed at a later check and announced again (native_hooks.cpp). same_frame: no SubmitDone came
 /// between the first announce and the change (a real late write); else the engine may just have rewritten it.
 void NoteLateWrite(uint64_t size, bool same_frame);
+
+// sotc: SOTC_NATIVE_DRAIN_AHEAD=1 (read once; needs SOTC_NATIVE on, default off). A worker thread (native.cpp) takes the
+// queued announces as they come, in announce order, and publishes them with the seq up to which they are all taken.
+// The draw thread (BufferCache::NativeDrain, at each submit start) takes what was published, after it waited for the
+// worker to reach the submit's pickup seq. PendingUpload is defined in native_draw.h.
+struct PendingUpload;
+/// sotc: SOTC_NATIVE_DRAIN_AHEAD=1 (and SOTC_NATIVE on). Any thread.
+bool DrainAheadOn();
+/// sotc: starts the worker (BufferCache constructor; no-op when the switch is off). Joins it in DrainAheadStop.
+void DrainAheadStart();
+/// sotc: stops the worker and joins it (BufferCache destructor; no-op when it did not start).
+void DrainAheadStop();
+/// sotc: one published announce: its range and its index into raw (DrainAheadTake's raw).
+struct InvalRef {
+    uint64_t addr;
+    uint64_t size;
+    uint32_t index;
+};
+/// sotc: one invalidation group of NativeDrain: the announces inval[begin, end) (inval sorted by address, see
+/// InvalRef) lie in [lo, hi). A group stays under 1 MiB (HasImagesExact answers true past 256 pages).
+struct InvalGroup {
+    uint64_t lo;
+    uint64_t hi;
+    uint32_t begin;
+    uint32_t end;
+};
+/// sotc: draw thread only. Waits until the worker has taken every announce with seq <= want_seq (0: no wait), then moves
+/// what it took into raw (announce order, served entries included) and into ranges (the non-served ones, sorted and
+/// merged per worker batch: MergeUploads). Returns how many entries of raw were published before the call.
+/// inval and groups: every entry of raw (served ones too) sorted by address, and the invalidation groups over them
+/// (the grouping NativeDrain used to do inline, built by the worker: native.cpp GroupInval).
+size_t DrainAheadTake(uint64_t want_seq, std::vector<PendingUpload>& raw, std::vector<PendingUpload>& ranges,
+                      std::vector<InvalRef>& inval, std::vector<InvalGroup>& groups);
+/// sotc: draw thread. Counters of one drain: entries (and their bytes) the worker had taken ahead of the submit.
+void NoteDrainAhead(uint64_t entries, uint64_t bytes);
+/// sotc: any thread. Sorts taken (non-served announces) by kind, then address, and merges the overlapping or touching
+/// ranges of one kind (at most 64 MiB each) into merged. taken is sorted in place. Pure: no shared state.
+void MergeUploads(std::vector<PendingUpload>& taken, std::vector<PendingUpload>& merged);
 
 /// The engine freed or decommitted [addr, addr + size): drop its device copy and any pending upload.
 void Release(uint64_t addr, uint64_t size);

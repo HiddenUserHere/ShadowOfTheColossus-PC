@@ -32,6 +32,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
+#include "video_core/page_manager.h" // sotc: SOTC_PROTECT_ASYNC stats
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "bbport_overlay.h"
@@ -668,11 +669,15 @@ void VideoOutDriver::Flip(const Request& req) {
     if (req.frame) {
         req.frame->sotc_flip_index = SotcStats::flip_count.load(std::memory_order_relaxed) + 1;
     }
-    // Update HDR status before presenting, and present the frame.
-    RunPresentJob([frame = req.frame, hdr = req.port->is_hdr] {
-        presenter->SetHDR(hdr);
-        presenter->Present(frame);
-    });
+    // sotc: SOTC_FLIP_COALESCE: a flip that joined another flip's frame has no frame of its own. It
+    // counts as a flip below (count, flip events, VO label) without a second present.
+    if (req.frame) {
+        // Update HDR status before presenting, and present the frame.
+        RunPresentJob([frame = req.frame, hdr = req.port->is_hdr] {
+            presenter->SetHDR(hdr);
+            presenter->Present(frame);
+        });
+    }
     const uint64_t sotc_flip = SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (SotcTrace::kOn) { // sotc: SOTC_TRACE, the game's flip on the frames track
         SotcTrace::FlipMark(sotc_flip);
@@ -1689,6 +1694,19 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(lookups),
                              100.0 * double(skipped) / double(std::max<u64>(lookups, 1)));
             }
+            if (const auto pa = VideoCore::PageManager::GetProtectAsyncStats(true); pa.queued_runs) {
+                // sotc: SOTC_PROTECT_ASYNC (page_manager.h)
+                ReportPrintf(report,
+                             "SOTC PROTECT ASYNC runs %llu (pages %llu, merged %llu), applied %llu in %llu batches, "
+                             "flushes %llu waited %.1f ms, worker idle %.1f ms\n",
+                             static_cast<unsigned long long>(pa.queued_runs),
+                             static_cast<unsigned long long>(pa.queued_pages),
+                             static_cast<unsigned long long>(pa.merged_runs),
+                             static_cast<unsigned long long>(pa.applied_runs),
+                             static_cast<unsigned long long>(pa.applied_batches),
+                             static_cast<unsigned long long>(pa.flushes), pa.flush_wait_ns / 1e6,
+                             pa.worker_wait_ns / 1e6);
+            }
             if (SotcStats::kProtectBatch) { // sotc: SOTC_PROTECT_BATCH (sotc_stats.h)
                 ReportPrintf(report,
                              "SOTC PROTECT BATCH calls %llu (pages %llu), merged from %llu, "
@@ -2244,13 +2262,61 @@ void VideoOutDriver::Flip(const Request& req) {
                 const uint64_t pw_unk = P::taken_unknown.exchange(0), pw_retry = P::retries.exchange(0);
                 const uint64_t pw_fb = P::fallback.exchange(0), pw_ver = P::verified.exchange(0);
                 const uint64_t pw_bad = P::violations.exchange(0), pw_ns = P::ns_blocked.exchange(0);
-                if (pw_avoided || pw_ov || pw_unk || pw_retry || pw_fb || pw_ver || pw_bad || pw_ns) {
+                // sotc: SOTC_CP_SRT_PLAN: walker programs served by their plan, plans too big, reads outside a plan (=2).
+                const uint64_t sp_used = P::srt_plan_used.exchange(0), sp_big = P::srt_plan_big.exchange(0);
+                const uint64_t sp_miss = P::srt_plan_misses.exchange(0);
+                std::vector<uint64_t> sp_hashes;
+                P::TakeSrtPlanMisses(sp_hashes);
+                std::string sp_text;
+                for (size_t i = 0; i < sp_hashes.size(); ++i) {
+                    char buf[40];
+                    std::snprintf(buf, sizeof buf, "%s%#llx", i == 0 ? "" : " ",
+                                  static_cast<unsigned long long>(sp_hashes[i]));
+                    sp_text += buf;
+                }
+                // sotc: unknown waits by CpUnknown reason (None excluded, same order) and their blocked time.
+                static const char* const kUnkNames[] = {
+                    "null pipeline", "srt walker", "tess consts", "range table full",
+                    "ring overflow", "unknown write: held WRITE_DATA", "unknown write: no range",
+                    "srt plan too big"};
+                static_assert(sizeof(kUnkNames) / sizeof(kUnkNames[0]) == P::kUnknownReasons - 1,
+                              "one name per CpUnknown reason");
+                std::string unk_text;
+                for (uint32_t r = 1; r < P::kUnknownReasons; ++r) {
+                    const uint64_t n = P::unknown_n[r].exchange(0);
+                    const uint64_t ns = P::unknown_ns[r].exchange(0);
+                    char buf[128];
+                    std::snprintf(buf, sizeof buf, "%s%s %.0f/s (%.2f ms/s)", r == 1 ? "" : ", ",
+                                  kUnkNames[r - 1], n / seconds, ns / 1e6 / seconds);
+                    unk_text += buf;
+                }
+                // sotc: SRT walker programs of the window: distinct count, hits beyond the table, top 8 (pgm_hash:hits).
+                std::vector<std::pair<uint64_t, uint64_t>> srt_top;
+                uint64_t srt_distinct = 0, srt_dropped = 0;
+                P::TakeSrtWalkers(srt_top, srt_distinct, srt_dropped);
+                std::string srt_text;
+                for (size_t i = 0; i < srt_top.size() && i < 8; ++i) {
+                    char buf[64];
+                    std::snprintf(buf, sizeof buf, "%s%#llx:%llu", i == 0 ? "" : " ",
+                                  static_cast<unsigned long long>(srt_top[i].first),
+                                  static_cast<unsigned long long>(srt_top[i].second));
+                    srt_text += buf;
+                }
+                if (pw_avoided || pw_ov || pw_unk || pw_retry || pw_fb || pw_ver || pw_bad || pw_ns ||
+                    srt_distinct || sp_used || sp_big || sp_miss) {
                     ReportPrintf(report,
                                  "SOTC CP precise waits: avoided %.0f/s, taken overlap %.0f/s, unknown %.0f/s, "
-                                 "retries %.0f/s, fallback %.0f/s, verified %.0f/s, violations %llu, blocked %.2f ms/s\n",
+                                 "retries %.0f/s, fallback %.0f/s, verified %.0f/s, violations %llu, blocked %.2f ms/s"
+                                 " | unknown by reason: %s"
+                                 " | srt walker programs: %llu distinct, %llu hits beyond the table, top: %s"
+                                 " | srt plan: used %.0f/s, too big %.0f/s, misses %llu (programs: %s)\n",
                                  pw_avoided / seconds, pw_ov / seconds, pw_unk / seconds, pw_retry / seconds,
                                  pw_fb / seconds, pw_ver / seconds, static_cast<unsigned long long>(pw_bad),
-                                 pw_ns / 1e6 / seconds);
+                                 pw_ns / 1e6 / seconds, unk_text.c_str(),
+                                 static_cast<unsigned long long>(srt_distinct),
+                                 static_cast<unsigned long long>(srt_dropped), srt_text.c_str(),
+                                 sp_used / seconds, sp_big / seconds,
+                                 static_cast<unsigned long long>(sp_miss), sp_text.c_str());
                 }
             }
             // sotc: SOTC_FUTEX_WAIT counters, per 5 s window (liverpool.h, vk_recorder.h).
@@ -3018,7 +3084,13 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
 
-    if (!is_eop) {
+    // sotc: SOTC_TC_SINGLE_WRITER (same switch as TextureCache::SingleWriter): EOP flips go to the
+    // GPU thread too, so the texture cache is only written by the draw thread (PrepareFrame locks it).
+    static const bool tc_single_writer = [] {
+        const char* v = std::getenv("SOTC_TC_SINGLE_WRITER");
+        return v && v[0] == '1';
+    }();
+    if (!is_eop || tc_single_writer) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
         liverpool->SendOrderedCommand(
             [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
@@ -3031,31 +3103,82 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
 // sotc: SOTC_DET_FLIP, wakes PresentThreadDet when a flip is queued (the wall-clock path polls).
 static std::condition_variable det_request_cv;
+// sotc: SOTC_FLIP_COALESCE. The flips that joined a job whose frame is still being produced: their
+// requests are pushed together with the frame's (SubmitFlipInternal), so they are never queued
+// without it. Only the flip thread and the locked callbacks touch it (guarded by VideoOutDriver::mutex).
+struct SotcStagedFlip {
+    VideoOutPort* port;
+    s64 flip_arg;
+    s32 index;
+    bool eop;
+};
+static std::vector<SotcStagedFlip> sotc_staged_flips;
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
-    Vulkan::Frame* frame;
-    if (index == -1) {
-        frame = presenter->PrepareBlankFrame(false);
-    } else {
-        const auto& buffer = port->buffer_slots[index];
-        ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
-        const auto& group = port->groups[buffer.group_index];
-        frame = presenter->PrepareFrame(group, buffer.address_left);
-    }
-
     // sotc: the buffer shown before this flip is free once the copy of this one is recorded:
     // PrepareFrame read it on the GPU timeline, ahead of anything the game renders into the old
     // buffer next. Upstream frees it only when the present thread takes this flip on a vblank
     // tick, and the command processor waits for that in the VO label wait at the start of the
     // next frame.
-    if (EarlyVoLabel()) {
-        if (port->submit_prev_index != -1) {
-            port->buffer_labels[port->submit_prev_index] = 0;
-            port->SignalVoLabel();
-            liverpool->NotifyCpWait(); // sotc: SOTC_CP_IDLE_US (VO label waits)
+    const auto release_early_vo_label = [&] {
+        if (EarlyVoLabel()) {
+            if (port->submit_prev_index != -1) {
+                port->buffer_labels[port->submit_prev_index] = 0;
+                port->SignalVoLabel();
+                liverpool->NotifyCpWait(); // sotc: SOTC_CP_IDLE_US (VO label waits)
+            }
+            port->submit_prev_index = index;
         }
-        port->submit_prev_index = index;
+    };
+
+    Vulkan::Frame* frame;
+    if (index == -1) {
+        presenter->FlipDrain(); // sotc: SOTC_FLIP_THREAD, the flips queued before this one go first
+        frame = presenter->PrepareBlankFrame(false);
+    } else {
+        const auto& buffer = port->buffer_slots[index];
+        ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
+        const auto& group = port->groups[buffer.group_index];
+        // sotc: SOTC_FLIP_THREAD: the copy of the buffer is recorded here, and the frame is taken
+        // and presented on the flip thread, which requests it in flip order (on_frame). Otherwise
+        // (the switch is off, or the flip needs the draw thread) it is PrepareFrame, as before.
+        if (presenter->QueueFlip(group, buffer.address_left, [this, port, index, flip_arg,
+                                                              is_eop](Vulkan::Frame* queued) {
+                std::scoped_lock lock{mutex};
+                if (!queued) {
+                    // sotc: SOTC_FLIP_COALESCE, a flip that joined another flip's frame: its request
+                    // follows the frame's, which the job's last callback pushes (RunFlipJob).
+                    sotc_staged_flips.push_back({port, flip_arg, index, is_eop});
+                    return;
+                }
+                requests.push({
+                    .frame = queued,
+                    .port = port,
+                    .flip_arg = flip_arg,
+                    .index = index,
+                    .eop = is_eop,
+                });
+                for (const auto& staged : sotc_staged_flips) {
+                    requests.push({
+                        .frame = nullptr,
+                        .port = staged.port,
+                        .flip_arg = staged.flip_arg,
+                        .index = staged.index,
+                        .eop = staged.eop,
+                    });
+                }
+                sotc_staged_flips.clear();
+                if (SotcDetFlip::kOn) {
+                    det_request_cv.notify_one();
+                }
+            })) {
+            release_early_vo_label();
+            return;
+        }
+        frame = presenter->PrepareFrame(group, buffer.address_left);
     }
+
+    release_early_vo_label();
 
     std::scoped_lock lock{mutex};
     requests.push({
@@ -3135,7 +3258,7 @@ void VideoOutDriver::PresentThreadDet(std::stop_token token) {
                 requests.pop();
             }
         }
-        if (!request) {
+        if (!request.port) { // sotc: SOTC_FLIP_COALESCE: a request may have no frame (port is the test)
             const auto now = std::chrono::steady_clock::now();
             if (now - last_flip >= std::chrono::seconds(5)) {
                 std::fprintf(stderr, "SOTC DET FLIP: no flip for 5 s, vblanks sent by the wall clock (not deterministic)\n");
@@ -3150,6 +3273,22 @@ void VideoOutDriver::PresentThreadDet(std::stop_token token) {
         Flip(request); // present (GPU work done on return), clock notified, flip events
         last_flip = std::chrono::steady_clock::now();
         emit_vblanks(vblanks_per_flip());
+        // sotc: SOTC_FLIP_COALESCE: the flips that joined this frame (queued right behind its request)
+        // each get their own vblanks, as a flip does, and no present.
+        while (true) {
+            Request joined{};
+            {
+                std::scoped_lock lk{mutex};
+                if (requests.empty() || requests.front().frame != nullptr ||
+                    requests.front().port != request.port) {
+                    break;
+                }
+                joined = requests.front();
+                requests.pop();
+            }
+            Flip(joined);
+            emit_vblanks(vblanks_per_flip());
+        }
         FRAME_END;
     }
 }
@@ -3271,6 +3410,24 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
         return {};
     };
+    // sotc: SOTC_FLIP_COALESCE. After a frame is presented, the flips that joined it are queued right
+    // behind its request (SubmitFlipInternal), so they are taken here, in order, without a vblank
+    // of their own: each one counts as a flip (count, events, VO label) and none presents.
+    const auto flip_joined = [this](VideoOutPort* port) {
+        while (true) {
+            Request joined{};
+            {
+                std::scoped_lock lk{mutex};
+                if (requests.empty() || requests.front().frame != nullptr ||
+                    requests.front().port != port) {
+                    break;
+                }
+                joined = requests.front();
+                requests.pop();
+            }
+            Flip(joined);
+        }
+    };
 
     while (!token.stop_requested()) {
         timer.Start();
@@ -3329,10 +3486,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
         if (take_request) {
             const auto request = receive_request();
-            if (request) {
+            if (request.port) { // sotc: SOTC_FLIP_COALESCE, see Flip (a request may have no frame)
                 last_flip_count = vblank_status.count;
             }
-            if (!request) {
+            if (!request.port) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
@@ -3346,6 +3503,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 // generic wait for the previous frame's GPU work. No-op when the switch is off.
                 presenter->LowLatencyFrameStart();
                 Flip(request);
+                flip_joined(request.port); // sotc: SOTC_FLIP_COALESCE
                 last_flip_vblank = vblank_status.count;
                 flipped = true;
                 // sotc: SOTC_ADAPTIVE_LOAD (sotc_adaptive.h): the flip interval against the

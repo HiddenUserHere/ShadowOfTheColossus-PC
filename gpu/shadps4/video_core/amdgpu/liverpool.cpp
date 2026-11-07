@@ -26,6 +26,7 @@
 #include "core/platform.h"
 #include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE submit start
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/page_manager.h" // sotc: SOTC_PROTECT_ASYNC (draw thread mark)
 #include "video_core/sotc_draw_runs.h" // sotc: SOTC_DRAW_RUNS (indirect draw run ceiling)
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
@@ -131,6 +132,19 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
 static u8 CpPreciseMode() {
     static const u8 mode = [] {
         const char* v = std::getenv("SOTC_CP_PRECISE_WAIT");
+        if (v && v[0] == '1') {
+            return u8{1};
+        }
+        return (v && v[0] == '2') ? u8{2} : u8{0};
+    }();
+    return mode;
+}
+
+// sotc: SOTC_CP_SRT_PLAN=1 (a walker program's reads come from its walk plan) or 2 (the same, and every
+// read the walker makes is checked against the plan); off by default. Only with SOTC_CP_PRECISE_WAIT.
+static u8 CpSrtPlanMode() {
+    static const u8 mode = [] {
+        const char* v = std::getenv("SOTC_CP_SRT_PLAN");
         if (v && v[0] == '1') {
             return u8{1};
         }
@@ -683,6 +697,7 @@ std::size_t Liverpool::BackOpSize() noexcept {
 
 void Liverpool::BackLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuDraw");
+    VideoCore::PageManager::SetProtectAsyncThread(true); // sotc: SOTC_PROTECT_ASYNC: restrictions go to the worker
     VideoCore::BufferCache::SetDrawThread(std::this_thread::get_id()); // sotc: SOTC_RB_EXACT
     SotcStats::RegisterThreadRole(SotcStats::RoleDraw); // sotc: SOTC_FPS thread accounting
     SotcRaiseGpuThread();
@@ -1310,7 +1325,7 @@ void Liverpool::RecordBackWrite(u64 head, bool writes_memory) {
     if (pub.wd.num_segs != 0) {
         if (writes_memory && pub.kind != BackOp::Kind::Func) {
             // A draw or dispatch that carries held-back WRITE_DATA and may write anything itself.
-            PushWriteRange(head, 0, 0, true);
+            PushWriteRange(head, 0, 0, CpUnknown::WriteHeldWd); // sotc: SOTC_CP_PRECISE_WAIT reason
         } else {
             // The held-back WRITE_DATA of the op: exactly the box of its segments (a flushed batch
             // is a Func op with no closure: the NoteBackWriteRange of the closure comes next).
@@ -1321,16 +1336,16 @@ void Liverpool::RecordBackWrite(u64 head, bool writes_memory) {
                 lo = std::min<VAddr>(lo, seg.address);
                 hi = std::max<VAddr>(hi, seg.address + seg.length);
             }
-            PushWriteRange(head, lo, hi - lo, false);
+            PushWriteRange(head, lo, hi - lo, CpUnknown::None);
             keep_note = noted && pub.kind == BackOp::Kind::Func;
         }
     } else if (writes_memory) {
         if (noted && cp_note_size == CpNoGuestWrite) {
             // NoteBackNoGuestWrite: nothing for the waits to see.
         } else if (noted && cp_note_size != 0) {
-            PushWriteRange(head, cp_note_addr, cp_note_size, false);
+            PushWriteRange(head, cp_note_addr, cp_note_size, CpUnknown::None);
         } else {
-            PushWriteRange(head, 0, 0, true);
+            PushWriteRange(head, 0, 0, CpUnknown::WriteNoRange); // sotc: SOTC_CP_PRECISE_WAIT reason
         }
     }
     if (keep_note) {
@@ -1341,7 +1356,7 @@ void Liverpool::RecordBackWrite(u64 head, bool writes_memory) {
     }
 }
 
-void Liverpool::PushWriteRange(u64 seq, VAddr addr, u64 size, bool unknown) {
+void Liverpool::PushWriteRange(u64 seq, VAddr addr, u64 size, CpUnknown why) {
     const u64 slot = cp_wr_count % CpWriteRingSize;
     if (cp_wr_count >= CpWriteRingSize) {
         // The entry this overwrites may still be pending: the waits must cover it (see
@@ -1351,20 +1366,24 @@ void Liverpool::PushWriteRange(u64 seq, VAddr addr, u64 size, bool unknown) {
             cp_wr_dropped_seq = std::max(cp_wr_dropped_seq, old_seq);
         }
     }
-    cp_wr_ring[slot] = CpWriteRange{seq, addr, size, unknown};
+    cp_wr_ring[slot] = CpWriteRange{seq, addr, size, why};
     ++cp_wr_count;
 }
 
-bool Liverpool::CpCollectReads(const Vulkan::Pipeline* pipeline, CpReadSet& reads) const {
+bool Liverpool::CpCollectReads(const Vulkan::Pipeline* pipeline, CpReadSet& reads,
+                               CpUnknown& why) const {
     reads.count = 0;
+    why = CpUnknown::None; // sotc: SOTC_CP_PRECISE_WAIT reason of a false return
     if (!pipeline) {
+        why = CpUnknown::NullPipeline;
         return false; // a stage is still translating: its reads are not known here
     }
-    const auto add = [&reads](VAddr addr, u64 size) {
+    const auto add = [&reads, &why](VAddr addr, u64 size) {
         if (size == 0) {
             return true;
         }
         if (reads.count == CpMaxReadRanges) {
+            why = CpUnknown::RangeTableFull;
             return false;
         }
         reads.ranges[reads.count++] = {addr, size};
@@ -1377,7 +1396,19 @@ bool Liverpool::CpCollectReads(const Vulkan::Pipeline* pipeline, CpReadSet& read
         const Shader::InfoRuntime& rt = info->runtime[0];
         // The SRT walker and the tessellation constants read guest memory at unbounded or
         // not-recorded places: such a lookup waits the old way.
-        if (info->srt_info.walker_func || info->tess_consts_dword_offset >= 0) {
+        if (info->srt_info.walker_func) {
+            if (CpSrtPlanMode() == 0 || !info->srt_info.walk_plan.complete) {
+                CpPreciseStats::NoteSrtWalker(info->pgm_hash); // sotc: SOTC_CP_PRECISE_WAIT reports them
+                why = CpUnknown::SrtWalker;
+                return false;
+            }
+            // sotc: SOTC_CP_SRT_PLAN: the walker's reads are known (its plan), the stage goes on below
+            if (!CpCollectSrtPlan(*info, reads, why)) {
+                return false;
+            }
+        }
+        if (info->tess_consts_dword_offset >= 0) {
+            why = CpUnknown::TessConsts;
             return false;
         }
         // The binary info of the code (what GetParams hashes): its recorded length.
@@ -1409,18 +1440,83 @@ bool Liverpool::CpCollectReads(const Vulkan::Pipeline* pipeline, CpReadSet& read
     return true;
 }
 
-u64 Liverpool::CpWaitTarget(const Vulkan::Pipeline* pipeline, u64 snap, bool& unknown) {
-    unknown = false;
+// sotc: SOTC_CP_SRT_PLAN. The read ranges of a walker program, from its walk plan (Shader::SrtWalkPlan): the
+// root tables are pointers of the flattened user data, and each child table is the pointer its parent holds,
+// read from the backing as RefreshSharpTables reads it. A child's pointer lies inside its parent's range, so
+// a pending write to it overlaps a range that CpWaitTarget checks: that lookup waits and runs again.
+bool Liverpool::CpCollectSrtPlan(const Shader::Info& info, CpReadSet& reads, CpUnknown& why) const {
+    const Shader::SrtWalkPlan& plan = info.srt_info.walk_plan;
+    const std::vector<u32>& ud = info.FlatBuf();
+    const u32 first = reads.count;
+    const auto add = [&reads, &why](VAddr addr, u64 size) {
+        if (reads.count == CpMaxReadRanges) {
+            why = CpUnknown::SrtPlanTooBig;
+            CpPreciseStats::srt_plan_big.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        reads.ranges[reads.count++] = {addr, size};
+        return true;
+    };
+    std::array<VAddr, Shader::SrtWalkMaxNodes> tables{};
+    for (u32 i = 0; i < plan.count; ++i) {
+        const Shader::SrtWalkNode& node = plan.nodes[i];
+        VAddr base = 0;
+        if (node.parent < 0) {
+            base = (VAddr{ud[node.ptr_dw]} | VAddr{ud[node.ptr_dw + 1]} << 32) & 0xFFFFFFFFFFFFULL;
+        } else if (const VAddr parent = tables[node.parent]; parent != 0) {
+            u64 pointer = 0;
+            if (!Core::Memory::Instance()->TryReadBacking(parent + u64{node.ptr_dw} * sizeof(u32),
+                                                          &pointer, sizeof(pointer))) {
+                pointer = 0;
+            }
+            base = pointer & 0xFFFFFFFFFFFFULL;
+        }
+        tables[i] = base;
+        if (base == 0) {
+            continue; // a null table: the walker's loads from it read zero
+        }
+        if (node.extent != 0 && !add(base, node.extent)) {
+            return false;
+        }
+        if (node.window != 0 &&
+            !add(base, u64{Shader::ReadConstDynamicWindowDwords} * sizeof(u32))) {
+            return false;
+        }
+    }
+    // sotc: SOTC_CP_SRT_PLAN=2: every read the walker made in its last run lies in a planned range.
+    if (CpSrtPlanMode() == 2) {
+        u64 misses = 0;
+        for (const auto& [address, size] : info.sotc_srt_trace) {
+            if (address < 0x10000) {
+                continue; // loads from null tables: the walker's faults read zero, no memory
+            }
+            bool planned = false;
+            for (u32 r = first; !planned && r < reads.count; ++r) {
+                const auto [start, length] = reads.ranges[r];
+                planned = address >= start && address + size <= start + length;
+            }
+            misses += planned ? 0 : 1;
+        }
+        if (misses != 0) {
+            CpPreciseStats::srt_plan_misses.fetch_add(misses, std::memory_order_relaxed);
+            CpPreciseStats::NoteSrtPlanMiss(info.pgm_hash);
+        }
+    }
+    CpPreciseStats::srt_plan_used.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+u64 Liverpool::CpWaitTarget(const Vulkan::Pipeline* pipeline, u64 snap, CpUnknown& why) {
+    why = CpUnknown::None;
     CpReadSet reads{};
-    if (!CpCollectReads(pipeline, reads)) {
-        unknown = true;
-        return back_write_seq;
+    if (!CpCollectReads(pipeline, reads, why)) {
+        return back_write_seq; // why: the reads are not bounded
     }
     if (cp_wr_dropped_seq != 0 && back_tail.load(std::memory_order_acquire) >= cp_wr_dropped_seq) {
         cp_wr_dropped_seq = 0;
     }
     if (cp_wr_dropped_seq > snap) {
-        unknown = true;
+        why = CpUnknown::RingOverflow;
         return back_write_seq;
     }
     // The ring is in publish order: newest first, the first hit is the newest overlapping write.
@@ -1430,25 +1526,99 @@ u64 Liverpool::CpWaitTarget(const Vulkan::Pipeline* pipeline, u64 snap, bool& un
         if (w.seq <= snap) {
             break; // done before the lookup started
         }
-        bool hit = w.unknown;
+        bool hit = w.why != CpUnknown::None;
         for (u32 r = 0; !hit && r < reads.count; ++r) {
             const auto [addr, size] = reads.ranges[r];
             hit = w.addr < addr + size && addr < w.addr + w.size;
         }
         if (hit) {
-            unknown = w.unknown;
+            why = w.why; // sotc: None for a known overlapping range
             return w.seq;
         }
     }
     return 0;
 }
 
-void Liverpool::CpWaitFor(u64 target, bool unknown) {
+void Liverpool::CpWaitFor(u64 target, CpUnknown why) {
     const u64 start = SotcStats::NowNs();
     WaitBackTail(target);
-    CpPreciseStats::ns_blocked.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
-    (unknown ? CpPreciseStats::taken_unknown : CpPreciseStats::taken_overlap)
-        .fetch_add(1, std::memory_order_relaxed);
+    const u64 blocked = SotcStats::NowNs() - start;
+    CpPreciseStats::ns_blocked.fetch_add(blocked, std::memory_order_relaxed);
+    if (why == CpUnknown::None) {
+        CpPreciseStats::taken_overlap.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // sotc: SOTC_CP_PRECISE_WAIT, unknown waits by reason (the 5 s report prints them).
+    CpPreciseStats::taken_unknown.fetch_add(1, std::memory_order_relaxed);
+    CpPreciseStats::unknown_n[u32(why)].fetch_add(1, std::memory_order_relaxed);
+    CpPreciseStats::unknown_ns[u32(why)].fetch_add(blocked, std::memory_order_relaxed);
+}
+
+namespace {
+// sotc: SRT walker hits per program for the report: the first SrtHitCap programs of a window.
+constexpr size_t SrtHitCap = 64;
+struct SrtHit {
+    u64 pgm_hash;
+    u64 hits;
+};
+std::mutex srt_mutex;
+std::array<SrtHit, SrtHitCap> srt_hits{};
+size_t srt_count{};
+u64 srt_over{}; ///< hits of programs beyond the cap
+} // namespace
+
+void Liverpool::CpPreciseStats::NoteSrtWalker(u64 pgm_hash) {
+    std::lock_guard lock{srt_mutex};
+    for (size_t i = 0; i < srt_count; ++i) {
+        if (srt_hits[i].pgm_hash == pgm_hash) {
+            ++srt_hits[i].hits;
+            return;
+        }
+    }
+    if (srt_count == SrtHitCap) {
+        ++srt_over;
+        return;
+    }
+    srt_hits[srt_count++] = SrtHit{pgm_hash, 1};
+}
+
+void Liverpool::CpPreciseStats::TakeSrtWalkers(std::vector<std::pair<u64, u64>>& top, u64& distinct,
+                                               u64& dropped) {
+    std::lock_guard lock{srt_mutex};
+    top.clear();
+    for (size_t i = 0; i < srt_count; ++i) {
+        top.emplace_back(srt_hits[i].pgm_hash, srt_hits[i].hits);
+    }
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    distinct = srt_count;
+    dropped = srt_over;
+    srt_count = 0;
+    srt_over = 0;
+}
+
+namespace {
+// sotc: SOTC_CP_SRT_PLAN=2: the first distinct programs whose walker read outside its plan (the report takes them).
+constexpr size_t SrtPlanMissCap = 8;
+std::array<u64, SrtPlanMissCap> srt_plan_miss_hashes{};
+size_t srt_plan_miss_count{};
+} // namespace
+
+void Liverpool::CpPreciseStats::NoteSrtPlanMiss(u64 pgm_hash) {
+    std::lock_guard lock{srt_mutex};
+    for (size_t i = 0; i < srt_plan_miss_count; ++i) {
+        if (srt_plan_miss_hashes[i] == pgm_hash) {
+            return;
+        }
+    }
+    if (srt_plan_miss_count < SrtPlanMissCap) {
+        srt_plan_miss_hashes[srt_plan_miss_count++] = pgm_hash;
+    }
+}
+
+void Liverpool::CpPreciseStats::TakeSrtPlanMisses(std::vector<u64>& hashes) {
+    std::lock_guard lock{srt_mutex};
+    hashes.assign(srt_plan_miss_hashes.begin(), srt_plan_miss_hashes.begin() + srt_plan_miss_count);
+    srt_plan_miss_count = 0;
 }
 
 void Liverpool::CpDigest(const Vulkan::Pipeline* pipeline, std::vector<u64>& out) const {
@@ -1677,7 +1847,7 @@ static bool FuseTransparent(const PM4Header* header, PM4ItOpcode opcode) {
 class OpCostScope {
 public:
     OpCostScope(SotcArch::OpCost::Thread thread, SotcArch::OpCost::Op op)
-        : thread_{thread}, op_{op}, on_{SotcArch::OpCost::On()} {
+        : thread_{thread}, op_{op}, on_{SotcArch::OpCost::kCostOn} {
         if (on_) {
             t0_ = SotcStats::NowNs();
         }
@@ -1719,23 +1889,27 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
     struct TraceOp {
         const BackOp& op;
         u64 t0;
+        // sotc: the span is built out of line, so with SOTC_TRACE off the destructor is one test of t0.
         ~TraceOp() {
             if (t0) {
-                static constexpr const char* kNames[] = {"func", "draw", "draw indirect",
-                                                         "dispatch", "dispatch indirect"};
-                static constexpr const char* kFuncNames[] = {"write data", "eop/release", "dma",
-                                                             "func"};
-                const auto kind = static_cast<u32>(op.kind);
-                const char* name = op.kind == BackOp::Kind::Func ? kFuncNames[op.func_kind & 3]
-                                                                 : kNames[kind < 5 ? kind : 0];
-                const u64 t1 = SotcStats::NowNs();
-                if (op.kind == BackOp::Kind::Func && op.func_kind == 1) {
-                    // Label writes (EOP/EOS/release) release guest waits: never merged.
-                    tl_op_batch.Flush();
-                    SotcTrace::Span(name, t0, t1, kind);
-                } else {
-                    tl_op_batch.Note(name, t0, t1, kind);
-                }
+                Emit();
+            }
+        }
+        __attribute__((noinline)) void Emit() const {
+            static constexpr const char* kNames[] = {"func", "draw", "draw indirect",
+                                                     "dispatch", "dispatch indirect"};
+            static constexpr const char* kFuncNames[] = {"write data", "eop/release", "dma",
+                                                         "func"};
+            const auto kind = static_cast<u32>(op.kind);
+            const char* name = op.kind == BackOp::Kind::Func ? kFuncNames[op.func_kind & 3]
+                                                             : kNames[kind < 5 ? kind : 0];
+            const u64 t1 = SotcStats::NowNs();
+            if (op.kind == BackOp::Kind::Func && op.func_kind == 1) {
+                // Label writes (EOP/EOS/release) release guest waits: never merged.
+                tl_op_batch.Flush();
+                SotcTrace::Span(name, t0, t1, kind);
+            } else {
+                tl_op_batch.Note(name, t0, t1, kind);
             }
         }
     } trace_op{op, SotcTrace::kOn ? SotcStats::NowNs() : 0};

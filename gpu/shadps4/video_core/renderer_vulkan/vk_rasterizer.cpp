@@ -6102,7 +6102,9 @@ void Rasterizer::BindCacheNoteMetaClear(VAddr addr, u64 size) {
     // which do not use the bind cache), and IsMeta, which they consult, depends on the registered surfaces only.
     // The range invalidation is the same one a write of this range makes: it is conservative, and it keeps the
     // result right should a clear ever write.
-    if (SotcStats::kFpsLog) {
+    // sotc: the narrowing statistics walk the whole cache per clear (6% of the draw thread in a lean profile, 7 Nov):
+    // only with the FPS timers (not SOTC_FPS_LEAN).
+    if (SotcStats::kFpsLog && SotcStats::kFpsTimers) {
         SotcStats::meta_clear_narrowed.fetch_add(1, std::memory_order_relaxed);
         const VAddr end = addr + size;
         const auto reads = [&](const BindCacheEntry& e) {
@@ -11270,14 +11272,15 @@ bool Rasterizer::InvalidateMemoryOnGuestFault(VAddr addr, u64 size) {
     if (VideoCore::FaultGrace::Pages() != 0) {
         {
             const SotcStats::FaultStat::StageScope tc{SotcStats::FaultStat::kStTc};
-            texture_cache.InvalidateMemory(addr, size);
+            // sotc: SOTC_TC_SINGLE_WRITER: queued for the draw thread (InvalidateMemoryGuest).
+            texture_cache.InvalidateMemoryGuest(addr, size);
         }
         buffer_cache.InvalidateMemory(addr, size, false, true);
     } else {
         buffer_cache.InvalidateMemory(addr, size, false);
         {
             const SotcStats::FaultStat::StageScope tc{SotcStats::FaultStat::kStTc};
-            texture_cache.InvalidateMemory(addr, size);
+            texture_cache.InvalidateMemoryGuest(addr, size);
         }
     }
     return true;
@@ -11458,7 +11461,14 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         liverpool->SendOrderedCommand(
             [this, addr, size] { buffer_cache.ReleaseMemory(addr, size); });
     }
-    texture_cache.UnmapMemory(addr, size);
+    // sotc: SOTC_TC_SINGLE_WRITER: the texture part runs on the draw thread, at the command
+    // processor's point of the stream (as the arena release above); the guest thread takes no lock.
+    if (VideoCore::TextureCache::SingleWriter()) {
+        liverpool->SendOrderedCommand(
+            [this, addr, size] { texture_cache.UnmapMemory(addr, size); });
+    } else {
+        texture_cache.UnmapMemory(addr, size);
+    }
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);

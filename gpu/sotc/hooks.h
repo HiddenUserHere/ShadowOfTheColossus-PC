@@ -28,7 +28,11 @@ static_assert(sizeof(GuestRegs) == 18 * 8 + 8 * 16);
 enum class Phase : uint32_t { Pre = 0, Post = 1 };
 enum class HookAction : uint32_t {
     Continue = 0, ///< run the original (Entry/Wrap) or the displaced instructions (Site)
-    Return = 1,   ///< Entry only: return to the guest caller with regs.rax/rdx/xmm0
+    /// Entry and Wrap, pre phase only: return to the guest caller with regs.rax/rdx/xmm0 (and the
+    /// other registers as the handler left them in GuestRegs). Entry: the original does not run.
+    /// Wrap: neither the original nor the post handler runs. The stub restores the registers and
+    /// returns through the return address at [rsp] of the entry. Site and Range: treated as Continue.
+    Return = 1,
     /// Pre phase only (Entry, Wrap, Site): the handler must have called SetGuestCall. The stub
     /// restores the registers (with the handler's changes), calls the guest function on the guest
     /// stack with the SysV ABI (args[0..5] in rdi, rsi, rdx, rcx, r8, r9; rsp 16-byte aligned at the

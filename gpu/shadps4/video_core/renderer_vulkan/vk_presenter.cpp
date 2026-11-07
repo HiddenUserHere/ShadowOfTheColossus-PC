@@ -9,6 +9,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
+#include "common/thread.h" // sotc: SOTC_FLIP_THREAD (the flip thread's name)
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/system/systemservice.h"
@@ -74,6 +75,46 @@ const bool kFlipOffthread = [] {
 std::atomic<u64> offthread_moves{0};  ///< frames the present thread moved to ready_queue
 std::atomic<u64> offthread_takes{0};  ///< GetRenderFrame calls served from ready_queue (no wait)
 std::atomic<u64> offthread_dropped{0}; ///< frames lost by GetRenderFrame (RecreateFrame failed)
+// sotc: SOTC_FLIP_THREAD=1 (off by default), see Presenter::QueueFlip. Read once.
+const bool kFlipThread = [] {
+    const char* v = std::getenv("SOTC_FLIP_THREAD");
+    return v && v[0] == '1';
+}();
+// sotc: SOTC_FLIP_COALESCE=1 (off by default, needs SOTC_FLIP_THREAD), see Presenter::QueueFlip. Read once.
+const bool kFlipCoalesce = [] {
+    const char* v = std::getenv("SOTC_FLIP_COALESCE");
+    return v && v[0] == '1';
+}();
+// sotc: SOTC_FLIP_COALESCE: a flip joins a queued job only while fewer than this many flips have joined
+// the queued jobs (beyond their own one each). Each flip counts against the port's pending limit (driver.cpp SubmitFlip,
+// 16), so an unbounded join would let one slow job absorb every flip the game makes meanwhile.
+constexpr size_t kFlipCoalesceMaxFlips = 4;
+// sotc: SOTC_FLIP_IMAGES=N, the size of the flip image ring (2..8, default 3; a value outside the range is
+// clamped, one that is not a number gives 3). Read once. See Presenter::FlipImageCount.
+u32 FlipImagesSetting() {
+    static const u32 n = [] {
+        const char* v = std::getenv("SOTC_FLIP_IMAGES");
+        if (!v || !*v) {
+            return 3u;
+        }
+        char* end = nullptr;
+        const long parsed = std::strtol(v, &end, 10);
+        if (end == v) {
+            return 3u;
+        }
+        return static_cast<u32>(std::clamp(parsed, 2L, 8L));
+    }();
+    return n;
+}
+// Counters of the switch (SOTC_FPS only). Reset by ReportFlipWait.
+std::atomic<u64> flip_thread_jobs{0};        ///< flips queued to the flip thread
+std::atomic<u64> flip_thread_fallbacks{0};   ///< flips that took the usual path (QueueFlip false)
+std::atomic<u64> flip_image_ns{0}, flip_image_waits{0}; ///< draw thread: waits for a free flip image
+std::atomic<u64> flip_thread_frame_ns{0}, flip_thread_frame_waits{0}; ///< flip thread: waits for a frame
+std::atomic<u64> flip_coalesced{0};    ///< SOTC_FLIP_COALESCE: flips that joined a queued job (no wait)
+std::atomic<u64> flip_still_waited{0}; ///< SOTC_FLIP_COALESCE: flips that waited, no queued job to join
+// sotc: set on the flip thread, so GetRenderFrame can tell its waits apart.
+thread_local bool t_flip_thread = false;
 } // namespace
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
@@ -542,6 +583,10 @@ static u32 FitPresentRing(const Instance& instance, u32 default_frames, u32 want
     return frames;
 }
 
+u32 Presenter::FlipImageCount() {
+    return FlipImagesSetting();
+}
+
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
@@ -553,7 +598,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
           const char* v = std::getenv("SOTC_RECORD_THREAD");
           return !v || v[0] != '0';
       }()},
-      present_scheduler{instance}, flip_scheduler{instance},
+      present_scheduler{instance}, flip_scheduler{instance}, flip_thread_scheduler{instance},
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
@@ -834,14 +879,29 @@ Presenter::~Presenter() {
     if (cp_pacer == this) {
         cp_pacer = nullptr;
     }
+    // sotc: SOTC_FLIP_THREAD: the flip thread drains the flips still queued, then exits. It uses
+    // draw_scheduler, so it goes before the draw scheduler is finished.
+    if (flip_thread.joinable()) {
+        {
+            std::scoped_lock lk{flip_mutex};
+            flip_stop = true;
+        }
+        flip_cv.notify_all();
+        flip_thread.join();
+    }
     // This thread records the last commands of the rasterizer scheduler.
     draw_scheduler.ClaimRecorder();
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
+    flip_thread_scheduler.Finish();
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
+    Check(flip_thread_scheduler.CommandBuffer().reset());
+    for (auto& flip : flip_images) {
+        DestroyFlipImage(flip);
+    }
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -1012,6 +1072,90 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
     return {};
 }
 
+// sotc: the game-only screenshot of a flip, the game image before any host-side scaling. Read back
+// on draw_scheduler (PrepareFrame and the flip thread's copy both call it, on the draw thread).
+static void RecordGameOnlyReadback(std::optional<ScreenshotReadback>& pending,
+                                   const Instance& instance, Runtime& runtime,
+                                   VideoCore::Image& image,
+                                   const Libraries::VideoOut::BufferAttributeGroup& attribute,
+                                   vk::Format view_format, u32 capture_game_only_count) {
+    const bool hdr_encoded =
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
+    auto& readback = pending.emplace(
+        instance, ScreenshotKind::GameOnly,
+        BuildScreenshotPaths(ScreenshotKind::GameOnly, capture_game_only_count),
+        image.info.size.width, image.info.size.height, view_format, hdr_encoded);
+    const vk::BufferImageCopy copy_region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {readback.width, readback.height, 1},
+    };
+    runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
+}
+
+void Presenter::ApplyOutputRes(vk::Extent2D image_size) {
+    // sotc: SOTC_OUTPUT_RES=WxH (1280x720 ... 3840x2160): the presented frame has this size, the
+    // game's 1080p image is scaled to it (FSR 1 + RCAS with BB_FSR1=1, else bilinear).
+    static const std::pair<s32, s32> output_size = [] {
+        const char* v = std::getenv("SOTC_OUTPUT_RES");
+        s32 w = 0, h = 0;
+        if (v && std::sscanf(v, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 7680 && h <= 4320) {
+            return std::pair{w, h};
+        }
+        return std::pair<s32, s32>{0, 0};
+    }();
+    if (output_size.first) {
+        SetExpectedGameSize(output_size.first, output_size.second);
+        static bool reported = false;
+        if (!std::exchange(reported, true)) {
+            std::fprintf(stderr, "SOTC output %ux%u from a %ux%u game image, FSR 1 %s\n",
+                         expected_frame_width, expected_frame_height, image_size.width,
+                         image_size.height, fsr_settings.enable ? "on" : "off");
+        }
+    }
+}
+
+void Presenter::RenderPlainPasses(vk::CommandBuffer cmdbuf, vk::ImageView source_view,
+                                  vk::Extent2D source_size, Frame* frame, bool srgb_input) {
+    // sotc: upscaler and sharpening as the in-game menu set them (sotc_live.h)
+    if (const int live = SotcLive::fsr1.load(std::memory_order_relaxed); live >= 0) {
+        fsr_settings.enable = live != 0;
+    }
+    if (const int live = SotcLive::rcas.load(std::memory_order_relaxed); live != -1) {
+        fsr_settings.use_rcas = live >= 0;
+        if (live >= 0) {
+            fsr_settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
+        }
+    }
+    // sotc: A1. The game image is a texture-cache image: GENERAL with the unified layouts, its sampled
+    // descriptors name the same layout. The FSR output (or the image itself when FSR passes it through)
+    // says which one the post process pass gets.
+    const vk::ImageView texture_view = source_view;
+    const vk::ImageLayout texture_layout =
+        SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal);
+    const vk::ImageView scaled = fsr_pass.Render(cmdbuf, source_view, source_size,
+                                                 {frame->width, frame->height}, fsr_settings,
+                                                 frame->is_hdr, texture_layout);
+    const vk::ImageLayout pp_layout = scaled == texture_view
+                                          ? texture_layout
+                                          : SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal);
+
+    // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
+    // the post process pass still sRGB encoded and has to be decoded there instead.
+    pp_settings.srgb_input = srgb_input;
+    pp_settings.ui = 0;
+    pp_settings.vignette = {};
+    pp_pass.Render(cmdbuf, scaled, source_size, *frame, pp_settings, {}, {}, pp_layout);
+}
+
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     if (wait_service) {
@@ -1064,51 +1208,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     Dlssg::PrepareInputs(frame->id, cmdbuf, texture_cache, runtime, image_size.width,
                          image_size.height);
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
-    // sotc: SOTC_OUTPUT_RES=WxH (1280x720 ... 3840x2160): the presented frame has this size, the
-    // game's 1080p image is scaled to it (FSR 1 + RCAS with BB_FSR1=1, else bilinear).
-    static const std::pair<s32, s32> output_size = [] {
-        const char* v = std::getenv("SOTC_OUTPUT_RES");
-        s32 w = 0, h = 0;
-        if (v && std::sscanf(v, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 7680 && h <= 4320) {
-            return std::pair{w, h};
-        }
-        return std::pair<s32, s32>{0, 0};
-    }();
-    if (output_size.first) {
-        SetExpectedGameSize(output_size.first, output_size.second);
-        static bool reported = false;
-        if (!std::exchange(reported, true)) {
-            std::fprintf(stderr, "SOTC output %ux%u from a %ux%u game image, FSR 1 %s\n",
-                         expected_frame_width, expected_frame_height, image_size.width,
-                         image_size.height, fsr_settings.enable ? "on" : "off");
-        }
-    }
+    ApplyOutputRes(image_size); // sotc: SOTC_OUTPUT_RES
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
 
     // Capture the guest output before any host-side scaling (FSR/PP) is applied.
     if (capture_game_only_count > 0) {
-        const bool hdr_encoded =
-            attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
-        auto& readback = pending_screenshot.emplace(
-            instance, ScreenshotKind::GameOnly,
-            BuildScreenshotPaths(ScreenshotKind::GameOnly, capture_game_only_count),
-            image_size.width, image_size.height, view_info.format, hdr_encoded);
-        const vk::BufferImageCopy copy_region = {
-            .bufferOffset = 0,
-            .bufferRowLength = 0,
-            .bufferImageHeight = 0,
-            .imageSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {readback.width, readback.height, 1},
-        };
-        runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
+        RecordGameOnlyReadback(pending_screenshot, instance, runtime, image, attribute,
+                               view_info.format, capture_game_only_count);
     }
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
@@ -1193,36 +1301,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                         vk::AccessFlagBits2::eShaderRead);
         runtime.FlushBarriers();
 
-        // sotc: upscaler and sharpening as the in-game menu set them (sotc_live.h)
-        if (const int live = SotcLive::fsr1.load(std::memory_order_relaxed); live >= 0) {
-            fsr_settings.enable = live != 0;
-        }
-        if (const int live = SotcLive::rcas.load(std::memory_order_relaxed); live != -1) {
-            fsr_settings.use_rcas = live >= 0;
-            if (live >= 0) {
-                fsr_settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
-            }
-        }
-        // sotc: A1. The game image is a texture-cache image: GENERAL with the unified layouts, its sampled
-        // descriptors name the same layout. The FSR output (or the image itself when FSR passes it through)
-        // says which one the post process pass gets.
-        const vk::ImageView texture_view = image_view;
-        const vk::ImageLayout texture_layout =
-            SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal);
-        image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
-                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr,
-                                     texture_layout);
-        const vk::ImageLayout pp_layout = image_view == texture_view
-                                              ? texture_layout
-                                              : SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal);
-
-        // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
-        // the post process pass still sRGB encoded and has to be decoded there instead.
-        pp_settings.srgb_input =
-            attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-        pp_settings.ui = 0;
-        pp_settings.vignette = {};
-        pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings, {}, {}, pp_layout);
+        RenderPlainPasses(cmdbuf, image_view, image_size, frame,
+                          attribute.attrib.pixel_format ==
+                              Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb);
     }
 
     // sotc: the game frame without the HUD, through the same pass (frame generation keeps the
@@ -1391,6 +1472,408 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     scheduler.Flush(info);
     Dlssg::NoInputs(frame->id); // sotc: no game image, no frame generation
     return frame;
+}
+
+// sotc: SOTC_FLIP_THREAD. The flip image of a flip: a port-owned image of the game image's format
+// and size, sampled through a view in the frame's format (like the texture cache's views).
+bool Presenter::CreateFlipImage(FlipImage& flip, vk::Format format, vk::Format view_format,
+                                vk::Extent2D size) {
+    const vk::ImageCreateInfo image_info{
+        .flags = vk::ImageCreateFlagBits::eMutableFormat,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {size.width, size.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+    };
+    const VmaAllocationCreateInfo alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+    VkImage raw{};
+    VkImageCreateInfo raw_info = static_cast<VkImageCreateInfo>(image_info);
+    if (vmaCreateImage(instance.GetAllocator(), &raw_info, &alloc_info, &raw, &flip.allocation,
+                       nullptr) != VK_SUCCESS) {
+        LOG_ERROR(Render_Vulkan, "SOTC_FLIP_THREAD: cannot create a {}x{} flip image", size.width,
+                  size.height);
+        return false;
+    }
+    flip.image = vk::Image{raw};
+    const vk::ImageViewCreateInfo view_info{
+        .image = flip.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = view_format,
+        // As the presenter's view of the game image: alpha excluded.
+        .components = {.a = vk::ComponentSwizzle::eOne},
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    auto [result, view] = instance.GetDevice().createImageView(view_info);
+    if (result != vk::Result::eSuccess) {
+        vmaDestroyImage(instance.GetAllocator(), flip.image, flip.allocation);
+        flip.image = vk::Image{};
+        flip.allocation = {};
+        return false;
+    }
+    flip.view = view;
+    flip.format = format;
+    flip.view_format = view_format;
+    flip.width = size.width;
+    flip.height = size.height;
+    return true;
+}
+
+void Presenter::DestroyFlipImage(FlipImage& flip) {
+    const vk::Device device = instance.GetDevice();
+    if (flip.view) {
+        device.destroyImageView(flip.view);
+    }
+    if (flip.image) {
+        vmaDestroyImage(instance.GetAllocator(), flip.image, flip.allocation);
+    }
+    flip.view = vk::ImageView{};
+    flip.image = vk::Image{};
+    flip.allocation = {};
+}
+
+bool Presenter::QueueFlip(const Libraries::VideoOut::BufferAttributeGroup& attribute,
+                          VAddr cpu_address, std::function<void(Frame*)> on_frame) {
+    if (!kFlipThread) {
+        return false;
+    }
+    // Frame generation, DLSS and the hud-less frame read the draw thread's state of the frame
+    // (PrepareInputs, Upscale, TakeHudless), and the hud-less shot is taken from it: those flips
+    // take the usual path, as does any flip while frame generation starts (AskedAtStart).
+    static const bool shot_hudless = std::getenv("SOTC_SHOT_HUDLESS") != nullptr;
+    const bool plain = !Dlssg::Enabled() && !Dlssg::SuperResolutionAvailable() &&
+                       !FrameGen::AskedAtStart() && FrameGen::Current() == FrameGen::Mode::Off &&
+                       !shot_hudless;
+    const auto fall_back = [this] {
+        if (SotcStats::kFpsLog) {
+            flip_thread_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        }
+        // The usual path presents on the draw thread: the flips queued before it go first.
+        FlipDrain();
+        return false;
+    };
+    if (!plain) {
+        return fall_back();
+    }
+    if (!flip_thread.joinable()) {
+        flip_thread = std::jthread{[this] { FlipThreadMain(); }};
+    }
+
+    auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
+    const auto image_id = texture_cache.FindImage(desc);
+    texture_cache.UpdateImage(image_id);
+    auto& image = texture_cache.GetImage(image_id);
+    const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+    const vk::Format view_format = GetFrameViewFormat(attribute.attrib.pixel_format);
+    const vk::Format format = image.info.pixel_format;
+
+    // sotc: records the copy of the game image into target (draw thread), at this point of the draw
+    // stream: the game's later writes to the buffer come after it, so the early VO label release
+    // that follows the queueing is safe. Flushes it and returns the draw_scheduler tick of the copy.
+    const bool srgb_input =
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    const auto record_copy = [&](FlipImage& target) -> u64 {
+        // sotc: the flip's counts and the output size, as PrepareFrame sets them.
+        SotcFrameMetrics::NoteFlip(liverpool ? liverpool->QueuedOps() : 0);
+        SotcStats::cp_frame.fetch_add(1, std::memory_order_relaxed);
+        expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+        ApplyOutputRes(image_size);
+
+        draw_scheduler.EndRendering();
+        const auto cmdbuf = draw_scheduler.CommandBuffer();
+
+        const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
+        std::optional<ScreenshotReadback> pending_screenshot;
+        if (capture_game_only_count > 0) {
+            RecordGameOnlyReadback(pending_screenshot, instance, runtime, image, attribute, view_format,
+                                   capture_game_only_count);
+        }
+
+        const vk::ImageSubresourceRange color_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        const auto to_copy = vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
+            .image = target.image,
+            .subresourceRange = color_range,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &to_copy,
+        });
+        runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+        const vk::ImageCopy region{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .extent = {image_size.width, image_size.height, 1},
+        };
+        cmdbuf.copyImage(image.GetImage(),
+                         SotcArch::Layouts::Pick(vk::ImageLayout::eTransferSrcOptimal), target.image,
+                         SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal), region);
+        runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
+        runtime.FlushBarriers();
+
+        if (pending_screenshot) {
+            draw_scheduler.DeferPriorityOperation(
+                [deferred_screenshot = std::move(pending_screenshot)]() {
+                    SavePendingScreenshot(deferred_screenshot.value());
+                });
+        }
+
+        // Flush the copy: the flip thread waits for this tick (RunFlipJob).
+        const u64 copy_tick = draw_scheduler.CurrentTick();
+        SubmitInfo info{};
+        draw_scheduler.Flush(info);
+        return copy_tick;
+    };
+
+    // sotc: SOTC_FLIP_COALESCE. The flip image of this flip is the one flip_images.size() flips ago.
+    // When the flip thread still uses it (no free image), this flip joins the newest queued job the
+    // flip thread has not started, instead of waiting: the copy overwrites that job's image, which
+    // the flip thread has not read yet, so the frame presented for the job shows the newest game
+    // image, and every flip of the job gets its callback (see RunFlipJob). The copy is ordered after
+    // the job's earlier copy on the draw queue, which already waited for the image's previous reader.
+    // Only a job whose image has this flip's size and format can take it. FIFO order is kept: the
+    // job is the newest queued one, and no later job is started before this copy is recorded.
+    const u32 slot = static_cast<u32>(flip_seq % flip_images.size());
+    FlipImage& flip = flip_images[slot];
+    FlipJob* join = nullptr;
+    if (kFlipCoalesce) {
+        std::scoped_lock lk{flip_mutex};
+        size_t queued_flips = 0; // the flips the queued jobs present (each is in the port's pending count)
+        for (const FlipJob& queued : flip_jobs) {
+            queued_flips += queued.on_frames.size();
+        }
+        // sotc: the cap is on the flips joined beyond one per job: every queued job already counts one
+        // flip, and the ring is full whenever a join is considered.
+        if (flip.busy && !flip_jobs.empty() && queued_flips < flip_jobs.size() + kFlipCoalesceMaxFlips) {
+            // Only this thread (the draw thread) adds jobs, so the back job stays the back one.
+            FlipJob& back = flip_jobs.back();
+            const FlipImage& back_image = flip_images[back.slot];
+            if (!back.started && !back.filling && back_image.image &&
+                back_image.width == image_size.width && back_image.height == image_size.height &&
+                back_image.format == format && back_image.view_format == view_format) {
+                back.filling = true; // the flip thread does not start it until the copy is recorded
+                join = &back;
+            }
+        }
+    }
+    if (join) {
+        const u64 copy_tick = record_copy(flip_images[join->slot]);
+        {
+            std::scoped_lock lk{flip_mutex};
+            join->copy_tick = copy_tick;
+            join->width = expected_frame_width;
+            join->height = expected_frame_height;
+            join->source_size = image_size;
+            join->srgb_input = srgb_input;
+            join->on_frames.push_back(std::move(on_frame));
+            join->filling = false;
+        }
+        flip_cv.notify_all();
+        if (SotcStats::kFpsLog) {
+            flip_coalesced.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
+    u64 read_tick = 0;
+    {
+        std::unique_lock lk{flip_mutex};
+        if (flip.busy) {
+            const u64 start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+            const auto is_free = [&flip] { return !flip.busy; };
+            while (!is_free()) {
+                if (wait_service) {
+                    // sotc: SOTC_FLIP_SERVICE, as WaitFreeFrame: the game's commands run meanwhile.
+                    flip_cv.wait_for(lk, std::chrono::microseconds{200}, is_free);
+                    if (!is_free()) {
+                        lk.unlock();
+                        wait_service();
+                        lk.lock();
+                    }
+                } else {
+                    flip_cv.wait(lk, is_free);
+                }
+            }
+            if (SotcStats::kFpsLog) {
+                flip_image_ns.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
+                flip_image_waits.fetch_add(1, std::memory_order_relaxed);
+                if (kFlipCoalesce) {
+                    flip_still_waited.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        flip.busy = true;
+        read_tick = flip.read_tick;
+    }
+
+    if (!flip.image || flip.width != image_size.width || flip.height != image_size.height ||
+        flip.format != format || flip.view_format != view_format) {
+        if (read_tick) {
+            // Host wait, only when the size or the format of a flip image changes.
+            flip_thread_scheduler.Wait(read_tick);
+        }
+        DestroyFlipImage(flip);
+        if (!CreateFlipImage(flip, format, view_format, image_size)) {
+            {
+                std::scoped_lock lk{flip_mutex};
+                flip.busy = false;
+            }
+            flip_cv.notify_all();
+            return fall_back();
+        }
+    }
+    // The copy is ordered after the flip thread's last read of this image: a GPU wait on its submit.
+    if (read_tick) {
+        draw_scheduler.RequireExternalWait(flip_thread_scheduler.GetWorkSemaphore()->Handle(),
+                                           read_tick, vk::PipelineStageFlagBits::eAllCommands);
+    }
+
+    const u64 copy_tick = record_copy(flip);
+    ++flip_seq;
+    {
+        std::scoped_lock lk{flip_mutex};
+        FlipJob job{
+            .slot = slot,
+            .copy_tick = copy_tick,
+            .width = expected_frame_width,
+            .height = expected_frame_height,
+            .source_size = image_size,
+            .srgb_input = srgb_input,
+        };
+        job.on_frames.push_back(std::move(on_frame));
+        flip_jobs.push_back(std::move(job));
+        ++flip_queued;
+    }
+    flip_cv.notify_all();
+    if (SotcStats::kFpsLog) {
+        flip_thread_jobs.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+void Presenter::FlipDrain() {
+    if (!kFlipThread) {
+        return;
+    }
+    std::unique_lock lk{flip_mutex};
+    flip_cv.wait(lk, [this] { return flip_done == flip_queued; });
+}
+
+void Presenter::FlipThreadMain() {
+    t_flip_thread = true;
+    Common::SetCurrentThreadName("shadPS4:FlipThread");
+    while (true) {
+        // sotc: the front job stays in flip_jobs while it runs, so a flip can still see it as
+        // started (no copy may join it). A deque keeps the reference valid across the draw
+        // thread's push_back.
+        FlipJob* job = nullptr;
+        {
+            std::unique_lock lk{flip_mutex};
+            // The front job waits while the draw thread records a coalesced copy into it.
+            flip_cv.wait(lk, [this] {
+                return (!flip_jobs.empty() && !flip_jobs.front().filling) ||
+                       (flip_stop && flip_jobs.empty());
+            });
+            if (flip_jobs.empty()) {
+                return; // stop requested, and every queued flip has been drawn
+            }
+            // sotc: not marked started yet: while this thread waits for a free frame (RunFlipJob), a flip
+            // may still join the job; it is marked started once the frame is ours, before the flip
+            // image is read.
+            job = &flip_jobs.front();
+        }
+        RunFlipJob(*job);
+        {
+            std::scoped_lock lk{flip_mutex};
+            flip_jobs.pop_front();
+            ++flip_done;
+        }
+        flip_cv.notify_all();
+    }
+}
+
+void Presenter::RunFlipJob(FlipJob& job) {
+    FlipImage& flip = flip_images[job.slot];
+    // The free frame and its present_done fence are waited for here, not on the draw thread.
+    // sotc: SOTC_FLIP_COALESCE: flips may join the job during this wait (same size and format only),
+    // so the job is marked started, and its copy tick read, only after the frame is ours.
+    Frame* frame = GetRenderFrame(job.width, job.height);
+    {
+        std::unique_lock lk{flip_mutex};
+        flip_cv.wait(lk, [&job] { return !job.filling; });
+        job.started = true;
+    }
+    // The copy must be on the draw queue before this submit waits for it (as Present does).
+    draw_scheduler.WaitSubmitted(job.copy_tick, false);
+
+    auto& scheduler = flip_thread_scheduler;
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::ImageSubresourceRange color_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+
+    // The copy is done (the submit waits for it): the passes read the flip image from here on.
+    const auto to_read = vk::ImageMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .oldLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eTransferDstOptimal),
+        .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eShaderReadOnlyOptimal),
+        .image = flip.image,
+        .subresourceRange = color_range,
+    };
+    // The frame: the pre-barrier of PrepareFrame.
+    const auto frame_barrier = vk::ImageMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = SotcArch::Layouts::Pick(vk::ImageLayout::eColorAttachmentOptimal),
+        .image = frame->image,
+        .subresourceRange = color_range,
+    };
+    const std::array barriers{to_read, frame_barrier};
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+        .pImageMemoryBarriers = barriers.data(),
+    });
+
+    RenderPlainPasses(cmdbuf, flip.view, job.source_size, frame, job.srgb_input);
+
+    // Flush: the present submit waits for this tick (Present), the copy tick is waited for here.
+    frame->ready_semaphore = scheduler.GetWorkSemaphore()->Handle();
+    frame->ready_tick = scheduler.CurrentTick();
+    SubmitInfo info{};
+    info.AddWait(draw_scheduler.GetWorkSemaphore()->Handle(), job.copy_tick);
+    scheduler.Flush(info);
+    {
+        std::scoped_lock lk{flip_mutex};
+        flip.read_tick = frame->ready_tick;
+        flip.busy = false;
+    }
+    flip_cv.notify_all();
+
+    // sotc: SOTC_FLIP_COALESCE: the flips that joined the job (null frame) first, the frame's own
+    // flip last. driver.cpp pushes the frame's request together with the staged null requests, so
+    // the present thread never sees the frame without its coalesced flips. Only the frame is
+    // presented; the others only flip (driver.cpp).
+    for (size_t i = 1; i < job.on_frames.size(); ++i) {
+        job.on_frames[i](nullptr);
+    }
+    job.on_frames[0](frame);
 }
 
 // sotc: SOTC_PRESENT_WAIT. Each present on the main path is tagged with the next id
@@ -2181,6 +2664,10 @@ void Presenter::WaitFreeFrame() {
 }
 
 Frame* Presenter::GetRenderFrame() {
+    return GetRenderFrame(expected_frame_width, expected_frame_height);
+}
+
+Frame* Presenter::GetRenderFrame(u32 width, u32 height) {
     const SotcStats::SplitTimer frame_split{SotcStats::SplitWaitFrame};
     // Wait for free presentation frames
     Frame* frame;
@@ -2195,9 +2682,14 @@ Frame* Presenter::GetRenderFrame() {
         if (SotcStats::kFpsLog && !frame_available()) {
             const u64 start = SotcStats::NowNs();
             free_cv.wait(lock, frame_available);
-            flip_free_ns.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
+            const u64 waited = SotcStats::NowNs() - start;
+            flip_free_ns.fetch_add(waited, std::memory_order_relaxed);
             flip_free_waits.fetch_add(1, std::memory_order_relaxed);
             ring_waits.fetch_add(1, std::memory_order_relaxed);
+            if (t_flip_thread) { // sotc: SOTC_FLIP_THREAD, the flip thread's own count
+                flip_thread_frame_ns.fetch_add(waited, std::memory_order_relaxed);
+                flip_thread_frame_waits.fetch_add(1, std::memory_order_relaxed);
+            }
         } else {
             free_cv.wait(lock, frame_available);
         }
@@ -2243,9 +2735,8 @@ Frame* Presenter::GetRenderFrame() {
         flip_fence_ns.fetch_add(SotcStats::NowNs() - fence_start, std::memory_order_relaxed);
         flip_frames.fetch_add(1, std::memory_order_relaxed);
     }
-    if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
-        frame->is_hdr != swapchain.GetHDR()) {
-        if (!RecreateFrame(frame, expected_frame_width, expected_frame_height)) {
+    if (frame->width != width || frame->height != height || frame->is_hdr != swapchain.GetHDR()) {
+        if (!RecreateFrame(frame, width, height)) {
             // sotc: the ring is capped at the frames that exist: this one is not given back to the
             // free queue, and another free frame is taken. Only frames past the default count can
             // fail here (RecreateFrame aborts for the others).
@@ -2254,7 +2745,7 @@ Frame* Presenter::GetRenderFrame() {
             if (SotcStats::kFpsLog) { // sotc: SOTC_FLIP_OFFTHREAD report: frames lost (must be 0)
                 offthread_dropped.fetch_add(1, std::memory_order_relaxed);
             }
-            return GetRenderFrame();
+            return GetRenderFrame(width, height);
         }
     }
     frame->hudless = nullptr;
@@ -2352,6 +2843,33 @@ void ReportFlipWait(std::string& out, double seconds) {
                   static_cast<unsigned long long>(takes), static_cast<unsigned long long>(frames),
                   static_cast<unsigned long long>(dropped));
     out += offthread_line;
+    // sotc: SOTC_FLIP_THREAD: the flip thread's counters. The draw thread's waits are the flip
+    // image ones; the frame waits are the flip thread's (per flip queued to it).
+    if (kFlipThread) {
+        const u64 jobs = flip_thread_jobs.exchange(0, std::memory_order_relaxed);
+        const u64 fallbacks = flip_thread_fallbacks.exchange(0, std::memory_order_relaxed);
+        const u64 image_n = flip_image_waits.exchange(0, std::memory_order_relaxed);
+        const u64 image_ns = flip_image_ns.exchange(0, std::memory_order_relaxed);
+        const u64 thread_n = flip_thread_frame_waits.exchange(0, std::memory_order_relaxed);
+        const u64 thread_ns = flip_thread_frame_ns.exchange(0, std::memory_order_relaxed);
+        // sotc: SOTC_FLIP_COALESCE: flips that joined a queued job, and those that waited anyway.
+        const u64 coalesced = flip_coalesced.exchange(0, std::memory_order_relaxed);
+        const u64 still_waited = flip_still_waited.exchange(0, std::memory_order_relaxed);
+        const auto per_job = [jobs](u64 ns) { return jobs ? ns / 1e6 / jobs : 0.0; };
+        char flip_line[640];
+        std::snprintf(flip_line, sizeof(flip_line),
+                      "SOTC FLIP THREAD (%.1f s, %u flip images): %llu flips queued to the flip thread, %llu on the "
+                      "usual path; draw thread waited for a free flip image %llu times, %.2f ms per "
+                      "flip; flip thread waited for a free frame %llu times, %.2f ms per flip; "
+                      "coalesced %llu flips into a queued flip, %llu still waited (SOTC_FLIP_COALESCE)\n",
+                      seconds, FlipImagesSetting(), static_cast<unsigned long long>(jobs),
+                      static_cast<unsigned long long>(fallbacks),
+                      static_cast<unsigned long long>(image_n), per_job(image_ns),
+                      static_cast<unsigned long long>(thread_n), per_job(thread_ns),
+                      static_cast<unsigned long long>(coalesced),
+                      static_cast<unsigned long long>(still_waited));
+        out += flip_line;
+    }
 }
 
 void ReportPresent(std::string& out, double seconds) {

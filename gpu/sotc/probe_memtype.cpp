@@ -7,6 +7,10 @@
 //                       caller's return address. Post (only with SOTC_MEMTYPE_CLASSES=1): rax =
 //                       the returned pointer; its 64 KiB granules are registered with
 //                       SotcMemClasses as owner blocks of the slot (see "granule claims" below).
+//   MEMTYPE_FREE        entry at the generic free 0x12af0(ptr, esi). Pre: rdi = the block; SOTC_ALLOC_SITES ends it.
+//   MEMTYPE_FREE_SMALL / MEMTYPE_FREE_BPE  entries at the heap frees 0x17e90 / 0x493d0 (rdi = heap, rsi = block).
+//   MEMTYPE_REALLOC     wrap at the realloc 0x12c50(ptr, size, align, flags); post rax = the block (moved or not).
+//                       These four only feed SOTC_ALLOC_SITES (group alloc_sites_free).
 //   RENDER_CTX_REQUEST  entry at PerFrameRenderContexts::RequestNewRenderContext (0x90470).
 //                       Pre: rsi = DCB size, 0 meaning the 0x500000 default (rdi = list, rdx = CCB
 //                       size, rcx = this). One call per render context chunk.
@@ -46,9 +50,13 @@ void NoteHeapAlloc(uint32_t slot, uint64_t addr, uint64_t size);
 #include "hooks.h"
 #include "pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE heap carves
 #include "mem_classes.h" // SotcMemClasses::OnGranule / OnGranuleShared (granule claims)
+#include "alloc_sites.h" // sotc: SOTC_ALLOC_SITES
+#include "gpu_region.h"  // sotc: SOTC_GPU_PLACE (the port-owned region)
+#include "gpu_sites.h"   // sotc: SOTC_GPU_PLACE (the GPU-written allocation sites)
 #include "native/n1verify.h" // sotc: SOTC_VERIFY=n1 allocator class feed
 #include "probes.h"
 #include "native/native.h"               // sotc: SOTC_NATIVE switch (SotcNative::On)
+#include "native/native_draw.h"          // sotc: SOTC_NATIVE_OWNER_DISCARD (SotcNative::DiscardOwner)
 
 namespace SotcNativeHooks { // sotc: gpu/sotc/native/native_hooks.cpp
 void NoteFrameBlock(uint64_t addr, uint64_t size);
@@ -290,11 +298,204 @@ struct PendingAlloc {
     uint32_t slot = 0;
     int32_t prev_heap = -1;
     uint64_t caller = 0; // sotc: SOTC_FAULT_OWNERS: the caller key (image offset or kOutside)
+    uint64_t caller2 = 0; // sotc: SOTC_ALLOC_SITES: the two callers above it (frame-pointer chain)
+    uint64_t caller3 = 0;
+    uint32_t trace = ~0u; // sotc: SOTC_ALLOC_TRACE record
 };
 thread_local std::array<PendingAlloc, kPendingDepth> t_pending{};
 thread_local uint32_t t_pending_depth = 0;
 // The memtype whose blocks are RenderSingleFrameCPU's (the per-frame CPU arena): NoteFrameBlock announces them.
 constexpr int64_t kRenderSingleFrameCpuSlot = 17;
+// sotc: the render-target pool heap (slot 20, alloc_sites.tsv): its blocks are carved into surfaces by the engine.
+constexpr uint32_t kRenderTargetSlot = 20;
+
+// sotc: SOTC_GPU_PLACE=1. Allocations of the GPU-written sites (gpu_sites.h) are served from the port-owned GPU region
+// (gpu_region.h) instead of the engine heap, so the engine's heaps never hold GPU-written bytes: no stale GPU marks on
+// reused CPU memory and no CPU object sharing a page with GPU data. The engine's heap never sees such a block, so every
+// path that takes one back is answered here: the generic free 0x12af0, the heap frees 0x17e90 / 0x493d0, the realloc
+// 0x12c50 and the pointer classifier 0x19a50 (docs/re-stutters/HEAP-MAP.md, "Port constraints"). A site is placed only
+// when its heap's free (vtbl+0xa8) is one of those intercepted (small-object, BPE) or the render-heap no-op (a ring:
+// its blocks expire by frame in the region). A freed block waits in the region's quarantine while the buffer cache
+// forgets its GPU-written state at the command processor's point, so a new owner never sees old contents.
+namespace place {
+constexpr uint64_t kHeapRegistry = 0x2dfaab0; // image offset: heap object per memtype slot
+constexpr uint64_t kFreeSmall = 0x17e90;      // vtbl+0xa8 targets the region answers
+constexpr uint64_t kFreeBpe = 0x493d0;
+constexpr uint64_t kFreeRing = 0x1d9b0;       // render heaps: free is a no-op (ring)
+constexpr uint64_t kFreeFamily = 0x47f30;     // GPUMemory / CPUMemory family heaps: free forwarder
+// The family free 0x47f30 cannot be hooked (it ends in an indirect jmp). It asks the classifier 0x19a50 for the
+// block's owner and jumps to owner->vtbl[+0xa8]. For a region block, the classifier called from there (return
+// address 0x47f45) answers a port-owned stand-in heap whose vtbl+0xa8 is the small-object free 0x17e90, which is
+// hooked (MEMTYPE_FREE_SMALL) and takes the block back. Other classifier callers get the family heap itself.
+constexpr uint64_t kFamilyClassifyRet = 0x47f45;
+struct alignas(16) StandInHeap {
+    uint64_t vptr;
+    uint64_t pad[31];
+};
+alignas(16) uint64_t g_stand_in_vtbl[64];
+StandInHeap g_stand_in{};
+uint64_t StandInHeapAddress() {
+    static const uint64_t addr = [] {
+        g_stand_in_vtbl[0xa8 / 8] = SotcTrace::ImageBase() + kFreeSmall;
+        g_stand_in.vptr = reinterpret_cast<uint64_t>(&g_stand_in_vtbl[0]);
+        return reinterpret_cast<uint64_t>(&g_stand_in);
+    }();
+    return addr;
+}
+std::atomic<int> g_state{0};                  // 0 not decided, 1 on, -1 off
+std::mutex g_init_mutex;
+std::array<std::atomic<int8_t>, 64> g_slot_kind{}; // 0 unknown, 1 normal heap, 2 ring heap, -1 not placeable
+std::atomic<uint64_t> g_frame{0};
+std::atomic<uint64_t> g_placed{0}, g_placed_bytes{0}, g_fallback{0}, g_refused_slot{0}, g_freed{0}, g_classified{0},
+    g_reallocs{0};
+
+void Quarantined(void*, uint64_t addr, uint64_t size) {
+    SotcNative::DiscardRegion(addr, size);
+}
+
+bool On() {
+    return g_state.load(std::memory_order_acquire) > 0;
+}
+
+// Decided at the first allocation: every intercept must be installed, and the region reserved.
+bool Ready() {
+    const int s = g_state.load(std::memory_order_acquire);
+    if (s != 0) {
+        return s > 0;
+    }
+    std::scoped_lock lock{g_init_mutex};
+    if (g_state.load(std::memory_order_relaxed) != 0) {
+        return g_state.load(std::memory_order_relaxed) > 0;
+    }
+    const char* missing = nullptr;
+    for (const char* name : {"MEMTYPE_FREE", "MEMTYPE_FREE_SMALL", "MEMTYPE_FREE_BPE", "MEMTYPE_CLASSIFY",
+                             "MEMTYPE_REALLOC", "MEMTYPE_FLIP_SITE"}) {
+        if (!SotcHooks::IsInstalled(name)) {
+            missing = name;
+            break;
+        }
+    }
+    bool ok = missing == nullptr;
+    if (ok) {
+        SotcGpuSites::Load();
+        ok = SotcGpuRegion::Init(0);
+        if (ok) {
+            SotcGpuRegion::SetQuarantineHook(&Quarantined, nullptr);
+        }
+    }
+    std::fprintf(stderr, "SOTC GPU PLACE: %s%s%s\n", ok ? "on" : "off",
+                 missing ? " (hook not installed: " : (ok ? "" : " (region reservation failed)"),
+                 missing ? missing : "");
+    if (missing) {
+        std::fprintf(stderr, ")\n");
+    }
+    g_state.store(ok ? 1 : -1, std::memory_order_release);
+    return ok;
+}
+
+uint64_t HeapOf(uint32_t slot) {
+    const uint64_t base = SotcTrace::ImageBase();
+    if (base == 0 || slot >= 64) {
+        return 0;
+    }
+    uint64_t heap = 0;
+    std::memcpy(&heap, reinterpret_cast<const void*>(static_cast<uintptr_t>(base + kHeapRegistry + slot * 8)),
+                sizeof heap);
+    return heap;
+}
+
+// 1 = a heap whose blocks are freed through an intercepted free, 2 = a ring heap, -1 = not placeable, 0 = no heap yet.
+int SlotKind(uint32_t slot) {
+    if (slot >= g_slot_kind.size()) {
+        return -1;
+    }
+    const int8_t known = g_slot_kind[slot].load(std::memory_order_relaxed);
+    if (known != 0) {
+        return known;
+    }
+    const uint64_t heap = HeapOf(slot);
+    if (heap == 0) {
+        return 0; // the registry fills lazily: ask again later
+    }
+    uint64_t vptr = 0;
+    uint64_t free_fn = 0;
+    std::memcpy(&vptr, reinterpret_cast<const void*>(static_cast<uintptr_t>(heap)), sizeof vptr);
+    if (vptr != 0) {
+        std::memcpy(&free_fn, reinterpret_cast<const void*>(static_cast<uintptr_t>(vptr + 0xa8)), sizeof free_fn);
+    }
+    uint64_t off = 0;
+    int8_t kind = -1;
+    if (ImageOffset(free_fn, &off)) {
+        if (off == kFreeSmall || off == kFreeBpe || off == kFreeFamily) {
+            kind = 1;
+        } else if (off == kFreeRing) {
+            kind = 2;
+        }
+    }
+    g_slot_kind[slot].store(kind, std::memory_order_relaxed);
+    if (kind < 0) {
+        std::fprintf(stderr, "SOTC GPU PLACE: slot %u not placeable (heap free at %#llx)\n", slot,
+                     (unsigned long long)off);
+    }
+    return kind;
+}
+
+// Pre phase of 0x12820 for a listed site: the block from the region, or 0 (the engine allocates as usual).
+uint64_t TryPlace(uint64_t c1, uint64_t c2, uint64_t c3, uint32_t slot, uint64_t size, uint64_t align) {
+    uint32_t flags = 0;
+    if (size == 0 || !SotcGpuSites::Lookup(c1, c2, c3, slot, &flags)) {
+        return 0;
+    }
+    const int kind = SlotKind(slot);
+    if (kind <= 0) {
+        g_refused_slot.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    if (align > (uint64_t{1} << 20)) {
+        g_fallback.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    const uint64_t addr = SotcGpuRegion::Alloc(size, align < 16 ? 16 : align, slot,
+                                               kind == 2 ? SotcGpuRegion::kKindRing : SotcGpuRegion::kKindNormal);
+    if (addr == 0) {
+        g_fallback.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    g_placed.fetch_add(1, std::memory_order_relaxed);
+    g_placed_bytes.fetch_add(size, std::memory_order_relaxed);
+    return addr;
+}
+
+// A region pointer reached a free: the region takes it back (quarantine). True when the pointer was the region's.
+bool TakeFree(uint64_t ptr) {
+    if (!On() || !SotcGpuRegion::Contains(ptr)) {
+        return false;
+    }
+    SotcGpuRegion::Free(ptr); // a block not live (a double free) is only counted there
+    g_freed.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void Report(std::string& out) {
+    if (!On()) {
+        return;
+    }
+    std::string region;
+    SotcGpuRegion::Report(region);
+    std::string sites;
+    SotcGpuSites::Report(sites);
+    SotcGpuSites::MaybeSave();
+    char line[512];
+    std::snprintf(line, sizeof line,
+                  "SOTC GPU PLACE: placed %llu (%.1f MiB), frees %llu, classified %llu, reallocs %llu, fallback %llu, "
+                  "slot refused %llu; region:%s; sites:%s\n",
+                  (unsigned long long)g_placed.exchange(0), g_placed_bytes.exchange(0) / 1048576.0,
+                  (unsigned long long)g_freed.exchange(0), (unsigned long long)g_classified.exchange(0),
+                  (unsigned long long)g_reallocs.exchange(0), (unsigned long long)g_fallback.exchange(0),
+                  (unsigned long long)g_refused_slot.exchange(0), region.c_str(), sites.c_str());
+    out += line;
+}
+} // namespace place
 bool g_post_on = false; // the post phase is registered: SOTC_MEMTYPE_CLASSES, the placement glue or SOTC_NATIVE
 bool g_post_granules = false; // the post phase also claims granules: SOTC_MEMTYPE_CLASSES or the placement glue
 
@@ -315,17 +516,75 @@ HookAction AllocPre(GuestRegs& regs, void*) {
     if (ImageOffset(ret, &off)) {
         key = off;
     }
+    // sotc: SOTC_ALLOC_SITES: two more return addresses through the frame-pointer chain. At the wrap's pre phase rbp
+    // is the caller's frame pointer, so [rbp+8] returns into the caller's caller and [[rbp]+8] one level higher. A
+    // frame pointer outside the stack window above rsp ends the chain (a frameless caller).
+    uint64_t key2 = kOutside;
+    uint64_t key3 = kOutside;
+    if (SotcAllocSites::On() || SotcGpuSites::On()) {
+        const uint64_t sp = regs.rsp;
+        uint64_t fp = regs.rbp;
+        const auto in_stack = [](uint64_t p, uint64_t lo) { return p >= lo && p < lo + 0x200000 && (p & 7) == 0; };
+        if (in_stack(fp, sp)) {
+            uint64_t r2 = 0;
+            std::memcpy(&r2, reinterpret_cast<const void*>(static_cast<uintptr_t>(fp + 8)), sizeof r2);
+            uint64_t o = 0;
+            if (ImageOffset(r2, &o)) {
+                key2 = o;
+            }
+            uint64_t fp2 = 0;
+            std::memcpy(&fp2, reinterpret_cast<const void*>(static_cast<uintptr_t>(fp)), sizeof fp2);
+            if (in_stack(fp2, fp + 8)) {
+                uint64_t r3 = 0;
+                std::memcpy(&r3, reinterpret_cast<const void*>(static_cast<uintptr_t>(fp2 + 8)), sizeof r3);
+                if (ImageOffset(r3, &o)) {
+                    key3 = o;
+                }
+            }
+        }
+    }
+    // sotc: SOTC_GPU_PLACE: a listed site's block comes from the GPU region; the engine's allocator does not run (no
+    // pending entry, no heap context: the post phase is skipped with it).
+    if (SotcGpuSites::On() && raw_slot < kSlots && place::Ready()) {
+        const uint64_t placed = place::TryPlace(key, key2, key3, static_cast<uint32_t>(raw_slot), size,
+                                                regs.rdx & 0xffffffffull);
+        if (placed != 0) {
+            regs.rax = placed;
+            // The post phase is skipped: a RenderSingleFrameCPU block is announced PerFrame here instead (as in
+            // AllocPost), so the CPU's per-frame writes still reach the GPU.
+            if (SotcNative::On() && static_cast<int64_t>(raw_slot) == kRenderSingleFrameCpuSlot) {
+                SotcNativeHooks::NoteFrameBlock(placed, size);
+            }
+            if (SotcAllocSites::On()) {
+                SotcAllocSites::NoteAlloc(placed, size, static_cast<uint32_t>(raw_slot), key, key2, key3);
+            }
+            return HookAction::Return;
+        }
+    }
+    uint32_t trace = ~0u;
+    if (SotcAllocSites::On()) { // sotc: SOTC_ALLOC_TRACE: the registers, stack and objects of a traced site
+        trace = SotcAllocSites::Capture(key, key2, key3, size, reinterpret_cast<const uint64_t*>(&regs));
+    }
     if (g_post_on) {
         // sotc: SOTC_PC_PLACE: this call is the heap context of every pool block its refill hands out.
         const int32_t prev = SotcPcPlaceGlue::PushHeapSlot(static_cast<int32_t>(idx));
-        t_pending[t_pending_depth % kPendingDepth] = PendingAlloc{size, static_cast<uint32_t>(idx), prev, key};
+        t_pending[t_pending_depth % kPendingDepth] =
+            PendingAlloc{size, static_cast<uint32_t>(idx), prev, key, key2, key3, trace};
         ++t_pending_depth;
     }
-    SlotStats& s = g_slots[idx];
-    s.calls.fetch_add(1, std::memory_order_relaxed);
-    s.bytes.fetch_add(size, std::memory_order_relaxed);
-    s.frame_bytes.fetch_add(size, std::memory_order_relaxed);
-    AddCaller(s, key, size);
+    // sotc: with SOTC_GPU_PLACE the hook is on for the placement; the per-call statistics (SOTC MEMTYPE lines) then
+    // run only with SOTC_MEMTYPE_STATS=1.
+    static const bool stats = [] {
+        const char* v = std::getenv("SOTC_MEMTYPE_STATS");
+        return !SotcGpuSites::On() || (v && v[0] == '1');
+    }();
+    if (stats) {
+        SlotStats& s = g_slots[idx];
+        s.calls.fetch_add(1, std::memory_order_relaxed);
+        s.bytes.fetch_add(size, std::memory_order_relaxed);
+        s.frame_bytes.fetch_add(size, std::memory_order_relaxed);
+        AddCaller(s, key, size);
+    }
     return HookAction::Continue;
 }
 
@@ -348,6 +607,9 @@ HookAction FrameFlipPre(GuestRegs&, void*) {
     }
     FinishFrame();
     SotcPcRing::OnFrameBoundary(); // sotc: SOTC_PC_RING frame epoch
+    if (place::On()) { // sotc: SOTC_GPU_PLACE: ring expiry and the quarantine run per frame
+        SotcGpuRegion::OnFrame(place::g_frame.fetch_add(1, std::memory_order_relaxed) + 1);
+    }
     return HookAction::Continue;
 }
 
@@ -501,12 +763,154 @@ void AllocPost(GuestRegs& regs, void*) {
     if (g_post_granules) {
         NoteAllocGranules(regs.rax, call.size, call.slot, call.caller);
     }
+    if (SotcAllocSites::On()) { // sotc: SOTC_ALLOC_SITES
+        SotcAllocSites::NoteAlloc(regs.rax, call.size, call.slot, call.caller, call.caller2, call.caller3,
+                                  call.trace);
+    }
+    // sotc: SOTC_NATIVE_OWNER_DISCARD: a fresh block's old contents are dead (freed, or a ring block reused with no
+    // free), so its GPU-written state is forgotten before the new owner writes it. The render-target pool (slot 20)
+    // is carved by the engine into surfaces the GPU keeps writing: excluded.
+    if (SotcNative::OwnerDiscardOn() && regs.rax != 0 && call.size != 0) {
+        if (SotcNative::OwnerDiscardAtFree()) {
+            SotcAllocSites::CoreNoteAlloc(regs.rax, call.size);
+        }
+        if (call.slot != kRenderTargetSlot) {
+            SotcNative::SetOwnerDiscardTag((static_cast<uint64_t>(call.slot & 0x7fff) << 48) |
+                                           (call.caller & 0xffffffffffull));
+            SotcNative::DiscardOwner(regs.rax, call.size);
+        }
+    }
     // sotc: SOTC_NATIVE: a RenderSingleFrameCPU block is announced PerFrame at the next submit.
     if (SotcNative::On() && static_cast<int64_t>(call.slot) == kRenderSingleFrameCpuSlot && regs.rax != 0) {
         SotcNativeHooks::NoteFrameBlock(regs.rax, call.size);
     }
     // sotc: SOTC_PC_RING_HEAPSTAT: where the allocation landed relative to the served ranges, per slot.
     SotcPcRing::NoteHeapAlloc(call.slot, regs.rax, call.size);
+}
+
+// sotc: SOTC_ALLOC_SITES: entry of the generic free 0x12af0 (MEMTYPE_FREE), rdi = the block 0x12820 returned.
+HookAction FreePre(GuestRegs& regs, void*) {
+    if (place::TakeFree(regs.rdi)) { // sotc: SOTC_GPU_PLACE: a region block never reaches the engine heap
+        if (SotcAllocSites::On()) {
+            SotcAllocSites::NoteFree(regs.rdi, SotcAllocSites::kFreeGeneric);
+        }
+        return HookAction::Return;
+    }
+    if (SotcAllocSites::On()) {
+        SotcAllocSites::NoteFree(regs.rdi, SotcAllocSites::kFreeGeneric);
+    }
+    // sotc: SOTC_NATIVE_OWNER_DISCARD: the freed block's contents are dead, so its GPU-written state is forgotten
+    // (the allocator's own writes into the free block, e.g. free-run headers, then hit an unprotected page).
+    if (SotcNative::OwnerDiscardAtFree()) {
+        if (const uint64_t size = SotcAllocSites::CoreTakeFree(regs.rdi); size != 0) {
+            uint64_t ret = 0;
+            std::memcpy(&ret, reinterpret_cast<const void*>(static_cast<uintptr_t>(regs.rsp)), sizeof ret);
+            uint64_t off = 0;
+            SotcNative::SetOwnerDiscardTag((uint64_t{1} << 63) | (ImageOffset(ret, &off) ? off : 0));
+            SotcNative::DiscardOwner(regs.rdi, size);
+        }
+    }
+    return HookAction::Continue;
+}
+
+// Entries of the heap frees reached through vtbl+0xa8 (rdi = heap, rsi = the block): the small-object allocator
+// 0x17e90 and the BPE heap 0x493d0. They see the frees that skip 0x12af0 (direct vtable calls, the realloc).
+HookAction FreeFamilyPre(GuestRegs& regs, void*) { // sotc: SOTC_GPU_PLACE: the family free 0x47f30
+    return place::TakeFree(regs.rsi) ? HookAction::Return : HookAction::Continue;
+}
+
+HookAction FreeSmallPre(GuestRegs& regs, void*) {
+    if (place::TakeFree(regs.rsi)) { // sotc: SOTC_GPU_PLACE (a direct vtable free of a region block)
+        return HookAction::Return;
+    }
+    if (SotcAllocSites::On()) {
+        SotcAllocSites::NoteFree(regs.rsi, SotcAllocSites::kFreeSmall);
+    }
+    return HookAction::Continue;
+}
+HookAction FreeBpePre(GuestRegs& regs, void*) {
+    if (place::TakeFree(regs.rsi)) { // sotc: SOTC_GPU_PLACE (a direct vtable free of a region block)
+        return HookAction::Return;
+    }
+    if (SotcAllocSites::On()) {
+        SotcAllocSites::NoteFree(regs.rsi, SotcAllocSites::kFreeBpe);
+    }
+    return HookAction::Continue;
+}
+
+// Wrap of the realloc 0x12c50(ptr, size, align, flags): it allocates through the heap's vtbl+0xa0 and frees the old
+// block through vtbl+0xa8, so neither 0x12820 nor 0x12af0 sees the new block. Pre: rdi = old block, rsi = new size.
+struct PendingRealloc {
+    uint64_t old_addr, size;
+    uint32_t site, trace;
+};
+thread_local std::array<PendingRealloc, kPendingDepth> t_realloc{};
+thread_local uint32_t t_realloc_depth = 0;
+HookAction ReallocPre(GuestRegs& regs, void*) {
+    // sotc: SOTC_GPU_PLACE: a region block is reallocated inside the region (the engine heap does not know it).
+    if (place::On() && SotcGpuRegion::Contains(regs.rdi)) {
+        const uint64_t old_addr = regs.rdi;
+        const uint64_t new_size = regs.rsi;
+        const uint64_t old_size = SotcGpuRegion::SizeOf(old_addr);
+        uint32_t slot = 0;
+        SotcGpuRegion::SlotOf(old_addr, &slot);
+        place::g_reallocs.fetch_add(1, std::memory_order_relaxed);
+        uint64_t new_addr = 0;
+        if (new_size != 0 && old_size != 0) {
+            new_addr = SotcGpuRegion::Alloc(new_size, 16, slot, SotcGpuRegion::kKindNormal);
+            if (new_addr != 0) {
+                std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(new_addr)),
+                            reinterpret_cast<const void*>(static_cast<uintptr_t>(old_addr)),
+                            std::min(old_size, new_size));
+            }
+        }
+        if (new_size == 0 || new_addr != 0) {
+            SotcGpuRegion::Free(old_addr);
+        }
+        regs.rax = new_addr;
+        return HookAction::Return;
+    }
+    PendingRealloc& p = t_realloc[t_realloc_depth % kPendingDepth];
+    p.old_addr = regs.rdi;
+    p.size = regs.rsi;
+    p.site = ~0u;
+    p.trace = ~0u;
+    if (SotcAllocSites::On()) {
+        SotcAllocSites::ReallocPre(regs.rdi, &p.site, &p.trace);
+    }
+    ++t_realloc_depth;
+    return HookAction::Continue;
+}
+void ReallocPost(GuestRegs& regs, void*) {
+    if (t_realloc_depth == 0) {
+        return;
+    }
+    --t_realloc_depth;
+    const PendingRealloc p = t_realloc[t_realloc_depth % kPendingDepth];
+    if (SotcAllocSites::On()) {
+        SotcAllocSites::ReallocPost(p.old_addr, regs.rax, p.size, p.site, p.trace);
+    }
+}
+
+// sotc: SOTC_GPU_PLACE: entry of the pointer classifier 0x19a50(ptr). A region pointer has no pool class byte; it is
+// answered with the heap object its site asked for (0 for a block that is no longer live, as for an unknown pointer).
+HookAction ClassifyPre(GuestRegs& regs, void*) {
+    if (!place::On() || !SotcGpuRegion::Contains(regs.rdi)) {
+        return HookAction::Continue;
+    }
+    uint32_t slot = 0;
+    uint64_t ret = 0;
+    std::memcpy(&ret, reinterpret_cast<const void*>(static_cast<uintptr_t>(regs.rsp)), sizeof ret);
+    uint64_t ret_off = 0;
+    if (!SotcGpuRegion::SlotOf(regs.rdi, &slot)) {
+        regs.rax = 0;
+    } else if (ImageOffset(ret, &ret_off) && ret_off == place::kFamilyClassifyRet) {
+        regs.rax = place::StandInHeapAddress(); // the family free forwards to its vtbl+0xa8: 0x17e90 (hooked)
+    } else {
+        regs.rax = place::HeapOf(slot);
+    }
+    place::g_classified.fetch_add(1, std::memory_order_relaxed);
+    return HookAction::Return;
 }
 
 // Granule summary of the classes mode. The counts are totals (granules are never freed), so the line
@@ -632,7 +1036,8 @@ void RegisterMemtype() {
     g_post_granules = g_classes_on || SotcPcPlaceGlue::On();
     // sotc: SOTC_NATIVE needs the post phase too (NoteFrameBlock runs there); the post phase then runs without the
     // granule claims unless the classes mode or the glue asks for them (g_post_granules).
-    g_post_on = g_post_granules || SotcNative::On() || SotcPcRing::HeapStatOn();
+    g_post_on = g_post_granules || SotcNative::On() || SotcPcRing::HeapStatOn() || SotcAllocSites::On() ||
+                SotcAllocSites::CoreOn(); // SOTC_NATIVE_OWNER_DISCARD (env only: the native mode is set later)
 
     SotcHooks::Handler alloc;
     alloc.pre = &AllocPre;
@@ -640,6 +1045,26 @@ void RegisterMemtype() {
         alloc.post = &AllocPost;
     }
     SotcHooks::RegisterHandler("MEMTYPE_ALLOC", alloc);
+
+    SotcHooks::Handler free_entry; // sotc: SOTC_ALLOC_SITES ends allocations at their free
+    free_entry.pre = &FreePre;
+    SotcHooks::RegisterHandler("MEMTYPE_FREE", free_entry);
+    SotcHooks::Handler free_small;
+    free_small.pre = &FreeSmallPre;
+    SotcHooks::RegisterHandler("MEMTYPE_FREE_SMALL", free_small);
+    SotcHooks::Handler free_bpe;
+    free_bpe.pre = &FreeBpePre;
+    SotcHooks::RegisterHandler("MEMTYPE_FREE_BPE", free_bpe);
+    SotcHooks::Handler free_family;
+    free_family.pre = &FreeFamilyPre;
+    SotcHooks::RegisterHandler("MEMTYPE_FREE_FAMILY", free_family);
+    SotcHooks::Handler classify;
+    classify.pre = &ClassifyPre;
+    SotcHooks::RegisterHandler("MEMTYPE_CLASSIFY", classify);
+    SotcHooks::Handler realloc_wrap;
+    realloc_wrap.pre = &ReallocPre;
+    realloc_wrap.post = &ReallocPost;
+    SotcHooks::RegisterHandler("MEMTYPE_REALLOC", realloc_wrap);
 
     SotcHooks::Handler ctx;
     ctx.pre = &RenderCtxPre;
@@ -654,6 +1079,7 @@ void ReportMemtype(std::string& out, double seconds) {
     if (seconds <= 0.0) {
         seconds = 1.0;
     }
+    place::Report(out); // sotc: SOTC_GPU_PLACE
     EnsureGlobals();
     if (g_classes_on) {
         RelabelResolved(); // granules claimed before the heap-id globals were set take their name now

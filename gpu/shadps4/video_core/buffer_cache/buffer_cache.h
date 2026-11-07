@@ -947,6 +947,16 @@ private:
     /// sotc: SOTC_NATIVE frame ticket backend (SotcNative::SetFrameBackend), set in the constructor.
     static u64 NativeFrameSubmitted(void* ctx);
     static void NativeDiscardFreed(void* ctx, u64 addr, u64 size); ///< sotc: SOTC_NATIVE_FREE_DISCARD
+    /// sotc: SOTC_NATIVE_OWNER_DISCARD. A range changed owner: forgets its GPU-written state byte-exactly (partly
+    /// covered pages stay GPU-modified while other bytes of them are). Bridge handler (SotcNative::SetOwnerDiscard).
+    static void NativeDiscardOwner(void* ctx, u64 addr, u64 size);
+    /// sotc: the part of NativeDiscardOwner that changes the GPU state: subtracts [addr, +size) from gpu_modified_ranges,
+    /// then unmarks the tracker's GPU bits of the whole pages it covers. Any thread.
+    void NativeOwnerForget(VAddr addr, u64 size, bool mark_cpu = true);
+    /// sotc: SOTC_GPU_PLACE: the GPU region's quarantine. As NativeDiscardOwner, only at the command processor's point,
+    /// and without a CPU mark: the block's next owner writes what it needs (announced as in the engine's heaps), so a
+    /// whole-block upload at its first bind is not forced.
+    static void NativeDiscardRegion(void* ctx, u64 addr, u64 size);
     static void NativeFrameWait(void* ctx, u64 frame);
     static u64 NativeFrameCompleted(void* ctx);
     /// sotc: SOTC_PC_RING=8. Marks CPU-modified the part of [addr, addr + size) that lies in an

@@ -216,6 +216,31 @@ public:
         bool active;
     };
 
+    /// sotc: SOTC_PROTECT_ASYNC=1 (off by default). Waits until every host protect queued so far is
+    /// applied (a no-op when the switch is off or nothing is queued). Required before anything that
+    /// depends on the host protection matching the tracker's state, outside the tracker: a readback
+    /// or other guest write by the draw thread, unmapping or decommitting guest memory (a queued
+    /// protect would otherwise land on the new mapping), a native exact upload. The caller must not
+    /// hold the runtime's memory lock (the worker takes it as a reader) or the guest stack registry.
+    static void FlushPendingProtects();
+    /// sotc: SOTC_PROTECT_ASYNC. Marks the calling thread as the draw thread: the restrictions it makes
+    /// (protections other than read-write) are then queued for the protect worker instead of applied
+    /// by the draw thread. Call it once on the draw thread, when it starts (Liverpool::BackLoop). Has
+    /// no effect with the switch off.
+    static void SetProtectAsyncThread(bool on) noexcept;
+    /// sotc: SOTC_PROTECT_ASYNC counters, since the last call when reset is true.
+    struct ProtectAsyncStats {
+        u64 queued_runs{};     ///< protect requests queued by the draw thread
+        u64 queued_pages{};    ///< pages those requests named
+        u64 merged_runs{};     ///< requests merged into the request queued before them
+        u64 applied_runs{};    ///< queued requests applied by the worker (after merging)
+        u64 applied_batches{}; ///< batches the worker took from the queue
+        u64 flushes{};         ///< flushes that waited for queued requests
+        u64 flush_wait_ns{};   ///< time those flushes waited
+        u64 worker_wait_ns{};  ///< time the worker slept with nothing queued
+    };
+    static ProtectAsyncStats GetProtectAsyncStats(bool reset);
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

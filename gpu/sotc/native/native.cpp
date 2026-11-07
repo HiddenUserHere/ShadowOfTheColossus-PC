@@ -14,11 +14,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -76,6 +78,14 @@ struct Counters {
     std::atomic<uint64_t> drain_invalidations{};   // TextureCache::InvalidateMemory calls
     std::atomic<uint64_t> drain_served{};          // queued entries served in place (no mark, no upload)
     std::atomic<uint64_t> drain_ranges{};          // merged ranges the drain processed
+    // sotc: SOTC_NATIVE_OWNER_DISCARD (DiscardOwner, BufferCache::NativeDiscardOwner).
+    std::atomic<uint64_t> owner_calls{}, owner_discarded{}, owner_bytes{};
+    std::atomic<uint64_t> owner_pages_unprotected{}, owner_shared_pages{};
+    std::atomic<uint64_t> owner_skipped_clean{}, owner_skipped_cmd{};
+    // sotc: SOTC_NATIVE_DRAIN_AHEAD. The worker's batches and entries, the entries the draw thread found taken ahead of
+    // its submit (and their bytes), and the draw thread's waits for the worker.
+    std::atomic<uint64_t> ahead_batches{}, ahead_taken{}, ahead_entries{}, ahead_bytes{};
+    std::atomic<uint64_t> ahead_waits{}, ahead_wait_ns{}, ahead_wait_max_ns{};
 };
 Counters g_c;
 std::atomic<uint64_t> g_submitted_local{}; // frame counter when no backend is set
@@ -139,6 +149,9 @@ bool Overlaps(uint64_t a, uint64_t as, uint64_t b, uint64_t bs) {
     return a < b + bs && b < a + as;
 }
 
+// sotc: SOTC_NATIVE_DRAIN_AHEAD. Drops [addr, +size) from the announces the worker already took (Release calls it).
+void DrainAheadDrop(uint64_t addr, uint64_t size);
+
 // SOTC_NATIVE: 0 off (default), 1 on, 2 on plus verify. Anything else reads as 0.
 int ReadMode() {
     const char* v = std::getenv("SOTC_NATIVE");
@@ -195,10 +208,10 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
         }
         return;
     }
-    const uint64_t seq = g_announce_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     SotcVerify::NoteAnnounce(addr, size); // sotc: clears the coverage oracle's pending faults
     SotcN1Verify::NoteAnnounce(addr, size, static_cast<uint8_t>(kind), __builtin_return_address(0)); // sotc: SOTC_VERIFY=n1
     if (kind == Kind::GpuWritten) {
+        g_announce_seq.fetch_add(1, std::memory_order_relaxed); // sotc: nothing queued; the count stays every Announce
         g_c.announce_gpu_written.fetch_add(1, std::memory_order_relaxed);
         return; // the GPU writes it: nothing to upload
     }
@@ -213,6 +226,9 @@ void Announce(uint64_t addr, uint64_t size, Kind kind) {
     // never fault, so the texture cache would not hear of a write there).
     const bool served = SotcPcRing::HostServed(addr, size);
     std::scoped_lock lock{g_mutex};
+    // sotc: SOTC_NATIVE_DRAIN_AHEAD: the seq is taken under g_mutex, with the push. Every queued announce with a seq up to
+    // AnnounceSeq() is then in the queue or already popped, which the worker's watermark (TakeAllUploads) relies on.
+    const uint64_t seq = g_announce_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     uint64_t merged = 0;
     for (uint64_t at = addr; at < addr + size;) {
         const uint64_t piece = std::min<uint64_t>(kMaxUploadChunk, addr + size - at);
@@ -306,6 +322,7 @@ void Release(uint64_t addr, uint64_t size) {
         }
     }
     g_pending_count.store(PendingTotal(), std::memory_order_release);
+    DrainAheadDrop(addr, size); // sotc: SOTC_NATIVE_DRAIN_AHEAD: the batches the worker took are released too
 }
 
 uint64_t FrameSubmitted() {
@@ -498,6 +515,29 @@ void Report(std::string& out, double seconds) {
             out += line;
         }
     }
+    if (DrainAheadOn()) { // sotc: SOTC_NATIVE_DRAIN_AHEAD counters, reset per window
+        const auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+        const uint64_t waits = take(g_c.ahead_waits);
+        const uint64_t wait_ns = take(g_c.ahead_wait_ns);
+        std::snprintf(line, sizeof(line),
+                      "SOTC NATIVE DRAIN AHEAD (%.1f s): worker batches %llu entries %llu; drained ahead %llu entries "
+                      "%llu KiB; submit-start waits %llu avg %.3f ms max %.3f ms\n",
+                      seconds, ull(take(g_c.ahead_batches)), ull(take(g_c.ahead_taken)),
+                      ull(take(g_c.ahead_entries)), ull(take(g_c.ahead_bytes) >> 10), ull(waits),
+                      waits ? wait_ns / 1e6 / static_cast<double>(waits) : 0.0, take(g_c.ahead_wait_max_ns) / 1e6);
+        out += line;
+    }
+    if (OwnerDiscardOn()) { // sotc: SOTC_NATIVE_OWNER_DISCARD counters, reset per window
+        const auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+        std::snprintf(line, sizeof(line),
+                      "SOTC NATIVE OWNER DISCARD (%.1f s): calls %llu discarded %llu (%llu KiB), pages unprotected "
+                      "%llu, shared boundary pages %llu, skipped clean %llu, skipped in command buffers %llu\n",
+                      seconds, ull(take(g_c.owner_calls)), ull(take(g_c.owner_discarded)),
+                      ull(take(g_c.owner_bytes) >> 10), ull(take(g_c.owner_pages_unprotected)),
+                      ull(take(g_c.owner_shared_pages)), ull(take(g_c.owner_skipped_clean)),
+                      ull(take(g_c.owner_skipped_cmd)));
+        out += line;
+    }
     if (g_mode == 1) {
         std::snprintf(line, sizeof(line),
                       "SOTC NATIVE tracking off (%.1f s): readbacks skipped %llu, stray faults write %llu "
@@ -621,6 +661,317 @@ void VerifyTakeUploads(const std::vector<PendingUpload>& snapshot, const std::ve
     }
 }
 
+// sotc: SOTC_NATIVE_DRAIN_AHEAD. Sorts the non-served announces of a batch by kind, then address, and merges the
+// overlapping or touching ranges of one kind (at most kMaxUploadChunk each). The draw thread's NativeDrain used to do
+// this inline; the drain-ahead worker does it per batch, the draw thread once more over the batches' ranges.
+void MergeUploads(std::vector<PendingUpload>& taken, std::vector<PendingUpload>& merged) {
+    std::sort(taken.begin(), taken.end(), [](const PendingUpload& a, const PendingUpload& b) {
+        return a.kind != b.kind ? a.kind < b.kind : a.addr < b.addr;
+    });
+    merged.clear();
+    for (const auto& e : taken) {
+        if (!merged.empty()) {
+            PendingUpload& r = merged.back();
+            const uint64_t lo = std::min<uint64_t>(r.addr, e.addr);
+            const uint64_t hi = std::max<uint64_t>(r.addr + r.size, e.addr + e.size);
+            if (r.kind == e.kind && e.addr <= r.addr + r.size && r.addr <= e.addr + e.size &&
+                hi - lo <= kMaxUploadChunk) {
+                r.addr = lo;
+                r.size = hi - lo;
+                continue;
+            }
+        }
+        merged.push_back(e);
+    }
+}
+
+namespace {
+
+// sotc: SOTC_NATIVE_DRAIN_AHEAD (read once; needs SOTC_NATIVE on). The announces are taken by a worker thread as they
+// are queued, so the draw thread's submit start finds them taken. Threads and locks:
+// - Worker: TakeAll (g_mutex, the same pops as TakeUploads), then Publish (ready_mutex). It holds no lock of the
+//   buffer cache, the texture cache, the memory tracker or the scheduler, and calls no Vulkan or tracker function.
+// - Draw thread (Take, at NativeDrain): ready_mutex (the wait and the swap). Never g_mutex while holding it.
+// - Release (any thread, under g_mutex) takes ready_mutex to drop the published ranges it covers. Order: g_mutex
+//   before ready_mutex; the worker never holds both.
+// The draw thread gets every announce with a seq up to its pickup seq: the worker publishes a seq only after it took the
+// queue under g_mutex, and Announce takes its seq under g_mutex with the push (so no queued announce is in flight then).
+struct DrainAheadState {
+    std::mutex ready_mutex;                  // ready_raw, ready_ranges, the wait of Take
+    std::condition_variable ready_cv;        // the draw thread waits here for ready_seq
+    std::vector<PendingUpload> ready_raw;    // published, announce order (served entries included), not yet taken
+    std::vector<PendingUpload> ready_ranges; // published: the non-served ranges of each batch, sorted and merged
+    std::vector<InvalRef> ready_inval;       // sotc: published: every ready_raw entry, sorted by (addr, index)
+    std::vector<InvalGroup> ready_groups;    // sotc: published: the invalidation groups over ready_inval
+    std::atomic<uint64_t> ready_seq{0};      // every announce with a seq up to this is published or taken
+    std::mutex wake_mutex;                   // wake_requested, stop_requested
+    std::condition_variable wake_cv;
+    bool wake_requested = false;
+    bool stop_requested = false;
+    std::atomic<bool> running{false};
+    std::thread* worker = nullptr; // set by Start, joined and cleared by Stop (the BufferCache constructor/destructor)
+};
+// Heap-allocated and never freed: a worker still running at process exit must not touch destroyed statics.
+DrainAheadState& DaState() {
+    static DrainAheadState* state = new DrainAheadState;
+    return *state;
+}
+
+// The worker waits this long between takes when no drain requests one.
+constexpr auto kDrainAheadPoll = std::chrono::microseconds(100);
+
+const bool g_drain_ahead_on = [] {
+    const char* v = std::getenv("SOTC_NATIVE_DRAIN_AHEAD");
+    return v && v[0] == '1' && Mode() != 0;
+}();
+
+// Pops every queued upload (the pops of TakeUploads, overflow included) and returns the announce seq current under the
+// same lock. An announce with a seq up to it is queued (and popped here) or was popped before.
+uint64_t TakeAll(std::vector<PendingUpload>& out) {
+    std::scoped_lock lock{g_mutex};
+    const uint64_t seq = g_announce_seq.load(std::memory_order_relaxed);
+    PendingUpload up{};
+    while (PopUpload(g_pending, g_overflow, up)) {
+        out.push_back(up);
+    }
+    g_pending_count.store(PendingTotal(), std::memory_order_release);
+    return seq;
+}
+
+// One batch: raw (announce order) and taken (the non-served ones, for MergeUploads). Returns the seq it covers.
+uint64_t TakeBatch(std::vector<PendingUpload>& raw, std::vector<PendingUpload>& taken,
+                   std::vector<PendingUpload>& ranges) {
+    raw.clear();
+    ranges.clear();
+    const uint64_t seq = TakeAll(raw);
+    if (!raw.empty()) {
+        taken.clear();
+        for (const PendingUpload& u : raw) {
+            if (!u.served) {
+                taken.push_back(u);
+            }
+        }
+        MergeUploads(taken, ranges);
+    }
+    return seq;
+}
+
+// sotc: SOTC_NATIVE_INVAL_MERGE groups, built here so the draw thread does no sort. ready_inval holds every published
+// announce (served ones too) sorted by address; GroupInval makes the groups NativeDrain used to make inline: greedy in
+// address order, a group extends while the next announce starts at or before its end and stays under 1 MiB.
+bool InvalLess(const InvalRef& a, const InvalRef& b) {
+    return a.addr != b.addr ? a.addr < b.addr : a.index < b.index;
+}
+
+void GroupInval(DrainAheadState& s) {
+    constexpr uint64_t kMaxGroup = uint64_t{1} << 20; // HasImagesExact answers true past 256 pages
+    const std::vector<InvalRef>& sorted = s.ready_inval;
+    s.ready_groups.clear();
+    for (size_t g = 0; g < sorted.size();) {
+        const uint64_t lo = sorted[g].addr;
+        uint64_t hi = lo + sorted[g].size;
+        size_t end = g + 1;
+        while (end < sorted.size() && sorted[end].addr <= hi) {
+            const uint64_t next_hi = std::max<uint64_t>(hi, sorted[end].addr + sorted[end].size);
+            if (next_hi - lo > kMaxGroup) {
+                break;
+            }
+            hi = next_hi;
+            ++end;
+        }
+        s.ready_groups.push_back(InvalGroup{lo, hi, static_cast<uint32_t>(g), static_cast<uint32_t>(end)});
+        g = end;
+    }
+}
+
+// Sorts every ready_raw entry again and groups them: after a drop split or removed entries, the indices moved.
+void RebuildInval(DrainAheadState& s) {
+    s.ready_inval.clear();
+    for (size_t i = 0; i < s.ready_raw.size(); ++i) {
+        s.ready_inval.push_back(InvalRef{s.ready_raw[i].addr, s.ready_raw[i].size, static_cast<uint32_t>(i)});
+    }
+    std::sort(s.ready_inval.begin(), s.ready_inval.end(), InvalLess);
+    GroupInval(s);
+}
+
+// Adds the entries appended to ready_raw from index first on: sorts them, merges them into ready_inval, groups.
+void AddInval(DrainAheadState& s, size_t first) {
+    static thread_local std::vector<InvalRef> batch;
+    static thread_local std::vector<InvalRef> merged;
+    batch.clear();
+    for (size_t i = first; i < s.ready_raw.size(); ++i) {
+        batch.push_back(InvalRef{s.ready_raw[i].addr, s.ready_raw[i].size, static_cast<uint32_t>(i)});
+    }
+    std::sort(batch.begin(), batch.end(), InvalLess);
+    merged.resize(s.ready_inval.size() + batch.size());
+    std::merge(s.ready_inval.begin(), s.ready_inval.end(), batch.begin(), batch.end(), merged.begin(), InvalLess);
+    s.ready_inval.swap(merged);
+    GroupInval(s);
+}
+
+void Publish(DrainAheadState& s, const std::vector<PendingUpload>& raw, const std::vector<PendingUpload>& ranges,
+             uint64_t seq) {
+    {
+        std::scoped_lock lock{s.ready_mutex};
+        const size_t first = s.ready_raw.size();
+        s.ready_raw.insert(s.ready_raw.end(), raw.begin(), raw.end());
+        if (!raw.empty()) {
+            AddInval(s, first); // sotc: the groups of this batch, merged with the ones already published
+        }
+        // sotc: kept sorted and merged across batches, so the draw thread uses them as they are (no sort there).
+        if (s.ready_ranges.empty()) {
+            s.ready_ranges.assign(ranges.begin(), ranges.end());
+        } else if (!ranges.empty()) {
+            static thread_local std::vector<PendingUpload> all;
+            all.assign(s.ready_ranges.begin(), s.ready_ranges.end());
+            all.insert(all.end(), ranges.begin(), ranges.end());
+            MergeUploads(all, s.ready_ranges);
+        }
+        s.ready_seq.store(seq, std::memory_order_release);
+    }
+    s.ready_cv.notify_all();
+    if (!raw.empty()) {
+        g_c.ahead_batches.fetch_add(1, std::memory_order_relaxed);
+        g_c.ahead_taken.fetch_add(raw.size(), std::memory_order_relaxed);
+    }
+}
+
+void DrainAheadWorker(DrainAheadState& s) {
+    std::vector<PendingUpload> raw;
+    std::vector<PendingUpload> taken;
+    std::vector<PendingUpload> ranges;
+    for (;;) {
+        const uint64_t seq = TakeBatch(raw, taken, ranges);
+        Publish(s, raw, ranges, seq);
+        std::unique_lock lock{s.wake_mutex};
+        s.wake_cv.wait_for(lock, kDrainAheadPoll, [&s] { return s.wake_requested || s.stop_requested; });
+        s.wake_requested = false;
+        if (s.stop_requested) {
+            return;
+        }
+    }
+}
+
+// Removes [addr, +size) from a published list, splitting the entries it cuts (the rule of Release for the queue).
+bool DropFrom(std::vector<PendingUpload>& v, uint64_t addr, uint64_t size) {
+    std::vector<PendingUpload> kept;
+    kept.reserve(v.size());
+    bool changed = false;
+    for (const PendingUpload& p : v) {
+        if (!Overlaps(p.addr, p.size, addr, size)) {
+            kept.push_back(p);
+            continue;
+        }
+        changed = true;
+        const uint64_t end = p.addr + p.size;
+        if (p.addr < addr) {
+            kept.push_back(PendingUpload{p.addr, addr - p.addr, p.kind, p.seq, p.served});
+        }
+        if (end > addr + size) {
+            kept.push_back(PendingUpload{addr + size, end - (addr + size), p.kind, p.seq, p.served});
+        }
+    }
+    v.swap(kept);
+    return changed;
+}
+
+void DrainAheadDrop(uint64_t addr, uint64_t size) {
+    if (!g_drain_ahead_on) {
+        return;
+    }
+    DrainAheadState& s = DaState();
+    std::scoped_lock lock{s.ready_mutex};
+    if (DropFrom(s.ready_raw, addr, size)) {
+        RebuildInval(s); // sotc: the raw indices moved (a split or a removed entry)
+    }
+    DropFrom(s.ready_ranges, addr, size);
+}
+
+void RequestDrainAheadWake(DrainAheadState& s) {
+    {
+        std::scoped_lock lock{s.wake_mutex};
+        s.wake_requested = true;
+    }
+    s.wake_cv.notify_one();
+}
+
+} // namespace
+
+bool DrainAheadOn() {
+    return g_drain_ahead_on;
+}
+
+void DrainAheadStart() {
+    DrainAheadState& s = DaState();
+    if (!g_drain_ahead_on || s.worker != nullptr) {
+        return;
+    }
+    {
+        std::scoped_lock lock{s.wake_mutex};
+        s.wake_requested = false;
+        s.stop_requested = false;
+    }
+    s.running.store(true, std::memory_order_release);
+    s.worker = new std::thread([&s] { DrainAheadWorker(s); });
+}
+
+void DrainAheadStop() {
+    DrainAheadState& s = DaState();
+    if (s.worker == nullptr) {
+        return;
+    }
+    {
+        std::scoped_lock lock{s.wake_mutex};
+        s.stop_requested = true;
+    }
+    s.wake_cv.notify_all();
+    s.worker->join();
+    delete s.worker;
+    s.worker = nullptr;
+    s.running.store(false, std::memory_order_release);
+}
+
+size_t DrainAheadTake(uint64_t want_seq, std::vector<PendingUpload>& raw, std::vector<PendingUpload>& ranges,
+                      std::vector<InvalRef>& inval, std::vector<InvalGroup>& groups) {
+    DrainAheadState& s = DaState();
+    if (!s.running.load(std::memory_order_acquire)) {
+        // Not started (or stopped): nothing else would take the queue, so this takes it as the worker would.
+        std::vector<PendingUpload> batch_raw;
+        std::vector<PendingUpload> batch_taken;
+        std::vector<PendingUpload> batch_ranges;
+        const uint64_t seq = TakeBatch(batch_raw, batch_taken, batch_ranges);
+        Publish(s, batch_raw, batch_ranges, seq);
+    }
+    std::unique_lock lock{s.ready_mutex};
+    const size_t ahead = s.ready_raw.size(); // published before this drain asked
+    if (s.ready_seq.load(std::memory_order_acquire) < want_seq) {
+        RequestDrainAheadWake(s);
+        const auto t0 = std::chrono::steady_clock::now();
+        s.ready_cv.wait(lock, [&s, want_seq] { return s.ready_seq.load(std::memory_order_acquire) >= want_seq; });
+        const uint64_t ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        g_c.ahead_waits.fetch_add(1, std::memory_order_relaxed);
+        g_c.ahead_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+        uint64_t prev = g_c.ahead_wait_max_ns.load(std::memory_order_relaxed);
+        while (ns > prev && !g_c.ahead_wait_max_ns.compare_exchange_weak(prev, ns, std::memory_order_relaxed)) {
+        }
+    }
+    raw.clear();
+    ranges.clear();
+    raw.swap(s.ready_raw);
+    ranges.swap(s.ready_ranges);
+    inval.clear(); // sotc: the worker starts the next batch of groups empty
+    groups.clear();
+    inval.swap(s.ready_inval);
+    groups.swap(s.ready_groups);
+    return ahead;
+}
+
+void NoteDrainAhead(uint64_t entries, uint64_t bytes) {
+    g_c.ahead_entries.fetch_add(entries, std::memory_order_relaxed);
+    g_c.ahead_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
 namespace {
 std::atomic<void*> g_free_ctx{nullptr};
 std::atomic<void (*)(void*, uint64_t, uint64_t)> g_free_fn{nullptr};
@@ -641,6 +992,93 @@ void DiscardFreed(uint64_t addr, uint64_t size) {
     }
     if (auto* fn = g_free_fn.load(std::memory_order_acquire)) {
         fn(g_free_ctx.load(std::memory_order_relaxed), addr, size);
+    }
+}
+
+namespace {
+std::atomic<void*> g_owner_ctx{nullptr};
+std::atomic<void (*)(void*, uint64_t, uint64_t)> g_owner_fn{nullptr};
+} // namespace
+
+void SetOwnerDiscard(void* ctx, void (*fn)(void* ctx, uint64_t addr, uint64_t size)) {
+    g_owner_ctx.store(ctx, std::memory_order_relaxed);
+    g_owner_fn.store(fn, std::memory_order_release);
+}
+
+// SOTC_NATIVE_OWNER_DISCARD: 1 = at allocations (0x12820) only, 2 = also at frees (0x12af0).
+int OwnerDiscardMode() {
+    static const int env_mode = [] {
+        const char* v = std::getenv("SOTC_NATIVE_OWNER_DISCARD");
+        return (v && (v[0] == '1' || v[0] == '2')) ? v[0] - '0' : 0;
+    }();
+    return g_mode != 0 ? env_mode : 0;
+}
+
+bool OwnerDiscardOn() {
+    return OwnerDiscardMode() != 0;
+}
+
+bool OwnerDiscardAtFree() {
+    return OwnerDiscardMode() == 2;
+}
+
+namespace {
+std::atomic<void*> g_region_ctx{nullptr};
+std::atomic<void (*)(void*, uint64_t, uint64_t)> g_region_fn{nullptr};
+} // namespace
+
+void SetRegionDiscard(void* ctx, void (*fn)(void* ctx, uint64_t addr, uint64_t size)) {
+    g_region_ctx.store(ctx, std::memory_order_relaxed);
+    g_region_fn.store(fn, std::memory_order_release);
+}
+
+void DiscardRegion(uint64_t addr, uint64_t size) {
+    if (g_mode == 0 || addr == 0 || size == 0) {
+        return;
+    }
+    if (auto* fn = g_region_fn.load(std::memory_order_acquire)) {
+        fn(g_region_ctx.load(std::memory_order_relaxed), addr, size);
+    }
+}
+
+void DiscardOwnerForced(uint64_t addr, uint64_t size) {
+    if (g_mode == 0 || addr == 0 || size == 0) {
+        return;
+    }
+    if (auto* fn = g_owner_fn.load(std::memory_order_acquire)) {
+        fn(g_owner_ctx.load(std::memory_order_relaxed), addr, size);
+    }
+}
+
+namespace {
+thread_local uint64_t t_owner_tag = 0;
+}
+void SetOwnerDiscardTag(uint64_t tag) {
+    t_owner_tag = tag;
+}
+uint64_t OwnerDiscardTag() {
+    return t_owner_tag;
+}
+
+void NoteOwnerDiscard(OwnerDiscard what, uint64_t n) {
+    switch (what) {
+    case OwnerDiscard::Call: g_c.owner_calls.fetch_add(n, std::memory_order_relaxed); break;
+    case OwnerDiscard::Discarded: g_c.owner_discarded.fetch_add(n, std::memory_order_relaxed); break;
+    case OwnerDiscard::Bytes: g_c.owner_bytes.fetch_add(n, std::memory_order_relaxed); break;
+    case OwnerDiscard::PagesUnprotected: g_c.owner_pages_unprotected.fetch_add(n, std::memory_order_relaxed); break;
+    case OwnerDiscard::SharedPages: g_c.owner_shared_pages.fetch_add(n, std::memory_order_relaxed); break;
+    case OwnerDiscard::SkippedClean: g_c.owner_skipped_clean.fetch_add(n, std::memory_order_relaxed); break;
+    case OwnerDiscard::SkippedCmd: g_c.owner_skipped_cmd.fetch_add(n, std::memory_order_relaxed); break;
+    }
+}
+
+void DiscardOwner(uint64_t addr, uint64_t size) {
+    if (!OwnerDiscardOn() || addr == 0 || size == 0) {
+        return;
+    }
+    NoteOwnerDiscard(OwnerDiscard::Call);
+    if (auto* fn = g_owner_fn.load(std::memory_order_acquire)) {
+        fn(g_owner_ctx.load(std::memory_order_relaxed), addr, size);
     }
 }
 

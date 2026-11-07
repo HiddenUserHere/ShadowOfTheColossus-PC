@@ -36,6 +36,7 @@ namespace Serialization {
 // mismatch between the pipeline with the geometry shader and the one without; PR #258).
 // 38/136 = SRT walker resolves Phis whose operands compute the same offset (flattened layout
 // changes for those shaders).
+// sotc: 44/141 (from 43/140): PersistentSrtInfo holds the SRT walk plan (SOTC_CP_SRT_PLAN, srt.h); the record is longer.
 // sotc: SOTC_STAGE_BINDINGS=1 binaries number their descriptors per stage: +1000 keeps them apart
 // from the others (the layouts and the shader bindings differ).
 // sotc: SOTC_BINDLESS_SAMP=1 binaries read their samplers from the heap: +2000 keeps them apart.
@@ -81,7 +82,7 @@ static bool AddrTableRequested() {
 // sotc: SOTC_PRETRANSLATE / SOTC_PRECOMPILE (+128000): those caches held permutations whose resources differed from
 // their program's Info (a layout variant without the flat buffer, then draws' translations with it, recorded under
 // the variant's Info): the device lost of 4 Nov. Their caches are made again; the others are unchanged.
-static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 43u : 140u) +
+static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 44u : 141u) +
                                        (Shader::StageBindingsEnabled() ? 1000u : 0u) +
                                        (BindlessSamplersRequested() ? 2000u : 0u) +
                                        (SrtPhiDisabled() ? 4000u : 0u) +

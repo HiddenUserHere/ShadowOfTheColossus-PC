@@ -1122,7 +1122,8 @@ inline Plan Observe(uint64_t page) {
     Tl& t = tl;
     Plan plan;
     t.cur_page = page;
-    if (t.last_hi != 0 && NowNs() - t.last_end_ns <= kWriteAheadAdaptUs * 1000) {
+    // sotc: the clock is read only for SOTC_WRITE_AHEAD_ADAPT: the plan is used only with it.
+    if (kWriteAheadAdapt && t.last_hi != 0 && NowNs() - t.last_end_ns <= kWriteAheadAdaptUs * 1000) {
         int dir = 0;
         if (page > t.last_page && page <= t.last_hi + kSlack) {
             dir = 1;
@@ -1149,7 +1150,7 @@ inline void Done(uint64_t lo, uint64_t hi) {
     t.last_page = t.cur_page;
     t.last_lo = lo < t.cur_page ? lo : t.cur_page;
     t.last_hi = hi > t.cur_page + 4096 ? hi : t.cur_page + 4096;
-    t.last_end_ns = NowNs();
+    t.last_end_ns = kWriteAheadAdapt ? NowNs() : 0; // sotc: read only for SOTC_WRITE_AHEAD_ADAPT
     t.counted = true;
 }
 } // namespace FaultStat
@@ -1187,12 +1188,20 @@ struct SplitTimer {
     SplitPart part;
     bool on;
     uint64_t start;
-    explicit SplitTimer(SplitPart p, bool draw_thread_only = true)
+    // sotc: with SOTC_DRAW_SPLIT off the constructor is one test of kDrawSplit and the destructor
+    // one test of `on`; the counter update is out of line (RecordSplit). Inline so that the
+    // draw thread's per-op timers do not cost a call each.
+    [[gnu::always_inline]] explicit SplitTimer(SplitPart p, bool draw_thread_only = true)
         : part{p}, on{kDrawSplit && (!draw_thread_only || t_draw_thread)}, start{on ? Ticks() : 0} {}
-    ~SplitTimer() {
+    [[gnu::always_inline]] ~SplitTimer() {
         if (on) {
-            split_ticks[part].fetch_add(Ticks() - start, std::memory_order_relaxed);
+            RecordSplit();
         }
+    }
+
+private:
+    __attribute__((noinline)) void RecordSplit() const {
+        split_ticks[part].fetch_add(Ticks() - start, std::memory_order_relaxed);
     }
 };
 enum SplitThread { SplitThreadDraw, SplitThreadCp, SplitThreadRecorder, SplitThreads };

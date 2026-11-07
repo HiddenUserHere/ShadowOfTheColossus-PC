@@ -3052,8 +3052,10 @@ bool EmitGuestDetour(Xbyak::CodeGenerator& c, const DetourRequest& request,
     Xbyak::Label return_to_guest;
     EmitDetourSave(c, request.hook_id, 0);
     const bool entry = request.mode == DetourMode::Entry;
-    if (entry) {
-        // HookAction::Return (Entry only): the handler supplied the result in regs.rax/rdx/xmm0.
+    if (entry || wrap) {
+        // HookAction::Return (Entry and Wrap): the handler supplied the result in regs.rax/rdx/xmm0.
+        // Wrap skips its original and its post phase: the stub returns to the caller from the
+        // frame base, exactly as an Entry return does (rsp = E, return address at [E]).
         c.cmp(eax, static_cast<uint32_t>(SotcHooks::HookAction::Return));
         c.je(return_to_guest, Xbyak::CodeGenerator::T_NEAR); // the restore + span exceed rel8
     }
@@ -3083,7 +3085,7 @@ bool EmitGuestDetour(Xbyak::CodeGenerator& c, const DetourRequest& request,
         }
         c.jmp(reinterpret_cast<void*>(continuation));
     }
-    if (entry) {
+    if (entry || wrap) {
         c.L(return_to_guest);
         EmitDetourRestore(c);
         c.ret();

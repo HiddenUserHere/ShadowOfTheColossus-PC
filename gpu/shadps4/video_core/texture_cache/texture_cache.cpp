@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <stb_image.h>
 #include "common/path_util.h"
+#include "../../../sotc/alloc_sites.h" // sotc: SOTC_ALLOC_SITES
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -460,7 +461,15 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     UntrackImage(image_id);
 }
 
-void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_written) {
+bool TextureCache::SingleWriter() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_TC_SINGLE_WRITER");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+bool TextureCache::PagesMayHoldImage(VAddr addr, size_t size) {
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
     // sotc: most guest write faults hit buffer pages without any image: no lock for them (they
@@ -478,8 +487,15 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_writt
             return any;
         });
         if (!any) {
-            return;
+            return false;
         }
+    }
+    return true;
+}
+
+void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_written) {
+    if (!PagesMayHoldImage(addr, size)) {
+        return;
     }
     // sotc: SOTC_SYNC_EVENTS. A guest write reached pages with an image: the draw-side drain
     // (DrainImageEvents) looks at the images over the range before the next submit's binds.
@@ -487,6 +503,12 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_writt
         SotcSyncEvents::PushImage(addr, size);
     }
     std::scoped_lock lock{mutex};
+    InvalidateImagesLocked(addr, size, keep_gpu_written);
+}
+
+void TextureCache::InvalidateImagesLocked(VAddr addr, size_t size, bool keep_gpu_written) {
+    const auto pages_start = PageManager::GetPageAddr(addr);
+    const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         if (keep_gpu_written && True(image.flags & ImageFlagBits::GpuModified)) {
             // sotc: SOTC_NATIVE: the announce is remembered on the image (FindImage decides at its next lookup
@@ -550,6 +572,44 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size, bool keep_gpu_writt
             MarkAsMaybeDirty(image_id, image);
         }
     });
+}
+
+void TextureCache::InvalidateMemoryGuest(VAddr addr, size_t size) {
+    if (!SingleWriter()) {
+        InvalidateMemory(addr, size);
+        return;
+    }
+    if (!PagesMayHoldImage(addr, size)) {
+        return;
+    }
+    // sotc: SOTC_TC_SINGLE_WRITER. The fault thread only queues the range (guest_inval_mutex, a leaf
+    // lock). The draw thread applies it under `mutex` at its next bind pass. Guest faults never keep
+    // GPU-written images, so the body needs no tick from here.
+    {
+        std::scoped_lock q{guest_inval_mutex};
+        guest_inval_queue.push_back({addr, size});
+        guest_inval_pending.fetch_add(1, std::memory_order_release);
+    }
+    if (SotcSyncEvents::On()) {
+        SotcSyncEvents::PushImage(addr, size);
+    }
+}
+
+void TextureCache::DrainGuestInvalidationsSlow() {
+    thread_local std::vector<GuestInvalidation> batch;
+    batch.clear();
+    {
+        std::scoped_lock q{guest_inval_mutex};
+        batch.swap(guest_inval_queue);
+        guest_inval_pending.store(0, std::memory_order_release);
+    }
+    if (batch.empty()) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    for (const GuestInvalidation& inv : batch) {
+        InvalidateImagesLocked(inv.addr, inv.size, false);
+    }
 }
 
 // sotc: SOTC_SYNC_EVENTS. The images over [addr, addr + size) that the CPU changed or may have
@@ -1466,6 +1526,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // sotc: writers free the mip tails they overlap (below); with mip tails on, a writer only
     // takes a perfect match memoized by a writer lookup, i.e. after that freeing.
     const bool writer = desc.type != BindingType::Texture;
+    if (SotcAllocSites::On()) { // sotc: SOTC_ALLOC_SITES: render targets, depth and storage images are GPU writes
+        SotcAllocSites::NoteGpuImage(info.guest_address, info.guest_size, writer);
+    }
     const bool memo_writer = writer && MipTailMode() != 0;
     // sotc: thousands of lookups per frame find the same images; a perfect match stays one
     // until an image is registered or unregistered (SOTC_FIND_MEMO=0: always search).

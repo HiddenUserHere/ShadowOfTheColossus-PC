@@ -43,6 +43,8 @@ namespace OpCost {
 enum class Thread : u8 { Draw, CommandProcessor };
 enum class Op : u8 { Draw, DrawIndirect, Dispatch, DispatchIndirect, Other, Count };
 bool On();
+/// sotc: On() as a plain bool, read once (OpCostScope checks it without a call). Same switch.
+inline const bool kCostOn = SwitchMode("SOTC_OPCOST") != 0;
 /// Wall time of one op on `thread`, measured by the caller (ns).
 void Note(Thread thread, Op op, u64 ns);
 void Report(char* out, u32 size, double seconds);

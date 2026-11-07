@@ -12,6 +12,7 @@
 #include <utility>
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/interval_set.hpp>
+#include <condition_variable>
 #include <mutex>
 #include <shared_mutex>
 #include <atomic>
@@ -32,6 +33,7 @@
 #include "core/memory.h"
 #include "../../sotc/native/fault_emu.h" // sotc: SOTC_NATIVE_TRACK_EMU
 #include "../../sotc/probes.h"            // sotc: SOTC_FAULT_OWNERS
+#include "../../sotc/alloc_sites.h"       // sotc: SOTC_ALLOC_SITES
 #include "common/decoder.h"
 #include "core/signals.h"
 #include "shader_recompiler/ir/passes/srt.h"
@@ -261,6 +263,167 @@ std::function<void(VAddr)> g_fault_page_fix;
 // tracker has no state for it. Lock-free look, for the N1VERIFY fault handler.
 std::function<int(VAddr)> g_n1_page_state;
 
+// sotc: SOTC_PROTECT_ASYNC=1 (default off). The restrictions the draw thread makes (a page write-
+// protected again after an upload, texture and readback tracking) are applied by a worker thread, so
+// the draw thread does not wait for the operating system's protect call. The tracker's state is still
+// updated on the calling thread under the page locks, exactly as before; only the protect call moves.
+// Requests are applied in the order they were made. Everything else is applied at once, after the
+// queue is flushed: an unprotect (read-write), a protect of any other thread, and a protect made
+// inside a fault. So a page is never made writable behind a queued restriction, and a write by the
+// draw thread never meets a page that is still queued as read-only.
+bool ProtectAsyncOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_PROTECT_ASYNC");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+// sotc: set on the draw thread by PageManager::SetProtectAsyncThread.
+thread_local bool tl_protect_offload_thread = false;
+
+// sotc: one queued protect: pages [address, address + size) get perms.
+struct ProtectRequest {
+    VAddr address;
+    size_t size;
+    Core::MemoryPermission perms;
+};
+
+// sotc: SOTC_PROTECT_ASYNC. Applies queued protects in FIFO order on one thread (apply is the Impl's
+// ProtectNow). A request that touches the last queued one with the same permission is merged into it:
+// nothing is queued between them, so the order is unchanged. Flush waits until every request made
+// before the call has been applied. Neither the worker nor Flush takes a page lock, so a flush may be
+// made with page locks held. While applying, the worker takes the guest stack registry (shared) and
+// the runtime's memory lock (as a reader), as every protect does.
+class ProtectWorker {
+public:
+    using Apply = std::function<void(VAddr, size_t, Core::MemoryPermission)>;
+
+    explicit ProtectWorker(Apply apply_) : apply{std::move(apply_)}, thread{[this] { Run(); }} {}
+
+    ~ProtectWorker() {
+        {
+            std::lock_guard lk{mtx};
+            stop = true;
+        }
+        work_cv.notify_one();
+        thread.join(); // Run applies what is still queued, then returns
+    }
+
+    ProtectWorker(const ProtectWorker&) = delete;
+    ProtectWorker& operator=(const ProtectWorker&) = delete;
+
+    void Enqueue(VAddr address, size_t size, Core::MemoryPermission perms) {
+        std::lock_guard lk{mtx};
+        ++enqueued_seq;
+        ++stats.queued_runs;
+        stats.queued_pages += size / 4096;
+        if (!queue.empty()) {
+            ProtectRequest& last = queue.back();
+            if (last.perms == perms && address <= last.address + last.size &&
+                last.address <= address + size) {
+                const VAddr begin = std::min<VAddr>(last.address, address);
+                const VAddr end = std::max<VAddr>(last.address + last.size, address + size);
+                last.address = begin;
+                last.size = end - begin;
+                ++stats.merged_runs;
+                return;
+            }
+        }
+        const bool wake = queue.empty();
+        queue.push_back({address, size, perms});
+        if (wake) {
+            work_cv.notify_one();
+        }
+    }
+
+    /// Waits until every request made before this call has been applied.
+    void Flush() {
+        std::unique_lock lk{mtx};
+        const u64 target = enqueued_seq;
+        if (done_seq >= target) {
+            return;
+        }
+        ++stats.flushes;
+        const u64 start = SotcStats::NowNs();
+        done_cv.wait(lk, [this, target] { return done_seq >= target; });
+        stats.flush_wait_ns += SotcStats::NowNs() - start;
+    }
+
+    /// True while a request is queued or being applied.
+    bool Pending() {
+        std::lock_guard lk{mtx};
+        return done_seq < enqueued_seq;
+    }
+
+    PageManager::ProtectAsyncStats TakeStats(bool reset) {
+        std::lock_guard lk{mtx};
+        PageManager::ProtectAsyncStats out = stats;
+        if (reset) {
+            stats = {};
+        }
+        return out;
+    }
+
+private:
+    void Run() {
+        Common::SetCurrentThreadName("shadPS4:ProtectAsync");
+        std::vector<ProtectRequest> batch;
+        for (;;) {
+            u64 batch_seq = 0;
+            {
+                std::unique_lock lk{mtx};
+                const u64 start = SotcStats::NowNs();
+                work_cv.wait(lk, [this] { return stop || !queue.empty(); });
+                stats.worker_wait_ns += SotcStats::NowNs() - start;
+                if (queue.empty()) {
+                    return; // stopped, with nothing left to apply
+                }
+                // The queue keeps the batch's empty buffer; the order of the requests is kept.
+                batch.swap(queue);
+                batch_seq = enqueued_seq;
+                ++stats.applied_batches;
+            }
+            for (const ProtectRequest& request : batch) {
+                apply(request.address, request.size, request.perms);
+            }
+            {
+                std::lock_guard lk{mtx};
+                stats.applied_runs += batch.size();
+                done_seq = batch_seq;
+            }
+            done_cv.notify_all();
+            batch.clear();
+        }
+    }
+
+    Apply apply;
+    std::mutex mtx;
+    std::condition_variable work_cv;
+    std::condition_variable done_cv;
+    std::vector<ProtectRequest> queue; ///< requests not yet taken by the worker, in order
+    u64 enqueued_seq = 0;              ///< requests made so far
+    u64 done_seq = 0;                  ///< requests applied (the batches are taken in order)
+    bool stop = false;
+    PageManager::ProtectAsyncStats stats{};
+    std::thread thread; // last: Run uses the members above
+};
+
+// sotc: the protect worker of SOTC_PROTECT_ASYNC (null when the switch is off). Created by the
+// PageManager constructor and destroyed, after applying what is queued, by its destructor.
+std::unique_ptr<ProtectWorker> g_protect_async;
+
+// sotc: applies every queued protect (no-op without SOTC_PROTECT_ASYNC).
+void FlushProtectQueue() {
+    if (g_protect_async) {
+        g_protect_async->Flush();
+    }
+}
+
+// sotc: a queued protect has not been applied yet: the OS protection of its pages lags the tracker.
+bool ProtectsPending() {
+    return g_protect_async && g_protect_async->Pending();
+}
+
 /// sotc: SOTC_PROTECT_COALESCE: pages of a hole between two runs of one protection that a flush
 /// bridges with a single call (SOTC_PROTECT_GAP, default 8; 0 = no bridging, also when the switch
 /// is off). A bridged page is protected only if its own state is that protection, under its page
@@ -296,6 +459,7 @@ void RegisterGuestStack(VAddr address, u64 size) {
     }
     // Protects that computed their ranges before the insert have finished their host protect
     // (they held the lock shared); later ones see the range. Make it accessible now.
+    FlushProtectQueue(); // sotc: SOTC_PROTECT_ASYNC, queued protects of these pages come first
     Core::Memory::Instance()->GetAddressSpace().Protect(begin, end - begin,
                                                         Core::MemoryPermission::ReadWrite);
 }
@@ -523,7 +687,20 @@ struct PageManager::Impl {
         // No-op
     }
 
-    virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
+    /// sotc: SOTC_PROTECT_ASYNC. The host protection of [address, address + size) as the tracker asks
+    /// for it. A restriction made by the draw thread (outside a fault) is queued for the worker; every
+    /// other protect is applied at once, after the queue is flushed, so it cannot be overtaken.
+    void Protect(VAddr address, size_t size, Core::MemoryPermission perms) {
+        if (g_protect_async && tl_protect_offload_thread && tl_protect_batch.suspended == 0 &&
+            perms != Core::MemoryPermission::ReadWrite) {
+            g_protect_async->Enqueue(address, size, perms);
+            return;
+        }
+        FlushProtectQueue();
+        ProtectNow(address, size, perms);
+    }
+    /// Applies the protection now (the operating system call). Protect and the worker call it.
+    virtual void ProtectNow(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
 
     /// Re-applies the protection implied by the watchers of every page in the range, after the
     /// host mapping was recreated with its default protection.
@@ -1067,7 +1244,7 @@ public:
         ASSERT_MSG(ret != -1, "Uffdio unregister failed with error: {}", Common::GetLastErrorMsg());
     }
 
-    void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+    void ProtectNow(VAddr address, size_t size, Core::MemoryPermission perms) override {
         if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, no page is ever protected
             return;
         }
@@ -1174,7 +1351,7 @@ struct SignalImpl : public PageManager::Impl {
         }
     }
 
-    void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+    void ProtectNow(VAddr address, size_t size, Core::MemoryPermission perms) override {
         // sotc: SOTC_NATIVE=1, no page is ever protected (SOTC_VERIFY=n1: record-only protection)
         if (!SotcNative::TracksGuestPages() && !SotcN1Verify::On() && SotcNative::TrackMode() != 3) {
             return;
@@ -1384,6 +1561,10 @@ struct SignalImpl : public PageManager::Impl {
             }
             return;
         }
+        // sotc: SOTC_PROTECT_ASYNC: a queued protect makes the OS state lag the tracker: not a desync.
+        if (ProtectsPending()) {
+            return;
+        }
 #ifdef _WIN32
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(reinterpret_cast<void*>(page), &mbi, sizeof(mbi)) &&
@@ -1488,6 +1669,7 @@ struct SignalImpl : public PageManager::Impl {
         } else {
             SotcN1Verify::NoteReadFault(addr, rip, who);
         }
+        FlushProtectQueue(); // sotc: SOTC_PROTECT_ASYNC, see SignalImpl::ProtectNow
         Core::Memory::Instance()->GetAddressSpace().Protect(page, PageManager::PM_PAGE_SIZE,
                                                             Core::MemoryPermission::ReadWrite);
         return true;
@@ -1651,6 +1833,7 @@ struct SignalImpl : public PageManager::Impl {
                 }
                 return false;
             }
+            FlushProtectQueue(); // sotc: SOTC_PROTECT_ASYNC, see SignalImpl::ProtectNow
             Core::Memory::Instance()->GetAddressSpace().Protect(
                 PageManager::GetPageAddr(addr), PageManager::PM_PAGE_SIZE,
                 Core::MemoryPermission::ReadWrite);
@@ -1753,6 +1936,7 @@ struct SignalImpl : public PageManager::Impl {
                             rasterizer->GetBufferCache().DropGpuWrittenState(PageManager::GetPageAddr(addr),
                                                                              PageManager::PM_PAGE_SIZE);
                         }
+                        FlushProtectQueue(); // sotc: SOTC_PROTECT_ASYNC, see SignalImpl::ProtectNow
                         Core::Memory::Instance()->GetAddressSpace().Protect(
                             PageManager::GetPageAddr(addr), PageManager::PM_PAGE_SIZE,
                             Core::MemoryPermission::ReadWrite);
@@ -1764,6 +1948,9 @@ struct SignalImpl : public PageManager::Impl {
                 // sotc: SOTC_FAULT_OWNERS: the allocation that owns the faulting page (probe_memtype.cpp).
                 if (!is_gpu_thread && SotcNative::TrackMode() == 3 && SotcProbes::FaultOwnersOn()) {
                     SotcProbes::NoteFaultOwner(addr);
+                }
+                if (!is_gpu_thread && SotcNative::TrackMode() == 3 && SotcAllocSites::On()) {
+                    SotcAllocSites::NoteCpuFault(addr); // sotc: SOTC_ALLOC_SITES
                 }
                 if (static bool query_set = false; !query_set && SotcFaultEmu::On()) {
                     SotcFaultEmu::SetGpuQuery([](uint64_t a, uint64_t s) {
@@ -2055,11 +2242,22 @@ struct SignalImpl : public PageManager::Impl {
 };
 
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
+    // sotc: SOTC_PROTECT_ASYNC: the worker applies queued protects through the implementation.
+    const auto start_protect_async = [this] {
+        if (ProtectAsyncOn()) {
+            Impl* raw = impl.get();
+            g_protect_async = std::make_unique<ProtectWorker>(
+                [raw](VAddr address, size_t size, Core::MemoryPermission perms) {
+                    raw->ProtectNow(address, size, perms);
+                });
+        }
+    };
 #ifdef __linux__
     if (EmulatorSettings.IsUserfaultfdTracking()) {
         try {
             impl = std::make_unique<UffdImpl>(rasterizer_);
             LOG_INFO(Config, "Memory tracking method: userfaultfd");
+            start_protect_async();
             return;
         } catch (const std::runtime_error& e) {
             // if uffd is unsupported, falls back to SignalImpl
@@ -2068,16 +2266,35 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
     LOG_INFO(Config, "Memory tracking method: signals");
 #endif
     impl = std::make_unique<SignalImpl>(rasterizer_);
+    start_protect_async();
 }
 
-PageManager::~PageManager() = default;
+PageManager::~PageManager() {
+    // sotc: SOTC_PROTECT_ASYNC: the queue is applied and the worker stopped before impl goes.
+    g_protect_async.reset();
+}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);
 }
 
 void PageManager::OnGpuUnmap(VAddr address, size_t size) {
+    // sotc: SOTC_PROTECT_ASYNC: queued protects land before the mapping goes.
+    FlushProtectQueue();
     impl->OnUnmap(address, size);
+}
+
+// sotc: SOTC_PROTECT_ASYNC (page_manager.h).
+void PageManager::FlushPendingProtects() {
+    FlushProtectQueue();
+}
+
+void PageManager::SetProtectAsyncThread(bool on) noexcept {
+    tl_protect_offload_thread = on;
+}
+
+PageManager::ProtectAsyncStats PageManager::GetProtectAsyncStats(bool reset) {
+    return g_protect_async ? g_protect_async->TakeStats(reset) : ProtectAsyncStats{};
 }
 
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op, bool deferrable) const {

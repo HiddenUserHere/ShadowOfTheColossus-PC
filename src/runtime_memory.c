@@ -1865,6 +1865,32 @@ int32_t runtime_memory_reserve_range_export(void **inout, uint64_t size, int fla
 int32_t runtime_memory_batch_map_export(void *entries, int count, int *processed) {
     return batch_map((BatchEntry *)entries,count,processed);
 }
+/* sotc: SOTC_GPU_PLACE (gpu/sotc/gpu_region.cpp): maps backing for the port's GPU region at a fixed address of a
+ * range the port reserved. The game takes all direct memory there is and most of its FLEXIBLE_SIZE (448 MiB) budget,
+ * so the region uses the flexible backing above that budget (FLEX_SPAN is 1 GiB). The bytes are not charged to the
+ * game's flexible budget (flexible_bytes), so its own maps and its available-memory query are unchanged. The region
+ * never unmaps. */
+int32_t runtime_memory_port_flexible_export(uint64_t start, uint64_t size, int prot) {
+    int32_t result = INVALID;
+    write_lock();
+    if (start && size && !(size % PAGE) && !(prot & ~0x37) && !pool()) {
+        uint64_t phys = flex_alloc(size);
+        if (phys == UINT64_MAX) {
+            result = NO_MEMORY;
+        } else {
+            chunks_alloc_note(phys, size);
+            void *at = (void *)(uintptr_t)start;
+            result = place(&at, size, prot, MAP_FIXED_FLAG, PAGE, KIND_FLEXIBLE, 0, phys);
+            if (result) flex_free(phys, size);
+            else flexible_bytes -= size; /* place() charged it to the game's budget */
+        }
+    }
+    write_unlock();
+    flush_hooks();
+    if (result) fprintf(stderr, "Runtime: port flexible map of %" PRIu64 " bytes at 0x%" PRIx64 " failed (0x%x)\n",
+                        size, start, (unsigned)result);
+    return result;
+}
 /* sotc: largest free direct-memory range in [low,high) at the given alignment. */
 static ABI int32_t direct_available(int64_t low, int64_t high, uint64_t alignment, int64_t *physical, uint64_t *size) {
     if (!alignment) alignment = PAGE;

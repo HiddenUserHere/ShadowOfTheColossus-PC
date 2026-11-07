@@ -6,9 +6,14 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "core/libraries/videoout/buffer.h"
 #include <imgui.h> // sotc port: ImTextureID only
@@ -122,6 +127,25 @@ public:
     Frame* PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                         VAddr cpu_address);
 
+    /// sotc: SOTC_FLIP_THREAD=1 (off by default). The draw thread records only the copy of the
+    /// game's front buffer into one of the SOTC_FLIP_IMAGES port-owned images, on draw_scheduler at the
+    /// flip's position of the stream, and queues the rest of the flip (the frame's wait for a free
+    /// presentation frame, FSR 1 / sharpen, the post process pass, the submit) to the flip thread,
+    /// which hands the frame to on_frame, in flip order. With SOTC_FLIP_COALESCE, a flip that finds
+    /// its flip image still in use joins the newest queued job the flip thread has not started
+    /// instead of waiting: on_frame then runs with the job's frame (first flip) or with null
+    /// (later flips of the job, which only flip). True when queued: the caller must not
+    /// call PrepareFrame, and on_frame runs later on the flip thread. False when the flip takes the
+    /// usual path (any DLSS / frame generation / hud-less / shot case, or the switch is off): the
+    /// flip thread has then finished every earlier flip, and the caller calls PrepareFrame.
+    bool QueueFlip(const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address,
+                   std::function<void(Frame*)> on_frame);
+
+    /// sotc: SOTC_FLIP_THREAD. Returns once every flip queued by QueueFlip has been handed to its
+    /// on_frame. Call before anything else that presents or takes a frame on the draw thread
+    /// (blank frames, the usual path), so that the presentation order is kept. No-op when off.
+    void FlipDrain();
+
     /// sotc: SOTC_FLIP_SERVICE=1 (off by default). Set by the command processor when the draw
     /// thread prepares the frames: PrepareFrame first waits for a free presentation frame,
     /// calling this every 200 us of waiting, so the commands of the game's threads (unmaps,
@@ -182,9 +206,61 @@ public:
     u64 PresentDoneNs(u64 id) const;
 
 private:
+    /// sotc: SOTC_FLIP_THREAD: one of the port-owned images a flip is copied into (SOTC_FLIP_IMAGES).
+    /// busy: from the draw thread's copy until the flip thread's submit that reads it; read_tick is
+    /// the flip scheduler tick of that submit (0: none yet). Guarded by flip_mutex, except image,
+    /// view and the size fields, which only the draw thread changes, and only while !busy.
+    struct FlipImage {
+        vk::Image image{};
+        vk::ImageView view{};
+        VmaAllocation allocation{};
+        vk::Format format{};      ///< format of the game image it copies
+        vk::Format view_format{}; ///< format of the view the passes sample
+        u32 width{};
+        u32 height{};
+        bool busy{};
+        u64 read_tick{};
+    };
+
+    /// sotc: SOTC_FLIP_THREAD: one queued job, in the order the draw thread queued them. A job is
+    /// one presented frame; with SOTC_FLIP_COALESCE it can carry several flips (on_frames). The
+    /// job at the front of flip_jobs is the one the flip thread runs; it leaves the deque when done.
+    struct FlipJob {
+        u32 slot{};
+        u64 copy_tick{};          ///< draw_scheduler tick of the (last) copy
+        u32 width{};              ///< presentation frame size of the flip
+        u32 height{};
+        vk::Extent2D source_size{}; ///< size of the game image the copy read
+        bool srgb_input{};
+        bool started{};           ///< the flip thread runs it (guarded by flip_mutex); no more copies
+        bool filling{};           ///< the draw thread is recording a coalesced copy into it; not started yet
+        /// One per flip the job presents, in flip order. The first gets the frame; the others get
+        /// null, so the driver flips without a second present (SOTC_FLIP_COALESCE).
+        std::vector<std::function<void(Frame*)>> on_frames;
+    };
+
+    /// sotc: SOTC_FLIP_IMAGES=N (2..8, default 3, read once): the number of flip images (the ring size).
+    static u32 FlipImageCount();
+
     Frame* GetRenderFrame();
+    /// sotc: a presentation frame of width x height (GetRenderFrame() uses the expected size).
+    Frame* GetRenderFrame(u32 width, u32 height);
     /// sotc: SOTC_FLIP_SERVICE: waits until a presentation frame is free, calling wait_service.
     void WaitFreeFrame();
+
+    /// sotc: SOTC_FLIP_THREAD. The output size of the game image (SOTC_OUTPUT_RES), as PrepareFrame
+    /// sets it.
+    void ApplyOutputRes(vk::Extent2D image_size);
+    /// sotc: the host passes of the usual path (FSR 1 or bilinear, then the post process pass) from
+    /// source_view into frame. Records into cmdbuf only; shared by PrepareFrame and the flip thread.
+    void RenderPlainPasses(vk::CommandBuffer cmdbuf, vk::ImageView source_view,
+                           vk::Extent2D source_size, Frame* frame, bool srgb_input);
+    bool CreateFlipImage(FlipImage& flip, vk::Format format, vk::Format view_format,
+                         vk::Extent2D size);
+    void DestroyFlipImage(FlipImage& flip);
+    /// sotc: SOTC_FLIP_THREAD, the flip thread's loop and one flip of it.
+    void FlipThreadMain();
+    void RunFlipJob(FlipJob& job);
 
     /// sotc: SOTC_PRESENT_WAIT. A tagged present: its id, the swapchain it went to, and when
     /// WaitPresented saw it done (0 until then).
@@ -228,6 +304,9 @@ private:
     Scheduler draw_scheduler;
     Scheduler present_scheduler;
     Scheduler flip_scheduler;
+    /// sotc: SOTC_FLIP_THREAD: the flip thread's own scheduler (no recorder thread). Used by the flip
+    /// thread, except Wait on the draw thread when a flip image changes size or format.
+    Scheduler flip_thread_scheduler;
     Swapchain swapchain;
     LowLatency low_latency{instance}; ///< sotc: SOTC_LOW_LATENCY backend, see vk_low_latency.h
     Runtime runtime;
@@ -246,6 +325,16 @@ private:
     Frame* last_submit_frame;
     std::mutex free_mutex;
     std::condition_variable free_cv;
+    /// sotc: SOTC_FLIP_THREAD state, guarded by flip_mutex (see FlipImage, FlipJob).
+    std::mutex flip_mutex;
+    std::condition_variable_any flip_cv; ///< flip jobs queued, flip images freed, drained
+    std::deque<FlipJob> flip_jobs; ///< front: the job the flip thread runs (started), then the queued ones
+    u64 flip_queued{};   ///< jobs queued by QueueFlip
+    u64 flip_done{};     ///< jobs whose on_frame has run
+    bool flip_stop{};    ///< the destructor asks the flip thread to drain and exit
+    std::vector<FlipImage> flip_images = std::vector<FlipImage>(FlipImageCount());
+    u64 flip_seq{};      ///< draw thread only: the flip image of the next flip is flip_seq % flip_images.size()
+    std::jthread flip_thread; ///< started by the first QueueFlip while the switch is on
     std::atomic<s32> pending_flips{0}; ///< sotc: SOTC_CP_FLIP_PACE, see cp_pacer
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;

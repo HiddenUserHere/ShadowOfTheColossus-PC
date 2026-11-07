@@ -10,13 +10,13 @@ was not run. "Verified" means seen in the code; everything else is marked inferr
 ## Result
 
 No true sharing was found in any of the systems behind the remaining faults. In each one the CPU writes CPU-only
-data that shares 4 KiB pages with GPU-written buffers, or the GPU writes data the CPU only reads.
+data that shares 4 KiB pages with GPU-written buffers, or the GPU writes data the CPU only reads. A static scan of every GPU-written allocation site (2026-11-06) found no true sharing either; see HEAP-MAP.md, "Allocation-site registry".
 
 | System | CPU writes | GPU writes | Same bytes? | Fix without a merge |
 |---|---|---|---|---|
 | Render jobs (`RenderThread::SubmitJob` block 0x610, `RunFunctionAsRenderJob` block 0x100, both RenderSingleFrameCPU) | job records, command-list pointer lists | nothing in them (the GPU reads the DCBs the lists point to) | no | the blocks are CPU-only: place them in a CPU heap, or skip the merge when the write is outside GPU ranges |
 | ResolveSunShadows header (`0xafde0` region, 16 bytes, CPU_RenderToGPUToGame) | the header once per frame before the draw | nothing (GPU reads it in place through a `sub_8be60` usage 0x804 view) | no | upload on bind as today |
-| EOP completion labels (`BPGnm_EmitEventWriteEop` 0x86eb60, `BPGnm_WriteCsDoneLabel`) | other words of the same command-buffer block | label qwords (e.g. +0x68, +0x78) | no (different bytes) | skip the merge when the CPU write is outside the GPU range |
+| EOP completion labels (`BPGnm_EmitEventWriteEop` 0x86eb60, `BPGnm_WriteCsDoneLabel`) | other words of the same command-buffer block | label qwords (e.g. +0x68, +0x78), written by the emulated command processor, not by a shader | yes (same bytes; the writer is the emulated command processor) | skip the merge when the CPU write is outside the GPU range |
 | XPR visibility masks (`BuildSetDraws` 0x19b760, shadow variant `sub_19c1a0`) | **never** (no clear before, no write after) | the masks, by compute (`BPGnm_DispatchDirect` 0x19c0f1), then an EOP label = 1 after all dispatches | no | the masks' neighbours in RenderSingleFrameCPU are the faulting writers (`sub_c7850` 0x1228-byte records, job blocks); the masks themselves only need a GPU->CPU path |
 | Particle stats (`sub_fffa0` pool, `ParticleSystemPool::ProcessStats` 0x1018c0, dispatch `sub_928f0`) | CPU-only pool arrays: stamp array `pool+0x188` (the hot store 0x101ae4 is a clock stamp), records `+0x178`, handle table `+0x180`, bitmap `+0x198` | a 3-slot stats ring (usage 1 buffers `+0xf8/+0x120/+0x148`) | no; the CPU reads slot (k-2)%3, two frames late, and never writes the ring | placement of the CPU arrays away from the GPU buffers |
 | PhysX writer (`sub_a3ee50`, 64-byte records in GameSingleFrame), GameToRenderThread (`sub_4f6f40`), `xadd` in `sub_b30ce0` | CPU data / a CPU refcount under a mutex | nothing | no | none needed |

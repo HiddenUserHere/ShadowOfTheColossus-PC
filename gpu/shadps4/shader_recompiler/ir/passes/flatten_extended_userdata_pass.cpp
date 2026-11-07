@@ -341,6 +341,10 @@ struct PassInfo {
     std::vector<SotcSrtSource>* sotc_sources = nullptr;
     std::vector<u32> sotc_path;
     bool sotc_path_ok = true;
+    // sotc: SOTC_CP_SRT_PLAN: the walk plan (srt.h), built as the walker is emitted, and the node of
+    // the level being walked (-1: none, so a root has no parent)
+    SrtWalkPlan plan{};
+    s32 plan_cur = -1;
 
     PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
         auto it = pointer_uses.find(inst);
@@ -974,6 +978,160 @@ static void EmitCleanLoadStub(Xbyak::CodeGenerator& c, PassInfo& pass_info) {
     c.ret();
 }
 
+// sotc: SOTC_CP_SRT_PLAN. The largest value the walker can compute for an offset (its code is 32-bit).
+// nullopt when no bound is known: a guest load, a subtraction, a Phi that does not resolve, ...
+static std::optional<u64> OffsetBound(const IR::Value& value, PassInfo& pass_info, int depth) {
+    constexpr u64 Max32 = 0xFFFFFFFFULL;
+    if (depth > 64) {
+        return std::nullopt;
+    }
+    if (value.IsImmediate()) {
+        return u64{value.U32()};
+    }
+    const IR::Inst* inst = value.Inst();
+    const auto bound = [&](const IR::Value& arg) { return OffsetBound(arg, pass_info, depth + 1); };
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::IAdd32: {
+        const auto a = bound(inst->Arg(0));
+        const auto b = bound(inst->Arg(1));
+        if (!a || !b || *a + *b > Max32) {
+            return std::nullopt;
+        }
+        return *a + *b;
+    }
+    case IR::Opcode::IMul32: {
+        const auto a = bound(inst->Arg(0));
+        const auto b = bound(inst->Arg(1));
+        if (!a || !b || (*a != 0 && *b > Max32 / *a)) {
+            return std::nullopt;
+        }
+        return *a * *b;
+    }
+    case IR::Opcode::ShiftLeftLogical32: {
+        const auto a = bound(inst->Arg(0));
+        if (!a || !inst->Arg(1).IsImmediate() || inst->Arg(1).U32() >= 32) {
+            return std::nullopt;
+        }
+        const u64 shifted = *a << inst->Arg(1).U32();
+        if (shifted > Max32) {
+            return std::nullopt;
+        }
+        return shifted;
+    }
+    case IR::Opcode::ShiftRightLogical32: {
+        if (!inst->Arg(1).IsImmediate() || inst->Arg(1).U32() >= 32) {
+            return std::nullopt;
+        }
+        // whatever the operand is, the shifted value is below 2^(32 - shift)
+        const auto a = bound(inst->Arg(0));
+        const u64 operand = a ? *a : Max32;
+        return operand >> inst->Arg(1).U32();
+    }
+    case IR::Opcode::BitwiseAnd32:
+    case IR::Opcode::UMin32: {
+        // at most each bounded operand
+        const auto a = bound(inst->Arg(0));
+        const auto b = bound(inst->Arg(1));
+        if (a && b) {
+            return *a < *b ? *a : *b;
+        }
+        return a ? a : b;
+    }
+    case IR::Opcode::BitwiseOr32:
+    case IR::Opcode::BitwiseXor32: {
+        const auto a = bound(inst->Arg(0));
+        const auto b = bound(inst->Arg(1));
+        if (!a || !b) {
+            return std::nullopt;
+        }
+        // below the next all-ones value above the larger operand
+        u64 m = *a < *b ? *b : *a;
+        m |= m >> 1;
+        m |= m >> 2;
+        m |= m >> 4;
+        m |= m >> 8;
+        m |= m >> 16;
+        return m;
+    }
+    case IR::Opcode::UMax32: {
+        const auto a = bound(inst->Arg(0));
+        const auto b = bound(inst->Arg(1));
+        if (!a || !b) {
+            return std::nullopt;
+        }
+        return *a < *b ? *b : *a;
+    }
+    case IR::Opcode::BitFieldUExtract: {
+        // the emitted code masks the field with its immediate count
+        if (!inst->Arg(2).IsImmediate() || inst->Arg(2).U32() >= 32) {
+            return std::nullopt;
+        }
+        const u32 count = inst->Arg(2).U32();
+        return count == 0 ? u64{0} : Max32 >> (32 - count);
+    }
+    case IR::Opcode::Phi: {
+        IR::Value resolved;
+        boost::container::small_vector<const IR::Inst*, 8> path;
+        int budget = 256;
+        if (!ResolvePhi(pass_info, inst, resolved, path, budget)) {
+            return std::nullopt;
+        }
+        return bound(resolved);
+    }
+    default:
+        // GetUserData, ReadConst and ReadConstBuffer: values known only when the walker runs
+        return std::nullopt;
+    }
+}
+
+// sotc: SOTC_CP_SRT_PLAN. The read extent of a walk-plan node: bytes from its table base.
+static void PlanExtent(PassInfo& pass_info, s32 node, u64 bytes) {
+    if (node < 0) {
+        return;
+    }
+    if (bytes > 0xFFFFFFFFULL) {
+        pass_info.plan.complete = false;
+        return;
+    }
+    SrtWalkNode& entry = pass_info.plan.nodes[node];
+    if (bytes > entry.extent) {
+        entry.extent = static_cast<u32>(bytes);
+    }
+}
+
+// sotc: SOTC_CP_SRT_PLAN. Adds the node of a table whose pointer is read at off_dw of the level being
+// walked (plan_cur), or of the user data for a root (plan_cur -1). -1 when the plan is not complete.
+static s32 PlanAddLevel(PassInfo& pass_info, const IR::Value& off_dw) {
+    SrtWalkPlan& plan = pass_info.plan;
+    const s32 parent = pass_info.plan_cur;
+    if (!plan.complete) {
+        return -1;
+    }
+    if (!off_dw.IsImmediate() || plan.count == SrtWalkMaxNodes) {
+        // a computed pointer: its table is known only when the walker runs
+        plan.complete = false;
+        return -1;
+    }
+    if (parent >= 0) {
+        // the child's pointer is the 8 bytes at off_dw of the parent table: inside the parent's extent
+        PlanExtent(pass_info, parent, u64{off_dw.U32()} * sizeof(u32) + sizeof(u64));
+    }
+    plan.nodes[plan.count] = SrtWalkNode{parent, off_dw.U32(), 0, 0};
+    return static_cast<s32>(plan.count++);
+}
+
+// sotc: SOTC_CP_SRT_PLAN. A dynamic window (ReadConstDynamicWindowDwords from the base) of a node.
+static void PlanWindow(PassInfo& pass_info, s32 node) {
+    if (node >= 0) {
+        pass_info.plan.nodes[node].window = 1;
+    }
+}
+
+// sotc: SOTC_CP_SRT_PLAN. A read whose extent is not bounded: the program has no plan.
+static void PlanUnbounded(PassInfo& pass_info) {
+    pass_info.plan.complete = false;
+}
+
 static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const IR::Value& off_dw) {
     c.push(rdi);
     if (off_dw.IsImmediate()) {
@@ -1034,6 +1192,11 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
     ASSERT(use_list);
 
+    // sotc: SOTC_CP_SRT_PLAN: this level's node. Its parent is the level above (none for a root).
+    const s32 plan_parent = pass_info.plan_cur;
+    const s32 plan_node = PlanAddLevel(pass_info, off_dw);
+    pass_info.plan_cur = plan_node;
+
     // sotc: SOTC_VSIZE_PROBE. This level's table pointer is loaded at off_dw of the level above: extend the path.
     const bool sotc_prev_ok = pass_info.sotc_path_ok;
     if (pass_info.sotc_sources) {
@@ -1053,6 +1216,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     for (auto [src_off_dw, use] : *use_list) {
         if (src_off_dw.IsImmediate()) {
             EmitGuestLoad(c, pass_info, GuestLoadDst::R10d, ptr[rdi + (src_off_dw.U32() << 2)]);
+            PlanExtent(pass_info, plan_node, (u64{src_off_dw.U32()} + 1) * sizeof(u32));
         } else {
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
                 if (use->GetOpcode() != IR::Opcode::ReadConst) {
@@ -1066,8 +1230,15 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
                     EmitCopyWindow(c, pass_info.dst_off_dw);
                     pass_info.dst_off_dw += ReadConstDynamicWindowDwords;
                 }
+                PlanWindow(pass_info, plan_node);
                 use->SetFlags(*dynamic_window | ReadConstDynamicWindowFlag);
                 continue;
+            }
+            // sotc: SOTC_CP_SRT_PLAN: the index is at most its bound, so the read is inside (bound + 1) dwords
+            if (const auto bound = OffsetBound(src_off_dw, pass_info, 0)) {
+                PlanExtent(pass_info, plan_node, (*bound + 1) * sizeof(u32));
+            } else {
+                PlanUnbounded(pass_info);
             }
             c.shl(r10d, 2);
             c.mov(r10d, r10d);
@@ -1098,6 +1269,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         }
         pass_info.sotc_path_ok = sotc_prev_ok;
     }
+    pass_info.plan_cur = plan_parent; // sotc: SOTC_CP_SRT_PLAN, leave this level
     PopPtr(c);
 }
 
@@ -1154,6 +1326,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
                        info.srt_info.walker_func_size);
     }
 
+    info.srt_info.walk_plan = pass_info.plan; // sotc: SOTC_CP_SRT_PLAN
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
 }
 

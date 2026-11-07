@@ -295,21 +295,27 @@ struct ScopeMin {
     const char* name;
     uint64_t t0 = 0;
     uint64_t a;
-    explicit ScopeMin(const char* n, uint64_t a_ = 0) : name{n}, a{a_} {
+    // sotc: with SOTC_TRACE off, both are one test of kOn / t0; the span is out of line (Emit).
+    [[gnu::always_inline]] explicit ScopeMin(const char* n, uint64_t a_ = 0) : name{n}, a{a_} {
         if (kOn) {
             t0 = Now();
         }
     }
-    ~ScopeMin() {
+    [[gnu::always_inline]] ~ScopeMin() {
         if (t0) {
-            const uint64_t t1 = Now();
-            if (t1 - t0 >= kMinNs) {
-                Span(name, t0, t1, a);
-            }
+            Emit();
         }
     }
     ScopeMin(const ScopeMin&) = delete;
     ScopeMin& operator=(const ScopeMin&) = delete;
+
+private:
+    __attribute__((noinline)) void Emit() const {
+        const uint64_t t1 = Now();
+        if (t1 - t0 >= kMinNs) {
+            Span(name, t0, t1, a);
+        }
+    }
 };
 
 /// Draw-thread back ops: thousands per frame, so short ones are merged. An op of at least

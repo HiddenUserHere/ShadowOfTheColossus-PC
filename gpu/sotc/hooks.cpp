@@ -591,8 +591,8 @@ void RunDispatch(void* arg) {
             if (rec.has_handler && rec.handler.pre) {
                 action = rec.handler.pre(*call.regs, rec.handler.user);
             }
-            // sotc: Return is only valid at a function entry (hooks.h).
-            if (action == HookAction::Return && rec.mode != 0) {
+            // sotc: Return is only valid at a function entry, Entry (0) or Wrap (1) (hooks.h).
+            if (action == HookAction::Return && rec.mode != 0 && rec.mode != 1) {
                 action = HookAction::Continue;
             }
             // sotc: CallGuest needs the call the handler set (hooks.h); the stub runs it.

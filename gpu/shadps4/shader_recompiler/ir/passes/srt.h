@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <array>
+#include <utility>
+#include <vector>
 #include <boost/container/set.hpp>
 #include <boost/container/small_vector.hpp>
 #include "common/types.h"
@@ -45,6 +48,32 @@ PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
 /// True when code is inside the generated SRT walkers.
 bool IsSrtWalkerCode(const void* code);
 
+// sotc: SOTC_CP_SRT_PLAN=2 (read once): RefreshFlatBuf runs the walker with SrtPlanTraceContext and
+// SrtCopyWindowTraced, so every guest read it makes is recorded (Info::sotc_srt_trace). The reads are
+// the same as without it; only the context's page test and the window copy are wrapped.
+bool SrtPlanTraceEnabled();
+const SrtWalkerContext* SrtPlanTraceContext();
+void SrtCopyWindowTraced(u32* dst, u64 src, u64 bytes);
+void SrtTraceReset();
+/// Takes the reads recorded since the reset, without the ones inside [skip_begin, skip_end).
+void SrtTraceTake(std::vector<std::pair<u64, u32>>& out, u64 skip_begin, u64 skip_end);
+
+/// sotc: SOTC_CP_SRT_PLAN. One table level of a walker and the guest memory the walker reads from it.
+/// The levels are listed parents first (the walk order). Built with the walker (flatten pass) and
+/// evaluated by the CP precise wait (Liverpool::CpCollectSrtPlan).
+struct SrtWalkNode {
+    s32 parent{-1}; ///< the level that holds this level's pointer; -1: a root (user data)
+    u32 ptr_dw{};   ///< a root: the user data dword of its pointer; else the dword offset of the pointer in the parent
+    u32 extent{};   ///< bytes read from the table at its base (immediate and bounded dynamic offsets)
+    u32 window{};   ///< 1: a dynamic window (ReadConstDynamicWindowDwords dwords) is copied from the base
+};
+constexpr u32 SrtWalkMaxNodes = 48;
+struct SrtWalkPlan {
+    std::array<SrtWalkNode, SrtWalkMaxNodes> nodes{};
+    u32 count{};
+    bool complete{true}; ///< false: a read is not bounded, or the plan is too big: there is no plan
+};
+
 struct PersistentSrtInfo {
     // Special case when fetch shader uses step rates.
     struct SrtSharpReservation {
@@ -56,6 +85,7 @@ struct PersistentSrtInfo {
     PFN_SrtWalker walker_func{};
     size_t walker_func_size{};
     u32 flattened_bufsize_dw = 16; // NumUserDataRegs
+    SrtWalkPlan walk_plan{};       // sotc: SOTC_CP_SRT_PLAN; plain data (Serialize writes it as is)
 
     void Serialize(Serialization::Archive& ar) const;
     bool Deserialize(Serialization::Archive& ar);
