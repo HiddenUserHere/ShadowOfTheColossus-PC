@@ -413,3 +413,38 @@ add_executable(gpu-region-test EXCLUDE_FROM_ALL sotc/tests/gpu_region_test.cpp s
 target_include_directories(gpu-region-test PRIVATE sotc)
 target_compile_options(gpu-region-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_link_libraries(gpu-region-test PRIVATE -pthread)
+
+# sotc: 30 FPS cadence thresholds and consecutive misses (no Vulkan, no game).
+add_executable(frame-budget-test EXCLUDE_FROM_ALL sotc/tests/frame_budget_test.cpp)
+target_include_directories(frame-budget-test PRIVATE sotc)
+target_compile_options(frame-budget-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+
+# sotc: ledger/flight-recorder timing with a fake trace sink, no GPU.
+add_executable(block-ledger-test EXCLUDE_FROM_ALL sotc/tests/block_ledger_test.cpp sotc/block_ledger.cpp)
+target_include_directories(block-ledger-test PRIVATE sotc shadps4)
+target_compile_options(block-ledger-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+
+# sotc: mismatched/truncated driver cache headers must invalidate the GPL list (no GPU).
+add_executable(driver-cache-identity-test EXCLUDE_FROM_ALL sotc/tests/driver_cache_identity_test.cpp)
+target_include_directories(driver-cache-identity-test PRIVATE sotc)
+target_compile_options(driver-cache-identity-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+
+# sotc: boot completion with warm shaders and outstanding compute jobs (no GPU).
+add_executable(preparation-status-test EXCLUDE_FROM_ALL sotc/tests/preparation_status_test.cpp)
+target_include_directories(preparation-status-test PRIVATE sotc)
+target_compile_options(preparation-status-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+
+# sotc: actual recorder + ledger integration on a 64 KiB stack (no Vulkan).
+add_executable(trace-ledger-smoke-test EXCLUDE_FROM_ALL sotc/tests/trace_ledger_smoke_test.cpp
+               sotc/block_ledger.cpp shim/sotc_trace.cpp)
+target_include_directories(trace-ledger-smoke-test PRIVATE sotc shadps4)
+target_compile_options(trace-ledger-smoke-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_link_libraries(trace-ledger-smoke-test PRIVATE miniz::miniz -pthread)
+
+# sotc: a wildcard-compatible module is not necessarily a reproducible preparation recipe.
+add_executable(manifest-capture-test EXCLUDE_FROM_ALL sotc/tests/manifest_capture_test.cpp)
+target_include_directories(manifest-capture-test PRIVATE sotc shim shadps4 third_party/gcn/include)
+target_compile_options(manifest-capture-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_link_libraries(manifest-capture-test PRIVATE bbgpu)
+# Vendored shader headers have existing warnings; keep this test's own code under -Werror.
+target_include_directories(manifest-capture-test SYSTEM PRIVATE shadps4)

@@ -29,6 +29,7 @@ FrameAccount TakeAccount() {
     }
     a.parse_ns = cp_parse_all_ns.load(std::memory_order_relaxed);
     a.blocked_ns = cp_blocked_ns.load(std::memory_order_relaxed);
+    a.libwait_ns = cp_libwait_ns.load(std::memory_order_relaxed); // sotc: SOTCSTALL "cp libwait"
     a.spin_ns = cp_spin_ns.load(std::memory_order_relaxed);
     a.rec_busy = rec_busy_ns.load(std::memory_order_relaxed);
     a.rec_upload = rec_upload_wait_ns.load(std::memory_order_relaxed);
@@ -62,6 +63,7 @@ FrameAccount DiffAccount(const FrameAccount& now, const FrameAccount& before) {
     }
     d.parse_ns = sub(now.parse_ns, before.parse_ns);
     d.blocked_ns = sub(now.blocked_ns, before.blocked_ns);
+    d.libwait_ns = sub(now.libwait_ns, before.libwait_ns);
     d.spin_ns = sub(now.spin_ns, before.spin_ns);
     d.rec_busy = sub(now.rec_busy, before.rec_busy);
     d.rec_upload = sub(now.rec_upload, before.rec_upload);

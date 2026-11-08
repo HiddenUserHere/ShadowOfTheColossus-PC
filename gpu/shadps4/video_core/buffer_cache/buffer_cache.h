@@ -69,6 +69,47 @@ class TextureCache;
 class MemoryTracker;
 class PageManager;
 
+/// sotc: SOTC_FLAT_ARENA (gpu/sotc/nonblocking.h). A persistent home for flat constant tables keyed by content hash:
+/// a table seen before is bound at its arena offset, a new one is uploaded once (host-visible memory, as the stream
+/// ring). The arena is kChunks chunks of kChunkBytes, bump-allocated; when the current chunk is full the oldest
+/// chunk unused for kIdleTicks ticks whose last tick the GPU finished is emptied (its entries retired) and reused;
+/// with no such chunk the caller copies into the stream ring as before. Draw thread only.
+class FlatArena {
+public:
+    static constexpr u64 kChunkBytes = 2_MB;
+    static constexpr u32 kChunks = 32;
+    static constexpr u64 kIdleTicks = 64;
+    struct Ref {
+        vk::Buffer buffer{};
+        vk::DeviceAddress address{}; ///< device address of the arena buffer's byte 0
+        u64 offset{};
+    };
+    FlatArena(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler);
+    /// The place of the table `data` (`size` bytes, content hash `hash`): found, or uploaded now (`uploaded`).
+    /// `tick` is the tick of the command that reads it. false: no room (the caller uses the stream ring).
+    bool Obtain(u64 hash, const void* data, u32 size, u64 alignment, u64 tick, Ref& out, bool& uploaded);
+
+private:
+    struct Entry {
+        u32 chunk{};
+        u32 size{};
+        u64 offset{}; ///< in the arena buffer
+    };
+    struct Chunk {
+        u64 used{};
+        u64 last_tick{};
+        u32 entries{};
+    };
+    /// Makes another chunk current (empty or retired); false when every other chunk is in use.
+    bool OpenChunk(u64 tick);
+
+    Vulkan::Scheduler& scheduler;
+    Buffer buffer;
+    std::array<Chunk, kChunks> chunks{};
+    u32 current{};
+    std::unordered_map<u64, Entry> entries;
+};
+
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
     static constexpr u64 ARENA_PAGE_BITS = 32;
@@ -105,6 +146,11 @@ public:
     /// Retrieves the stream buffer.
     [[nodiscard]] StreamBuffer& GetStreamBuffer() noexcept {
         return stream_buffer;
+    }
+
+    /// sotc: SOTC_FLAT_ARENA: the flat constant arena, null without the switch.
+    [[nodiscard]] FlatArena* GetFlatArena() noexcept {
+        return flat_arena.get();
     }
 
     /// Returns minimum granularity of a sparse memory bind.
@@ -901,6 +947,7 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
 
     StreamBuffer stream_buffer;
+    std::unique_ptr<FlatArena> flat_arena; ///< sotc: SOTC_FLAT_ARENA
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
     /// sotc: gpu_modified_ranges is changed on the GPU side (the draw thread, see

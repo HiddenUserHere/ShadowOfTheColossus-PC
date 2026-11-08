@@ -317,7 +317,11 @@ void Swapchain::Destroy() {
     images_view.clear();
 
     if (swapchain) {
+        // sotc: not during a display cadence wait on this handle (PresentWaitMutex); the handle is
+        // cleared so a waiter never sees the destroyed one before Create sets the new one.
+        std::scoped_lock wait_lock{present_wait_mutex};
         device.destroySwapchainKHR(swapchain);
+        swapchain = nullptr;
     }
 
     for (const auto& sem : image_acquired) {

@@ -56,7 +56,13 @@ thread_local bool t_gpl_draw_use = false;       // sotc: SOTC_GPL_PREDICT (GplLi
 thread_local u32 t_gpl_missing = 0;
 thread_local bool t_gpl_discard = false;        // sotc: SOTC_GPL_PACK_LIBS (GplLibraryCache::SetDiscard)
 thread_local u64 t_gpl_found = 0;               // sotc: SOTC_GPL_PACK_LIBS (GplLibraryCache::ThreadFound)
-thread_local u64 t_gpl_failed = 0;              // sotc: SOTC_GPL_PACK_LIBS (GplLibraryCache::ThreadFailed)             // sotc: SOTC_GPL_PARALLEL_LIBS (GplLibraryCache::Missing)
+thread_local u64 t_gpl_failed = 0;              // sotc: SOTC_GPL_PACK_LIBS (GplLibraryCache::ThreadFailed)
+thread_local u64 t_gpl_lib_id = 0;              // sotc: SOTC_GPL_PREDICT (GplLibraryCache::SetLibraryId)
+u64 GplNowNs() {
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}             // sotc: SOTC_GPL_PARALLEL_LIBS (GplLibraryCache::Missing)
 } // namespace
 
 void GplLibraryCache::SetLookupOnly(bool lookup_only) {
@@ -89,6 +95,68 @@ bool GplLibraryCache::PartWanted(Part part) {
 
 void GplLibraryCache::SetOrigin(Origin origin) {
     t_gpl_origin = origin;
+}
+
+void GplLibraryCache::SetLibraryId(u64 id) {
+    t_gpl_lib_id = id;
+}
+
+void GplLibraryCache::Touch(u64 id, u64 now_ns) {
+    std::scoped_lock lock{refs_mutex};
+    Ref& ref = refs[id];
+    ++ref.count;
+    ref.last_ns = now_ns;
+}
+
+size_t GplLibraryCache::Referenced() {
+    std::scoped_lock lock{refs_mutex};
+    return refs.size();
+}
+
+void GplLibraryCache::SetLibraryCache(vk::PipelineCache cache) {
+    library_cache = cache;
+}
+
+vk::PipelineCache GplLibraryCache::LibraryCache() {
+    return library_cache;
+}
+
+u64 GplLibraryCache::LibraryBuilds() {
+    return library_builds.load(std::memory_order_relaxed);
+}
+
+size_t GplLibraryCache::EvictStale(u64 now_ns, u64 max_age_ns, const std::unordered_set<u64>& in_flight,
+                                   Evicted& out) {
+    std::scoped_lock lock{mutex, refs_mutex};
+    size_t evicted = 0;
+    for (const Part part : {PreRaster, Fragment}) { // the shader parts are the predicted ones
+        auto& map = parts[part];
+        for (auto it = map.begin(); it != map.end();) {
+            const Entry& e = it->second;
+            if ((e.flags & FlagPredicted) == 0 || (e.flags & FlagManifest) != 0 || e.lib_id == 0 ||
+                in_flight.contains(e.lib_id)) {
+                ++it;
+                continue;
+            }
+            u64 last = e.last_use_ns;
+            if (const auto ref = refs.find(e.lib_id); ref != refs.end()) {
+                last = std::max(last, ref->second.last_ns);
+            }
+            if (now_ns - std::min(now_ns, last) <= max_age_ns) {
+                ++it;
+                continue;
+            }
+            out.pipes.push_back(std::move(it.value().pipe));
+            out.ids.push_back(e.lib_id);
+            it = map.erase(it);
+            ++evicted;
+        }
+    }
+    if (evicted != 0) {
+        g_gpl_counters.predicted_evicted.fetch_add(evicted, std::memory_order_relaxed);
+        g_gpl_counters.held.fetch_sub(evicted, std::memory_order_relaxed);
+    }
+    return evicted;
 }
 
 void GplLibraryCache::SetDrawUse(bool draw_use) {
@@ -134,14 +202,24 @@ vk::Pipeline GplLibraryCache::GetOrBuild(Part part, const std::string& key, bool
             built = false;
             ++t_gpl_found;
             // sotc: SOTC_GPL_PREDICT: the first draw that finds a predicted library.
-            if (t_gpl_draw_use && (it->second.flags & FlagUsed) == 0) {
-                it.value().flags |= FlagUsed;
-                if ((it->second.flags & FlagPredicted) != 0) {
-                    g_gpl_counters.predicted_used.fetch_add(1, std::memory_order_relaxed);
+            if (t_gpl_draw_use) {
+                it.value().last_use_ns = GplNowNs(); // the eviction keeps what draws use
+                if ((it->second.flags & FlagUsed) == 0) {
+                    it.value().flags |= FlagUsed;
+                    if ((it->second.flags & FlagPredicted) != 0) {
+                        g_gpl_counters.predicted_used.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if ((it->second.flags & FlagPrebuilt) != 0) {
+                        g_gpl_counters.prebuilt_used.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
-                if ((it->second.flags & FlagPrebuilt) != 0) {
-                    g_gpl_counters.prebuilt_used.fetch_add(1, std::memory_order_relaxed);
-                }
+            } else if (t_gpl_origin == OriginPredicted && PartWanted(part) && (it->second.flags & FlagUsed) != 0 &&
+                       (it->second.flags & FlagPredicted) == 0) {
+                // sotc: SOTC_GPL_PREDICT: a predicted job whose library a draw built first: built after the draw. The
+                // library takes the predicted flag (its material references it from now on; evictable by age).
+                it.value().flags |= FlagPredicted;
+                it.value().lib_id = t_gpl_lib_id;
+                g_gpl_counters.predicted_late.fetch_add(1, std::memory_order_relaxed);
             }
             return *it->second.pipe;
         }
@@ -163,6 +241,7 @@ vk::Pipeline GplLibraryCache::GetOrBuild(Part part, const std::string& key, bool
         return {};
     }
     ++t_gpl_thread_built; // sotc: SOTC_GPL_NODROP, a library build on this thread (kept or not)
+    library_builds.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_PLAY_QUIET: the pack cache grew
     if (t_gpl_discard) {
         // sotc: SOTC_GPL_PACK_LIBS: compiled into the driver's pipeline cache only; destroyed here.
         built = true;
@@ -183,6 +262,12 @@ vk::Pipeline GplLibraryCache::GetOrBuild(Part part, const std::string& key, bool
             g_gpl_counters.predicted_built.fetch_add(1, std::memory_order_relaxed);
         } else if (t_gpl_origin == OriginUrgent) {
             g_gpl_counters.urgent_built.fetch_add(1, std::memory_order_relaxed);
+        } else if (t_gpl_origin == OriginManifest) {
+            flags |= FlagManifest; // sotc: SOTC_GPL_PREDICT: never evicted
+        }
+        it.value().lib_id = t_gpl_lib_id; // sotc: SOTC_GPL_PREDICT
+        if (t_gpl_draw_use) {
+            it.value().last_use_ns = GplNowNs();
         }
         // sotc: SOTC_GPL_DYN_STATE: built ahead of any draw (not for a waiting draw).
         if (!t_gpl_draw_use && t_gpl_origin != OriginUrgent) {
@@ -900,7 +985,10 @@ GraphicsPipeline::GraphicsPipeline(
                         if (fail_on_compile) {
                             c.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
                         }
-                        auto [r, h] = device.createGraphicsPipelineUnique(pipeline_cache, c);
+                        // sotc: SOTC_PLAY_QUIET: libraries live in the pack cache (read-mostly, saved by the pack
+                        // publication), not in the live cache the periodic saver reads.
+                        const vk::PipelineCache lib_cache = GplLibraryCache::LibraryCache();
+                        auto [r, h] = device.createGraphicsPipelineUnique(lib_cache ? lib_cache : pipeline_cache, c);
                         return std::pair{r, std::move(h)};
                     },
                     [&] { return debug_str; });
@@ -1152,6 +1240,9 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
     uses_bindless_samplers = false;
     uses_slot_words = false; // sotc: SOTC_HEAP
     packet_range = false;    // sotc: SOTC_PACKET, set by the stages below
+    // sotc: SOTC_BIND_DESC_REUSE: the flat buffer bindings of each set (indices into its bindings).
+    ResetDynamicFlat();
+    std::array<boost::container::small_vector<u32, 2>, Shader::MaxStageDescriptorSets> set_flat;
 
     for (const auto* stage : stages) {
         if (!stage) {
@@ -1172,6 +1263,9 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
             const auto sharp =
                 preloading ? AmdGpu::Buffer{}
                            : buffer.GetSharp(*stage); // See for the comment in compute PL creation
+            if (buffer.buffer_type == Shader::BufferType::Flatbuf) { // sotc: SOTC_BIND_DESC_REUSE
+                set_flat[set].push_back(static_cast<u32>(bindings.size()));
+            }
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eStorageBuffer,
@@ -1302,6 +1396,21 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
         .offset = sizeof(Shader::PushData),
         .size = sizeof(Shader::BindlessSamplerSlots),
     };
+    // sotc: SOTC_BIND_DESC_REUSE: in pool-allocated sets (not push descriptors or descriptor buffers, which cannot
+    // hold dynamic descriptors) the flat buffers become dynamic storage buffers. With a set per stage the device limit
+    // is split between the sets a layout can have, so a stage's set layout never depends on the other stages.
+    if (!uses_push_descriptors && !descriptor_buffer) {
+        const u32 limit = instance.MaxDescriptorSetStorageBuffersDynamic();
+        const u32 cap = stage_sets ? limit / Shader::MaxStageDescriptorSets : limit;
+        for (u32 set = 0; set < num_sets; ++set) {
+            MarkDynamicFlat(set_bindings[set], set_flat[set], set, cap);
+        }
+    } else {
+        for (u32 set = 0; set < num_sets; ++set) {
+            flat_bindings += static_cast<u32>(set_flat[set].size());
+        }
+    }
+    FinishDynamicFlat();
     boost::container::small_vector<LayoutCache::SetRequest, Shader::MaxStageDescriptorSets>
         requests;
     for (u32 set = 0; set < num_sets; ++set) {

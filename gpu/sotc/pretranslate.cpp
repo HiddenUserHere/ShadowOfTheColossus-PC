@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "common/hash.h"
+#include "nonblocking.h" // sotc: SOTC_COMPUTE_PACK turns the compute prebuild on
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/params.h"
@@ -82,7 +83,11 @@ bool PixelVertexOn() noexcept {
 bool ComputeOn() noexcept {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_PRETRANSLATE_COMPUTE");
-        return v && v[0] == '1';
+        if (v && v[0] != '\0') {
+            return v[0] == '1';
+        }
+        // sotc: SOTC_COMPUTE_PACK (default on) prebuilds the compute programs through this path when the switch is unset.
+        return SotcNonBlocking::ComputePackRequested();
     }();
     return on;
 }

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <deque>
 #include <memory>
 #include <span>
@@ -79,6 +80,37 @@ private:
     std::vector<vk::CommandBuffer> cmd_buffers;
 };
 
+/// sotc: SOTC_BIND_DESC_REUSE (gpu/sotc/nonblocking.h). The descriptor sets a Pipeline::BindResources committed and
+/// wrote, kept by the frame bind-cache entry of that bind so a later hit binds them without writing. Valid while the
+/// heap's pool serial is unchanged (DescriptorHeap::PoolSerial: a roll resets or replaces the pool the sets came from)
+/// and the descriptors a hit would write are the entry's own (checked by the rasterizer).
+/// sotc: with persistent sets (DescriptorHeap::PersistentSets) the sets come from the never-rolled persistent pools
+/// instead: the entry owns them until DescriptorHeap::RetirePersistent hands them back after `last_tick`, and the
+/// pool serial is not checked.
+struct DescriptorSetReuse {
+    static constexpr u32 MaxSets = 5; ///< Shader::MaxStageDescriptorSets
+    std::array<vk::DescriptorSet, MaxSets> sets{};
+    std::array<vk::DescriptorSetLayout, MaxSets> layouts{}; ///< sotc: the layout of each set (persistent sets)
+    u32 count{};          ///< sets kept (0: the bind path keeps none)
+    u64 pool_serial{};    ///< DescriptorHeap::PoolSerial() when the sets were committed
+    u64 last_tick{};      ///< sotc: the scheduler tick of the last command buffer that bound the sets
+    bool reuse{};         ///< in: bind `sets` as they are, write nothing; out: false when the path could not
+    bool keep{};          ///< sotc: in: a bind-cache entry will own the sets (persistent sets may be taken)
+    bool persistent{};    ///< sotc: out: the sets are persistent (RetirePersistent frees them)
+};
+
+/// sotc: SOTC_BIND_DESC_REUSE persistent set counters (DescriptorHeap::TakePersistentStats).
+struct PersistentSetStats {
+    u64 alive{};     ///< sets owned by bind-cache entries now
+    u64 retiring{};  ///< sets waiting for their last tick
+    u64 free{};      ///< sets in the per-layout free lists
+    u64 allocated{}; ///< sets allocated from the pools (since the last take)
+    u64 recycled{};  ///< sets taken from a free list (since the last take)
+    u64 freed{};     ///< sets back in a free list after their last tick (since the last take)
+    u64 pools{};     ///< persistent pools
+    u64 bytes{};     ///< estimate of the pools' descriptor memory
+};
+
 class DescriptorHeap final {
     static constexpr u32 DescriptorSetBatch = 32;
 
@@ -89,6 +121,29 @@ public:
     ~DescriptorHeap();
 
     vk::DescriptorSet Commit(vk::DescriptorSetLayout set_layout);
+
+    /// sotc: SOTC_BIND_DESC_REUSE. Serial of the pool Commit allocates from, bumped at every roll (reset or new pool).
+    /// A set committed under the current serial stays as written until this pool is retired, and the pool is retired
+    /// with the tick being recorded when it fills, so a set reused at any tick before that is covered by its wait.
+    [[nodiscard]] u64 PoolSerial() const noexcept {
+        return pool_serial;
+    }
+
+    /// sotc: SOTC_BIND_DESC_REUSE with the layout cache on (stable set layout handles): the sets a bind-cache entry
+    /// keeps come from persistent pools that are never reset. Set once by PipelineCache before any bind.
+    void EnablePersistentSets(bool on) noexcept {
+        persistent_on = on;
+    }
+    [[nodiscard]] bool PersistentSets() const noexcept {
+        return persistent_on;
+    }
+    /// sotc: a persistent set of `set_layout`: a free one whose last tick the GPU finished, else a new one.
+    vk::DescriptorSet AcquirePersistent(vk::DescriptorSetLayout set_layout);
+    /// sotc: hands the record's persistent sets back; they are reused once the GPU finished record.last_tick.
+    /// Nothing happens for a record without persistent sets.
+    void RetirePersistent(const DescriptorSetReuse& record);
+    /// sotc: the persistent set counters; the per-interval ones are reset.
+    PersistentSetStats TakePersistentStats();
 
     /// sotc: the descriptor buffer ring when SOTC_DESC_BUFFER=1 (vk_descriptor_buffer.h), else null.
     [[nodiscard]] DescriptorBufferRing* GetDescriptorBuffer() const noexcept {
@@ -114,6 +169,8 @@ public:
 
 private:
     void CreateDescriptorPool();
+    void CreatePersistentPool(); // sotc: SOTC_BIND_DESC_REUSE
+    void CollectPersistent();    // sotc: retired sets whose tick is free go back to their free list
 
 private:
     vk::Device device;
@@ -121,6 +178,8 @@ private:
     u32 descriptor_heap_count;
     std::span<const vk::DescriptorPoolSize> pool_sizes;
     vk::DescriptorPool curr_pool;
+    u64 pool_serial{1}; ///< sotc: SOTC_BIND_DESC_REUSE (PoolSerial)
+    std::vector<vk::DescriptorPoolSize> scaled_sizes; ///< sotc: SOTC_BIND_DESC_REUSE: pool_sizes x8 (CreateDescriptorPool)
     std::deque<std::pair<vk::DescriptorPool, u64>> pending_pools;
     using DescSetBatch = boost::container::static_vector<vk::DescriptorSet, DescriptorSetBatch>;
     tsl::robin_map<u64, DescSetBatch> descriptor_sets;
@@ -128,6 +187,20 @@ private:
     std::unique_ptr<DescriptorHeapBuffers> descriptor_heap_buffers; // sotc: SOTC_DESCRIPTOR_HEAP=1 only
     vk::DescriptorSetLayout bindless_layout{}; // sotc: SOTC_BINDLESS_SAMP, null otherwise
     vk::DescriptorSet bindless_set{};
+    // sotc: SOTC_BIND_DESC_REUSE persistent sets: pools never reset (destroyed with the heap), per-layout free lists,
+    // and the retired sets with the tick after which they are free.
+    struct RetiredSet {
+        u64 tick;
+        vk::DescriptorSetLayout layout;
+        vk::DescriptorSet set;
+    };
+    bool persistent_on{};
+    std::vector<vk::DescriptorPool> persistent_pools;
+    tsl::robin_map<u64, std::vector<vk::DescriptorSet>> persistent_free;
+    std::deque<RetiredSet> persistent_retired;
+    std::vector<vk::DescriptorPoolSize> persistent_sizes;
+    u64 persistent_alive{}, persistent_free_count{}, persistent_allocated{}, persistent_recycled{},
+        persistent_freed{};
 };
 
 } // namespace Vulkan

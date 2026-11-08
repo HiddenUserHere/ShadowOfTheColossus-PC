@@ -309,6 +309,52 @@ def display_drivers():
     return ';'.join(sorted(found)) or 'unknown'
 
 
+def run_file_identity(path, content_hash=False):
+    """Identify a run input without copying game data or reading large driver caches."""
+    path = Path(path)
+    result = {'path': str(path)}
+    try:
+        info = path.stat()
+        result.update(size=info.st_size, mtime_ns=info.st_mtime_ns)
+        if content_hash:
+            result['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        result['unavailable'] = type(error).__name__
+    return result
+
+
+def write_run_metadata(env, user, probe, image):
+    """Save the resolved launcher environment before starting native code (never on a frame thread).
+
+    Unset switches still use the binary's defaults; native PIPE CONFIG reports the resolved pipeline features.
+    Only runtime settings are recorded: unrelated environment variables and PATH are excluded.
+    """
+    user = Path(user)
+    manifest = Path(env.get('SOTC_PIPE_MANIFEST_DIR', PORT / 'data' / 'pipeline_manifest'))
+    record = {
+        'schema': 1, 'started_ns': time.time_ns(), 'pid': os.getpid(),
+        'image_fingerprint': image, 'probe': run_file_identity(probe),
+        'display_drivers': display_drivers(),
+        'settings': {name: env[name] for name in sorted(env) if name.startswith(('SOTC_', 'BB_'))},
+        'inputs': {
+            'shipped_manifest': run_file_identity(manifest / 'sotc-pipelines.tsv', True),
+            'user_manifest': run_file_identity(user / 'shader_predict' / 'sotc-pipelines.user.tsv', True),
+            'driver_cache': run_file_identity(user / 'cache' / 'sotc_vk_pipelines.bin'),
+            'preparation_stamp': run_file_identity(user / 'cache' / PREPARE_STAMP, True),
+        },
+    }
+    folder = user / 'prof' / 'run-settings'
+    path = folder / f'{record["started_ns"]}-{record["pid"]}.json'
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    except OSError as error:
+        print(f'SOTC RUN SETTINGS: not saved ({error})', file=sys.stderr, flush=True)
+        return None
+    print(f'SOTC RUN SETTINGS: {path}', flush=True)
+    return path
+
+
 def prepare_key(env, probe, image):
     """The fingerprint of the shaders a play launch would use: the port binary (size and mtime), the game image
     (its fingerprint, fingerprint()), the display drivers, and every SOTC_*/BB_* setting not in PREPARE_IGNORED."""
@@ -605,6 +651,10 @@ def main():
     if env.get('SOTC_PIPE_MANIFEST', '1') not in ('', '0'):
         env.setdefault('SOTC_RES_LOADED', '1')
         env.setdefault('SOTC_PIPE_MANIFEST_DIR', str(PORT / 'data' / 'pipeline_manifest'))
+    # The compute pack (default on, with the GPL pack): the compute programs of the loaded shader files are prebuilt
+    # into the pack cache at the first launch's loading hold; the loader hook feeds them (SotcPredict::NoteLoadedData).
+    if env.get('SOTC_COMPUTE_PACK', '1') not in ('', '0'):
+        env.setdefault('SOTC_RES_LOADED', '1')
     if on('SOTC_PRETRANSLATE') or on('SOTC_PRECOMPILE'):
         predict = user / 'shader_predict'
         predict.mkdir(exist_ok=True)
@@ -625,6 +675,8 @@ def main():
         ok = prepare_shaders(env, game, user, wanted, probe, force=prepare_only)
         if prepare_only:
             return 0 if ok else 1
+    # Resolved environment after ini, pending settings, mode defaults and preparation. No game execution here.
+    write_run_metadata(env, user, probe, wanted)
     command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--patches', str(out / 'patches.bin'),
                *(['--sotc-cmdline', str(out / 'cmdline.bin')] if (out / 'cmdline.bin').is_file() else []),

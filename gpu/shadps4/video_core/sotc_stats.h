@@ -2,6 +2,7 @@
 // sotc: counters printed with the frame rate (SOTC_FPS=1, videoout/driver.cpp).
 #pragma once
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -279,6 +280,31 @@ inline std::atomic<uint64_t> bf_memo_hits{0}, bf_memo_misses{0}, bf_memo_repaire
 /// hold a frame's worth?), and the entries live in the table.
 inline std::atomic<uint64_t> bf_flat_copied{0}, bf_flat_reused{0}, bf_distinct_keys{0},
     bf_frames{0}, bf_live{0};
+/// sotc: plan B of LOCKED-30-PLAN-2026-11-08 (gpu/sotc/nonblocking.h), one switch per group, printed in the
+/// "SOTC PLAN-B" 5 s line (vk_rasterizer.cpp, PlanBReport) while any of them is on.
+/// SOTC_BIND_DESC_REUSE: hits that bound the entry's committed sets without writing them; hits that wrote (by reason:
+/// no sets kept yet, the rolling descriptor pool rolled (sets not persistent), a flat copy moved to another buffer
+/// (ring reallocated, arena <-> ring), a flat copy moved in a layout whose flat bindings are not dynamic (limit
+/// fallback), a bind path that keeps no sets).
+inline std::atomic<uint64_t> pb_desc_reused{0};
+enum PbDescRewrite : uint32_t { PbDrNoSets, PbDrPoolRolled, PbDrRingMoved, PbDrLayoutFallback, PbDrNoPath, PbDrSites };
+inline std::array<std::atomic<uint64_t>, PbDrSites> pb_desc_rewritten{};
+inline constexpr const char* PbDescRewriteName(uint32_t r) {
+    constexpr const char* names[PbDrSites] = {"nosets", "pool", "ring", "layout", "path"};
+    return r < PbDrSites ? names[r] : "?";
+}
+/// sotc: SOTC_BIND_DESC_REUSE layouts (cumulative): sets whose flat buffer bindings became dynamic storage buffers,
+/// and sets that kept them static (more than the device's dynamic limit allows per set).
+inline std::atomic<uint64_t> pb_dyn_sets{0}, pb_dyn_fallback_sets{0};
+/// SOTC_SAMPLER_CACHE: per-tick sampler checks of a hit skipped / run.
+inline std::atomic<uint64_t> pb_sampler_skipped{0}, pb_sampler_checked{0};
+/// SOTC_HLE_FILL_SKIP: replicate fills skipped (same table in place) / run; run because no exact signal exists.
+inline std::atomic<uint64_t> pb_fill_skipped{0}, pb_fill_executed{0}, pb_fill_nosignal{0};
+/// SOTC_FLAT_ARENA: flat constant tables found in the arena / uploaded to it / retired with their chunk / sent to
+/// the stream ring (arena full or table too large).
+inline std::atomic<uint64_t> pb_flat_reused{0}, pb_flat_uploaded{0}, pb_flat_retired{0}, pb_flat_stream{0};
+/// SOTC_PROTECT_ASYNC_UNPROTECT: draw-thread unprotects queued for the worker / applied synchronously.
+inline std::atomic<uint64_t> pb_unprotect_queued{0}, pb_unprotect_sync{0};
 /// sotc: SOTC_BIND_CACHE_PACKET (default 0; needs SOTC_BIND_CACHE, _RANGES, _XTICK and _FRAME, read here on their own).
 /// 1: the packet ops of heap pipelines (profile heap_images 1) take the frame bind cache too: a hit re-resolves nothing
 /// of the heap table (Rasterizer::BindResources resolves it before the lookup) but binds the heap images and the heap
@@ -1292,6 +1318,10 @@ inline std::atomic<uint64_t> async_compute_build_ns{0}; ///< worker time buildin
 inline std::atomic<uint64_t> async_compute_waits{0};    ///< binds the recording thread waited for
 inline std::atomic<uint64_t> async_compute_wait_ns{0};
 inline std::atomic<uint64_t> async_compute_self_built{0}; ///< built by the recording thread itself
+/// sotc: SOTC_COMPUTE_PACK: pipelines the pack list names, built inline by the recorder from the pack cache (no worker
+/// job; counted apart from the waits), and the recorder time they took.
+inline std::atomic<uint64_t> async_compute_inline_built{0};
+inline std::atomic<uint64_t> async_compute_inline_ns{0};
 inline std::atomic<uint64_t> async_translate_stale{0}; ///< permutations whose tables changed
 // sotc: graphics shader stages translated by pipeline workers (SOTC_ASYNC_TRANSLATE), totals.
 inline std::atomic<uint64_t> async_translate_built{0};
@@ -1533,6 +1563,10 @@ inline std::atomic<uint64_t> draw_wait_ns[WaitKinds]{}, draw_wait_count[WaitKind
 /// Command processor time blocked on the draw thread (inside cp_parse_ns): BackAlloc while the
 /// op ring is full, WaitBackTail/DrainBack. cp_parse_all_ns is cp_parse_ns, never reset.
 inline std::atomic<uint64_t> cp_blocked_ns{0}, cp_parse_all_ns{0};
+/// sotc: command processor time waiting for the driver to build a draw's missing stage libraries (NoDropLink: the
+/// parallel library jobs it waits for and the libraries it builds itself). Counted always, SOTC_FPS_LEAN included
+/// (the 8 Nov draw stutter was a 585 ms wait no counter showed), and added to cp_blocked_ns. SOTCSTALL "cp libwait".
+inline std::atomic<uint64_t> cp_libwait_ns{0};
 /// sotc: SOTC_FPS "SOTC CP ops" lines (Liverpool, SOTC_WD_FUSE). Func ops queued by kind (0 write
 /// data, 1 EOP/EOS/release, 2 DMA, 3 other) and their run time on the draw thread; WRITE_DATA
 /// packets fused into a draw; WRITE_DATA -> indirect draw/dispatch pairs; WaitBackWrites calls
@@ -1643,6 +1677,7 @@ struct FrameAccount {
     uint64_t cpu_ns[CpuRoles]{};
     uint64_t wait_ns[WaitKinds]{}, wait_count[WaitKinds]{};
     uint64_t parse_ns = 0, blocked_ns = 0;
+    uint64_t libwait_ns = 0; ///< sotc: command processor waits for a draw's libraries (cp_libwait_ns)
     uint64_t spin_ns = 0; ///< sotc: command processor no-progress spin (cp_spin_ns)
     uint64_t rec_busy = 0, rec_upload = 0, rec_submit = 0;
     uint64_t fence = 0; ///< SOTC_ASYNC_UPLOAD write fence waits (async_upload_fence_ns)

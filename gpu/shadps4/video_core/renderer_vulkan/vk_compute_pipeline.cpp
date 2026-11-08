@@ -31,12 +31,16 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
 
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
+    boost::container::small_vector<u32, 2> flat; // sotc: SOTC_BIND_DESC_REUSE: the flat buffer bindings
     for (const auto& buffer : info->buffers) {
         // During deserialization, we don't have access to the UD to fetch sharp data. To address
         // this properly we need to track shaprs or portion of them in `sdata`, but since we're
         // interested only in "is storage" flag (which is not even effective atm), we can take a
         // shortcut there.
         const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(*info);
+        if (buffer.buffer_type == Shader::BufferType::Flatbuf) { // sotc: SOTC_BIND_DESC_REUSE
+            flat.push_back(static_cast<u32>(bindings.size()));
+        }
         bindings.push_back({
             .binding = binding++,
             .descriptorType = vk::DescriptorType::eStorageBuffer,
@@ -121,6 +125,14 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         PlanHeapMode(heap_bindings, pre);
     }
     uses_push_descriptors = !heap_mode && !descriptor_buffer && binding < instance.MaxPushDescriptors();
+    // sotc: SOTC_BIND_DESC_REUSE: a pool-allocated set gets dynamic flat buffers (see GraphicsPipeline).
+    ResetDynamicFlat();
+    if (!heap_mode && !uses_push_descriptors && !descriptor_buffer) {
+        MarkDynamicFlat(bindings, flat, 0, instance.MaxDescriptorSetStorageBuffersDynamic());
+    } else {
+        flat_bindings = static_cast<u32>(flat.size());
+    }
+    FinishDynamicFlat();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                        : descriptor_buffer
@@ -269,20 +281,27 @@ void ComputePipeline::BindWhenReady() const {
             SotcPipeFeedback::NoteWait(SotcPipeFeedback::Kind::Compute, &sotc_logged,
                                        [this] { return GetDebugString(); });
             const auto start = std::chrono::steady_clock::now();
+            // sotc: demand includes a build taken by the recorder, not only ready.wait below.
+            const SotcBlockLedger::Scope ledger{SotcBlockLedger::ComputeWait, compute_key.value};
+            bool self_built = false;
             if (!claimed.load(std::memory_order_acquire)) {
                 const_cast<ComputePipeline*>(this)->Build();
+                self_built = true;
                 SotcStats::async_compute_self_built.fetch_add(1, std::memory_order_relaxed);
             }
-            {
-                const SotcBlockLedger::Scope ledger{SotcBlockLedger::ComputeWait};
-                ready.wait(false, std::memory_order_acquire);
+            ready.wait(false, std::memory_order_acquire);
+            const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+            // sotc: SOTC_COMPUTE_PACK: a listed pipeline (pack cache hit) built here by design is an inline build,
+            // not a wait for a worker.
+            if (sotc_inline && self_built) {
+                SotcStats::async_compute_inline_ns.fetch_add(spent, std::memory_order_relaxed);
+                SotcStats::async_compute_inline_built.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                SotcStats::async_compute_wait_ns.fetch_add(spent, std::memory_order_relaxed);
+                SotcStats::async_compute_waits.fetch_add(1, std::memory_order_relaxed);
             }
-            SotcStats::async_compute_wait_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - start)
-                    .count(),
-                std::memory_order_relaxed);
-            SotcStats::async_compute_waits.fetch_add(1, std::memory_order_relaxed);
         }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
     });

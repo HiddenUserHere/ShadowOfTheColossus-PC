@@ -608,6 +608,11 @@ public:
         return push_descriptor_props.maxPushDescriptors;
     }
 
+    /// sotc: SOTC_BIND_DESC_REUSE: the most dynamic storage buffers a pipeline layout can hold (the flat buffers).
+    u32 MaxDescriptorSetStorageBuffersDynamic() const {
+        return properties.limits.maxDescriptorSetStorageBuffersDynamic;
+    }
+
     /// sotc: the most descriptor sets a pipeline layout can bind (SOTC_STAGE_BINDINGS needs 5).
     u32 GetMaxBoundDescriptorSets() const {
         return properties.limits.maxBoundDescriptorSets;

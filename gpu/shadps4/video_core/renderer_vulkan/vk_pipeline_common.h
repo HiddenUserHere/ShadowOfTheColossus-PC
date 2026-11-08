@@ -7,6 +7,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_descriptor_heap.h" // sotc: SOTC_DESCRIPTOR_HEAP (heap plan of a pipeline)
+#include "video_core/renderer_vulkan/vk_resource_pool.h"    // sotc: SOTC_BIND_DESC_REUSE (DescriptorSetReuse)
 #include "video_core/sotc_arch/sotc_arch.h"
 
 #include <atomic> // sotc: SOTC_GCN_COMMIT (Pipeline::sotc_gcn_commit)
@@ -98,6 +99,11 @@ public:
     /// the cache off, they are created into `owned` instead. Thread-safe.
     Layouts Get(const Request& request, Owned& owned);
 
+    /// sotc: true when layouts are shared and kept for the cache's lifetime (SOTC_BIND_DESC_REUSE persistent sets).
+    [[nodiscard]] bool Enabled() const noexcept {
+        return enabled;
+    }
+
 private:
     /// Keys are compared in full (the hash only picks the bucket).
     using Key = std::vector<u64>;
@@ -176,6 +182,12 @@ public:
     bool HasSlotWords() const noexcept {
         return uses_slot_words;
     }
+    /// sotc: SOTC_BIND_DESC_REUSE: true when every flat buffer binding of the layout is a dynamic storage buffer (also
+    /// true without flat buffers). Then a bind-cache hit whose flat copies moved inside the same buffer can bind its
+    /// kept sets with new dynamic offsets; otherwise the offsets are in the sets and a moved copy needs a write.
+    [[nodiscard]] bool FlatDynamic() const noexcept {
+        return dyn_flat.size() == flat_bindings;
+    }
     /// sotc: SOTC_DESCRIPTOR_HEAP: true when the pipeline was built with the heap flag and no layout. Its
     /// BindResources writes the descriptors into the heap rings and pushes the push block with vkCmdPushDataEXT.
     [[nodiscard]] bool UsesDescriptorHeap() const noexcept {
@@ -186,14 +198,48 @@ public:
     /// `write_sets[i]` is the descriptor set of `set_writes[i]`, used only with UsesStageSets().
     /// sotc: `packet` is required when HasPacketRange() and ignored otherwise. `heap_block` is the heap block of the
     /// draw (sotc_arch.h, HeapBlock): read when the profile has the heap (heap_images), zeros when null.
+    /// sotc: SOTC_BIND_DESC_REUSE: `reuse` (vk_resource_pool.h), when given, carries the committed sets. In with
+    /// reuse->reuse: the sets are bound as they are and nothing is written (the caller checked they hold these
+    /// descriptors). Otherwise the sets committed and written here are stored in it (count 0 when this bind path
+    /// keeps no sets: heap pipelines, push descriptors, descriptor buffers, no writes).
     void BindResources(DescriptorWrites& set_writes, std::span<const u32> write_sets,
                        const Shader::PushData& push_data,
                        const Shader::BindlessSamplerSlots& bindless_slots,
                        const SotcArch::DrawPacket* packet = nullptr,
-                       const SotcArch::HeapBlock* heap_block = nullptr) const;
+                       const SotcArch::HeapBlock* heap_block = nullptr,
+                       DescriptorSetReuse* reuse = nullptr) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
+
+    /// sotc: SOTC_BIND_DESC_REUSE. Called by the layout builders with the flat buffer bindings of one set (`flat`:
+    /// indices into `bindings`) once the set is known to be a classic pool set (no push descriptors, descriptor buffer
+    /// or heap). With the switch, they become dynamic storage buffers when there are at most `cap` of them (the
+    /// device's dynamic storage buffer limit shared by the sets a layout can have), else the set keeps them static
+    /// (counted). The decision depends on the stage's shader alone, so a per-shader GPL library and every pipeline
+    /// that uses it agree on the set layout. ResetDynamicFlat first; FinishDynamicFlat after the last set.
+    void ResetDynamicFlat() noexcept {
+        dyn_flat.clear();
+        flat_bindings = 0;
+    }
+    void MarkDynamicFlat(std::span<vk::DescriptorSetLayoutBinding> bindings, std::span<const u32> flat, u32 set,
+                         u32 cap);
+    void FinishDynamicFlat();
+
+    /// sotc: SOTC_BIND_DESC_REUSE. The dynamic offsets of a bind, in dyn_flat order: each is the offset of the buffer
+    /// info of the write to that (set, binding) (0 when the bind has no such write). With `patch`, those writes are
+    /// changed to dynamic storage buffer writes at offset 0 (the offset moves to the dynamic offset) until
+    /// RestoreDynamicWrites puts them back.
+    static constexpr u32 MaxDynamicFlat = 16;
+    struct DynamicPatch {
+        std::array<vk::DescriptorBufferInfo, MaxDynamicFlat> infos{};
+        std::array<const vk::DescriptorBufferInfo*, MaxDynamicFlat> saved{};
+        std::array<u32, MaxDynamicFlat> write{};
+        u32 count{};
+    };
+    u32 PrepareDynamicFlat(DescriptorWrites& set_writes, std::span<const u32> write_sets,
+                           std::array<u32, MaxDynamicFlat>& offsets, DynamicPatch* patch) const;
+    static void RestoreDynamicWrites(DescriptorWrites& set_writes, const DynamicPatch& patch);
 
     /// sotc: SOTC_DESCRIPTOR_HEAP: plans the mapping of `bindings` (the layout's set 0, in order) when the mode is on
     /// and `pre` (the reason the caller found, Heap when none) allows it. Counts the outcome. True when the pipeline is
@@ -205,8 +251,11 @@ protected:
 
     /// sotc: SOTC_STAGE_BINDINGS: commits one descriptor set per stage layout, writes each
     /// stage's descriptors into its own set and binds them all together.
+    /// sotc: SOTC_BIND_DESC_REUSE: reuse_in (null without a request) holds the sets to bind unwritten; reuse_out (may
+    /// be null) receives the sets this call bound, fresh or reused.
     void BindStageSets(DescriptorWrites& set_writes, std::span<const u32> write_sets,
-                       vk::PipelineBindPoint bind_point) const;
+                       vk::PipelineBindPoint bind_point, const DescriptorSetReuse* reuse_in,
+                       DescriptorSetReuse* reuse_out) const;
 
     /// sotc: with descriptor buffers (SOTC_DESC_BUFFER=1) the set layout is queried once after its
     /// creation: the size of a set and the offset of each binding number inside it.
@@ -247,6 +296,14 @@ protected:
     /// when a stage has a shader-addressed buffer (UsesShaderAddr) or is the heap stage. Never true together with
     /// uses_slot_words (the packet and the slot words share bytes 56..128).
     bool packet_range{};
+    /// sotc: SOTC_BIND_DESC_REUSE: the dynamic flat buffer bindings, (set, binding) in the order of their dynamic
+    /// offsets (set, then binding), and the count of flat buffer bindings in the layout (dynamic or not).
+    struct DynamicBinding {
+        u32 set;
+        u32 binding;
+    };
+    boost::container::static_vector<DynamicBinding, MaxDynamicFlat> dyn_flat;
+    u32 flat_bindings{};
     vk::DeviceSize desc_layout_size{};             ///< sotc: descriptor buffer size of one set
     std::vector<vk::DeviceSize> desc_binding_offsets; ///< sotc: by binding number, in the set
 public:

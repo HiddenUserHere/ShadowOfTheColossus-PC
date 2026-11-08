@@ -85,6 +85,13 @@ public:
     mutable bool recent_noted{};
     /// sotc: SOTC_PIPE_MANIFEST: already checked against the manifest (captured when it held none) this session.
     mutable bool manifest_noted{};
+    /// sotc: SOTC_COMPUTE_PACK: a prebuild of the loading hold, compiled into the pack cache; the compute pack destroys
+    /// it (and its program's module) once built unless a dispatch bound it. sotc_pack_program is its program cache key.
+    bool sotc_pack{};
+    u64 sotc_pack_program{};
+    /// sotc: SOTC_COMPUTE_PACK: the pack list names this pipeline (a driver-cache hit): no worker job is queued, the
+    /// recorder builds it inline at its first bind (counted as an inline build, not a wait).
+    bool sotc_inline{};
     u64 KeyValue() const {
         return compute_key.value;
     }

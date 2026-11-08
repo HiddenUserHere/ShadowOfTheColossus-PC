@@ -16,9 +16,11 @@
 #include <cstring>
 #include <string>
 
+#include "video_core/sotc_trace.h" // sotc: reuse the per-thread flight recorder
+
 namespace SotcBlockLedger {
 
-/// SOTC_BLOCK_LEDGER=1, read once at load. Every Scope is a no-op when it is off.
+/// SOTC_BLOCK_LEDGER=1, read once at load. Scopes are no-ops when both ledger and trace are off.
 inline const bool kOn = [] {
     const char* v = std::getenv("SOTC_BLOCK_LEDGER");
     return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
@@ -37,7 +39,10 @@ enum Site : uint8_t {
     DriverCacheGet,  ///< of that, vkGetPipelineCacheData alone (the driver's cache serialization)
     GplBuild,        ///< a GPL library built by GplLibraryCache::GetOrBuild
     GplLockWait,     ///< waiting for the GplLibraryCache mutex
-    ComputeWait,     ///< the recorder waiting for a compute pipeline (ComputePipeline::BindWhenReady)
+    ComputeWait,     ///< recorder demand, including building a pipeline not claimed by a worker
+    LibraryWait,     ///< command processor demand for missing graphics libraries
+    StageDemand,     ///< command processor translating a pending graphics stage synchronously
+    GplLink,         ///< fast-link request, inclusive of missing-library work
     SiteCount
 };
 
@@ -47,13 +52,24 @@ void Add(Site site, uint64_t ns) noexcept;
 /// Steady clock in nanoseconds.
 uint64_t NowNs() noexcept;
 
-/// Times one site on the calling thread.
+/// Records a completed site in the flight recorder (literal site name, key and ending flip).
+void Record(Site site, uint64_t start, uint64_t end, uint64_t key) noexcept;
+
+/// Times one site on the calling thread. Timings are inclusive when scopes nest.
 class Scope {
 public:
-    explicit Scope(Site site) noexcept : site_(site), start_(kOn ? NowNs() : 0) {}
+    explicit Scope(Site site, uint64_t key = 0) noexcept
+        : site_(site), start_((kOn || SotcTrace::kOn) ? NowNs() : 0), key_(key) {}
     ~Scope() {
+        if (!start_) {
+            return;
+        }
+        const uint64_t end = NowNs();
         if (kOn) {
-            Add(site_, NowNs() - start_);
+            Add(site_, end - start_);
+        }
+        if (SotcTrace::kOn && end - start_ >= SotcTrace::kZoneMinNs) {
+            Record(site_, start_, end, key_);
         }
     }
     Scope(const Scope&) = delete;
@@ -62,9 +78,11 @@ public:
 private:
     Site site_;
     uint64_t start_;
+    uint64_t key_;
 };
 
-/// The 5 s report line ("SOTC BLOCK LEDGER: ..."), the totals since the previous call; flips = frames in the window.
+/// The 5 s report line, inclusive site sums since the previous call; flips = frames in the window.
+/// Nested sites overlap: these sums are not exclusive CPU time or a frame critical-path duration.
 std::string TakeReport(uint64_t flips);
 
 /// The frame's part (", ledger cp X ms [site ms ...] draw ... rec ..."), since the previous call; empty when nothing

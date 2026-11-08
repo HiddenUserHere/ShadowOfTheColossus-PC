@@ -8,6 +8,7 @@
 #include <array>
 #include <condition_variable>
 #include <deque>
+#include <filesystem> // sotc: SOTC_PLAY_QUIET (SaveCacheFile)
 #include <mutex>
 #include <optional>
 #include <string>
@@ -218,7 +219,11 @@ public:
 
     /// sotc: writes the driver's compiled pipelines to disk (sotc_vk_pipelines.bin), so the next
     /// start, also after an update of the port, does not compile them again.
-    void SaveDriverCache(bool final_save = false);
+    // sotc: true only after a successful write; non-null written_size forces an unchanged-size save too.
+    // written_size is set under the save mutex on success (pack list publication).
+    bool SaveDriverCache(bool final_save = false, size_t* written_size = nullptr, u64* written_hash = nullptr);
+    /// sotc: SOTC_PLAY_QUIET: writes the pack cache (stage libraries) to sotc_vk_pack.bin; false without one.
+    bool SavePackCache(size_t* written_size = nullptr, u64* written_hash = nullptr);
     void Sync();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
@@ -465,6 +470,10 @@ private:
         /// sotc: SOTC_GPL_PACK_LIBS: the stage library this job compiles (PackLibraryId); its library is destroyed
         /// once compiled (GplLibraryCache::SetDiscard).
         u64 pack_id{};
+        /// sotc: SOTC_GPL_PACK_LEAN: the program cache key and permutation of the stage a pack job compiles (its module
+        /// is destroyed by the command processor once the job is done).
+        u64 pack_program{};
+        u32 pack_perm{};
         struct LibWait {
             std::atomic<int> remaining{0};
         };
@@ -472,6 +481,8 @@ private:
         ComputePipeline* compute{}; ///< a compute job: only Build() is run
         bool priority{}; ///< sotc: a depth-only (shadow) graphics job queued ahead of the others
         bool pre_compute{}; ///< sotc: SOTC_PRETRANSLATE_COMPUTE: a prebuilt compute pipeline (its build counts as done)
+        /// sotc: SOTC_COMPUTE_PACK: a prebuild compiled into the pack cache (the worker notes when the last one built).
+        bool pack_compute{};
         /// sotc: SOTC_ADDR_FALLBACK: a table-variant pipeline queued while its draws take the descriptor pipeline
         /// (counted as pending until built).
         bool addr_table{};
@@ -524,6 +535,7 @@ private:
             std::vector<u32> owned_code;
             u8 synthetic_variant{}; ///< Info::sotc_synthetic_variant of the translation
             bool first_variant{};   ///< the job that may queue the synthetic variant 1
+            bool hinted{};          ///< sotc: SOTC_COMPUTE_PACK: a compute prebuild translated with a hint (report)
             /// sotc: SOTC_PIPE_MANIFEST: the manifest stage this synthetic translation rebuilds (-1: none), the raw
             /// sharp fields of its draw, the fetch shader data of its draw (vertex), and the V# table its user data
             /// points to for the fetch attributes (ManifestUserData, filled on the worker).
@@ -581,9 +593,14 @@ private:
     /// sotc: queues a job in a lane (async_mutex held by the caller) and counts it for the report.
     void PushJobLocked(JobLane lane, std::unique_ptr<AsyncPipelineJob> job);
     /// sotc: the job a worker takes now (async_mutex held), or null when only capped background jobs wait.
-    std::unique_ptr<AsyncPipelineJob> PopJobLocked(JobLane& lane);
+    /// urgent_only (SOTC_GPL_URGENT_WORKERS): the Urgent and Predict lanes only.
+    std::unique_ptr<AsyncPipelineJob> PopJobLocked(JobLane& lane, bool urgent_only = false);
     /// sotc: a worker can take a job now (async_mutex held).
-    bool HasRunnableJobLocked() const;
+    bool HasRunnableJobLocked(bool urgent_only = false) const;
+    /// sotc: SOTC_GPL_URGENT_WORKERS: a lane the reserved workers serve.
+    static constexpr bool UrgentLane(JobLane lane) {
+        return lane == JobLane::Urgent || lane == JobLane::Predict;
+    }
     u32 BackgroundCap() const;
     /// sotc: the lanes whose jobs no draw or recorder is blocked on right now (SOTC_NB_WORKER_CAP caps them).
     static constexpr bool CappedLane(JobLane lane) {
@@ -711,7 +728,7 @@ private:
     std::string cache_variant_key;         ///< sotc: the shader cache variant key (WarmUp), the manifest header's
     bool manifest_holding{};               ///< sotc: the manifest's boot hold is running (every worker serves it)
     void LoadManifest();
-    void MaybeHoldForManifest();
+    void MaybeHoldForManifest(bool compute = false); // sotc: compute: SOTC_MANIFEST_HOLD_FAST
     void RunManifestHold();
     void ManifestPump(bool holding);
     bool ManifestResolveStage(u32 index, bool holding);
@@ -720,8 +737,8 @@ private:
     void ManifestSchedulePipes(bool holding);
     void ManifestUserData(AsyncPipelineJob::Translate& t);
     SotcPipeManifest::Header ManifestHeader() const;
-    void CaptureManifestGraphics();
-    void CaptureManifestCompute();
+    bool CaptureManifestGraphics();
+    bool CaptureManifestCompute();
     /// sotc: SOTC_NB_LAZY_PSO: the pipelines used in the last sessions (id -> session of the last use), so the lazy
     /// warm-up still builds what the player is likely to meet. LoadRecentPipelines at the warm-up, NoteRecentPipeline at
     /// a pipeline's first use in the session, saved every 5 s (when changed) by a detached thread.
@@ -769,13 +786,54 @@ private:
     /// sotc: SOTC_GPL_PACK_LIBS (sotc/nonblocking.h). At the end of the pretranslate hold, before the eviction: compiles
     /// the stage library of every translated vertex/pixel permutation that sotc_pack_libraries.bin does not list into
     /// the driver's pipeline cache (destroyed after), saves that cache and the list. Command processor.
-    void BuildPackLibraries();
+    bool BuildPackLibraries(); // sotc: false on incomplete jobs/builds/persistence; logged skips return true
+    bool PackLibraryListMatches() const;
+    /// sotc: SOTC_COMPUTE_PACK (sotc/nonblocking.h). Inside BuildPackLibraries, before the publication: every compute
+    /// prebuild of the hold (compiled into the pack cache) is counted, its id (PackComputeId) appended to `compiled`,
+    /// and its pipeline and module destroyed unless a dispatch bound it; the program goes back to the index at the
+    /// eviction. Logs the "SOTC COMPUTE PACK" line. Command processor.
+    void PackComputePipelines(const std::unordered_set<u64>& listed, std::vector<u64>& compiled,
+                              std::chrono::steady_clock::time_point start);
+    /// sotc: SOTC_COMPUTE_PACK: the VkPipelineCache the compute pack builds into (the pack cache when the caches are
+    /// split, else the driver cache), used again by a dispatch whose pipeline the list names.
+    vk::PipelineCache PackPipelineCache() const;
+    /// sotc: SOTC_COMPUTE_PACK: whether the pack list (loaded once, lazily, when valid) names this compute key's
+    /// pipeline; such a dispatch builds inline on the recorder (no worker job). Command processor.
+    bool PackComputeListed(u64 compute_key_value);
+    /// sotc: SOTC_COMPUTE_PACK state (CP only): the listed ids as a set (loaded from the file or from the publication),
+    /// the prebuilds translated with a hint, the queued/capped prebuild counts, and the first install / last build
+    /// times (the "in T s" of the pack line).
+    std::unordered_set<u64> pack_listed_set;
+    bool pack_listed_set_loaded{};
+    std::unordered_set<u64> pack_compute_hinted;
+    u64 pack_compute_queued{}, pack_compute_capped{};
+    std::atomic<s64> pack_compute_first_ns{0}, pack_compute_last_ns{0};
+    std::atomic<u64> pack_compute_build_ns{0}; ///< worker time of the pack's compute builds
+    bool pack_list_checked{}, pack_list_valid{}; ///< sotc: startup validity, independent of translation backlog
     /// sotc: SOTC_GPL_PACK_LIBS: ids of the pack libraries compiled this session (workers append).
     std::mutex pack_mutex;
     std::vector<u64> pack_compiled;
     std::atomic<u64> pack_failed{0};
+    /// sotc: SOTC_GPL_PACK_LEAN: (program cache key, permutation) of the pack jobs done (workers append under pack_mutex;
+    /// the command processor destroys those modules while the hold runs) and the programs whose modules it destroyed.
+    std::vector<std::pair<u64, u32>> pack_done_modules;
+    std::unordered_set<u64> pack_touched;
+    /// sotc: SOTC_GPL_PACK_LEAN: the workers added for the pack compile (up to the hardware thread count), stopped
+    /// after it (they leave at the next idle moment, without draining the queues).
+    std::vector<std::jthread> extra_workers;
+    std::atomic<bool> extra_workers_quit{false};
+    void StartExtraWorkers();
+    void StopExtraWorkers();
+    /// sotc: SOTC_GPL_PACK_LEAN: the pack publication (the driver cache, then the list of the ids below) on the saver
+    /// thread. state: 0 idle, 1 requested, 2 written, 3 failed; pack_publish_cv (driver_cache_cv_mutex) on 2 or 3.
+    std::vector<u64> pack_publish_ids;
+    std::vector<u8> pack_publish_header;
+    std::atomic<u32> pack_publish_state{0};
+    std::condition_variable_any pack_publish_cv;
+    void RunPackPublish();
     /// sotc: SOTC_GPL_PACK_LIBS: the saved driver cache was loaded and accepted at startup (else the list is void).
     bool driver_cache_loaded{};
+    u64 loaded_driver_cache_hash{}; ///< sotc: immutable identity of the startup cache used by the pack list
     /// sotc: SOTC_GPL_LIB_PHASE: queues the manifest library jobs held back for the library phase of the boot hold.
     void ManifestFlushLibraries(JobLane lane);
     /// sotc: SOTC_GPL_PREDICT (gpu/sotc/pipe_predict.h). Command processor, before a draw's key is built: takes the
@@ -790,9 +848,14 @@ private:
     std::atomic<u32> lib_jobs_pending{0};
     /// sotc: SOTC_GPL_PARALLEL_LIBS: notified (under async_mutex) when a waited library job is done.
     std::condition_variable_any lib_wait_cv;
+    /// sotc: SOTC_GPL_URGENT_WORKERS: the reserved workers wait on it (async_mutex); a push to the Urgent or Predict lane
+    /// notifies it (PushJobLocked, BuildLibrariesParallel).
+    std::condition_variable_any urgent_cv;
     /// sotc: SOTC_ASYNC_COMPUTE_XLATE: waits for (or takes back) a prefetched translation.
     void WaitPendingTranslation(u64 hash);
-    void AsyncPipelineWorker(std::stop_token token);
+    /// sotc: urgent_only (SOTC_GPL_URGENT_WORKERS): serves the Urgent and Predict lanes only. extra (SOTC_GPL_PACK_LEAN):
+    /// a worker of the pack hold, which leaves when extra_workers_quit is set.
+    void AsyncPipelineWorker(std::stop_token token, bool urgent_only = false, bool extra = false);
 
 private:
     const Instance& instance;
@@ -806,6 +869,18 @@ private:
     GplLibraryCache gpl_libs;
     vk::UniquePipelineCache pipeline_cache;
     size_t saved_driver_cache_size{};
+    /// sotc: SOTC_PLAY_QUIET: the second VkPipelineCache, for the stage libraries (pack, predicted, manifest, urgent;
+    /// GplLibraryCache::SetLibraryCache). Loaded from sotc_vk_pack.bin, written by the pack publication (RunPackPublish)
+    /// and at exit when it grew (FinalPackPublish); the periodic saver never reads it. Null when the switch is off.
+    vk::UniquePipelineCache pack_cache;
+    size_t saved_pack_cache_size{};
+    u64 pack_cache_published{}; ///< GplLibraryCache::LibraryBuilds at the last pack publication
+    std::vector<u64> pack_listed_ids; ///< the ids of the last list written or read (driver_cache_cv_mutex)
+    void FinalPackPublish();
+    /// sotc: one VkPipelineCache to one file, whole, through a temporary (driver_cache_save_mutex). final_save skips the
+    /// growth threshold of the periodic saves.
+    bool SaveCacheFile(vk::PipelineCache cache, const std::filesystem::path& path, size_t& saved_size, bool final_save,
+                       size_t* written_size, u64* written_hash, const char* what);
     std::mutex driver_cache_save_mutex;
     /// sotc: SOTC_NB_IO: RequestDriverCacheSave wakes the saver (declared before it: it outlives the thread).
     std::mutex driver_cache_cv_mutex;
@@ -925,6 +1000,7 @@ private:
     std::condition_variable_any translate_done_cv;
     bool compute_prefetch{}; ///< SOTC_ASYNC_COMPUTE_XLATE=1 and workers exist
     std::vector<std::jthread> async_workers;
+    unsigned reserved_workers{}; ///< sotc: SOTC_GPL_URGENT_WORKERS: of them, the Urgent/Predict-only ones
 };
 
 /// sotc: SOTC_PIPE_MEMO=1/2 counters (vk_pipeline_cache.cpp): appends one line for the 5 s report

@@ -173,4 +173,169 @@ inline bool LazyPso() {
     return on;
 }
 
+/// SOTC_GPL_PACK_LEAN (on unless set to 0; with SOTC_GPL_PACK_LIBS): the first-launch pack compile runs lean: after the
+/// manifest pipelines and the compute prebuilds, on every hardware thread (extra workers for the hold only), each pack
+/// job's shader module is destroyed as soon as its library is compiled (the program keeps its hash, permutation and
+/// specialization in the shader index and is loaded again from the pack at its first draw), and the driver cache and
+/// the compiled list are written once at the end, on the saver thread (the list after the cache, so it never names a
+/// library the saved cache lacks); the hold waits for that write only while it is short. 0: the 7 Nov behaviour (every
+/// module resident until the eviction, the normal worker count, a synchronous save on the command processor).
+inline bool GplPackLean() {
+    static const bool on = SwitchOnByDefault("SOTC_GPL_PACK_LEAN");
+    return on;
+}
+
+/// SOTC_COMPUTE_PACK (on unless set to 0; with SOTC_GPL_PACK_LEAN): the first-launch loading hold also compiles every
+/// compute program of the loaded shader files (the SOTC_PRETRANSLATE_COMPUTE prebuild, turned on by this switch when
+/// its own is unset: the hint of user/shader_predict/compute_hints.tsv when there is one, the synthetic perm-0
+/// specialization otherwise) into the pack's VkPipelineCache (sotc_vk_pack.bin), then destroys the pipeline and its
+/// module (the program stays in the shader index and is loaded again at its first dispatch), except for the pipelines
+/// a dispatch already bound (resident as before). Their ids go into sotc_pack_libraries.bin with the compute kind bit,
+/// so a later launch skips them, and a dispatch whose pipeline the list names is built inline by the recorder from
+/// the pack cache (a ~1 ms hit) instead of waiting for a worker. The manifest's compute pipelines are not touched.
+/// ComputePackRequested is the switch alone (read once); ComputePack adds the runtime gate of the GPL pack.
+/// sotc: default off since 8 Nov: 3,799 of 3,800 packed programs had no hint (never dispatched in any recorded session), so their synthetic specs never matched a dispatch; 61 s of first loading for nothing.
+inline bool ComputePackRequested() {
+    static const bool on = SwitchOn("SOTC_COMPUTE_PACK") && GplPackLean();
+    return on;
+}
+inline bool ComputePack() {
+    return ComputePackRequested() && GplPackLibs();
+}
+
+/// SOTC_COMPUTE_PACK_MAX=<n> (default 10000): the most compute programs the compute pack prebuilds in one session; a
+/// shader set beyond it is capped (the rest build at their first dispatch, as before) and the pack line says so.
+inline unsigned ComputePackMax() {
+    static const unsigned n = [] {
+        const char* v = std::getenv("SOTC_COMPUTE_PACK_MAX");
+        if (v == nullptr || v[0] == '\0') {
+            return 10000u;
+        }
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed < 0 ? 0u : static_cast<unsigned>(parsed);
+    }();
+    return n;
+}
+
+/// SOTC_GPL_URGENT_WORKERS=<n> (default 2; 0 off): this many pipeline workers serve only the Urgent and Predict lanes
+/// (the library builds a draw waits for, and the libraries of the materials the game just created), so a library
+/// compile costs its real time on an idle worker, never a turn behind translations, compute prebuilds and optimized
+/// pipeline builds. The other workers serve every lane as before. Needs at least n + 2 workers, else none is reserved.
+inline unsigned GplUrgentWorkers() {
+    static const unsigned n = [] {
+        const char* v = std::getenv("SOTC_GPL_URGENT_WORKERS");
+        if (v == nullptr || v[0] == '\0') {
+            return 2u;
+        }
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed < 0 ? 0u : static_cast<unsigned>(parsed);
+    }();
+    return n;
+}
+
+/// SOTC_PLAY_QUIET (on unless set to 0): nothing heavy while the game plays. The manifest's later holds and the
+/// pretranslate hold run only while the loading screen is shown (late manifest stages go to the Predict lane during
+/// play); every driver cache save runs on the saver thread (never the command processor, draw or a guest thread), at a
+/// loading screen, at exit, or after the cache has seen no pipeline creation for a few seconds; and the driver cache is
+/// split in two VkPipelineCache objects: the pack cache (stage libraries: pack, predicted, manifest, urgent; saved by
+/// the pack publication) and the live cache (every other pipeline; the periodic saver reads only this one).
+inline bool PlayQuiet() {
+    static const bool on = SwitchOnByDefault("SOTC_PLAY_QUIET");
+    return on;
+}
+
+// sotc: plan C (command processor thread costs, docs/re-stutters/LOCKED-30-PLAN-2026-11-08.md).
+
+/// SOTC_MANIFEST_HOLD_FAST (on unless set to 0): the manifest hold check on every slow pipeline lookup is O(1): the
+/// Pending stage count is kept at each stage state change (no pass over the ~2,700 stage records per lookup), the pump
+/// skips its pass when no stage is Pending and no new code came, and a compute lookup only installs finished
+/// translations. =0 restores the per-lookup passes.
+inline bool ManifestHoldFast() {
+    static const bool on = SwitchOnByDefault("SOTC_MANIFEST_HOLD_FAST");
+    return on;
+}
+
+/// SOTC_BACK_WRITE_EXACT=1 (off): the submit-start ops queued to the draw thread, which write no guest memory
+/// (PcRingCopy::OnSubmitStart, BufferCache::DrainSyncEvents, Rasterizer::GcnSubmitStart: uploads, imports, residency,
+/// protections), no longer advance back_write_seq, so a CP pipeline lookup after them does not wait for the draw thread
+/// (LookupAfterWrites with SOTC_CP_PRECISE_WAIT=0).
+inline bool BackWriteExact() {
+    static const bool on = SwitchOn("SOTC_BACK_WRITE_EXACT");
+    return on;
+}
+
+/// SOTC_CP_LABEL_SLEEP=1 (off, Windows): after 64 command processor rounds over the queues with no progress (every task
+/// waits on a label, a register/memory value or a counter), the thread sleeps on cp_wake_epoch (WaitOnAddress, 1 ms
+/// timeout) instead of yielding; NotifyCpWait wakes it (the draw thread after each queued function, new submits and
+/// commands, labels and fences written). SOTC_CP_LABEL_SLEEP_ROUNDS / SOTC_CP_LABEL_SLEEP_MS tune it.
+inline bool CpLabelSleep() {
+    static const bool on = SwitchOn("SOTC_CP_LABEL_SLEEP");
+    return on;
+}
+
+/// SOTC_RING8_CACHE=1 (off): the label lookahead of a submit (Ring8ScanSubmit) is cached per (DCB, CCB) span with a copy
+/// of every buffer it walked; a later submit of the same spans takes it while the memory table generation is unchanged
+/// and every buffer still holds the copied words (the game rewrites command buffers in place without a table change).
+inline bool Ring8Cache() {
+    static const bool on = SwitchOn("SOTC_RING8_CACHE");
+    return on;
+}
+
+/// Plan B of docs/re-stutters/LOCKED-30-PLAN-2026-11-08.md: the draw thread's per-draw work, one switch per item, all
+/// off by default (each is measured alone on the test route). Counters: SotcStats::pb_* (sotc_stats.h), printed in the
+/// "SOTC PLAN-B" 5 s line (vk_rasterizer.cpp) while any of them is on.
+
+/// SOTC_BIND_DESC_REUSE=1: a frame bind-cache hit whose entry holds the descriptor sets committed for its last write
+/// binds those sets again (no DescriptorHeap::Commit, no vkUpdateDescriptorSets) when they are still valid. With the
+/// layout cache on (SOTC_STAGE_BINDINGS=1 or SOTC_LAYOUT_CACHE=1) the entry's sets are persistent: allocated from pools
+/// that are never reset (DescriptorHeap::AcquirePersistent), owned by the entry and freed only after the GPU finished
+/// the last tick that bound them; without it they come from the rolling pool and hold until it rolls (PoolSerial).
+/// The flat buffer bindings of pool-allocated sets are dynamic storage buffers (Pipeline::MarkDynamicFlat; changes
+/// the set and pipeline layouts, not the SPIR-V), so a flat copy at a new stream-ring offset is a dynamic offset; a
+/// copy in another buffer (arena <-> ring) writes the sets again. A layout whose flat buffers exceed the device's
+/// dynamic storage buffer limit keeps them static (counted). The rolling pool is 8x larger with the switch. Classic
+/// set paths only (per-stage sets or set 0); push descriptors, descriptor buffers and heap pipelines keep no sets.
+inline bool BindDescReuse() {
+    static const bool on = SwitchOn("SOTC_BIND_DESC_REUSE");
+    return on;
+}
+
+/// SOTC_SAMPLER_CACHE=1: the per-tick sampler re-resolution of a bind-cache hit (TextureCache::GetSampler per sampler,
+/// a mutex each) runs only every 8 ticks per entry; a destroyed sampler flushes the whole cache anyway
+/// (SamplerGeneration), so the handles cannot change in between. The periodic run keeps the samplers' LRU touched.
+inline bool SamplerCache() {
+    static const bool on = SwitchOn("SOTC_SAMPLER_CACHE");
+    return on;
+}
+
+/// SOTC_HLE_FILL_SKIP=1: a REPLICATE fill (vk_shader_hle.cpp) whose control words, pattern hash and generation sums
+/// (SotcGen::Sum of the destination, source and control ranges) are those of the last fill of the same destination,
+/// with none of the three ranges CPU- or GPU-modified, skips the page compare and the write-back: the destination
+/// already holds this table. Needs a generation source (SOTC_GEN_BIND or SOTC_GEN_DMA) and page tracking of guest
+/// writes (not SOTC_NATIVE without tracking); otherwise every fill runs as before and is counted as not skippable.
+inline bool HleFillSkip() {
+    static const bool on = SwitchOn("SOTC_HLE_FILL_SKIP");
+    return on;
+}
+
+/// SOTC_FLAT_ARENA=1: flat constant buffers go to a persistent arena keyed by content hash (BufferCache::FlatArena)
+/// instead of the stream ring: a table seen before is bound at its arena offset (no copy); a new one is uploaded
+/// once. The arena is 32 chunks of 2 MiB bump-allocated; a chunk unused for 64 ticks and finished by the GPU is
+/// emptied and reused (its entries retired). When no chunk is free the copy goes to the stream ring as before.
+inline bool FlatArena() {
+    static const bool on = SwitchOn("SOTC_FLAT_ARENA");
+    return on;
+}
+
+/// SOTC_PROTECT_ASYNC_UNPROTECT=1 (with SOTC_PROTECT_ASYNC=1): an unprotect (read-write) the draw thread makes while
+/// it binds resources for the GPU (PageManager::GpuOnlyScope, opened by Rasterizer::BindResources) is queued for the
+/// protect worker like a restriction, in order, instead of flushing the queue and running synchronously. Outside the
+/// scope (HLE fills, readback write-back, faults) unprotects stay synchronous. A guest write that meets a page whose
+/// unprotect is still queued faults and the handler applies the tracker's state (EnsurePageWritable), as it does for
+/// a page covered by another thread's pending flush.
+inline bool ProtectAsyncUnprotect() {
+    static const bool on = SwitchOn("SOTC_PROTECT_ASYNC_UNPROTECT");
+    return on;
+}
+
 } // namespace SotcNonBlocking

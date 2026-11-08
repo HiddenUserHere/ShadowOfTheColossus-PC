@@ -22,6 +22,9 @@
 #include "video_core/sotc_shadow_cull.h" // sotc: SOTC_HLE_SHADOW_CULL
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/sotc_generation.h"  // sotc: SOTC_HLE_FILL_SKIP (SotcGen::Sum)
+#include "../../../sotc/nonblocking.h"   // sotc: SOTC_HLE_FILL_SKIP
+#include <xxhash.h>
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "../../../sotc/native/native.h" // sotc: SOTC_NATIVE (TracksGuestPages)
 
@@ -552,6 +555,58 @@ static void BuildTable(const u32* source, u64 src_count, u64 count) {
     }
 }
 
+// sotc: SOTC_HLE_FILL_SKIP (gpu/sotc/nonblocking.h). The last fill of each destination: its size, its pattern (period
+// and content hash), the control words it read and the generation sums (SotcGen::Sum) of the destination, source and
+// control ranges read right after the fill landed. A fill whose inputs and sums are the same, with the three ranges
+// clean (no CPU-modified page: a page the fault grace left writable is CPU-modified until synced, and its writes make
+// no other signal; no GPU-modified byte), finds the destination already holding its table: skipped. The sums are
+// exact for every tracked write (a guest write faults and invalidates, a GPU write marks, a sync bumps); without
+// generations (SOTC_GEN_BIND / SOTC_GEN_DMA both off) or without page tracking of guest writes (SOTC_NATIVE without
+// tracking) there is no signal and every fill runs (counted as "no signal"). Draw thread only.
+namespace FillSkip {
+struct Memo {
+    u64 bytes{};
+    u64 period{};
+    u64 pattern_hash{};
+    u32 n{};
+    u32 m{};
+    u64 gen_dst{};
+    u64 gen_src{};
+    u64 gen_ctl{};
+    bool operator==(const Memo&) const = default;
+};
+std::unordered_map<VAddr, Memo> memos; // by destination address
+// The fill being run: committed to `memos` by Commit after a successful replace (ExecuteShaderHLE).
+struct Pending {
+    bool valid{};
+    VAddr address{};
+    VAddr src{};
+    VAddr ctl{};
+    Memo memo{};
+};
+Pending pending;
+
+bool Signal() {
+    static const bool signal = SotcGen::Bumps() && SotcNative::TracksGuestPages();
+    return signal;
+}
+
+/// After a fill that wrote (or found the table in place): the sums of the three ranges as they are now are what an
+/// unchanged state reads next time. A write that lands after this read bumps a sum; one that landed before it and
+/// is not yet synced keeps its page CPU-modified (refused by the clean test at the next check).
+void Commit() {
+    if (!pending.valid) {
+        return;
+    }
+    pending.valid = false;
+    Memo memo = pending.memo;
+    memo.gen_dst = SotcGen::Sum(pending.address, memo.bytes);
+    memo.gen_src = SotcGen::Sum(pending.src, memo.period);
+    memo.gen_ctl = SotcGen::Sum(pending.ctl, 8);
+    memos[pending.address] = memo;
+}
+} // namespace FillSkip
+
 static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                                       const AmdGpu::ComputeProgram& cs_program,
                                       Rasterizer& rasterizer, bool& wrote) {
@@ -597,6 +652,40 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     }
     const u32* source = std::bit_cast<const u32*>(src.base_address);
     const VAddr address = dst.base_address;
+    // sotc: SOTC_HLE_FILL_SKIP: the same table already in place (FillSkip above). The pattern hash reads the source
+    // (period bytes), which the compare below reads anyway. The pending record is committed by ExecuteShaderHLE
+    // after the replace succeeded, with the sums read then.
+    FillSkip::pending.valid = false;
+    if (SotcNonBlocking::HleFillSkip()) {
+        if (!FillSkip::Signal()) {
+            SotcStats::pb_fill_nosignal.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const u64 bytes = count * 4;
+            const u64 period = src_count * 4;
+            const bool clean = !buffer_cache.IsRegionCpuModified(address, bytes) &&
+                               !buffer_cache.IsRegionCpuModified(src.base_address, period) &&
+                               !buffer_cache.IsRegionCpuModified(ctl.base_address, 8) &&
+                               !buffer_cache.IsRegionGpuModified(address, bytes);
+            if (clean) {
+                FillSkip::Memo now{};
+                now.bytes = bytes;
+                now.period = period;
+                now.pattern_hash = XXH3_64bits(source, period);
+                now.n = n;
+                now.m = m;
+                now.gen_dst = SotcGen::Sum(address, bytes);
+                now.gen_src = SotcGen::Sum(src.base_address, period);
+                now.gen_ctl = SotcGen::Sum(ctl.base_address, 8);
+                if (const auto it = FillSkip::memos.find(address);
+                    it != FillSkip::memos.end() && it->second == now) {
+                    SotcStats::pb_fill_skipped.fetch_add(1, std::memory_order_relaxed);
+                    return true; // wrote stays false: the destination holds this table
+                }
+                FillSkip::pending = {true, address, src.base_address, ctl.base_address, now};
+            }
+            SotcStats::pb_fill_executed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // sotc: the tables are mostly the same every frame. When no byte of the destination is GPU
     // written (so its pages are not read-protected and the backing is authoritative) and it
     // already holds this data, the result of the replace below is already in place: skip its
@@ -758,9 +847,11 @@ bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
             hle_skip_stats.runs.fetch_add(1, std::memory_order_relaxed);
         }
         if (!ExecuteReplicateShaderHLE(info, cs_program, rasterizer, wrote)) {
+            FillSkip::pending.valid = false; // sotc: SOTC_HLE_FILL_SKIP: the GPU ran it, the guest copy is not the table
             NoteFillOnGpu(true);
             return false;
         }
+        FillSkip::Commit(); // sotc: SOTC_HLE_FILL_SKIP: the table is in place, remember its state
         NoteFillOnGpu(false);
         if (kHleSkipMode != 0 && !wrote) {
             hle_skip_stats.noop.fetch_add(1, std::memory_order_relaxed);

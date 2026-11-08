@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <cstddef>
 #include <limits>
 #include <optional>
+#include <utility>
 
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
@@ -12,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "../../../sotc/nonblocking.h" // sotc: SOTC_BIND_DESC_REUSE
 
 namespace Vulkan {
 
@@ -148,6 +151,9 @@ DescriptorHeap::DescriptorHeap(const Instance& instance, Scheduler& scheduler,
 
 DescriptorHeap::~DescriptorHeap() {
     device.destroyDescriptorPool(curr_pool);
+    for (const auto pool : persistent_pools) { // sotc: SOTC_BIND_DESC_REUSE
+        device.destroyDescriptorPool(pool);
+    }
     for (const auto [pool, tick] : pending_pools) {
         work_semaphore->Wait(tick);
         device.destroyDescriptorPool(pool);
@@ -213,18 +219,138 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
 
     // We've changed pool so also reset descriptor batch cache.
     descriptor_sets.clear();
+    ++pool_serial; // sotc: SOTC_BIND_DESC_REUSE: sets kept by bind-cache entries are no longer reusable
     const auto desc_set = desc_sets.back();
     desc_sets.pop_back();
     descriptor_sets[set_key] = std::move(desc_sets);
     return desc_set;
 }
 
-void DescriptorHeap::CreateDescriptorPool() {
+// sotc: SOTC_BIND_DESC_REUSE persistent sets. A pool holds 4096 sets and 4x the rolling pool's descriptors of each
+// type; it is never reset, a full one is kept and another made. The sets go back to a per-layout free list only after
+// the GPU finished the last tick that bound them, so a set is never written while a command buffer may read it.
+void DescriptorHeap::CreatePersistentPool() {
+    constexpr u32 kScale = 4;
+    if (persistent_sizes.empty()) {
+        persistent_sizes.assign(pool_sizes.begin(), pool_sizes.end());
+        for (auto& size : persistent_sizes) {
+            size.descriptorCount *= kScale;
+        }
+    }
     const vk::DescriptorPoolCreateInfo pool_info = {
         .flags = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind,
-        .maxSets = descriptor_heap_count,
-        .poolSizeCount = static_cast<u32>(pool_sizes.size()),
-        .pPoolSizes = pool_sizes.data(),
+        .maxSets = descriptor_heap_count * kScale,
+        .poolSizeCount = static_cast<u32>(persistent_sizes.size()),
+        .pPoolSizes = persistent_sizes.data(),
+    };
+    auto [pool_result, pool] = device.createDescriptorPool(pool_info);
+    ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create persistent descriptor pool: {}",
+               vk::to_string(pool_result));
+    persistent_pools.push_back(pool);
+}
+
+void DescriptorHeap::CollectPersistent() {
+    while (!persistent_retired.empty() && work_semaphore->IsFree(persistent_retired.front().tick)) {
+        const auto& r = persistent_retired.front();
+        persistent_free[std::bit_cast<u64>(r.layout)].push_back(r.set);
+        ++persistent_free_count;
+        ++persistent_freed;
+        persistent_retired.pop_front();
+    }
+}
+
+vk::DescriptorSet DescriptorHeap::AcquirePersistent(vk::DescriptorSetLayout set_layout) {
+    CollectPersistent();
+    auto& list = persistent_free[std::bit_cast<u64>(set_layout)];
+    if (list.empty() && !persistent_retired.empty() &&
+        !work_semaphore->IsFree(persistent_retired.front().tick)) {
+        // The known GPU tick is refreshed lazily: query it once before allocating a new set.
+        work_semaphore->Refresh();
+        CollectPersistent();
+    }
+    ++persistent_alive;
+    if (!list.empty()) {
+        const auto set = list.back();
+        list.pop_back();
+        --persistent_free_count;
+        ++persistent_recycled;
+        return set;
+    }
+    if (persistent_pools.empty()) {
+        CreatePersistentPool();
+    }
+    vk::DescriptorSetAllocateInfo alloc_info = {
+        .descriptorPool = persistent_pools.back(),
+        .descriptorSetCount = 1,
+        .pSetLayouts = &set_layout,
+    };
+    vk::DescriptorSet set{};
+    auto result = device.allocateDescriptorSets(&alloc_info, &set);
+    if (result != vk::Result::eSuccess) {
+        ASSERT_MSG(result == vk::Result::eErrorOutOfPoolMemory ||
+                       result == vk::Result::eErrorFragmentedPool,
+                   "Unexpected error during persistent descriptor set allocation: {}", vk::to_string(result));
+        CreatePersistentPool();
+        alloc_info.descriptorPool = persistent_pools.back();
+        result = device.allocateDescriptorSets(&alloc_info, &set);
+        ASSERT_MSG(result == vk::Result::eSuccess,
+                   "Unexpected error during persistent descriptor set allocation {}", vk::to_string(result));
+    }
+    ++persistent_allocated;
+    return set;
+}
+
+void DescriptorHeap::RetirePersistent(const DescriptorSetReuse& record) {
+    if (!record.persistent) {
+        return;
+    }
+    for (u32 i = 0; i < record.count; ++i) {
+        if (record.sets[i]) {
+            persistent_retired.push_back({record.last_tick, record.layouts[i], record.sets[i]});
+            --persistent_alive;
+        }
+    }
+}
+
+PersistentSetStats DescriptorHeap::TakePersistentStats() {
+    PersistentSetStats st{};
+    st.alive = persistent_alive;
+    st.retiring = persistent_retired.size();
+    st.free = persistent_free_count;
+    st.allocated = std::exchange(persistent_allocated, 0);
+    st.recycled = std::exchange(persistent_recycled, 0);
+    st.freed = std::exchange(persistent_freed, 0);
+    st.pools = persistent_pools.size();
+    u64 descriptors = 0;
+    for (const auto& size : persistent_sizes) {
+        descriptors += size.descriptorCount;
+    }
+    // Rough: 32 bytes per descriptor slot of each pool (the driver's real cost is not visible).
+    st.bytes = st.pools * descriptors * 32;
+    return st;
+}
+
+void DescriptorHeap::CreateDescriptorPool() {
+    // sotc: SOTC_BIND_DESC_REUSE: a pool 8x the size (sets and descriptors), so the sets kept by the bind cache survive
+    // more frames between rolls (every roll makes every kept set unusable).
+    u32 max_sets = descriptor_heap_count;
+    std::span<const vk::DescriptorPoolSize> sizes = pool_sizes;
+    if (SotcNonBlocking::BindDescReuse()) {
+        constexpr u32 kScale = 8;
+        max_sets *= kScale;
+        if (scaled_sizes.empty()) {
+            scaled_sizes.assign(pool_sizes.begin(), pool_sizes.end());
+            for (auto& size : scaled_sizes) {
+                size.descriptorCount *= kScale;
+            }
+        }
+        sizes = scaled_sizes;
+    }
+    const vk::DescriptorPoolCreateInfo pool_info = {
+        .flags = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind,
+        .maxSets = max_sets,
+        .poolSizeCount = static_cast<u32>(sizes.size()),
+        .pPoolSizes = sizes.data(),
     };
     auto [pool_result, pool] = device.createDescriptorPool(pool_info);
     ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create descriptor pool: {}",

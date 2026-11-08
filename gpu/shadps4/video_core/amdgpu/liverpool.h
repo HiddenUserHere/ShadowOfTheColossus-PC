@@ -149,7 +149,7 @@ public:
     /// new submit or command): wakes the command processor if it sleeps in CpIdleSleep. Nothing
     /// (not even the atomic) when the switch is off. Any thread.
     void NotifyCpWait() noexcept {
-        if (!cp_idle_ns) {
+        if (!cp_idle_ns && !cp_round_sleep) { // sotc: SOTC_CP_LABEL_SLEEP uses the epoch too
             return;
         }
         // seq_cst on both sides (CpIdleSleep): either this sees cp_sleeping or the command
@@ -157,6 +157,10 @@ public:
         cp_wake_epoch.fetch_add(1, std::memory_order_seq_cst);
         if (cp_sleeping.load(std::memory_order_seq_cst)) [[unlikely]] {
             WakeCp();
+        }
+        // sotc: SOTC_CP_LABEL_SLEEP: the same handshake with CpRoundSleep (WaitOnAddress on the epoch).
+        if (cp_round_sleeping.load(std::memory_order_seq_cst)) [[unlikely]] {
+            WakeCpRound();
         }
     }
 
@@ -1367,6 +1371,19 @@ private:
     /// Returns true when woken by a notification (or the epoch had already moved).
     bool CpIdleSleep(u64 seen_epoch);
     void WakeCp() noexcept;
+    // sotc: SOTC_CP_LABEL_SLEEP=1 (nonblocking.h; Windows only, read in the constructor). After
+    // cp_round_sleep_rounds whole rounds over the queues without progress, the command processor
+    // sleeps in CpRoundSleep (WaitOnAddress on cp_wake_epoch, at most cp_round_sleep_ms) instead
+    // of yielding; NotifyCpWait (the draw thread after each queued function, new submits and
+    // commands, labels and fences written) wakes it. SOTC_CP_LABEL_SLEEP_ROUNDS (default 64) and
+    // SOTC_CP_LABEL_SLEEP_MS (default 1) tune it.
+    bool cp_round_sleep{};
+    u32 cp_round_sleep_rounds{64};
+    u32 cp_round_sleep_ms{1};
+    std::atomic<bool> cp_round_sleeping{false};
+    /// Returns true when the epoch moved from seen_epoch (a notification), false on the timeout.
+    bool CpRoundSleep(u64 seen_epoch);
+    void WakeCpRound() noexcept;
 };
 
 } // namespace AmdGpu

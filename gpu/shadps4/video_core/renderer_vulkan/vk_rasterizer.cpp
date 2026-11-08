@@ -54,6 +54,7 @@
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
+#include "../../../sotc/nonblocking.h" // sotc: plan B switches (SOTC_BIND_DESC_REUSE, SOTC_SAMPLER_CACHE, SOTC_FLAT_ARENA)
 #include "video_core/sotc_noprepass.h" // sotc: SOTC_NO_PREPASS=2 (measurement only)
 #include "video_core/sotc_prepass_probe.h" // sotc: SOTC_PREPASS_PROBE (main depth address, observe only)
 #include "../../../sotc/native/verify.h" // sotc: SOTC_VERIFY (SotcVerify::VerifyAll)
@@ -3219,7 +3220,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
         if (!merged && (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick())) {
-            pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
+            BindPipelineResources(pipeline);
         }
         if (!merged) { // sotc: SOTC_DRAW_MERGE_STATS=1, this bind is the one later draws may reuse
             MergeBindDone(bound, op_static_reads || !bound_buffers.empty() || shader_addr_touch);
@@ -3492,7 +3493,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         {
             const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
             if (!merged && (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick())) {
-                pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
+                BindPipelineResources(pipeline);
             }
             if (!merged) { // sotc: SOTC_DRAW_MERGE_STATS=1, this direct draw's bind may be reused
                 MergeBindDone(true, op_static_reads || !bound_buffers.empty() || shader_addr_touch);
@@ -3599,7 +3600,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
         if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
-            pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
+            BindPipelineResources(pipeline);
         }
     }
     {
@@ -3959,7 +3960,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved,
     GcnEndRendering(scheduler);
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
-        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
+        BindPipelineResources(pipeline);
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -4075,7 +4076,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     GcnEndRendering(scheduler);
     {
         const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
-        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
+        BindPipelineResources(pipeline);
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -4669,6 +4670,8 @@ namespace {
 u64 BindCacheFrameKey(const Pipeline* pipeline, u64 hash, u64 targets_key);
 }
 
+static void PlanBReport(DescriptorHeap& heap); // sotc: plan B 5 s line (defined before BindCacheDropFrame)
+
 bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* prepared) {
     // sotc: SOTC_SHADER_ADDR / SOTC_HEAP: the pipeline's profile, read by BindBuffers (ShaderAddrBuffer) below.
     SotcArch::ShaderAddr::SetBindProfile(&pipeline->GetProfile());
@@ -4693,6 +4696,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     } write_scope_guard{buffer_cache};
     const SotcStats::SplitTimer bind_split{SotcStats::SplitBind}; // sotc: SOTC_DRAW_SPLIT
     fast_bind_hit = false;
+    desc_reuse = {}; // sotc: SOTC_BIND_DESC_REUSE: this op's record (BindPipelineResources)
+    desc_reuse_entry = nullptr;
+    PlanBReport(pipeline_cache.GetDescriptorHeap());
+    // sotc: SOTC_PROTECT_ASYNC_UNPROTECT: the unprotects this bind makes are read next by the GPU (page_manager.h).
+    const VideoCore::PageManager::GpuOnlyScope gpu_only_scope;
     // sotc: SOTC_DESCRIPTOR_HEAP: a heap draw replaces the descriptor state of the command buffer, so a classic draw
     // after it must not replay an older fast bind.
     if (pipeline->UsesDescriptorHeap()) {
@@ -5549,6 +5557,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         bind_cache_recording = false;
         if (SotcStats::kBindCacheFrame) {
             made = CommitBindCacheFrame(pipeline, cache_hash, uses_dma, first_bound_buffer);
+            desc_reuse_entry = made; // sotc: SOTC_BIND_DESC_REUSE: the sets of this bind go to the new entry
         } else {
             CommitBindCache(pipeline, cache_hash, uses_dma, first_bound_buffer);
         }
@@ -6766,6 +6775,91 @@ bool Rasterizer::BindCacheEntryFresh(BindCacheEntry& entry, u32& reason) {
     return BindCacheStampsFresh(entry, reason);
 }
 
+// sotc: plan B counters (SotcStats::pb_*), one line on stderr per 5 s while any plan B switch is on
+// (gpu/sotc/nonblocking.h). Called from Rasterizer::BindResources (the draw thread).
+static void PlanBReport(DescriptorHeap& heap) {
+    static const bool any = SotcNonBlocking::BindDescReuse() || SotcNonBlocking::SamplerCache() ||
+                            SotcNonBlocking::HleFillSkip() || SotcNonBlocking::FlatArena() ||
+                            SotcNonBlocking::ProtectAsyncUnprotect();
+    if (!any) {
+        return;
+    }
+    static std::atomic<s64> due{};
+    const s64 now = static_cast<s64>(SotcStats::NowNs());
+    s64 d = due.load(std::memory_order_relaxed);
+    if (now < d || !due.compare_exchange_strong(d, now + 5'000'000'000LL)) {
+        return;
+    }
+    const auto take = [](std::atomic<uint64_t>& c) {
+        return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed));
+    };
+    char rewrite[160]{};
+    size_t ri = 0;
+    for (uint32_t r = 0; r < SotcStats::PbDrSites; ++r) {
+        ri += std::snprintf(rewrite + ri, sizeof(rewrite) - ri, "%s%s %llu", r ? ", " : "",
+                            SotcStats::PbDescRewriteName(r), take(SotcStats::pb_desc_rewritten[r]));
+    }
+    std::fprintf(stderr,
+                 "SOTC PLAN-B (5 s): desc sets reused %llu, rewritten (%s); sampler checks skipped %llu, run %llu; "
+                 "fills skipped %llu, run %llu (no signal %llu); flat arena reused %llu, uploaded %llu, retired %llu, "
+                 "to stream %llu; unprotects queued %llu, sync %llu\n",
+                 take(SotcStats::pb_desc_reused), rewrite, take(SotcStats::pb_sampler_skipped),
+                 take(SotcStats::pb_sampler_checked), take(SotcStats::pb_fill_skipped),
+                 take(SotcStats::pb_fill_executed), take(SotcStats::pb_fill_nosignal),
+                 take(SotcStats::pb_flat_reused), take(SotcStats::pb_flat_uploaded),
+                 take(SotcStats::pb_flat_retired), take(SotcStats::pb_flat_stream),
+                 take(SotcStats::pb_unprotect_queued), take(SotcStats::pb_unprotect_sync));
+    // sotc: SOTC_BIND_DESC_REUSE: the persistent sets (alive = owned by entries) and the dynamic flat layouts.
+    if (SotcNonBlocking::BindDescReuse()) {
+        const auto st = heap.TakePersistentStats();
+        std::fprintf(stderr,
+                     "SOTC DESC REUSE (5 s): persistent %s; sets alive %llu, retiring %llu, free %llu; allocated %llu, "
+                     "recycled %llu, freed %llu; pools %llu (~%llu KiB); dynamic flat sets %llu, static (limit) %llu\n",
+                     heap.PersistentSets() ? "on" : "off (layout cache off: rolling pool)",
+                     static_cast<unsigned long long>(st.alive), static_cast<unsigned long long>(st.retiring),
+                     static_cast<unsigned long long>(st.free), static_cast<unsigned long long>(st.allocated),
+                     static_cast<unsigned long long>(st.recycled), static_cast<unsigned long long>(st.freed),
+                     static_cast<unsigned long long>(st.pools), static_cast<unsigned long long>(st.bytes / 1024),
+                     static_cast<unsigned long long>(SotcStats::pb_dyn_sets.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(SotcStats::pb_dyn_fallback_sets.load(std::memory_order_relaxed)));
+    }
+}
+
+// sotc: SOTC_BIND_DESC_REUSE (vk_rasterizer.h). Without the switch: the plain Pipeline::BindResources call.
+void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
+    if (!SotcNonBlocking::BindDescReuse()) {
+        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block);
+        return;
+    }
+    const bool asked = desc_reuse.reuse;
+    desc_reuse.keep = desc_reuse_entry != nullptr; // persistent sets only for a bind an entry will own
+    pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots, &draw_packet, &heap_block,
+                            &desc_reuse);
+    if (SotcStats::kFpsLog) {
+        if (desc_reuse.reuse) {
+            SotcStats::pb_desc_reused.fetch_add(1, std::memory_order_relaxed);
+        } else if (asked) {
+            SotcStats::pb_desc_rewritten[SotcStats::PbDrNoPath].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (desc_reuse_entry && desc_reuse.reuse) {
+        // The kept sets were bound by this tick's command buffer: they stay the entry's until after it.
+        desc_reuse_entry->desc_sets.last_tick = desc_reuse.last_tick;
+    } else if (desc_reuse_entry) {
+        // The sets this bind wrote (or none, on a path that keeps none) are the entry's record, together with the
+        // flat descriptors they were written with: a later hit must bind its flat copies in the same buffers (at the
+        // same offsets too, unless the flat bindings are dynamic). The entry's previous persistent sets are freed
+        // once the GPU finished their last tick.
+        pipeline_cache.GetDescriptorHeap().RetirePersistent(desc_reuse_entry->desc_sets);
+        desc_reuse_entry->desc_sets = desc_reuse;
+        for (auto& slot : desc_reuse_entry->flat_slots) {
+            slot.desc_buffer = buffer_infos[slot.info].buffer;
+            slot.desc_offset = buffer_infos[slot.info].offset;
+        }
+    }
+    desc_reuse_entry = nullptr;
+}
+
 void Rasterizer::BindCacheDropFrame(BindCacheEntry& entry, u32 reason) {
     const size_t index = static_cast<size_t>(&entry - frame_cache.data());
     if (index < frame_keys.size() && frame_keys[index] != 0) {
@@ -7060,16 +7154,44 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
             }
             const u32* flat = FlatForBind(*st);
             const u64 hash = XXH3_64bits(flat, slot.size);
+            // sotc: SOTC_FLAT_ARENA: the table's arena place (kept across ticks while the arena holds it); the ring
+            // below only when the arena has no room.
+            bool placed = false;
+            if (auto* arena = buffer_cache.GetFlatArena()) {
+                VideoCore::FlatArena::Ref ref{};
+                bool uploaded = false;
+                if (arena->Obtain(hash, flat, slot.size, alignment, scheduler.CurrentTick(), ref, uploaded)) {
+                    slot.offset = ref.offset;
+                    slot.buffer = ref.buffer;
+                    slot.base = ref.address;
+                    slot.arena = true;
+                    slot.hash = hash;
+                    slot.gen = buffer_cache.StreamGeneration();
+                    slot.tick = scheduler.CurrentTick();
+                    placed = true;
+                    if (stats) {
+                        (uploaded ? SotcStats::pb_flat_uploaded : SotcStats::pb_flat_reused)
+                            .fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else if (stats) {
+                    SotcStats::pb_flat_stream.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             // sotc: only a copy made in this tick may be reused: a later tick reusing it does not
             // extend the ring's watch over it, and a wrap would overwrite it while that tick's
             // draws still read it on the GPU (review of 2026-10-29).
-            if (hash == slot.hash && slot.gen == buffer_cache.StreamGeneration() &&
-                slot.tick == scheduler.CurrentTick()) {
+            if (placed) {
+                // placed in the arena above
+            } else if (!slot.arena && hash == slot.hash && slot.gen == buffer_cache.StreamGeneration() &&
+                       slot.tick == scheduler.CurrentTick()) {
                 if (stats) {
                     SotcStats::bf_flat_reused.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
                 slot.offset = vk_buffer.Copy(flat, slot.size, alignment);
+                slot.buffer = vk_buffer.Handle();
+                slot.base = vk_buffer.BufferDeviceAddress();
+                slot.arena = false;
                 slot.hash = hash;
                 slot.gen = buffer_cache.StreamGeneration();
                 slot.tick = scheduler.CurrentTick();
@@ -7079,7 +7201,7 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
             }
             // sotc: SOTC_PACKET. The packet word of this flat buffer, as BindBuffers sets it (by the stage's kind).
             if (entry->packet) {
-                const u64 address = vk_buffer.BufferDeviceAddress() + slot.offset;
+                const u64 address = (slot.base ? slot.base : vk_buffer.BufferDeviceAddress()) + slot.offset;
                 if (st->sw_stage == Shader::SwStage::Fragment) {
                     draw_packet.flatbuf_fragment_address = address;
                 } else if (st->sw_stage == Shader::SwStage::Vertex ||
@@ -7143,6 +7265,9 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
         // sotc: the flat copies made or reused above must still be in this lap and tick of the
         // stream ring (the synchronization may have wrapped it or submitted).
         for (const auto& slot : entry->flat_slots) {
+            if (slot.arena) { // sotc: SOTC_FLAT_ARENA: not a ring copy
+                continue;
+            }
             if (slot.gen != buffer_cache.StreamGeneration() ||
                 slot.tick != scheduler.CurrentTick()) {
                 return refuse(true, SotcStats::RfFlatTick);
@@ -7159,13 +7284,27 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
         }
     }
     if (replay) {
-        for (const auto& s : entry->samplers) {
-            u32 slot = 0;
-            const vk::Sampler handle = texture_cache.GetSampler(
-                s.sharp, liverpool->DrawRegs().ta_bc_base, s.is_depth, &slot); // as BindTextures
-            if (handle != s.handle || slot != s.slot) {
-                return refuse(true, SotcStats::RfSampler);
+        // sotc: SOTC_SAMPLER_CACHE. A sampler handle can only change by a destruction, which bumps SamplerGeneration
+        // and flushes this cache (below); the per-tick re-resolution is kept every 8 ticks per entry for its LRU
+        // touch (the garbage collector frees samplers untouched for 16+ ticks) and for a bindless slot taken since.
+        const bool check_samplers = !SotcNonBlocking::SamplerCache() || entry->samplers.empty() ||
+                                    entry->sampler_check_tick == ~0ULL ||
+                                    current_tick - entry->sampler_check_tick >= 8;
+        if (check_samplers) {
+            for (const auto& s : entry->samplers) {
+                u32 slot = 0;
+                const vk::Sampler handle = texture_cache.GetSampler(
+                    s.sharp, liverpool->DrawRegs().ta_bc_base, s.is_depth, &slot); // as BindTextures
+                if (handle != s.handle || slot != s.slot) {
+                    return refuse(true, SotcStats::RfSampler);
+                }
             }
+            entry->sampler_check_tick = current_tick;
+            if (stats && SotcNonBlocking::SamplerCache() && !entry->samplers.empty()) {
+                SotcStats::pb_sampler_checked.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (stats) {
+            SotcStats::pb_sampler_skipped.fetch_add(1, std::memory_order_relaxed);
         }
     }
     // sotc: SOTC_PACKET. The addressed ranges of the packet op, touched as BindBuffers does; Touch may place or evict
@@ -7336,6 +7475,43 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
     push_data.yscale = bind_input_push.yscale;
     for (const auto& slot : entry->flat_slots) {
         buffer_infos[slot.info].offset = slot.offset;
+        if (slot.buffer) { // sotc: SOTC_FLAT_ARENA: the copy may live in the arena or the ring
+            buffer_infos[slot.info].buffer = slot.buffer;
+        }
+    }
+    // sotc: SOTC_BIND_DESC_REUSE. The sets written for this entry's descriptors are bound again by
+    // BindPipelineResources when they are still the entry's: persistent sets always are (rolling-pool sets only while
+    // the heap's pool has not rolled), and every flat copy is in the buffer the sets name. A copy at another offset of
+    // that buffer is passed as a dynamic offset when the pipeline's flat bindings are dynamic (Pipeline::FlatDynamic);
+    // in a static layout it needs a write. The other descriptors are the entry's own by construction (the checks above
+    // refused any difference).
+    if (SotcNonBlocking::BindDescReuse()) {
+        desc_reuse_entry = entry;
+        u32 reason = SotcStats::PbDrSites;
+        const auto& rec = entry->desc_sets;
+        if (rec.count == 0) {
+            reason = SotcStats::PbDrNoSets;
+        } else if (!rec.persistent && rec.pool_serial != pipeline_cache.GetDescriptorHeap().PoolSerial()) {
+            reason = SotcStats::PbDrPoolRolled;
+        } else {
+            const bool dynamic = entry->pipeline->FlatDynamic();
+            for (const auto& slot : entry->flat_slots) {
+                if (buffer_infos[slot.info].buffer != slot.desc_buffer) {
+                    reason = SotcStats::PbDrRingMoved;
+                    break;
+                }
+                if (!dynamic && buffer_infos[slot.info].offset != slot.desc_offset) {
+                    reason = SotcStats::PbDrLayoutFallback;
+                    break;
+                }
+            }
+        }
+        if (reason == SotcStats::PbDrSites) {
+            desc_reuse = entry->desc_sets;
+            desc_reuse.reuse = true;
+        } else if (stats) {
+            SotcStats::pb_desc_rewritten[reason].fetch_add(1, std::memory_order_relaxed);
+        }
     }
     bindless_slots = entry->bindless_slots;
     if (bindless_images) { // sotc: SOTC_N5_BINDLESS: the replayed slots are used by this tick
@@ -7563,6 +7739,11 @@ Rasterizer::BindCacheEntry* Rasterizer::CommitBindCacheFrame(const Pipeline* pip
     entry->stamp_tick = state.tick; // the full bind just made this tick's stamps
     entry->stamp_epoch = 0;         // block stamps due at the first hit
     entry->key = key;
+    // sotc: SOTC_BIND_DESC_REUSE: a re-made slot keeps no sets of its old occupant (persistent ones are freed after
+    // their last tick).
+    pipeline_cache.GetDescriptorHeap().RetirePersistent(entry->desc_sets);
+    entry->desc_sets = {};
+    entry->sampler_check_tick = ~0ULL;  // sotc: SOTC_SAMPLER_CACHE
     entry->targets_key = state.targets_key;
     entry->flush_gen = bind_cache_flush_gen;
     entry->buffer_version = state.buffer_generation;
@@ -8772,23 +8953,51 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                      stage.pgm_hash == kTonemapHash)) {
                     bind_cache_uncacheable = true;
                 }
-                const u64 offset = vk_buffer.Copy(flat, ubo_size, alignment);
-                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                // sotc: SOTC_FLAT_ARENA: the table's arena place when the arena has it or has room (else the ring).
+                vk::Buffer flat_buffer = vk_buffer.Handle();
+                vk::DeviceAddress flat_base = vk_buffer.BufferDeviceAddress();
+                u64 offset = 0;
+                u64 flat_hash = 0;
+                bool hashed = false;
+                bool in_arena = false;
+                if (auto* arena = buffer_cache.GetFlatArena()) {
+                    flat_hash = XXH3_64bits(flat, ubo_size);
+                    hashed = true;
+                    VideoCore::FlatArena::Ref ref{};
+                    bool uploaded = false;
+                    if (arena->Obtain(flat_hash, flat, ubo_size, alignment, scheduler.CurrentTick(), ref,
+                                      uploaded)) {
+                        offset = ref.offset;
+                        flat_buffer = ref.buffer;
+                        flat_base = ref.address;
+                        in_arena = true;
+                        if (SotcStats::kFpsLog) {
+                            (uploaded ? SotcStats::pb_flat_uploaded : SotcStats::pb_flat_reused)
+                                .fetch_add(1, std::memory_order_relaxed);
+                        }
+                    } else if (SotcStats::kFpsLog) {
+                        SotcStats::pb_flat_stream.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                if (!in_arena) {
+                    offset = vk_buffer.Copy(flat, ubo_size, alignment);
+                    bind_cache_stream_rec = true; // sotc: SOTC_BIND_CACHE_FRAME: a copy in the ring
+                }
+                buffer_infos.emplace_back(flat_buffer, offset, ubo_size);
                 // sotc: SOTC_PACKET: the flat buffer's device address for the packet (flat buffers are per stage:
                 // the fragment one has its own word, the vertex and compute one shares flatbuf_address).
                 if (stage.sw_stage == Shader::SwStage::Fragment) {
-                    draw_packet.flatbuf_fragment_address = vk_buffer.BufferDeviceAddress() + offset;
+                    draw_packet.flatbuf_fragment_address = flat_base + offset;
                 } else if (stage.sw_stage == Shader::SwStage::Vertex ||
                            stage.sw_stage == Shader::SwStage::Compute) {
-                    draw_packet.flatbuf_address = vk_buffer.BufferDeviceAddress() + offset;
+                    draw_packet.flatbuf_address = flat_base + offset;
                 }
-                bind_cache_stream_rec = true; // sotc: SOTC_BIND_CACHE_FRAME: a copy in the ring
                 if (bind_cache_recording && SotcStats::kBindCacheFrame) {
                     bind_cache_flat_rec.push_back({cur_bind_stage,
                                                    static_cast<u32>(buffer_infos.size() - 1),
-                                                   ubo_size, XXH3_64bits(flat, ubo_size), offset,
-                                                   buffer_cache.StreamGeneration(),
-                                                   scheduler.CurrentTick()});
+                                                   ubo_size, hashed ? flat_hash : XXH3_64bits(flat, ubo_size),
+                                                   offset, buffer_cache.StreamGeneration(),
+                                                   scheduler.CurrentTick(), flat_buffer, flat_base, in_arena});
                 }
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the

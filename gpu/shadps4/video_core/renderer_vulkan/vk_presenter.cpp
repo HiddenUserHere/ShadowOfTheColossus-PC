@@ -876,6 +876,12 @@ struct SotcFrameHashRing : std::enable_shared_from_this<SotcFrameHashRing> {
 };
 
 Presenter::~Presenter() {
+    // sotc: the display waiter uses the swapchain: stopped before anything is destroyed.
+    if (display_thread.joinable()) {
+        display_thread.request_stop();
+        display_wait_cv.notify_all();
+        display_thread.join();
+    }
     if (cp_pacer == this) {
         cp_pacer = nullptr;
     }
@@ -1876,18 +1882,232 @@ void Presenter::RunFlipJob(FlipJob& job) {
     job.on_frames[0](frame);
 }
 
+namespace {
+
+u64 SteadyNs() {
+    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count());
+}
+
+// sotc: display cadence log (always on). One "SOTC DISPLAY" line every 5 s: how many display vblanks
+// each presented frame stayed on screen (the interval between its completion and the next one,
+// bucketed within 25% of a whole number of vblanks), the present->display latency (from the id being
+// taken just before vkQueuePresentKHR to the completion) and, with SOTC_PACER, the pacer's counters.
+// Fed by the display waiter thread with the time each present was seen done (VK_KHR_present_wait),
+// or, on a device without present wait, by the presenting thread with the time vkQueuePresentKHR
+// returned (FIFO blocks there once its queue is full, so it follows the display, less exactly; no
+// latency then). One writer in either mode, so no lock.
+struct DisplayCadence {
+    double nominal_ns = 0.0; ///< from the primary display's refresh rate
+    double vblank_ns = 0.0;  ///< refined from the completion intervals
+    u64 prev_ns = 0;         ///< previous completion; 0 after a gap
+    u64 window_start_ns = 0;
+    u32 frames = 0;
+    u32 shown[4]{}; ///< 1, 2, 3, 4+ vblanks
+    u32 off_grid = 0;
+    u32 on_time = 0, late1 = 0, late2 = 0;
+    std::vector<float> latency_ms, phase_ms;
+
+    /// Returns the line to print when a 5 s window ends, else an empty string.
+    std::string Note(bool exact, u64 done_ns, u64 queued_ns, u64 target_ns, bool pacer_active,
+                     std::atomic<u32>& dropped, std::atomic<double>& vblank_out) {
+        if (vblank_ns <= 0.0) {
+            nominal_ns = 1e9 / double(std::max<u32>(1, BbDisplayRefreshHz()));
+            vblank_ns = nominal_ns;
+            vblank_out.store(vblank_ns, std::memory_order_relaxed);
+        }
+        if (window_start_ns == 0) {
+            window_start_ns = done_ns;
+        }
+        if (prev_ns != 0 && done_ns > prev_ns && done_ns - prev_ns < 250'000'000) {
+            // (a longer interval is a pause, loading or a hidden window, not a frame on screen)
+            const double d = double(done_ns - prev_ns);
+            const double n = std::round(d / vblank_ns);
+            const bool on_grid = n >= 1.0 && std::abs(d - n * vblank_ns) <= 0.25 * vblank_ns;
+            ++frames;
+            if (d >= 3.75 * vblank_ns) {
+                ++shown[3];
+            } else if (on_grid) {
+                ++shown[int(n) - 1];
+            } else {
+                ++off_grid;
+            }
+            if (on_grid && n <= 8.0) {
+                // Continuous refinement (a 59.94 Hz display against the nominal 60), kept within
+                // 20% of the nominal period so noise cannot walk it to another multiple.
+                vblank_ns += (d / n - vblank_ns) / 64.0;
+                vblank_ns = std::clamp(vblank_ns, nominal_ns * 0.8, nominal_ns * 1.2);
+                vblank_out.store(vblank_ns, std::memory_order_relaxed);
+            }
+        }
+        prev_ns = done_ns;
+        if (exact && queued_ns != 0 && done_ns > queued_ns) {
+            latency_ms.push_back(float(double(done_ns - queued_ns) / 1e6));
+        }
+        if (target_ns != 0) {
+            // The pacer's planned display time: whole vblanks late, and the phase error within the
+            // vblank the frame was shown on.
+            const double err = double(s64(done_ns - target_ns));
+            const double slots = std::round(err / vblank_ns);
+            if (slots <= 0.0) {
+                ++on_time;
+            } else if (slots == 1.0) {
+                ++late1;
+            } else {
+                ++late2;
+            }
+            phase_ms.push_back(float(std::abs(err - slots * vblank_ns) / 1e6));
+        }
+        if (done_ns - window_start_ns < 5'000'000'000ULL) {
+            return {};
+        }
+        const auto pct = [](std::vector<float>& v, double p) -> double {
+            if (v.empty()) {
+                return 0.0;
+            }
+            std::sort(v.begin(), v.end());
+            return v[std::min(v.size() - 1, size_t(p * double(v.size())))];
+        };
+        char line[640];
+        int len = std::snprintf(
+            line, sizeof(line),
+            "SOTC DISPLAY: frames %u, shown 1 vblank %u, 2 vblanks %u, 3 vblanks %u, 4+ %u, "
+            "off-grid %u (vblank %.2f ms = %.2f Hz, %s)",
+            frames, shown[0], shown[1], shown[2], shown[3], off_grid, vblank_ns / 1e6,
+            1e9 / vblank_ns,
+            exact ? "present_id" : "no present_id: FIFO present-return times");
+        if (exact) {
+            len += std::snprintf(line + len, sizeof(line) - size_t(len),
+                                 ", present->display latency p50 %.1f ms, p99 %.1f ms",
+                                 pct(latency_ms, 0.5), pct(latency_ms, 0.99));
+        } else {
+            len += std::snprintf(line + len, sizeof(line) - size_t(len),
+                                 ", present->display latency n/a");
+        }
+        const u32 drops = dropped.exchange(0, std::memory_order_relaxed);
+        if (pacer_active || on_time || late1 || late2 || drops) {
+            std::snprintf(line + len, sizeof(line) - size_t(len),
+                          "; pacer: on-time %u, late-by-1 %u, late-by-2+ %u, dropped %u, phase "
+                          "error p50 %.2f ms, p99 %.2f ms\n",
+                          on_time, late1, late2, drops, pct(phase_ms, 0.5), pct(phase_ms, 0.99));
+        } else {
+            std::snprintf(line + len, sizeof(line) - size_t(len), "; pacer: off\n");
+        }
+        window_start_ns = done_ns;
+        frames = off_grid = on_time = late1 = late2 = 0;
+        std::fill(std::begin(shown), std::end(shown), 0u);
+        latency_ms.clear();
+        phase_ms.clear();
+        return line;
+    }
+};
+DisplayCadence display_cadence;
+
+} // namespace
+
+double Presenter::DisplayVblankNs() const {
+    const double v = display_vblank_ns.load(std::memory_order_relaxed);
+    return v > 0.0 ? v : 1e9 / double(std::max<u32>(1, BbDisplayRefreshHz()));
+}
+
+// sotc: display cadence log. The waiter takes the tagged presents in id order and blocks in
+// vkWaitForPresentKHR (20 ms at a time, under the swapchain's PresentWaitMutex so a recreate never
+// destroys the handle during the wait) until each is on screen; the wake-up time is its completion.
+// A present from a replaced swapchain, or one already recycled from the 64-entry ring because the
+// waiter fell behind, is skipped and starts a new interval.
+void Presenter::DisplayWaitMain(std::stop_token token) {
+    Common::SetCurrentThreadName("shadPS4:DisplayWait");
+    const VkDevice device = static_cast<VkDevice>(instance.GetDevice());
+    u64 next = 1;
+    while (!token.stop_requested()) {
+        const u64 last = last_present_id.load(std::memory_order_acquire);
+        if (next > last) {
+            std::unique_lock lock{display_wait_mutex};
+            display_wait_cv.wait_for(lock, token, std::chrono::milliseconds(50), [&] {
+                return last_present_id.load(std::memory_order_acquire) >= next;
+            });
+            continue;
+        }
+        if (last - next >= present_records.size() / 2) {
+            next = last;
+            display_cadence.prev_ns = 0;
+        }
+        PresentRecord record;
+        {
+            std::scoped_lock lock{present_records_mutex};
+            record = present_records[next % present_records.size()];
+        }
+        if (record.id != next) {
+            ++next;
+            display_cadence.prev_ns = 0;
+            continue;
+        }
+        VkResult result = VK_ERROR_OUT_OF_DATE_KHR;
+        {
+            std::scoped_lock wait_lock{swapchain.PresentWaitMutex()};
+            const VkSwapchainKHR current = static_cast<VkSwapchainKHR>(swapchain.GetHandle());
+            if (current != VK_NULL_HANDLE && current == record.swapchain) {
+                result = VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitForPresentKHR(device, current, next,
+                                                                           20'000'000);
+            }
+        }
+        if (result == VK_TIMEOUT) {
+            continue; // not on screen yet (or a hidden window): wait again
+        }
+        u64 done_ns = 0;
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+            done_ns = SteadyNs();
+            std::scoped_lock lock{present_records_mutex};
+            PresentRecord& stored = present_records[next % present_records.size()];
+            if (stored.id == next) {
+                // The vblank thread's poll may have seen it first (never earlier than it was done).
+                if (stored.done_ns == 0 || done_ns < stored.done_ns) {
+                    stored.done_ns = done_ns;
+                } else {
+                    done_ns = stored.done_ns;
+                }
+            }
+        }
+        if (done_ns != 0) {
+            const std::string line = display_cadence.Note(
+                true, done_ns, record.queued_ns, record.target_ns,
+                pacer_active.load(std::memory_order_relaxed), pacer_dropped, display_vblank_ns);
+            if (!line.empty()) {
+                std::fwrite(line.data(), 1, line.size(), stderr); // this thread only waits
+            }
+        } else {
+            display_cadence.prev_ns = 0; // replaced swapchain or an error: no interval
+        }
+        ++next;
+    }
+}
+
 // sotc: SOTC_PRESENT_WAIT. Each present on the main path is tagged with the next id
 // (VK_KHR_present_id), so the vblank thread can wait until it is on screen (driver.cpp). Ids
 // are taken under Scheduler::submit_mutex together with swapchain.Present, so they follow the
-// queue order.
+// queue order. With VK_KHR_present_wait the first one starts the display waiter (cadence log).
 u64 Presenter::TagPresent() {
-    std::scoped_lock lock{present_records_mutex};
-    const u64 id = last_present_id.load(std::memory_order_relaxed) + 1;
-    present_records[id % present_records.size()] = {
-        .id = id,
-        .swapchain = static_cast<VkSwapchainKHR>(swapchain.GetHandle()),
-    };
-    last_present_id.store(id, std::memory_order_release);
+    u64 id;
+    {
+        std::scoped_lock lock{present_records_mutex};
+        id = last_present_id.load(std::memory_order_relaxed) + 1;
+        present_records[id % present_records.size()] = {
+            .id = id,
+            .swapchain = static_cast<VkSwapchainKHR>(swapchain.GetHandle()),
+            .queued_ns = SteadyNs(),
+            .target_ns = next_present_target_ns.exchange(0, std::memory_order_relaxed),
+        };
+        // Under the waiter's mutex too, so its predicate check cannot miss this id (a missed
+        // wake-up would date the completion up to 50 ms late).
+        std::scoped_lock wait_lock{display_wait_mutex};
+        last_present_id.store(id, std::memory_order_release);
+    }
+    display_wait_cv.notify_one();
+    if (!display_thread.joinable() && instance.IsPresentWaitEnabled()) {
+        display_thread = std::jthread{[this](std::stop_token token) { DisplayWaitMain(token); }};
+        display_clock_on.store(true, std::memory_order_release);
+    }
     return id;
 }
 
@@ -1931,10 +2151,29 @@ bool Presenter::WaitPresented(u64 id, u64 timeout_ns) {
                                 .count());
     std::scoped_lock lock{present_records_mutex};
     PresentRecord& record = present_records[id % present_records.size()];
-    if (record.id == id) {
+    // sotc: the earliest sighting is kept (the display waiter may have recorded it first).
+    if (record.id == id && (record.done_ns == 0 || done_ns < record.done_ns)) {
         record.done_ns = done_ns;
     }
     return true;
+}
+
+// sotc: SOTC_PACER, see the declaration. Same pattern as SOTC_FSRFG_ONLY_GENERATED in Present: an
+// empty submit on the present queue waits for the frame's ready semaphore and signals present_done,
+// which the next user of this frame waits for (GetRenderFrame).
+void Presenter::DiscardFrame(Frame* frame) {
+    const Scheduler::SubmitRoleScope present_role{Scheduler::SubmitRole::Present};
+    if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
+        draw_scheduler.WaitSubmitted(frame->ready_tick, false);
+    }
+    Check(instance.GetDevice().resetFences(frame->present_done));
+    SubmitInfo info{};
+    info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    info.AddSignal(frame->present_done);
+    present_scheduler.Flush(info);
+    std::scoped_lock fl{free_mutex};
+    free_queue.push(frame);
+    free_cv.notify_all();
 }
 
 u64 Presenter::PresentDoneNs(u64 id) const {
@@ -2304,6 +2543,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         low_latency.BeforePresent(present_id);
         const SotcTrace::Scope trace_present{"present", present_id}; // sotc: SOTC_TRACE
         const bool presented = swapchain.Present(present_id);
+        // sotc: display cadence log without VK_KHR_present_wait: the FIFO present-return times.
+        if (presented && !display_clock_on.load(std::memory_order_relaxed)) {
+            std::string line = display_cadence.Note(false, SteadyNs(), 0, 0, false, pacer_dropped,
+                                                    display_vblank_ns);
+            if (!line.empty()) { // written off this thread (a stderr write can take ~10 ms)
+                std::thread([text = std::move(line)] {
+                    std::fwrite(text.data(), 1, text.size(), stderr);
+                }).detach();
+            }
+        }
         if (SotcStats::kFpsLog) {
             present_under_lock_ns.fetch_add(SotcStats::NowNs() - lock_taken,
                                             std::memory_order_relaxed);
@@ -2398,8 +2647,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                     account_text, sizeof(account_text),
                     "; cpu draw %.1f cp %.1f rec %.1f passsec %.1f upload %.1f ms; draw waits "
                     "gpu %.1f (%llu) rec %.1f (%llu) upload %.1f (%llu) tc %.1f (%llu) ms; cp "
-                    "parse %.1f blocked %.1f spin %.1f ms; rec busy %.1f upload-wait %.1f submit %.1f ms; "
-                    "fence %.1f ms", // sotc: SOTC_ASYNC_UPLOAD write fence waits
+                    "parse %.1f blocked %.1f spin %.1f ms; cp libwait %.1f ms; rec busy %.1f upload-wait %.1f "
+                    "submit %.1f ms; fence %.1f ms", // sotc: SOTC_ASYNC_UPLOAD write fence waits
                     ms(d.cpu_ns[SotcStats::RoleDraw]), ms(d.cpu_ns[SotcStats::RoleCp]),
                     ms(d.cpu_ns[SotcStats::RoleRecorder]),
                     ms(d.cpu_ns[SotcStats::RolePassSecondary]),
@@ -2409,6 +2658,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                     n(d.wait_count[WaitUpload]), ms(d.wait_ns[WaitTcLock]),
                     n(d.wait_count[WaitTcLock]), ms(d.parse_ns), ms(d.blocked_ns),
                     ms(d.spin_ns), // sotc: CP no-progress spin (Liverpool::Process)
+                    ms(d.libwait_ns), // sotc: the command processor's waits for a draw's libraries (plan step 3)
                     ms(d.rec_busy), ms(d.rec_upload), ms(d.rec_submit), ms(d.fence));
                 // sotc: guest threads' wall-clock wait in asynchronous readbacks this frame
                 const size_t used = std::strlen(account_text);

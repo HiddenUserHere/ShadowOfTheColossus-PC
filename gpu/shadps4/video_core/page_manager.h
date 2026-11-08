@@ -127,6 +127,19 @@ public:
     /// state for it is read-write and the host protection is not (see FaultProtectScope).
     static void EnsureFaultPageWritable(VAddr page);
 
+    /// sotc: SOTC_PROTECT_ASYNC_UNPROTECT (gpu/sotc/nonblocking.h; with SOTC_PROTECT_ASYNC). While one is open on
+    /// the draw thread, the unprotects (read-write) that thread makes are queued for the protect worker in order
+    /// with its restrictions instead of flushing the queue and running synchronously: the next reader of the pages
+    /// is the GPU. Opened by Rasterizer::BindResources around an op's bind; no code inside writes guest memory
+    /// through its protected mapping (uploads read the backing). Outside a scope every unprotect stays synchronous.
+    class GpuOnlyScope {
+    public:
+        GpuOnlyScope() noexcept;
+        ~GpuOnlyScope();
+        GpuOnlyScope(const GpuOnlyScope&) = delete;
+        GpuOnlyScope& operator=(const GpuOnlyScope&) = delete;
+    };
+
     /// sotc: SOTC_VERIFY=n1 (gpu/sotc/native/n1verify.h). Protects [addr, addr + size) again from
     /// the tracker's watcher state, after the N1VERIFY fault handler opened the pages. Draw thread.
     static void N1VerifyRearm(VAddr addr, u64 size);

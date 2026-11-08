@@ -61,6 +61,12 @@ public:
         return swapchain;
     }
 
+    /// sotc: the display cadence waiter (vk_presenter.cpp DisplayWaitMain) holds this around its
+    /// blocking vkWaitForPresentKHR; Destroy takes it, so the handle is never destroyed during a wait.
+    std::mutex& PresentWaitMutex() const {
+        return present_wait_mutex;
+    }
+
     u32 GetWidth() const {
         return width;
     }
@@ -141,6 +147,7 @@ private:
     bool needs_recreation = true;
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output
+    mutable std::mutex present_wait_mutex; // sotc: see PresentWaitMutex
 };
 
 } // namespace Vulkan

@@ -175,6 +175,19 @@ private:
 /// with FAIL_ON_PIPELINE_COMPILE_REQUIRED: a success is the pipeline (a driver cache hit) and is
 /// returned; a compile-required result is a driver cache miss, and the normal build follows.
 /// make(next, fail_on_compile_required) runs one create call and returns {result, handle}.
+/// sotc: SOTC_PLAY_QUIET: when the last pipeline (library, link, full or compute) was created on any thread, steady
+/// clock nanoseconds; the driver cache saver runs its periodic save only after a few idle seconds.
+inline std::atomic<u64> g_last_create_ns{0};
+inline void NoteCreate() {
+    g_last_create_ns.store(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count()),
+                           std::memory_order_relaxed);
+}
+inline u64 LastCreateNs() {
+    return g_last_create_ns.load(std::memory_order_relaxed);
+}
+
 template <typename Make, typename Name>
 auto Create(Kind kind, u32 stage_count, const void* next, bool probe_ok, Make&& make,
             Name&& name) {
@@ -190,6 +203,7 @@ auto Create(Kind kind, u32 stage_count, const void* next, bool probe_ok, Make&& 
     Call call{kind, stage_count, next};
     auto out = make(call.Next(), false);
     call.Done(out.first, name);
+    NoteCreate();
     return out;
 }
 

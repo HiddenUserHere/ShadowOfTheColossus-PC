@@ -54,7 +54,8 @@ void OnFrame(double frame_ms);
 struct Window {
     std::string segment;
     uint64_t frames{};
-    double p50{}, p99{}, max{};
+    double p50{}, p99{}, p999{}, max{};
+    uint64_t late30{}, max_consecutive_late30{}; ///< sotc: >1000/30 + 0.5 ms (flip cadence)
     uint64_t hitch33{}, hitch50{}, hitch100{};
 };
 /// Current stats window (since the last mark).

@@ -2804,13 +2804,17 @@ void VideoOutDriver::Flip(const Request& req) {
                     SotcStats::async_compute_built.load(std::memory_order_relaxed)) {
                 std::fprintf(
                     stderr,
-                    "SOTC ASYNC COMPUTE built %llu (%.0f ms on workers), recorder waited %llu "
-                    "times (%.0f ms)\n",
+                    "SOTC ASYNC COMPUTE built %llu (%.0f ms on workers), compute waits %llu (%.0f ms), "
+                    "compute cache-hit builds inline %llu (%.0f ms)\n",
                     static_cast<unsigned long long>(built),
                     SotcStats::async_compute_build_ns.load(std::memory_order_relaxed) / 1e6,
                     static_cast<unsigned long long>(
                         SotcStats::async_compute_waits.load(std::memory_order_relaxed)),
-                    SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6);
+                    SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6,
+                    // sotc: SOTC_COMPUTE_PACK: listed pipelines the recorder built from the pack cache
+                    static_cast<unsigned long long>(
+                        SotcStats::async_compute_inline_built.load(std::memory_order_relaxed)),
+                    SotcStats::async_compute_inline_ns.load(std::memory_order_relaxed) / 1e6);
             }
             // sotc: graphics shaders translated by workers (SOTC_ASYNC_TRANSLATE), totals; and the draws dropped while
             // their pipeline was queued on a worker (SOTC_PIPE_MANIFEST safety net counter).
@@ -3438,8 +3442,122 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
     };
 
+    // sotc: SOTC_PACER=1 (off by default): the frame pacer (docs/re-stutters/LOCKED-30-PLAN-2026-11-08.md,
+    // plan A). For a capped game it replaces "take a flip once (rate + 1) timer ticks passed" with a
+    // cadence locked to the display: each frame stays on screen n display vblanks, n being the flip
+    // interval ((rate + 1) 60 Hz vblanks) in display vblanks, 2 at 30 FPS on a 60 Hz display.
+    //   - Timing: the display vblank period is Presenter::DisplayVblankNs (the display's refresh rate,
+    //     refined continuously from the present completion intervals), the phase is the completion
+    //     of the last paced present (PresentDoneNs, recorded by the display waiter, VK_KHR_present_wait).
+    //     Target display time of the next frame = that completion + n vblanks.
+    //   - present is called kPacerLead vblank before the target: after the vblank before it, so FIFO
+    //     cannot show the frame one vblank early, and early enough for the present blit.
+    //   - The NEWEST queued frame is presented then. Older frames still queued are dropped (counted;
+    //     their flips are still signalled to the game, in order), so a frame is dropped only when a
+    //     newer one exists, never when it is the only one.
+    //   - No frame by then: the target moves to the next display vblank (slot), and the phase relocks
+    //     on the completion of whatever goes out.
+    //   - One frame in flight plus one ready: nothing is presented while the last paced present is
+    //     not on screen (at most kPacerInFlightTimeoutNs, then unlocked: the next frame goes out at once).
+    // FIFO stays (forced by SOTC_PRESENT_WAIT), so the driver still aligns the scanout and nothing
+    // tears; the pacer only decides when present is called and with which frame. The SOTC_PRESENT_WAIT
+    // display gate is not used while pacing (the pacer's in-flight rule replaces it).
+    // Latency: a frame finished early waits in the queue for its slot: up to one slot (n vblanks,
+    // 33.3 ms at 30 FPS on 60 Hz), about half a slot on average, on top of FIFO's present->display time
+    // (SOTC DISPLAY line). That is what buys showing a 36 ms frame on time instead of for 50 ms.
+    // The game's rate 0 (uncapped, the 60 FPS mode) is not paced unless SOTC_PACER_RATE=<rate> forces a
+    // rate (then that rate is paced whatever the game asks). Off while frame generation or async present
+    // is on, when the display refresh is not a multiple of the frame rate (144 Hz at 30 FPS), and
+    // without VK_KHR_present_wait; the timer rule above applies then.
+    static const bool pacer_on = [] {
+        const char* v = std::getenv("SOTC_PACER");
+        return v && v[0] == '1';
+    }();
+    static const int pacer_rate_forced = [] {
+        const char* v = std::getenv("SOTC_PACER_RATE");
+        return v && v[0] ? int(std::strtol(v, nullptr, 10)) : -1;
+    }();
+    constexpr double kPacerLead = 0.3;  // vblanks before the target display time
+    constexpr double kPacerMinLead = 0.1; // later than this before the target: the next slot
+    constexpr u64 kPacerInFlightTimeoutNs = 100'000'000;
+    struct PacerState {
+        bool active = false;      // pacing on the last tick
+        bool locked = false;      // the phase is anchored on a completion
+        u64 pending_id = 0;       // the last paced present, until it is on screen
+        u64 pending_since_ns = 0;
+        u64 slot_target_ns = 0;   // display time of the next slot
+        u64 on_time_target_ns = 0; // the slot the next frame was planned for (phase error reference)
+        u64 logged_vblanks = 0;   // n of the last "SOTC PACER: on" line
+        bool warned_refresh = false;
+        bool warned_unavailable = false;
+    } pacer;
+    // Display vblanks per frame at `rate`, 0 when the refresh is not near a multiple of the frame rate.
+    const auto pacer_vblanks = [](int rate, double vblank_ns) -> u64 {
+        const double ratio = double(rate + 1) * (1e9 / 60.0) / vblank_ns;
+        const double n = std::round(ratio);
+        return n >= 1.0 && std::abs(ratio - n) <= 0.1 ? u64(n) : u64{0};
+    };
+    // Presents the newest queued frame (dropping older ones) with `on_time_target` as its planned
+    // display time (0: none). False when no frame is queued.
+    std::vector<Request> pacer_taken;
+    const auto pacer_present = [&](u64 on_time_target, int rate) -> bool {
+        pacer_taken.clear();
+        {
+            std::scoped_lock lk{mutex};
+            while (!requests.empty()) {
+                pacer_taken.push_back(requests.front());
+                requests.pop();
+            }
+        }
+        std::ptrdiff_t newest = -1;
+        for (std::ptrdiff_t i = 0; i < std::ptrdiff_t(pacer_taken.size()); ++i) {
+            if (pacer_taken[i].frame != nullptr) {
+                newest = i;
+            }
+        }
+        if (newest < 0) {
+            for (const auto& joined : pacer_taken) { // SOTC_FLIP_COALESCE flips without a frame
+                Flip(joined);
+            }
+            return false;
+        }
+        u32 dropped = 0;
+        for (std::ptrdiff_t i = 0; i < newest; ++i) {
+            Request older = pacer_taken[i];
+            if (older.frame != nullptr) {
+                presenter->DiscardFrame(older.frame);
+                older.frame = nullptr;
+                ++dropped;
+            }
+            Flip(older); // the game still sees this flip (count, events, VO label), unshown
+        }
+        presenter->LowLatencyFrameStart(); // sotc: SOTC_LOW_LATENCY, as in the timer path
+        const u64 id_before = presenter->LastPresentId();
+        presenter->SetNextPresentTarget(on_time_target);
+        Flip(pacer_taken[newest]);
+        presenter->SetNextPresentTarget(0);
+        for (std::size_t i = std::size_t(newest) + 1; i < pacer_taken.size(); ++i) {
+            Flip(pacer_taken[i]); // SOTC_FLIP_COALESCE flips that joined this frame
+        }
+        const u64 id = presenter->LastPresentId();
+        pacer.pending_id = id != id_before ? id : 0;
+        pacer.pending_since_ns = steady_ns();
+        if (pacer.pending_id == 0) {
+            pacer.locked = false; // the present was skipped (swapchain recreate): relock
+        }
+        last_flip_vblank = main_port.vblank_status.count;
+        flipped = true;
+        if (SotcAdaptive::kEnabled) {
+            SotcAdaptive::OnFlip(steady_ns(), u64(rate + 1) * 1'000'000'000ULL / 60);
+        }
+        presenter->NotePacer(true, dropped);
+        FRAME_END;
+        return true;
+    };
+
     while (!token.stop_requested()) {
         timer.Start();
+        const u64 tick_start_ns = steady_ns(); // sotc: SOTC_PACER, the end of this tick
         // sotc: SOTC_FLIP_OFFTHREAD: the present thread moves a frame whose present is done to the
         // draw thread's ready queue (vk_presenter.cpp RefillReadyFrames). Non-blocking; off by default.
         // The presenter may not exist yet when this thread starts (gnmdriver RegisterLib creates it).
@@ -3482,9 +3600,50 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const u64 interval = u64(flip_rate + 1) * vblanks_per_60hz;
             take_request = vblank_status.count - last_flip_vblank >= interval;
         }
+        // sotc: SOTC_PACER (see above): whether the pacer paces this tick, and its n.
+        const int pace_rate = pacer_rate_forced >= 0 ? pacer_rate_forced : flip_rate;
+        u64 pace_vblanks = 0;
+        if (pacer_on && flipped && presenter && main_port.is_open) {
+            if (!presenter->DisplayClockAvailable()) {
+                if (!pacer.warned_unavailable) {
+                    pacer.warned_unavailable = true;
+                    std::fprintf(stderr, "SOTC PACER: off (needs VK_KHR_present_wait: "
+                                         "SOTC_PRESENT_WAIT on and supported by the driver)\n");
+                }
+            } else if ((pace_rate > 0 || pacer_rate_forced >= 0) && !AsyncPresent() &&
+                       Vulkan::FrameGen::Current() == Vulkan::FrameGen::Mode::Off) {
+                const double vblank_ns = presenter->DisplayVblankNs();
+                pace_vblanks = pacer_vblanks(pace_rate, vblank_ns);
+                if (pace_vblanks == 0 && !pacer.warned_refresh) {
+                    pacer.warned_refresh = true;
+                    std::fprintf(stderr,
+                                 "SOTC PACER: display %.2f Hz is not a multiple of %.1f FPS, "
+                                 "pacing off (timer cadence)\n",
+                                 1e9 / vblank_ns, 60.0 / double(pace_rate + 1));
+                }
+                if (pace_vblanks != 0 && pace_vblanks != pacer.logged_vblanks) {
+                    pacer.logged_vblanks = pace_vblanks;
+                    const double slot_ms = double(pace_vblanks) * vblank_ns / 1e6;
+                    std::fprintf(stderr,
+                                 "SOTC PACER: on, target %llu vblanks (%.1f ms), queue 1 frame; "
+                                 "adds up to %.1f ms of latency (one slot, about half on average)\n",
+                                 static_cast<unsigned long long>(pace_vblanks), slot_ms, slot_ms);
+                }
+            }
+        }
+        const bool pacer_now = pace_vblanks != 0;
+        if (pacer_now != pacer.active) {
+            pacer.active = pacer_now;
+            pacer.locked = false;
+            pacer.pending_id = 0;
+            presenter->NotePacer(pacer_now, 0);
+        }
+        if (pacer_now) {
+            take_request = false; // the pacer takes the flips, after the vblank below
+        }
         // sotc: SOTC_PRESENT_WAIT display gate (see above). The poll of the last present, without
         // waiting, records when it was seen on screen for the refresh estimate.
-        const bool display_pacing = present_wait && !AsyncPresent();
+        const bool display_pacing = present_wait && !AsyncPresent() && !pacer_now;
         if (!display_pacing) {
             gate_id = 0;
         } else if (flipped) {
@@ -3568,6 +3727,52 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();
+        }
+
+        // sotc: SOTC_PACER step (see above), after this tick's vblank so the game's vblanks keep the
+        // timer's rate. It may sleep until the present call time when that falls inside this tick
+        // (the timer subtracts it from the next wait).
+        if (pacer_now) {
+            const double vblank_ns = presenter->DisplayVblankNs();
+            if (pacer.pending_id != 0) {
+                const u64 done = presenter->PresentDoneNs(pacer.pending_id);
+                if (done != 0) {
+                    pacer.locked = true;
+                    pacer.slot_target_ns = done + u64(double(pace_vblanks) * vblank_ns);
+                    pacer.on_time_target_ns = pacer.slot_target_ns;
+                    pacer.pending_id = 0;
+                } else if (steady_ns() - pacer.pending_since_ns >= kPacerInFlightTimeoutNs) {
+                    pacer.pending_id = 0;
+                    pacer.locked = false;
+                }
+            }
+            if (pacer.pending_id == 0 && !pacer.locked) {
+                // Not anchored (first paced frame, or after a skipped/stuck present): at once.
+                if (!pacer_present(0, pace_rate) && timer.GetTotalWait().count() < 0 &&
+                    !prep_painting && (ImGui::Core::MustKeepDrawing() || BbOverlay::LoadingShown())) {
+                    DrawLastFrame(); // as the timer path does when no flip is queued
+                }
+            } else if (pacer.pending_id == 0) {
+                const u64 tick_end_ns = tick_start_ns + u64(vblank_period.count());
+                while (true) {
+                    const u64 call_ns = pacer.slot_target_ns - u64(kPacerLead * vblank_ns);
+                    u64 now = steady_ns();
+                    if (now < call_ns) {
+                        if (call_ns >= tick_end_ns) {
+                            break; // a later tick
+                        }
+                        Common::AccurateSleep(std::chrono::nanoseconds(call_ns - now), nullptr,
+                                              false);
+                        now = steady_ns();
+                    }
+                    if (now + u64(kPacerMinLead * vblank_ns) <= pacer.slot_target_ns &&
+                        pacer_present(pacer.on_time_target_ns, pace_rate)) {
+                        break;
+                    }
+                    // No frame, or too late for this slot: the next display vblank.
+                    pacer.slot_target_ns += u64(vblank_ns);
+                }
+            }
         }
 
         timer.End();

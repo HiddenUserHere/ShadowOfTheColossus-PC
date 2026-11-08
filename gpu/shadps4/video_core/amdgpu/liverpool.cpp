@@ -54,12 +54,15 @@
 #include "video_core/amdgpu/op_footprint.h" // sotc: SOTC_CULL_EXPRESS
 #include "../../../sotc/load_warm.h"     // sotc: SOTC_LOAD_WARM
 #include "../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN (idle upload of fresh regions)
+#include "../../../sotc/nonblocking.h"     // sotc: plan C switches (SOTC_BACK_WRITE_EXACT, SOTC_CP_LABEL_SLEEP, ...)
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include <xmmintrin.h>
 
 // sotc: writes guest memory through the backing view (runtime_memory.c).
 extern "C" int runtime_memory_write_backing(unsigned long long address, const void* data,
                                             unsigned long long size);
+// sotc: SOTC_RING8_CACHE: generation of the runtime memory table (odd while a change is in progress).
+extern "C" uint64_t runtime_memory_generation(void);
 
 // Counted for the SOTC_PROBE diagnostic log (emulator.cpp).
 std::atomic<u64> g_sotc_zpass_dumps{0};
@@ -169,6 +172,23 @@ static u8 CpLabelSkipMode() {
 // thread adds to them, the report thread takes them).
 static std::atomic<u64> g_lbl_waits{}, g_lbl_skippable{}, g_lbl_skipped{}, g_lbl_gpu_waits{};
 
+// sotc: plan C counters (command processor adds, the 5 s report takes them; ReportPlanC).
+// SOTC_BACK_WRITE_EXACT: publishes queued without advancing back_write_seq.
+static std::atomic<u64> g_bw_exact_ops{};
+// SOTC_CP_LABEL_SLEEP: futex sleeps of the CP round loop, those ended by a wake (progress seen) and by the timeout.
+static std::atomic<u64> g_cp_sleeps{}, g_cp_sleep_wakes{}, g_cp_sleep_timeouts{}, g_cp_sleep_ns{};
+// SOTC_RING8_CACHE: submit lookaheads served from the cache, walked, and cache entries refused (content changed).
+static std::atomic<u64> g_ring8_hits{}, g_ring8_walks{}, g_ring8_stale{};
+// sotc: SOTC_BACK_WRITE_EXACT: the writes_memory flag of an op that provably writes no guest memory.
+// Counted (g_bw_exact_ops) when the switch drops the flag.
+static bool BackWritesFor(bool writes_no_guest_memory) {
+    if (writes_no_guest_memory && SotcNonBlocking::BackWriteExact()) {
+        g_bw_exact_ops.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
+}
+
 // sotc: SOTC_PC_RING full ring. ProcessGraphics nesting depth (command processor thread only).
 static u32 pc_ring_gfx_depth = 0;
 static u32 pc_ring_asc_depth = 0; // sotc: SOTC_PC_RING full ring, compute submits
@@ -202,9 +222,21 @@ static bool Ring8LabelsEnv() {
     const char* v = std::getenv("SOTC_PC_RING8_LABELS");
     return !(v && v[0] == '0');
 }
-static void Ring8CollectWaits(std::span<const u32> cb, u32 depth, size_t& packets) {
+// sotc: SOTC_RING8_CACHE: a command buffer the cached walk read, and the copy it walked.
+struct Ring8Buf {
+    const u32* data;
+    std::vector<u32> words;
+};
+// rec (SOTC_RING8_CACHE): each buffer is copied there first and the copy is walked, so the result is a function of the
+// recorded copies alone (a nested buffer's address comes from its parent's copy).
+static void Ring8CollectWaits(std::span<const u32> cb, u32 depth, size_t& packets,
+                              std::vector<Ring8Buf>* rec = nullptr) {
     constexpr u32 kMaxDepth = 4;
     constexpr size_t kMaxPackets = size_t{1} << 20;
+    if (rec && !cb.empty()) {
+        rec->push_back({cb.data(), std::vector<u32>(cb.begin(), cb.end())});
+        cb = rec->back().words; // the vector's storage moves with it when rec grows
+    }
     while (!cb.empty()) {
         if (packets++ >= kMaxPackets) {
             g_ring8_wait_unknown = true;
@@ -230,7 +262,7 @@ static void Ring8CollectWaits(std::span<const u32> cb, u32 depth, size_t& packet
                                                                   bytes)) {
                         g_ring8_wait_unknown = true; // not readable here: its waits are unknown
                     } else {
-                        Ring8CollectWaits({data, ib->ib_size}, depth + 1, packets);
+                        Ring8CollectWaits({data, ib->ib_size}, depth + 1, packets, rec);
                     }
                 }
             }
@@ -247,15 +279,118 @@ static void Ring8CollectWaits(std::span<const u32> cb, u32 depth, size_t& packet
     }
 }
 // Called once per outermost gfx submit (ProcessGraphics), before its first packet is parsed.
+// sotc: SOTC_RING8_CACHE. The lookahead of a submit is kept per (DCB, CCB) span with the copies of every buffer the walk
+// read and the memory table generation. A later submit of the same spans takes the result when the generation is
+// unchanged and even (so are the mappings IsValidMapping saw) and every buffer still holds its copied words (memcmp):
+// the walk is a function of those alone, so the result is the one a walk would give. The game rewrites its command
+// buffers in place without any table change, hence the content compare (the generation alone is not enough).
+struct Ring8CacheEntry {
+    const u32* dcb{};
+    size_t dcb_size{};
+    const u32* ccb{};
+    size_t ccb_size{};
+    u64 generation{1}; ///< odd: empty
+    std::vector<Ring8Buf> bufs;
+    std::vector<VAddr> waits;
+    bool unknown{};
+};
+static std::array<Ring8CacheEntry, 16> g_ring8_cache{}; // command processor only
+static u32 g_ring8_cache_next = 0;
+static bool Ring8CacheLookup(std::span<const u32> dcb, std::span<const u32> ccb) {
+    const u64 generation = runtime_memory_generation();
+    if (generation & 1) {
+        return false;
+    }
+    for (auto& e : g_ring8_cache) {
+        if (e.dcb != dcb.data() || e.dcb_size != dcb.size() || e.ccb != ccb.data() || e.ccb_size != ccb.size() ||
+            e.generation != generation) {
+            continue;
+        }
+        for (const auto& buf : e.bufs) {
+            if (std::memcmp(buf.data, buf.words.data(), buf.words.size() * sizeof(u32)) != 0) {
+                e.generation = 1; // content changed: walked again below
+                g_ring8_stale.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        g_ring8_submit_waits.clear();
+        g_ring8_submit_waits.insert(e.waits.begin(), e.waits.end());
+        g_ring8_wait_unknown = e.unknown;
+        g_ring8_hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
 static void Ring8ScanSubmit(std::span<const u32> dcb, std::span<const u32> ccb) {
+    const bool cache = SotcNonBlocking::Ring8Cache();
+    if (cache && Ring8CacheLookup(dcb, ccb)) {
+        return;
+    }
     g_ring8_submit_waits.clear();
     g_ring8_wait_unknown = false;
     size_t packets = 0;
-    Ring8CollectWaits(dcb, 0, packets);
-    Ring8CollectWaits(ccb, 0, packets);
+    if (!cache) {
+        Ring8CollectWaits(dcb, 0, packets);
+        Ring8CollectWaits(ccb, 0, packets);
+        return;
+    }
+    g_ring8_walks.fetch_add(1, std::memory_order_relaxed);
+    // Read before the copies: a table change during the walk leaves the entry stale (another generation).
+    const u64 generation = runtime_memory_generation();
+    auto& e = g_ring8_cache[g_ring8_cache_next++ % g_ring8_cache.size()];
+    e.generation = 1;
+    e.bufs.clear();
+    Ring8CollectWaits(dcb, 0, packets, &e.bufs);
+    Ring8CollectWaits(ccb, 0, packets, &e.bufs);
+    if (generation & 1) {
+        return; // a table change was under way: not cached
+    }
+    e.dcb = dcb.data();
+    e.dcb_size = dcb.size();
+    e.ccb = ccb.data();
+    e.ccb_size = ccb.size();
+    e.waits.assign(g_ring8_submit_waits.begin(), g_ring8_submit_waits.end());
+    e.unknown = g_ring8_wait_unknown;
+    e.generation = generation;
+}
+
+// sotc: plan C lines (SOTC_BACK_WRITE_EXACT, SOTC_CP_LABEL_SLEEP, SOTC_RING8_CACHE), each only while its switch is on.
+// Printed from ReportCpLabelSkip, which the 5 s report calls whatever SOTC_CP_LABEL_SKIP is.
+static void ReportPlanC(std::string& out, double seconds) {
+    char line[320];
+    const double per_s = seconds > 0.0 ? 1.0 / seconds : 0.0;
+    if (SotcNonBlocking::BackWriteExact()) {
+        const u64 n = g_bw_exact_ops.exchange(0, std::memory_order_relaxed);
+        std::snprintf(line, sizeof line, "SOTC CP back-write exact: %.0f/s ops queued without a guest write\n",
+                      static_cast<double>(n) * per_s);
+        out += line;
+    }
+    if (SotcNonBlocking::CpLabelSleep()) {
+        const u64 n = g_cp_sleeps.exchange(0, std::memory_order_relaxed);
+        const u64 wakes = g_cp_sleep_wakes.exchange(0, std::memory_order_relaxed);
+        const u64 timeouts = g_cp_sleep_timeouts.exchange(0, std::memory_order_relaxed);
+        const u64 ns = g_cp_sleep_ns.exchange(0, std::memory_order_relaxed);
+        std::snprintf(line, sizeof line,
+                      "SOTC CP label sleep: %llu sleeps (%.0f/s), woken %llu, timed out %llu, %.2f ms/s asleep\n",
+                      static_cast<unsigned long long>(n), static_cast<double>(n) * per_s,
+                      static_cast<unsigned long long>(wakes), static_cast<unsigned long long>(timeouts),
+                      static_cast<double>(ns) / 1e6 * per_s);
+        out += line;
+    }
+    if (SotcNonBlocking::Ring8Cache()) {
+        const u64 hits = g_ring8_hits.exchange(0, std::memory_order_relaxed);
+        const u64 walks = g_ring8_walks.exchange(0, std::memory_order_relaxed);
+        const u64 stale = g_ring8_stale.exchange(0, std::memory_order_relaxed);
+        std::snprintf(line, sizeof line,
+                      "SOTC CP ring8 lookahead cache: hits %llu, walks %llu (content changed %llu)\n",
+                      static_cast<unsigned long long>(hits), static_cast<unsigned long long>(walks),
+                      static_cast<unsigned long long>(stale));
+        out += line;
+    }
 }
 
 void ReportCpLabelSkip(std::string& out, double seconds) {
+    ReportPlanC(out, seconds); // sotc: plan C
     const u8 mode = CpLabelSkipMode();
     if (mode == 0) {
         return;
@@ -324,6 +459,16 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     }
     if (const char* v = std::getenv("SOTC_CP_IDLE_TIMEOUT_US")) {
         cp_idle_timeout_ns = std::max<u64>(std::strtoull(v, nullptr, 10), 10) * 1000ULL;
+    }
+    // sotc: SOTC_CP_LABEL_SLEEP (Windows only; see cp_round_sleep in liverpool.h).
+#ifdef _WIN32
+    cp_round_sleep = SotcNonBlocking::CpLabelSleep();
+#endif
+    if (const char* v = std::getenv("SOTC_CP_LABEL_SLEEP_ROUNDS")) {
+        cp_round_sleep_rounds = static_cast<u32>(std::max<u64>(std::strtoull(v, nullptr, 10), 1));
+    }
+    if (const char* v = std::getenv("SOTC_CP_LABEL_SLEEP_MS")) {
+        cp_round_sleep_ms = static_cast<u32>(std::clamp<u64>(std::strtoull(v, nullptr, 10), 1, 100));
     }
 #ifdef _WIN32
     if (cp_idle_ns) {
@@ -1299,10 +1444,14 @@ void Liverpool::WaitBackWritesSlow() {
         WaitBackTail(back_write_seq);
         return;
     }
-    if (!SotcStats::kFpsTimers) { // sotc: SOTC_FPS_LEAN: the count only, no clock reads
+    if (!SotcStats::kFpsTimers) { // sotc: SOTC_FPS_LEAN: the count, and (plan C, lean-exempt) the time
+        const u64 start = SotcStats::NowNs();
         WaitBackTail(back_write_seq);
+        const u64 waited = SotcStats::NowNs() - start;
         SotcStats::cp_bw_waits.fetch_add(1, std::memory_order_relaxed);
         SotcStats::cp_bw_rep_waits.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::cp_bw_rep_ns.fetch_add(waited, std::memory_order_relaxed);
+        SotcStats::GateStoreMax(SotcStats::cp_bw_rep_max_ns, waited);
         return;
     }
     const u64 start = SotcStats::NowNs();
@@ -3827,6 +3976,34 @@ bool Liverpool::CpIdleSleep(u64 seen_epoch) {
     return notified;
 }
 
+// sotc: SOTC_CP_LABEL_SLEEP. Lost wake-ups as in CpIdleSleep: cp_round_sleeping is set (seq_cst)
+// before the epoch is compared, NotifyCpWait bumps the epoch before it reads the flag, and
+// WaitOnAddress returns at once when the epoch no longer holds seen_epoch. Conditions only the
+// guest CPU changes are seen at the timeout at the latest.
+bool Liverpool::CpRoundSleep(u64 seen_epoch) {
+    const u64 start = SotcStats::NowNs();
+    cp_round_sleeping.store(true, std::memory_order_seq_cst);
+    bool notified = cp_wake_epoch.load(std::memory_order_seq_cst) != seen_epoch;
+    if (!notified) {
+#ifdef _WIN32
+        u64 observed = seen_epoch;
+        ::WaitOnAddress(&cp_wake_epoch, &observed, sizeof(observed), cp_round_sleep_ms);
+#endif
+        notified = cp_wake_epoch.load(std::memory_order_seq_cst) != seen_epoch;
+    }
+    cp_round_sleeping.store(false, std::memory_order_relaxed);
+    g_cp_sleeps.fetch_add(1, std::memory_order_relaxed);
+    (notified ? g_cp_sleep_wakes : g_cp_sleep_timeouts).fetch_add(1, std::memory_order_relaxed);
+    g_cp_sleep_ns.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
+    return notified;
+}
+
+void Liverpool::WakeCpRound() noexcept {
+#ifdef _WIN32
+    ::WakeByAddressAll(&cp_wake_epoch);
+#endif
+}
+
 void Liverpool::WakeCp() noexcept {
     if (SotcStats::kFpsTimers) { // sotc: SOTC_FPS_LEAN: only the wake latency reads it
         cp_notify_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
@@ -3952,7 +4129,7 @@ void Liverpool::Process(std::stop_token stoken) {
         // (spin time, idle deadline); the resumes of a streak are not timed one by one.
         // sotc: SOTC_TRACE also tracks the streaks: the cp parse span needs the progress marks.
         // Scheduling is unchanged: idle_due is set only with cp_idle_ns.
-        const bool track = SotcStats::kFpsLog || SotcTrace::kOn || cp_idle_ns != 0;
+        const bool track = SotcStats::kFpsLog || SotcTrace::kOn || cp_idle_ns != 0 || cp_round_sleep;
         // sotc: SOTC_FPS_LEAN: the parse and spin clock reads (kFpsTimers, or SOTC_TRACE's spans).
         // The streak times that SOTC_CP_IDLE_US decides on are read whatever this is.
         const bool cp_timed = SotcStats::kFpsTimers || SotcTrace::kOn;
@@ -3966,6 +4143,7 @@ void Liverpool::Process(std::stop_token stoken) {
         u64 mark_ns = 0;         // last clock reading (resume start, or the streak's last sample)
         u64 streak_start_ns = 0; // start of the streak, or of the spin window after a wake
         u64 pending_rounds = 0;  // SOTC_FPS rounds not yet added to the counters
+        u32 still_rounds = 0;    // sotc: SOTC_CP_LABEL_SLEEP: whole rounds without progress in the streak
         std::array<u64, SotcStats::CpSpinKinds> pending_kinds{};
         const auto publish_rounds = [&] {
             if (pending_rounds) {
@@ -3986,6 +4164,7 @@ void Liverpool::Process(std::stop_token stoken) {
             spinning = false;
             idle_due = false;
             idle_iters = 0;
+            still_rounds = 0; // sotc: SOTC_CP_LABEL_SLEEP
         };
 
         while (num_submits || (num_commands && !back_threaded) || num_ordered) {
@@ -4040,12 +4219,33 @@ void Liverpool::Process(std::stop_token stoken) {
                         if (notified) {
                             streak_start_ns = mark_ns;
                         }
+                    } else if (cp_round_sleep && ++still_rounds >= cp_round_sleep_rounds) {
+                        // sotc: SOTC_CP_LABEL_SLEEP. Every queue was resumed after round_epoch was
+                        // read (as for SOTC_CP_IDLE_US above), so a notification since then ends the
+                        // sleep at once. The spin time stops at the sleep (SOTC_FPS).
+                        if (SotcStats::kFpsLog) {
+                            if (SotcStats::kFpsTimers) {
+                                SotcStats::CpAdd(SotcStats::cp_spin_ns, SotcStats::NowNs() - mark_ns);
+                            }
+                            publish_rounds();
+                        }
+                        const bool notified = CpRoundSleep(round_epoch);
+                        mark_ns = SotcStats::NowNs();
+                        streak_resumes = 0;
+                        since_progress = 0;
+                        // After a notification the rounds before the next sleep run again (the
+                        // condition probably just changed); after a timeout one round re-tests the
+                        // waits the guest CPU writes, then the thread sleeps again.
+                        if (notified) {
+                            still_rounds = 0;
+                            streak_start_ns = mark_ns;
+                        }
                     }
                     idle_iters = 0;
                 }
                 if (idle_iters == 0) {
                     round_kinds = 0;
-                    if (cp_idle_ns) {
+                    if (cp_idle_ns || cp_round_sleep) { // sotc: SOTC_CP_LABEL_SLEEP too
                         round_epoch = cp_wake_epoch.load(std::memory_order_seq_cst);
                     }
                 }
@@ -4412,17 +4612,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (pc_ring_top && rasterizer &&
         (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8 || SotcNative::On())) {
         NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (host ring copy)
-        BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); });
+        // sotc: SOTC_BACK_WRITE_EXACT: the submit start reads guest memory (uploads, imports, protections) and writes
+        // only host state: it does not advance back_write_seq.
+        BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); },
+                  BackWritesFor(true));
     }
     // sotc: SOTC_SYNC_EVENTS. The journal's hinted uploads, on the draw thread before this submit's ops
     // (outermost gfx submit only; the BufferCache checks the switch again).
     if (pc_ring_top && rasterizer && SotcSyncEvents::On()) {
-        BackOrRun([r = rasterizer] { r->GetBufferCache().DrainSyncEvents(); });
+        // sotc: SOTC_BACK_WRITE_EXACT: uploads of the hinted ranges (guest -> GPU), no guest write.
+        BackOrRun([r = rasterizer] { r->GetBufferCache().DrainSyncEvents(); }, BackWritesFor(true));
     }
     // sotc: ARCH-GCN-NATIVE (gcn_native.h). The miss drain and the per-submit freshness batch, on the draw thread
     // before this submit's ops (outermost gfx submit only).
     if (pc_ring_top && rasterizer && (SotcGcn::Mem::On() || SotcGcn::Tex::On())) {
-        BackOrRun([r = rasterizer] { r->GcnSubmitStart(); });
+        // sotc: SOTC_BACK_WRITE_EXACT: miss drain (residency, uploads) and sync batch, no guest write.
+        BackOrRun([r = rasterizer] { r->GcnSubmitStart(); }, BackWritesFor(true));
     }
 
     // TODO: potentially, ASCs also can depend on CE and in this case the
@@ -5645,11 +5850,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     if (pc_ring_asc.top && rasterizer &&
         (SotcPcRing::FullRingMode() != 0 || SotcPcRing::Mode() == 8 || SotcNative::On())) { // sotc: as above
         NoteBackNoGuestWrite(); // sotc: SOTC_CP_PRECISE_WAIT (host ring copy)
-        BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); });
+        // sotc: SOTC_BACK_WRITE_EXACT: the submit start reads guest memory (uploads, imports, protections) and writes
+        // only host state: it does not advance back_write_seq.
+        BackOrRun([r = rasterizer, seq = SotcNative::AnnounceSeq()] { VideoCore::PcRingCopy::OnSubmitStart(*r, seq); },
+                  BackWritesFor(true));
     }
     // sotc: ARCH-GCN-NATIVE: a compute submit gets the same submit-start batch (outermost call only).
     if (pc_ring_asc.top && rasterizer && (SotcGcn::Mem::On() || SotcGcn::Tex::On())) {
-        BackOrRun([r = rasterizer] { r->GcnSubmitStart(); });
+        // sotc: SOTC_BACK_WRITE_EXACT: miss drain (residency, uploads) and sync batch, no guest write.
+        BackOrRun([r = rasterizer] { r->GcnSubmitStart(); }, BackWritesFor(true));
     }
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());

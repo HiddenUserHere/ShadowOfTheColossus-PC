@@ -8,6 +8,9 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map> // sotc: SOTC_GPL_PREDICT (GplLibraryCache::Touch)
+#include <unordered_set>
+#include <vector>
 #include <boost/container/static_vector.hpp>
 #include <tsl/robin_map.h>
 #include <xxhash.h>
@@ -105,8 +108,29 @@ public:
     static bool PartWanted(Part part);
     /// sotc: who builds on this thread: 0 a draw or the boot hold, 1 a predicted library job, 2 a draw's waited job
     /// (counted apart in GplCounters).
-    enum Origin : u8 { OriginDefault = 0, OriginPredicted = 1, OriginUrgent = 2, OriginPack = 3 };
+    enum Origin : u8 { OriginDefault = 0, OriginPredicted = 1, OriginUrgent = 2, OriginPack = 3, OriginManifest = 4 };
     static void SetOrigin(Origin origin);
+    /// sotc: SOTC_GPL_PREDICT. The id (PackLibraryId: program, permutation, part) of the library the job on this thread
+    /// builds; stored with the library (0: none), so a material can refer to it and the eviction can name it.
+    static void SetLibraryId(u64 id);
+    /// sotc: SOTC_GPL_PREDICT. Command processor: a material created now references the library of id (its reference
+    /// count and last reference time; the game's material free path is not hooked, so references never drop: the
+    /// eviction is by age of the last reference, EvictStale).
+    void Touch(u64 id, u64 now_ns);
+    struct Evicted {
+        std::vector<vk::UniquePipeline> pipes; ///< to destroy once the GPU is done with the frames that linked them
+        std::vector<u64> ids;
+    };
+    /// sotc: SOTC_GPL_PREDICT. Removes the predicted libraries (never a manifest's, a draw-built or a job in flight)
+    /// whose last material reference and last draw use are both older than max_age_ns. Returns the count.
+    size_t EvictStale(u64 now_ns, u64 max_age_ns, const std::unordered_set<u64>& in_flight, Evicted& out);
+    /// sotc: SOTC_GPL_PREDICT. Libraries referenced by a material so far (ids touched; the report line).
+    static size_t Referenced();
+    /// sotc: SOTC_PLAY_QUIET. The VkPipelineCache every stage library is created against (the pack cache, set once by
+    /// the PipelineCache constructor; null: the pipeline's own cache), and the libraries built so far (any thread).
+    static void SetLibraryCache(vk::PipelineCache cache);
+    static vk::PipelineCache LibraryCache();
+    static u64 LibraryBuilds();
     /// sotc: SOTC_GPL_PACK_LIBS. While set on the calling thread (a pack library job), a library GetOrBuild builds is
     /// destroyed at once instead of stored: only its compiled code in the driver's pipeline cache is wanted. The handle
     /// returned is then dangling (callers in SetLibrariesOnly mode only test it against null).
@@ -128,10 +152,22 @@ private:
     struct Entry {
         vk::UniquePipeline pipe;
         u8 flags{};
+        u64 lib_id{};      ///< sotc: SOTC_GPL_PREDICT (SetLibraryId), 0 for a draw's or boot library
+        u64 last_use_ns{}; ///< sotc: SOTC_GPL_PREDICT: the last draw link that found it (0: never)
     };
-    enum Flag : u8 { FlagPredicted = 1, FlagUsed = 2, FlagPrebuilt = 4 };
+    enum Flag : u8 { FlagPredicted = 1, FlagUsed = 2, FlagPrebuilt = 4, FlagManifest = 8 };
+    /// sotc: SOTC_GPL_PREDICT: per library id, the materials that referenced it and when the last one did.
+    struct Ref {
+        u32 count{};
+        u64 last_ns{};
+    };
     std::mutex mutex;
     tsl::robin_map<std::string, Entry> parts[NumParts];
+    /// sotc: SOTC_GPL_PREDICT: one table for the process (the report reads it without the cache); taken after `mutex`.
+    static inline std::mutex refs_mutex;
+    static inline std::unordered_map<u64, Ref> refs;
+    static inline vk::PipelineCache library_cache{};      ///< sotc: SOTC_PLAY_QUIET (SetLibraryCache)
+    static inline std::atomic<u64> library_builds{0};     ///< sotc: SOTC_PLAY_QUIET (LibraryBuilds)
 };
 
 /// sotc: SOTC_PIPE_GPL counters, summed since the start. Written by GraphicsPipeline and
@@ -149,6 +185,10 @@ struct GplCounters {
     /// sotc: SOTC_GPL_PREDICT: libraries a predicted job stored, and those a draw's link then found (first time).
     std::atomic<u64> predicted_built{};
     std::atomic<u64> predicted_used{};
+    /// sotc: SOTC_GPL_PREDICT: predicted jobs that found their library already built by a draw (the material came too
+    /// late: built after the draw), and predicted libraries evicted (unreferenced for the age, EvictStale).
+    std::atomic<u64> predicted_late{};
+    std::atomic<u64> predicted_evicted{};
     /// sotc: SOTC_GPL_PARALLEL_LIBS: libraries a draw's waited job stored (on a worker or taken by the command processor).
     std::atomic<u64> urgent_built{};
     /// sotc: SOTC_GPL_DYN_STATE: libraries built ahead of any draw (boot manifest, predicted; not a draw's waited job),

@@ -1,0 +1,43 @@
+# Stutter work: preparation and causal diagnostics
+
+This change implements the first preparation/diagnostic work from the session audit. It does not certify stutter-free gameplay. Game runs were authorized after the first build and performed serially with private validation user/cache folders and copies of savedata.
+
+## Changes
+
+- Reuse the existing per-thread flight recorder for ledger scopes. When SOTC_TRACE is enabled, completed scopes above SOTC_TRACE_ZONE_MIN_US are emitted to already-initialized rings with a literal site name, optional pipeline key and the ending flip number. Ledger emission never allocates a ring in a resource/fault path; pipeline workers initialize their rings before jobs run. SOTC_BLOCK_LEDGER still controls aggregate counters independently. Nested sites are inclusive; their sums are not exclusive CPU time.
+- Trace worker queue latency separately from execution. Measure NODROP library demand, fast-link demand and synchronous translation fallback. Recorder compute demand now includes a self-build, previously absent from the ledger wait scope.
+- Keep legacy raw >33 ms counts for tooling compatibility. Add late30 (>1000/30 + 0.5 ms), longest consecutive late30 run, and p99.9. These describe flip cadence, not the display presentation timeline.
+- Save each resolved launch environment under user/prof/run-settings. Record executable metadata, display driver versions, manifest hashes, preparation stamp and driver-cache metadata. Native PIPE CONFIG reports device-dependent pipeline gates. Unrelated environment variables are excluded.
+- --precompile now builds the resident GPL pack before announcing completion. Already-known shader requests load their cached modules in this loading-only process. Fully cached shaders can finish with zero new translations, while pending compute builds prevent premature completion.
+- A normal boot can restore a missing/invalid GPL pack from cached programs even when fewer than 300 new translations are queued. Recreated modules are eligible for normal post-hold eviction if not already resident/drawn, after all library jobs finish.
+- Track completion of this pack batch independently of unrelated library jobs. Timeout never publishes an incomplete list. A failed preparation exits nonzero and cannot create the launcher preparation stamp.
+- Publish the GPL list only after an actual successful driver-cache write, including fclose and rename. Equal file sizes do not prove a successful save. Access to persisted-size outputs is under the saver mutex.
+- Validate the Vulkan version-one driver-cache header before reading the full blob. Use 64-bit filesystem sizes instead of Windows 32-bit ftell. GPL list version 2 includes the hash of the exact persisted driver-cache bytes, plus the existing GPU/driver/dynamic-state identity. A subsequently changed snapshot conservatively invalidates the list on the next boot.
+- Manifest specialization failures now report the PretranslateDiff bitmask. Incompatible specializations are still rejected, preserving correctness.
+- Capture now verifies the live descriptor specialization against the stored module specialization, including resource validity bits. Shader matching intentionally permits null-resource wildcards; preparation recipes cannot combine a stored specialization with different current raw hints. Transient mismatches are retried on later uses, rather than permanently marking the pipeline captured.
+- The shipped numeric manifest now includes 1777 graphics and 464 compute pipelines, 2619 stages, merged from existing records and authorized local captures. It still describes observed content, not the entire game.
+
+## Local configuration and toolchain
+
+The local ignored sotc.ini enables SOTC_DRIVER_CACHE, required by the pack implementation. The local ini also explicitly disables speculative GPL prediction (the validation baseline). Other render-path switches have not been promoted based on unvalidated performance claims.
+
+The original C:/msys64 toolchain was absent. The official MSYS2 2026-09-27 x86_64 SFX was downloaded and verified against its published SHA-256. The sandbox denied MSYS bash named-object creation. Native CLANG64 packages were therefore restored directly from https://repo.msys2.org/mingw/clang64/ into C:/Users/ptr/Documents/Codex/toolchains/msys64, with each archive verified against the official repository database. This is a portable native build prefix, not a pacman-managed installation. Package provenance is recorded in clang64-restoration.json at that prefix. System PATH/registry settings were not changed.
+
+The native toolchain uses clang 23.1.5 and CMake 4.4.5. A separate out/gpu-codex build directory preserves the old out/gpu artifacts. Compiler/dependency changes themselves can affect cache identity and performance, so runtime comparisons must record this build and avoid attributing every difference to the code changes.
+
+## Verification and remaining work
+
+- Python suite: 249 tests, 218 passed, 29 skipped, one failure and one error in unmodified Linux packaging tests (Windows symlink privilege and Linux driver-path expectations). The three new metadata/preparation tests passed.
+- Standalone cadence and actual-ledger tests also passed with Visual Studio's Clang before the native toolchain was restored.
+- Full native build passed. Six native targets passed: frame-budget-test, driver-cache-identity-test, preparation-status-test, block-ledger-test (four ledger/trace combinations), trace-ledger-smoke-test (actual recorder on a 64 KiB thread), and manifest-capture-test (real shader-specialization wildcard regression).
+- Cold application-cache validation with the expanded manifest completed the route: 202 frames, p50 33.4 ms, p99 67.4 ms, max 76.5 ms. Before the route, a 250.4 ms frame remained. Pack phase: 12918 libraries, zero failures, 33.3 s, 104 MB persisted cache. Four older compute-stage recipes still failed strict reconstruction.
+- Final warm validation after the capture guard completed: 202 frames, p50 33.4 ms, p99 66.8 ms, max 93.1 ms; zero recorder compute waits during the route, one library-demand wait of 40.2 ms in the relevant report window. Later post-route work still produced compute waits, so zero waits for the whole session was not achieved.
+- A diagnostic trace captured frame 96 at 1076.774 ms. Clipped to that exact frame, the command processor spent 989.359 ms in library demand and 53.047 ms in synchronous stage demand; the draw thread was idle for 1048.008 ms. Nested spans are inclusive and must not be added together.
+- The original optional FLIP_THREAD=1/FLIP_COALESCE=1 combination hit the existing EOP flip queue assertion in the first cold test. Conservative runs used both off and completed. The first diagnostic run also ended with stack overflow; later nonallocating-ledger trace integration and a real recorder smoke test passed, and a game trace run completed. This sequence does not prove the first crash had only one cause.
+- Startup sometimes failed at the guest-range reservation with error 487. A minimal native process reproduced occupied stacks in the guest range and reported high-entropy ASLR enabled despite the image flag being disabled. Startup retries were serial and only retried pre-guest-entry address collisions; Windows mitigation settings were never changed.
+- The cold label means empty application shader/pipeline caches in a fresh validation folder. OS and driver-global caches were not erased. The various runs changed manifest coverage and diagnostic/presentation settings, so they are not a controlled code-only A/B performance comparison.
+- No shader or pipeline caches were deleted; no commits or pushes were made.
+
+Next runtime validation must include cold preparation, warm SPIR-V with missing/rejected driver cache, valid caches, first world frames before the route, area transitions and image correctness. The causal trace already identifies long command-processor library demand; next work must make every required stage variant ready earlier and reduce the sustained draw-thread cost (about 36-37 ms/frame in the conservative warm configuration). The later attempt to collect driver feedback and a draw profile ended with stack overflow during loading and produced no usable profile; this remains a diagnostic stability issue, not a passed check. Missing specializations, compute coverage, first-use misses outside the collected content, streaming and sustained frame margin remain open until measured.
+
+References: https://www.msys2.org/docs/installer/ and https://docs.vulkan.org/refpages/latest/refpages/source/VkPipelineCacheHeaderVersionOne.html.

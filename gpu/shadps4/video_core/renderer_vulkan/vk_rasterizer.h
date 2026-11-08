@@ -684,6 +684,17 @@ private:
         /// sotc: tick of the copy. The ring keeps a region alive only for the tick that
         /// allocated it (StreamBuffer::AdvanceAndWatch), so a copy is reused only in that tick.
         u64 tick{~0ULL};
+        /// sotc: SOTC_FLAT_ARENA. The buffer the copy lives in (the arena or the stream ring) and its device
+        /// address base; arena: the copy is an arena entry (valid across ticks while the arena keeps it).
+        vk::Buffer buffer{};
+        vk::DeviceAddress base{};
+        bool arena{};
+        /// sotc: SOTC_BIND_DESC_REUSE. The buffer and offset the entry's kept descriptor sets were written with
+        /// for this slot (BindPipelineResources). A hit whose copy is in another buffer writes the sets again; one at
+        /// another offset of the same buffer binds them with a dynamic offset when the pipeline's flat bindings are
+        /// dynamic (Pipeline::FlatDynamic), else writes them again.
+        vk::Buffer desc_buffer{};
+        u64 desc_offset{~0ULL};
     };
     /// sotc: SOTC_OP_COMPUTE_BIND. One written buffer binding of a bind (BindBuffers, the guest path): the ObtainBuffer
     /// call it made (range, marks, texel is never set), the note calls it made, the narrowing dispatch it was made under
@@ -774,6 +785,13 @@ private:
         /// the push data are refreshed at every hit (flat_slots).
         bool refresh{};
         std::vector<BindCacheFlatSlot> flat_slots;
+        /// sotc: SOTC_BIND_DESC_REUSE. The descriptor sets Pipeline::BindResources committed and wrote for this
+        /// entry's descriptors (count 0: none kept), and the heap pool serial they belong to (vk_resource_pool.h).
+        /// Persistent sets are owned by the entry: freed (DescriptorHeap::RetirePersistent) after their last tick
+        /// when the entry writes new ones or its slot is made again.
+        Vulkan::DescriptorSetReuse desc_sets{};
+        /// sotc: SOTC_SAMPLER_CACHE. Tick of the last per-tick sampler re-resolution of a replay (~0: never).
+        u64 sampler_check_tick{~0ULL};
         std::vector<std::pair<VAddr, VAddr>> tex_watch;
         /// sotc: SOTC_BIND_CACHE_HEAP. The heap resolutions of a packet op of a heap pipeline, the held result of
         /// TableMemo::Resolve: bit 0 the fragment/compute heap stage, bit 1 the vertex one. heap[k] is its index table and
@@ -833,6 +851,15 @@ private:
     void BindCacheVerify(const BindCacheEntry& old, size_t first_bound_buffer);
     bool bind_cache_tail_rec{};       ///< the bind found a mip-tail image
     std::vector<BindCacheFlatSlot> bind_cache_flat_rec; ///< flat buffer copies of the bind
+    /// sotc: SOTC_BIND_DESC_REUSE. The descriptor set record of the op being bound: filled by TryBindCacheFrame from
+    /// the hit's entry (reuse set when the sets are valid), handed to Pipeline::BindResources by
+    /// BindPipelineResources, which stores what that call committed into desc_reuse_entry (the hit's or the newly
+    /// made entry; null when the op has no frame entry).
+    Vulkan::DescriptorSetReuse desc_reuse{};
+    BindCacheEntry* desc_reuse_entry{};
+    /// sotc: Pipeline::BindResources of the op's descriptor state (set_writes, push data, packet, heap block), with
+    /// the SOTC_BIND_DESC_REUSE record when the switch is on. Every draw and dispatch path binds through it.
+    void BindPipelineResources(const Pipeline* pipeline);
     u32 cur_bind_stage{};             ///< index (in GetStages) of the stage being bound
     bool bind_level2{};               ///< this bind's key is the resource identity
     Shader::PushData bind_input_push{}; ///< the draw's own push data (registers) before the bind

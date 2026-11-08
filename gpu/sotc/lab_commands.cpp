@@ -6,6 +6,7 @@
 
 #include "video_core/sotc_stats.h" // sotc: flip count of the route start
 #include "lab_commands.h"
+#include "frame_budget.h" // sotc: do not call a normal 33.333 ms frame a missed deadline
 
 #include <algorithm>
 #include <atomic>
@@ -51,6 +52,7 @@ struct FrameStats {
     std::string segment;
     uint64_t frames{};
     uint64_t hitch33{}, hitch50{}, hitch100{};
+    FrameBudget30 budget30;
     double max{};
     std::vector<double> samples;
 };
@@ -514,6 +516,11 @@ std::string CmdTrace(const Args& a) {
 std::string JsonWindow(const Window& w) {
     return "{\"frames\":" + std::to_string(w.frames) + ",\"p50\":" + JsonNum(w.p50) +
            ",\"p99\":" + JsonNum(w.p99) + ",\"max\":" + JsonNum(w.max) +
+           ",\"p999\":" + JsonNum(w.p999) +
+           ",\"late30\":" + std::to_string(w.late30) +
+           ",\"max_consecutive_late30\":" + std::to_string(w.max_consecutive_late30) +
+           ",\"deadline30_ms\":" + JsonNum(FrameBudget30::period_ms) +
+           ",\"deadline_tolerance_ms\":" + JsonNum(FrameBudget30::tolerance_ms) +
            ",\"hitch33\":" + std::to_string(w.hitch33) +
            ",\"hitch50\":" + std::to_string(w.hitch50) +
            ",\"hitch100\":" + std::to_string(w.hitch100) + "}";
@@ -838,6 +845,13 @@ void AutoRouteTick() {
                          static_cast<unsigned long long>(w.hitch33),
                          static_cast<unsigned long long>(w.hitch50),
                          static_cast<unsigned long long>(w.hitch100));
+            // sotc: separate line preserves existing route parsers; hitch33 remains a raw historical count.
+            std::fprintf(stderr,
+                         "SOTC LAB ROUTE cadence30: p99.9 %.1f ms; late %llu, longest run %llu; "
+                         "budget %.6f ms + tolerance %.3f ms; legacy >33 is raw, not deadline misses\n",
+                         w.p999, static_cast<unsigned long long>(w.late30),
+                         static_cast<unsigned long long>(w.max_consecutive_late30),
+                         FrameBudget30::period_ms, FrameBudget30::tolerance_ms);
             a.phase = AutoPhase::Done;
             a.phase_at = now;
         }
@@ -869,12 +883,13 @@ void AutoRouteTick() {
 void OnFrame(double frame_ms) {
     ++g_det_flips; // sotc: the route's frame clock (SOTC_DET_ROUTE)
     AutoRouteTick();
-    if (!std::isfinite(frame_ms)) {
+    if (!std::isfinite(frame_ms) || frame_ms < 0.0) {
         return;
     }
     FrameStats& s = Stats();
     std::lock_guard<std::mutex> lock(s.mutex);
     ++s.frames;
+    s.budget30.Add(frame_ms);
     s.max = std::max(s.max, frame_ms);
     if (frame_ms > 33.0) {
         ++s.hitch33;
@@ -902,10 +917,13 @@ Window CurrentWindow() {
         w.hitch33 = s.hitch33;
         w.hitch50 = s.hitch50;
         w.hitch100 = s.hitch100;
+        w.late30 = s.budget30.late;
+        w.max_consecutive_late30 = s.budget30.max_consecutive;
         samples = s.samples;
     }
     w.p50 = Percentile(samples, 0.50);
     w.p99 = Percentile(samples, 0.99);
+    w.p999 = Percentile(samples, 0.999);
     return w;
 }
 
@@ -915,6 +933,7 @@ void Mark(std::string_view segment) {
     s.segment = std::string(segment);
     s.frames = 0;
     s.hitch33 = s.hitch50 = s.hitch100 = 0;
+    s.budget30 = {};
     s.max = 0.0;
     s.samples.clear();
 }

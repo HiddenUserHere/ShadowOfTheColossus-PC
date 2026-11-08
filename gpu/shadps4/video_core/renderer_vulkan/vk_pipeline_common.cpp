@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_checkpoints.h" // sotc: SOTC_GPU_CHECKPOINTS
 #include "video_core/sotc_stats.h"
+#include "../../../sotc/nonblocking.h" // sotc: SOTC_BIND_DESC_REUSE
 
 namespace Vulkan {
 
@@ -500,14 +501,89 @@ void Pipeline::BindHeapResources(const Shader::PushData& push_data,
     scheduler.GetDynamicState().InvalidatePushConstants();
 }
 
+void Pipeline::MarkDynamicFlat(std::span<vk::DescriptorSetLayoutBinding> bindings, std::span<const u32> flat,
+                               u32 set, u32 cap) {
+    flat_bindings += static_cast<u32>(flat.size());
+    if (!SotcNonBlocking::BindDescReuse() || flat.empty()) {
+        return;
+    }
+    if (flat.size() > cap || dyn_flat.size() + flat.size() > MaxDynamicFlat) {
+        SotcStats::pb_dyn_fallback_sets.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    for (const u32 index : flat) {
+        auto& b = bindings[index];
+        b.descriptorType = vk::DescriptorType::eStorageBufferDynamic;
+        dyn_flat.push_back({set, b.binding});
+    }
+    SotcStats::pb_dyn_sets.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Pipeline::FinishDynamicFlat() {
+    // vkCmdBindDescriptorSets takes the dynamic offsets by set, then by binding number.
+    std::sort(dyn_flat.begin(), dyn_flat.end(), [](const DynamicBinding& a, const DynamicBinding& b) {
+        return a.set != b.set ? a.set < b.set : a.binding < b.binding;
+    });
+}
+
+u32 Pipeline::PrepareDynamicFlat(DescriptorWrites& set_writes, std::span<const u32> write_sets,
+                                 std::array<u32, MaxDynamicFlat>& offsets, DynamicPatch* patch) const {
+    const u32 num = static_cast<u32>(dyn_flat.size());
+    const bool by_set = write_sets.size() == set_writes.size();
+    for (u32 k = 0; k < num; ++k) {
+        offsets[k] = 0;
+        for (u32 j = 0; j < static_cast<u32>(set_writes.size()); ++j) {
+            auto& write = set_writes[j];
+            if (write.dstBinding != dyn_flat[k].binding || (by_set ? write_sets[j] : 0u) != dyn_flat[k].set ||
+                write.descriptorType != vk::DescriptorType::eStorageBuffer || !write.pBufferInfo) {
+                continue;
+            }
+            offsets[k] = static_cast<u32>(write.pBufferInfo->offset);
+            if (patch) {
+                const u32 n = patch->count++;
+                patch->infos[n] = *write.pBufferInfo;
+                patch->infos[n].offset = 0;
+                patch->saved[n] = write.pBufferInfo;
+                patch->write[n] = j;
+                write.descriptorType = vk::DescriptorType::eStorageBufferDynamic;
+                write.pBufferInfo = &patch->infos[n];
+            }
+            break;
+        }
+    }
+    return num;
+}
+
+void Pipeline::RestoreDynamicWrites(DescriptorWrites& set_writes, const DynamicPatch& patch) {
+    for (u32 n = 0; n < patch.count; ++n) {
+        auto& write = set_writes[patch.write[n]];
+        write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        write.pBufferInfo = patch.saved[n];
+    }
+}
+
 void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> write_sets,
                              const Shader::PushData& push_data,
                              const Shader::BindlessSamplerSlots& bindless_slots,
                              const SotcArch::DrawPacket* packet,
-                             const SotcArch::HeapBlock* heap_block) const {
+                             const SotcArch::HeapBlock* heap_block,
+                             DescriptorSetReuse* reuse) const {
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
+    // sotc: SOTC_BIND_DESC_REUSE: until a set path below stores its sets, the caller's record holds none. A reuse
+    // request is honoured only by the two classic set paths; any other path binds as before and clears it. The
+    // request's sets are read from a copy taken first (the record is cleared before any path looks at it).
+    const bool want_reuse = reuse && reuse->reuse;
+    DescriptorSetReuse reuse_in{};
+    if (want_reuse) {
+        reuse_in = *reuse;
+    }
+    if (reuse) {
+        reuse->count = 0;
+        reuse->reuse = false;
+        reuse->persistent = false;
+    }
 
     // sotc: SOTC_DESCRIPTOR_HEAP: a heap pipeline has no layout: its descriptors and push block go to the heaps.
     if (heap_mode) {
@@ -576,7 +652,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
     }
 
     if (stage_sets) {
-        BindStageSets(set_writes, write_sets, bind_point);
+        BindStageSets(set_writes, write_sets, bind_point, want_reuse ? &reuse_in : nullptr, reuse);
         return;
     }
 
@@ -603,31 +679,85 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
         return;
     }
 
-    const auto desc_set = desc_heap.Commit(desc_layout);
+    // sotc: SOTC_BIND_DESC_REUSE: the flat buffer bindings of a dynamic layout take their offsets at bind time.
+    std::array<u32, MaxDynamicFlat> dyn_offsets{};
+    // sotc: SOTC_BIND_DESC_REUSE: the set of the last write of this bind-cache entry, bound again unwritten.
+    if (want_reuse && reuse_in.count == 1 && reuse_in.sets[0]) {
+        const u32 num_dyn = PrepareDynamicFlat(set_writes, write_sets, dyn_offsets, nullptr);
+        cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, 1, &reuse_in.sets[0], num_dyn, dyn_offsets.data());
+        *reuse = reuse_in;
+        reuse->reuse = true;
+        reuse->last_tick = scheduler.CurrentTick();
+        return;
+    }
+    // sotc: SOTC_BIND_DESC_REUSE: a set a bind-cache entry keeps comes from the persistent pools when they are on.
+    const bool persist = reuse && reuse->keep && desc_heap.PersistentSets();
+    const auto desc_set = persist ? desc_heap.AcquirePersistent(desc_layout) : desc_heap.Commit(desc_layout);
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
     }
+    DynamicPatch patch{};
+    const u32 num_dyn = dyn_flat.empty() ? 0u : PrepareDynamicFlat(set_writes, write_sets, dyn_offsets, &patch);
     instance.GetDevice().updateDescriptorSets(set_writes, {});
-    cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, desc_set, {});
+    RestoreDynamicWrites(set_writes, patch);
+    cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, 1, &desc_set, num_dyn, dyn_offsets.data());
+    if (reuse) { // sotc: SOTC_BIND_DESC_REUSE: kept for the entry
+        reuse->sets[0] = desc_set;
+        reuse->layouts[0] = desc_layout;
+        reuse->count = 1;
+        reuse->pool_serial = desc_heap.PoolSerial();
+        reuse->persistent = persist;
+        reuse->last_tick = scheduler.CurrentTick();
+    }
 }
 
 void Pipeline::BindStageSets(DescriptorWrites& set_writes, std::span<const u32> write_sets,
-                             vk::PipelineBindPoint bind_point) const {
+                             vk::PipelineBindPoint bind_point, const DescriptorSetReuse* reuse_in,
+                             DescriptorSetReuse* reuse_out) const {
     ASSERT_MSG(write_sets.size() == set_writes.size(), "Descriptor write without a set");
     const auto cmdbuf = scheduler.CommandBuffer();
     const u32 num_sets = static_cast<u32>(set_layouts.size());
+    static_assert(DescriptorSetReuse::MaxSets == Shader::MaxStageDescriptorSets);
+    // sotc: SOTC_BIND_DESC_REUSE: the flat buffer bindings of a dynamic layout take their offsets at bind time.
+    std::array<u32, MaxDynamicFlat> dyn_offsets{};
+    // sotc: SOTC_BIND_DESC_REUSE: reuse_in is given only with a reuse request (BindResources). The entry's sets, one
+    // per layout set, bound again without a write; a record of another shape is written below instead.
+    if (reuse_in && reuse_out && reuse_in->count == num_sets) {
+        const u32 num_dyn = PrepareDynamicFlat(set_writes, write_sets, dyn_offsets, nullptr);
+        cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, num_sets, reuse_in->sets.data(), num_dyn,
+                                  dyn_offsets.data());
+        *reuse_out = *reuse_in;
+        reuse_out->reuse = true;
+        reuse_out->last_tick = scheduler.CurrentTick();
+        return;
+    }
+    // sotc: SOTC_BIND_DESC_REUSE: sets a bind-cache entry keeps come from the persistent pools when they are on.
+    const bool persist = reuse_out && reuse_out->keep && desc_heap.PersistentSets();
     std::array<vk::DescriptorSet, Shader::MaxStageDescriptorSets> desc_sets{};
     for (u32 set = 0; set < num_sets; ++set) {
-        desc_sets[set] = desc_heap.Commit(set_layouts[set]);
+        desc_sets[set] = persist ? desc_heap.AcquirePersistent(set_layouts[set]) : desc_heap.Commit(set_layouts[set]);
+    }
+    if (reuse_out) { // sotc: SOTC_BIND_DESC_REUSE: these fresh sets are the entry's record
+        reuse_out->sets = desc_sets;
+        for (u32 set = 0; set < num_sets; ++set) {
+            reuse_out->layouts[set] = set_layouts[set];
+        }
+        reuse_out->count = num_sets;
+        reuse_out->pool_serial = desc_heap.PoolSerial();
+        reuse_out->persistent = persist;
+        reuse_out->last_tick = scheduler.CurrentTick();
     }
     for (size_t i = 0; i < set_writes.size(); ++i) {
         ASSERT_MSG(write_sets[i] < num_sets, "Descriptor set {} is not in the layout",
                    write_sets[i]);
         set_writes[i].dstSet = desc_sets[write_sets[i]];
     }
+    DynamicPatch patch{};
+    const u32 num_dyn = dyn_flat.empty() ? 0u : PrepareDynamicFlat(set_writes, write_sets, dyn_offsets, &patch);
     instance.GetDevice().updateDescriptorSets(set_writes, {});
-    cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, num_sets, desc_sets.data(), 0,
-                              nullptr);
+    RestoreDynamicWrites(set_writes, patch);
+    cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, num_sets, desc_sets.data(), num_dyn,
+                              dyn_offsets.data());
 }
 
 std::string Pipeline::GetDebugString() const {

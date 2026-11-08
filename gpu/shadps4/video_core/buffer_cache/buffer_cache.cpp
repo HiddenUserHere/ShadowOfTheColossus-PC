@@ -63,6 +63,7 @@ extern "C" uintptr_t runtime_sotc_heap_table(void);
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "../../../sotc/nonblocking.h" // sotc: SOTC_FLAT_ARENA
 #include "video_core/texture_cache/texture_cache.h"
 
 #include <vk_mem_alloc.h>
@@ -538,6 +539,87 @@ std::optional<u32> FindMemoryType(const vk::PhysicalDeviceMemoryProperties& prop
     return std::nullopt;
 }
 
+// sotc: SOTC_FLAT_ARENA (buffer_cache.h).
+FlatArena::FlatArena(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_)
+    : scheduler{scheduler_},
+      buffer{instance, 0, kChunkBytes * kChunks, MemoryType::Stream, "Flat constant arena"} {
+    ASSERT_MSG(!buffer.mapped_data.empty(), "flat arena without a host mapping");
+}
+
+bool FlatArena::Obtain(u64 hash, const void* data, u32 size, u64 alignment, u64 tick, Ref& out,
+                       bool& uploaded) {
+    uploaded = false;
+    if (const auto it = entries.find(hash); it != entries.end() && it->second.size == size) {
+        const Entry& e = it->second;
+        chunks[e.chunk].last_tick = std::max(chunks[e.chunk].last_tick, tick);
+        out = {buffer.Handle(), buffer.BufferDeviceAddress(), e.offset};
+        return true;
+    }
+    if (size > kChunkBytes) {
+        return false;
+    }
+    u64 off = Common::AlignUp(chunks[current].used, std::max<u64>(alignment, 1));
+    if (off + size > kChunkBytes) {
+        if (!OpenChunk(tick)) {
+            return false;
+        }
+        off = 0;
+    }
+    Chunk& chunk = chunks[current];
+    const u64 arena_offset = u64{current} * kChunkBytes + off;
+    std::memcpy(buffer.mapped_data.data() + arena_offset, data, size);
+    buffer.Flush(arena_offset, size); // no-op on coherent memory
+    chunk.used = off + size;
+    chunk.last_tick = std::max(chunk.last_tick, tick);
+    ++chunk.entries;
+    entries[hash] = Entry{current, size, arena_offset}; // a same-hash table of another size is replaced
+    out = {buffer.Handle(), buffer.BufferDeviceAddress(), arena_offset};
+    uploaded = true;
+    return true;
+}
+
+bool FlatArena::OpenChunk(u64 tick) {
+    // An empty chunk first; else the longest-idle chunk the GPU is done with.
+    u32 pick = kChunks;
+    for (u32 c = 0; c < kChunks; ++c) {
+        if (c != current && chunks[c].entries == 0) {
+            pick = c;
+            break;
+        }
+    }
+    if (pick == kChunks) {
+        u64 oldest = tick;
+        for (u32 c = 0; c < kChunks; ++c) {
+            const Chunk& chunk = chunks[c];
+            if (c == current || tick - chunk.last_tick <= kIdleTicks || chunk.last_tick >= oldest) {
+                continue;
+            }
+            if (!scheduler.IsFree(chunk.last_tick)) {
+                continue;
+            }
+            oldest = chunk.last_tick;
+            pick = c;
+        }
+        if (pick == kChunks) {
+            return false;
+        }
+        // Retire the chunk's entries: a bind-cache slot naming one finds its hash gone and uploads again.
+        u64 retired = 0;
+        for (auto it = entries.begin(); it != entries.end();) {
+            if (it->second.chunk == pick) {
+                it = entries.erase(it);
+                ++retired;
+            } else {
+                ++it;
+            }
+        }
+        SotcStats::pb_flat_retired.fetch_add(retired, std::memory_order_relaxed);
+    }
+    chunks[pick] = Chunk{};
+    current = pick;
+    return true;
+}
+
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                          TextureCache& texture_cache_, PageManager& tracker)
@@ -553,6 +635,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_semaphore{instance} {
     // sotc: SOTC_ASYNC_UPLOAD (see async_upload.h).
     AsyncUpload::Init();
+    // sotc: SOTC_FLAT_ARENA (gpu/sotc/nonblocking.h): the flat constant arena.
+    if (SotcNonBlocking::FlatArena()) {
+        flat_arena = std::make_unique<FlatArena>(instance, scheduler);
+    }
     // sotc: SOTC_MIRROR (A2b): Touch of a range the mirror does not hold places it here (MirrorHold). Only used when
     // the mirror is on; the hook itself costs nothing.
     SotcArch::Mirror::SetArenaHold(&BufferCache::MirrorHoldThunk, this);

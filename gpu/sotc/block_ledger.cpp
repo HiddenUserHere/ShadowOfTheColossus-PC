@@ -19,7 +19,7 @@ enum Slot : uint8_t { SlotCp, SlotDraw, SlotRec, SlotOther, SlotCount };
 constexpr std::array<const char*, SiteCount> kSiteNames{
     "pipeline", "compute pipeline", "translate", "pack load", "register binary", "storage save",
     "storage load", "shader index", "driver cache save", "driver cache get", "gpl library", "gpl lock",
-    "compute wait",
+    "compute wait", "library demand", "stage demand", "gpl link",
 };
 constexpr std::array<const char*, SlotCount> kSlotNames{"cp", "draw", "rec", "other"};
 
@@ -103,6 +103,14 @@ uint64_t NowNs() noexcept {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
             .count());
+}
+
+void Record(Site site, uint64_t start, uint64_t end, uint64_t key) noexcept {
+    if (site < SiteCount) {
+        // sotc: no new writer or dynamic name: the recorder drains this thread's existing ring.
+        SotcTrace::SpanIfReady(kSiteNames[site], start, end, key,
+                        SotcStats::flip_count.load(std::memory_order_relaxed));
+    }
 }
 
 void Add(Site site, uint64_t ns) noexcept {

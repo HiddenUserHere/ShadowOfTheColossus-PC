@@ -934,7 +934,10 @@ void DrawTests() {
     ImGui::Text("%s: %s", T("Segmento", "Segment"), w.segment.empty() ? "-" : w.segment.c_str());
     ImGui::Text("%s: %llu", T("Quadros", "Frames"), static_cast<unsigned long long>(w.frames));
     ImGui::Text("p50 %.1f ms   p99 %.1f ms   max %.1f ms", w.p50, w.p99, w.max);
-    ImGui::Text("%s >33: %llu   >50: %llu   >100: %llu", T("Engasgos", "Hitches"),
+    ImGui::Text("30 FPS: late (>33.833 ms) %llu   streak %llu   p99.9 %.1f ms",
+                static_cast<unsigned long long>(w.late30),
+                static_cast<unsigned long long>(w.max_consecutive_late30), w.p999);
+    ImGui::Text("%s >33: %llu   >50: %llu   >100: %llu", T("Contagem bruta", "Raw counts"),
                 static_cast<unsigned long long>(w.hitch33),
                 static_cast<unsigned long long>(w.hitch50),
                 static_cast<unsigned long long>(w.hitch100));

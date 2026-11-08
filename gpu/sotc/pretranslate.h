@@ -28,9 +28,10 @@ namespace SotcPretranslate {
 bool On() noexcept;
 /// SOTC_PRETRANSLATE=1 or SOTC_PRECOMPILE=1: the pixel and vertex requests (and their backlog, hold and report).
 bool PixelVertexOn() noexcept;
-/// SOTC_PRETRANSLATE_COMPUTE=1 (default off, also set by SOTC_PRECOMPILE=1 with SOTC_PRETRANSLATE_COMPUTE=1):
-/// compute programs of the loaded shader files are prebuilt (translated, and their ComputePipeline built on a worker)
-/// under the key their first dispatch computes. Needs SOTC_RES_LOADED=1 (sotc.py sets it for the switches it knows).
+/// SOTC_PRETRANSLATE_COMPUTE=1 (also set by SOTC_PRECOMPILE=1 with SOTC_PRETRANSLATE_COMPUTE=1; unset: on when
+/// SOTC_COMPUTE_PACK is, sotc/nonblocking.h; 0: off): compute programs of the loaded shader files are prebuilt
+/// (translated, and their ComputePipeline built on a worker) under the key their first dispatch computes. Needs
+/// SOTC_RES_LOADED=1 (sotc.py sets it for the switches it knows).
 bool ComputeOn() noexcept;
 
 /// SOTC_PRECOMPILE=1 (sotc.py --precompile): the shader preparation run. Every program the game loads at boot is

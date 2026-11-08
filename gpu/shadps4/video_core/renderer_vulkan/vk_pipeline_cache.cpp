@@ -49,7 +49,12 @@
 #include "../../../sotc/predict_probe.h" // sotc: SOTC_PRETRANSLATE (pixel layouts)
 #include "../../../sotc/pipe_predict.h"  // sotc: SOTC_PIPE_PREDICT
 #include "../../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER
+#include "../../../sotc/driver_cache_identity.h" // sotc: do not trust silently ignored initial data
+#include "../../../sotc/preparation_status.h" // sotc: wait for compute builds, allow fully cached translations
+#include "../../../sotc/manifest_capture.h" // sotc: raw hints must describe the recorded module specialization
 #include "../../../sotc/nonblocking.h"  // sotc: SOTC_NB_* (non-blocking frame)
+#include "bbport_overlay.h"               // sotc: SOTC_PLAY_QUIET (BbOverlay::LoadingShown)
+#include "video_core/renderer_vulkan/sotc_pipe_feedback.h" // sotc: SOTC_PLAY_QUIET (LastCreateNs)
 #include "video_core/sotc_arch/addr_table.h" // sotc: ARCH-GCN-NATIVE (Init before the profile)
 #include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE (Profile::gcn_buf, gcn_tex)
 #include "bbport_threads.h"
@@ -109,6 +114,22 @@ struct PipelineCache::ManifestState {
     u64 saved_built{}; ///< pipelines built when the driver cache was last saved
     u32 stage_cached{}, stage_translated{};
     std::map<std::string, u32> skipped; ///< reason -> pipelines skipped
+    // sotc: SOTC_MANIFEST_HOLD_FAST: stages in the Pending and Waiting states, kept by SetState (every stage state
+    // change goes through it), so the per-lookup hold check never walks the stage records.
+    u32 pending{}, waiting{};
+    void SetState(StageRt& st, St s) {
+        if (st.state == St::Pending) {
+            --pending;
+        } else if (st.state == St::Waiting) {
+            --waiting;
+        }
+        if (s == St::Pending) {
+            ++pending;
+        } else if (s == St::Waiting) {
+            ++waiting;
+        }
+        st.state = s;
+    }
 };
 
 namespace {
@@ -116,6 +137,7 @@ namespace {
 struct ManifestStats {
     std::atomic<u64> compute_built{};          ///< manifest compute builds done (workers)
     std::atomic<u64> late_graphics{}, late_compute{}; ///< pipelines queued after the boot hold
+    std::atomic<u64> quiet_deferred{};         ///< sotc: SOTC_PLAY_QUIET: holds not started because the game drew
     std::atomic<u32> waiting_code{};           ///< stages whose program code has not come
     std::atomic<bool> boot_done{};
 };
@@ -159,6 +181,20 @@ static std::filesystem::path DriverCachePath() {
     std::filesystem::create_directories(dir, ec);
     return dir / "sotc_vk_pipelines.bin";
 }
+// sotc: SOTC_DRIVER_CACHE_MAX_MB (default 512): size cap of the live driver cache file only (not the pack cache).
+// A larger file is moved aside at load (it made the driver keep a multi-GB copy resident); 0 disables the cap.
+static size_t DriverCacheMaxBytes() {
+    static const size_t cap = [] {
+        const char* v = std::getenv("SOTC_DRIVER_CACHE_MAX_MB");
+        const unsigned long long mb = (v && v[0]) ? std::strtoull(v, nullptr, 10) : 512ull;
+        return static_cast<size_t>(mb) << 20;
+    }();
+    return cap;
+}
+// sotc: SOTC_PLAY_QUIET: the pack cache (stage libraries), next to it.
+static std::filesystem::path PackCachePath() {
+    return DriverCachePath().parent_path() / "sotc_vk_pack.bin";
+}
 
 using Shader::HwStage;
 using Shader::Output;
@@ -173,6 +209,22 @@ constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
     vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
 };
+// sotc: SOTC_BIND_DESC_REUSE: the flat buffer bindings are dynamic storage buffers (Pipeline::MarkDynamicFlat), so
+// the pools hold that type too.
+constexpr static std::array DescriptorHeapSizesDynamic = {
+    vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 512},
+    vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 8192},
+    vk::DescriptorPoolSize{vk::DescriptorType::eStorageBufferDynamic, 2048},
+    vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 8192},
+    vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
+    vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
+};
+static std::span<const vk::DescriptorPoolSize> HeapSizes() {
+    if (SotcNonBlocking::BindDescReuse()) {
+        return DescriptorHeapSizesDynamic;
+    }
+    return DescriptorHeapSizes;
+}
 
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
     u32 num_outputs = 0;
@@ -573,7 +625,10 @@ void N5SetWarming(bool warming) {
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      desc_heap{instance, scheduler, DescriptorHeapSizes}, layout_cache{instance} {
+      desc_heap{instance, scheduler, HeapSizes()}, layout_cache{instance} {
+    // sotc: SOTC_BIND_DESC_REUSE: persistent sets need set layout handles that live as long as the heap (the layout
+    // cache keeps them); without the cache the entries keep rolling-pool sets (checked by the pool serial).
+    desc_heap.EnablePersistentSets(SotcNonBlocking::BindDescReuse() && layout_cache.Enabled());
     const auto& vk12_props = instance.GetVk12Properties();
     // NVIDIA's shader compiler (seen on 617.14) hits a breakpoint on any OpFDiv in a shader
     // with RoundingModeRTZ for that width, killing the process. Prefer default rounding there.
@@ -712,57 +767,128 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // 2 minutes of loading screen, since the driver's own cache is tied to the executable. The
     // driver checks the header (vendor, device, driver version) and ignores a stale copy.
     // SOTC_DRIVER_CACHE=0 turns it off.
-    std::vector<u8> driver_cache_data;
-    if (DriverCacheEnabled()) {
-        const auto path = DriverCachePath();
+    // sotc: one saved cache file -> its bytes (empty: none, truncated, another GPU or driver).
+    const auto load_cache = [&](const std::filesystem::path& path, const char* what, size_t max_bytes = 0) {
+        std::vector<u8> data;
+        // sotc: SOTC_DRIVER_CACHE_MAX_MB: an oversize live cache is renamed to <name>.oversize (one backup, an older
+        // one is overwritten) and not loaded; the caller then creates an empty cache.
+        if (max_bytes) {
+            std::error_code cap_ec;
+            const auto file_bytes = std::filesystem::file_size(path, cap_ec);
+            if (!cap_ec && file_bytes > max_bytes) {
+                auto backup = path;
+                backup += L".oversize";
+                std::filesystem::remove(backup, cap_ec);
+                std::filesystem::rename(path, backup, cap_ec);
+                std::fprintf(stderr,
+                             "SOTC driver cache: %llu MB exceeds SOTC_DRIVER_CACHE_MAX_MB=%zu, starting a fresh cache "
+                             "(old file kept as .oversize)\n",
+                             static_cast<unsigned long long>(file_bytes >> 20), max_bytes >> 20);
+                return data;
+            }
+        }
         if (std::FILE* f = _wfopen(path.c_str(), L"rb")) {
-            std::fseek(f, 0, SEEK_END);
-            const long size = std::ftell(f);
-            std::fseek(f, 0, SEEK_SET);
-            if (size > 0) {
-                driver_cache_data.resize(static_cast<size_t>(size));
-                if (std::fread(driver_cache_data.data(), 1, driver_cache_data.size(), f) !=
-                    driver_cache_data.size()) {
-                    driver_cache_data.clear();
+            // sotc: ftell's long is only 32 bits on Windows; a GPL pack can exceed 2 GiB.
+            // Reject incompatible headers before allocating/reading the whole cache.
+            std::error_code size_ec;
+            const auto bytes = std::filesystem::file_size(path, size_ec);
+            std::array<u8, 32> header{};
+            const size_t header_read = std::fread(header.data(), 1, header.size(), f);
+            const char* mismatch = SotcCache::HeaderMismatch(std::span{header}.first(header_read),
+                                                             instance.GetVendorID(), instance.GetDeviceID(),
+                                                             instance.GetPipelineCacheUUID());
+            if (mismatch) {
+                std::fprintf(stderr, "SOTC %s: %s; starting empty\n", what, mismatch);
+            } else if (!size_ec && bytes >= header.size() && bytes <= data.max_size()) {
+                data.resize(static_cast<size_t>(bytes));
+                std::copy(header.begin(), header.end(), data.begin());
+                const size_t remaining = data.size() - header.size();
+                if (std::fread(data.data() + header.size(), 1, remaining, f) != remaining) {
+                    data.clear();
                 }
             }
             std::fclose(f);
         }
-    }
-    vk::PipelineCacheCreateInfo cache_ci{
-        .initialDataSize = driver_cache_data.size(),
-        .pInitialData = driver_cache_data.empty() ? nullptr : driver_cache_data.data(),
+        return data;
     };
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(cache_ci);
-    if (cache_result != vk::Result::eSuccess && !driver_cache_data.empty()) {
-        std::fprintf(stderr, "SOTC driver cache: saved copy rejected (%s), starting empty\n",
-                     vk::to_string(cache_result).c_str());
-        driver_cache_data.clear();
-        auto retry = instance.GetDevice().createPipelineCacheUnique({});
-        cache_result = retry.result;
-        cache = std::move(retry.value);
+    // sotc: the VkPipelineCache from those bytes (empty on rejection; data cleared then).
+    const auto create_cache = [&](std::vector<u8>& data, const char* what) {
+        vk::PipelineCacheCreateInfo cache_ci{
+            .initialDataSize = data.size(),
+            .pInitialData = data.empty() ? nullptr : data.data(),
+        };
+        auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(cache_ci);
+        if (cache_result != vk::Result::eSuccess && !data.empty()) {
+            std::fprintf(stderr, "SOTC %s: saved copy rejected (%s), starting empty\n", what,
+                         vk::to_string(cache_result).c_str());
+            data.clear();
+            auto retry = instance.GetDevice().createPipelineCacheUnique({});
+            cache_result = retry.result;
+            cache = std::move(retry.value);
+        }
+        ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
+                   vk::to_string(cache_result));
+        if (!data.empty()) {
+            std::fprintf(stderr, "SOTC %s: %zu MB loaded\n", what, data.size() >> 20); // sotc: MB
+        }
+        return std::move(cache);
+    };
+    std::vector<u8> driver_cache_data;
+    if (DriverCacheEnabled()) {
+        driver_cache_data = load_cache(DriverCachePath(), "driver cache", DriverCacheMaxBytes());
     }
-    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
-               vk::to_string(cache_result));
-    pipeline_cache = std::move(cache);
+    pipeline_cache = create_cache(driver_cache_data, "driver cache");
     saved_driver_cache_size = driver_cache_data.size();
-    driver_cache_loaded = !driver_cache_data.empty(); // sotc: SOTC_GPL_PACK_LIBS (the list of compiled libraries)
-    if (!driver_cache_data.empty()) {
-        std::fprintf(stderr, "SOTC driver cache: %zu KB loaded\n", driver_cache_data.size() >> 10);
+    // sotc: SOTC_PLAY_QUIET: the stage libraries get their own cache object and file (sotc_vk_pack.bin): the pack
+    // publication writes it once per pack compile (and the exit, when it grew), so the periodic saver's
+    // vkGetPipelineCacheData reads only the live cache. Libraries are VkPipeline objects: a link made from them with
+    // the live cache does not care which cache created them. (A merge into one cache at startup would keep the
+    // periodic save as large as before; the split keeps it small.) The pack library list is bound to this file.
+    std::vector<u8> pack_data;
+    const bool split_cache = DriverCacheEnabled() && SotcNonBlocking::PlayQuiet();
+    if (split_cache) {
+        pack_data = load_cache(PackCachePath(), "pack cache");
+        pack_cache = create_cache(pack_data, "pack cache");
+        saved_pack_cache_size = pack_data.size();
+        GplLibraryCache::SetLibraryCache(*pack_cache);
     }
+    const std::vector<u8>& pack_source = split_cache ? pack_data : driver_cache_data;
+    driver_cache_loaded = !pack_source.empty(); // sotc: compatible header; feedback still proves individual hits
+    loaded_driver_cache_hash = driver_cache_loaded ? XXH3_64bits(pack_source.data(), pack_source.size()) : 0;
     if (DriverCacheEnabled()) {
         // New pipelines (first visits) are saved every minute while playing: the game is often
         // closed by killing the process, which skips the destructor.
         driver_cache_saver = std::jthread([this](std::stop_token stop) {
+            using Clock = std::chrono::steady_clock;
+            auto last_save = Clock::now();
+            const bool quiet = SotcNonBlocking::PlayQuiet();
             while (!stop.stop_requested()) {
+                bool requested = false;
                 {
-                    // sotc: every 60 s, or now when RequestDriverCacheSave asks (SOTC_NB_IO).
+                    // sotc: every 60 s, or now when RequestDriverCacheSave asks (SOTC_NB_IO). SOTC_PLAY_QUIET: polled
+                    // every 5 s; the periodic save (60 s apart) runs only at a loading screen or after 5 s without a
+                    // pipeline creation, so vkGetPipelineCacheData never runs under a draw's link.
                     std::unique_lock lk{driver_cache_cv_mutex};
-                    driver_cache_cv.wait_for(lk, stop, std::chrono::seconds{60},
+                    driver_cache_cv.wait_for(lk, stop, std::chrono::seconds{quiet ? 5 : 60},
                                              [this] { return driver_cache_save_requested; });
+                    requested = driver_cache_save_requested;
                     driver_cache_save_requested = false;
                 }
-                if (!stop.stop_requested()) {
+                if (stop.stop_requested()) {
+                    break;
+                }
+                if (pack_publish_state.load(std::memory_order_acquire) == 1) {
+                    RunPackPublish(); // sotc: SOTC_GPL_PACK_LEAN: the pack cache, then the list
+                }
+                const auto now = Clock::now();
+                bool save = requested;
+                if (!save && now - last_save >= std::chrono::seconds{60}) {
+                    const u64 now_ns = SotcJobClockNs();
+                    const u64 idle_ns = now_ns - std::min(now_ns, SotcPipeFeedback::LastCreateNs());
+                    save = !quiet || BbOverlay::LoadingShown() || idle_ns > 5'000'000'000ull;
+                }
+                if (save) {
+                    last_save = now;
                     SaveDriverCache();
                 }
             }
@@ -779,15 +905,32 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         const int threads = static_cast<int>(std::thread::hardware_concurrency());
         const int default_cap = BbThreads::CpuSetsEnabled() ? 4 : 12;
         const unsigned count = static_cast<unsigned>(std::clamp(threads - 4, 2, default_cap));
+        // sotc: SOTC_GPL_URGENT_WORKERS: the first n workers serve only the Urgent and Predict lanes (a draw's missing
+        // libraries, the libraries of the materials just created), so those builds never queue behind translations,
+        // compute prebuilds or optimized pipeline builds. At least two general workers stay.
+        const unsigned urgent = SotcNonBlocking::GplUrgentWorkers();
+        reserved_workers = count >= urgent + 2 ? urgent : 0;
         for (unsigned i = 0; i < count; ++i) {
-            async_workers.emplace_back([this](std::stop_token token) { AsyncPipelineWorker(token); });
+            const bool urgent_only = i < reserved_workers;
+            async_workers.emplace_back(
+                [this, urgent_only](std::stop_token token) { AsyncPipelineWorker(token, urgent_only); });
         }
     }
     // sotc: SOTC_ASYNC_COMPUTE_XLATE=1 (off by default), see ComputePrefetchEnabled.
+    const uint64_t private_after_cache_load = SotcPipeManifest::ProcessPrivateBytes();
     compute_prefetch = !async_workers.empty() && [] {
         const char* v = std::getenv("SOTC_ASYNC_COMPUTE_XLATE");
         return v && v[0] == '1';
     }();
+    // sotc: the environment snapshot cannot resolve device-dependent gates; report them once here.
+    std::fprintf(stderr,
+                 "SOTC PIPE CONFIG: driver-cache %d loaded %d; workers %zu (urgent-only %u); nodrop %d requested %d; "
+                 "shader-only %d; pack %d; predict %d; precompile %d; compute-prefetch %d; private %llu MB after cache load\n",
+                 DriverCacheEnabled(), driver_cache_loaded, async_workers.size(), reserved_workers,
+                 SotcNonBlocking::GplNoDrop(),
+                 SotcNonBlocking::GplNoDropRequested(), SotcNonBlocking::GplShaderKeys(),
+                 SotcNonBlocking::GplPackLibs(), SotcNonBlocking::GplPredict(), SotcPretranslate::Precompile(),
+                 compute_prefetch, static_cast<unsigned long long>(private_after_cache_load >> 20));
 }
 
 PipelineCache::~PipelineCache() {
@@ -796,6 +939,7 @@ PipelineCache::~PipelineCache() {
         driver_cache_saver.request_stop();
         driver_cache_saver.join();
         SaveDriverCache(true);
+        FinalPackPublish(); // sotc: SOTC_PLAY_QUIET: the pack cache, when it grew since its publication
     }
 }
 
@@ -811,18 +955,32 @@ void PipelineCache::RequestDriverCacheSave() {
     driver_cache_cv.notify_all();
 }
 
-void PipelineCache::SaveDriverCache(bool final_save) {
+bool PipelineCache::SaveDriverCache(bool final_save, size_t* written_size, u64* written_hash) {
     if (!DriverCacheEnabled() || !pipeline_cache) {
-        return;
+        return false;
     }
+    return SaveCacheFile(*pipeline_cache, DriverCachePath(), saved_driver_cache_size, final_save, written_size,
+                         written_hash, "driver cache");
+}
+
+bool PipelineCache::SavePackCache(size_t* written_size, u64* written_hash) {
+    if (!DriverCacheEnabled() || !pack_cache) {
+        return false;
+    }
+    return SaveCacheFile(*pack_cache, PackCachePath(), saved_pack_cache_size, true, written_size, written_hash,
+                         "pack cache");
+}
+
+bool PipelineCache::SaveCacheFile(vk::PipelineCache cache, const std::filesystem::path& path, size_t& saved_size,
+                                  bool final_save, size_t* written_size, u64* written_hash, const char* what) {
     const SotcBlockLedger::Scope ledger{SotcBlockLedger::DriverCacheSave};
     std::scoped_lock lk{driver_cache_save_mutex};
     size_t size = 0;
     const vk::Device device = instance.GetDevice();
     std::optional<SotcBlockLedger::Scope> get_timer{std::in_place, SotcBlockLedger::DriverCacheGet};
-    if (device.getPipelineCacheData(*pipeline_cache, &size, nullptr) != vk::Result::eSuccess ||
-        size == 0 || size == saved_driver_cache_size) {
-        return;
+    if (device.getPipelineCacheData(cache, &size, nullptr) != vk::Result::eSuccess ||
+        size == 0 || (written_size == nullptr && size == saved_size)) {
+        return false;
     }
     // sotc: P5 of the non-blocking frame. The file is rewritten whole (1.9 GB, 25 s of disk writes on the saver thread
     // in a warm session), so the periodic saves wait until it grew by 5% or 64 MiB; the save at shutdown writes any
@@ -831,37 +989,54 @@ void PipelineCache::SaveDriverCache(bool final_save) {
         const char* v = std::getenv("SOTC_DRIVER_CACHE_ALWAYS");
         return v && v[0] == '1';
     }();
-    if (!final_save && !always && saved_driver_cache_size != 0 && size > saved_driver_cache_size &&
-        size - saved_driver_cache_size < std::max<size_t>(size_t{64} << 20, saved_driver_cache_size / 20)) {
-        return;
+    if (!final_save && !always && saved_size != 0 && size > saved_size &&
+        size - saved_size < std::max<size_t>(size_t{64} << 20, saved_size / 20)) {
+        return false;
+    }
+    // sotc: SOTC_DRIVER_CACHE_MAX_MB: still saved, but the next launch will move it aside (warn once).
+    if (path == DriverCachePath() && DriverCacheMaxBytes() && size > DriverCacheMaxBytes()) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            std::fprintf(stderr,
+                         "SOTC driver cache: %zu MB exceeds SOTC_DRIVER_CACHE_MAX_MB=%zu; saved anyway, the next "
+                         "launch will start fresh\n",
+                         size >> 20, DriverCacheMaxBytes() >> 20);
+        }
     }
     std::vector<u8> data(size);
-    if (device.getPipelineCacheData(*pipeline_cache, &size, data.data()) !=
-        vk::Result::eSuccess) {
-        return;
+    if (device.getPipelineCacheData(cache, &size, data.data()) != vk::Result::eSuccess) {
+        return false;
     }
     get_timer.reset();
     data.resize(size);
     // Written next to it and renamed: a crash while writing keeps the old copy.
-    const auto path = DriverCachePath();
     auto tmp = path;
     tmp += L".tmp";
     std::FILE* f = _wfopen(tmp.c_str(), L"wb");
     if (!f) {
-        return;
+        return false;
     }
-    const bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
-    std::fclose(f);
+    const bool wrote = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+    const bool closed = std::fclose(f) == 0;
+    const bool ok = wrote && closed; // sotc: buffered writes can fail only at close
     std::error_code ec;
     if (ok) {
         std::filesystem::rename(tmp, path, ec);
     }
     if (ok && !ec) {
-        saved_driver_cache_size = size;
-        std::fprintf(stderr, "SOTC driver cache: %zu KB saved\n", size >> 10);
+        saved_size = size;
+        if (written_size) {
+            *written_size = size;
+        }
+        if (written_hash) {
+            *written_hash = XXH3_64bits(data.data(), data.size());
+        }
+        std::fprintf(stderr, "SOTC %s: %zu KB saved\n", what, size >> 10);
+        return true;
     } else {
         std::filesystem::remove(tmp, ec);
     }
+    return false;
 }
 
 // sotc: SOTC_TINY_ASYNC (see GetGraphicsPipeline). 0 (unset): a tiny draw (<= 6 indices) whose
@@ -1463,6 +1638,9 @@ struct LibPredictState {
     std::deque<Want> waiting;
     /// Library jobs queued so far: HashCombine(stage hash, LibPreState / LibFsState).
     std::unordered_set<u64> queued;
+    /// sotc: library ids whose predicted job is queued or running (never evicted meanwhile; CollectAsyncPipelines erases).
+    std::unordered_set<u64> inflight;
+    std::chrono::steady_clock::time_point last_evict{};
     std::vector<SotcPipePredict::Slot> scratch;
     u64 calls{};
 
@@ -1509,9 +1687,18 @@ void PipelineCache::NoteLibraryTemplate() {
     tpl.valid = true;
 }
 
+// sotc: SOTC_COMPUTE_PACK. Bit 63 of a pack list id is its kind: 0 a graphics stage library, 1 a compute pipeline.
+static constexpr u64 kPackKindCompute = u64{1} << 63;
+
 // sotc: SOTC_GPL_DYN_STATE / SOTC_GPL_PACK_LIBS. The id of one stage library: program (CacheHash), permutation, part.
 static u64 PackLibraryId(u64 program, size_t perm, u32 part) {
-    return HashCombine(HashCombine(program, u64{perm}), u64{0x9000u + part});
+    return HashCombine(HashCombine(program, u64{perm}), u64{0x9000u + part}) & ~kPackKindCompute;
+}
+
+// sotc: SOTC_COMPUTE_PACK. The id of one compute pipeline of the pack: its ComputePipelineKey (program CacheHash and
+// permutation, HashCombine(hash, perm)) with the compute kind bit.
+static u64 PackComputeId(u64 compute_key_value) {
+    return HashCombine(compute_key_value, u64{0xC000u}) | kPackKindCompute;
 }
 
 // sotc: SOTC_GPL_DYN_STATE. The rest of a key for a library job that has no draw to take it from. With shader-only
@@ -1582,6 +1769,27 @@ void PipelineCache::PredictLibraries(const std::vector<SotcPipePredict::Slot>* s
     auto& st = *lib_predict;
     ++st.calls;
     const auto now = std::chrono::steady_clock::now();
+    const u64 now_ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    // sotc: SOTC_GPL_PREDICT eviction (every 10 s during play): a predicted library no material referenced and no draw
+    // used for SOTC_GPL_PREDICT_EVICT_S seconds (default 180; 0 keeps every library) leaves memory; its compiled code
+    // stays in the driver cache (a later material rebuilds it from there), never one of the manifest's, never a job in
+    // flight. The handles are destroyed once the GPU has finished the frames that linked them (DeferOperation).
+    static const u64 evict_age_ns = [] {
+        const char* v = std::getenv("SOTC_GPL_PREDICT_EVICT_S");
+        const long s = v && v[0] != '\0' ? std::strtol(v, nullptr, 10) : 180;
+        return s <= 0 ? u64{0} : static_cast<u64>(s) * 1'000'000'000ull;
+    }();
+    if (evict_age_ns != 0 && !manifest_holding && !pre_holding && now - st.last_evict > std::chrono::seconds{10}) {
+        st.last_evict = now;
+        GplLibraryCache::Evicted evicted;
+        if (gpl_libs.EvictStale(now_ns, evict_age_ns, st.inflight, evicted) != 0) {
+            for (const u64 id : evicted.ids) {
+                st.queued.erase(id); // a material naming it again queues a new job (a driver cache hit)
+            }
+            scheduler.DeferOperation([pipes = std::move(evicted.pipes)] { (void)pipes.size(); });
+        }
+    }
     if (!slots && SotcPipePredict::HasQueued()) {
         st.scratch.clear();
         SotcPipePredict::TakeSlots(st.scratch, 4);
@@ -1691,6 +1899,9 @@ void PipelineCache::PredictLibraries(const std::vector<SotcPipePredict::Slot>* s
         // pre-rasterization library), the pixel permutations with the first vertex one (their fragment library). A
         // library is keyed by its stage hash, so a draw of another permutation (another specialization) never finds it.
         const auto queue = [&](const GraphicsPipelineKey& rest, size_t vs_perm, size_t ps_perm, u32 parts, u64 id) {
+            if (shader_keys) {
+                gpl_libs.Touch(id, now_ns); // sotc: this material references the library (eviction by age)
+            }
             if (!st.queued.insert(id).second) {
                 return; // queued before (another material of the same program, same state)
             }
@@ -1699,6 +1910,8 @@ void PipelineCache::PredictLibraries(const std::vector<SotcPipePredict::Slot>* s
                 g_nodrop.pred_dropped.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
+            job->pack_id = id; // sotc: the library's id (GplLibraryCache::SetLibraryId in RunLibraryJob)
+            st.inflight.insert(id);
             lib_jobs_pending.fetch_add(1, std::memory_order_relaxed);
             g_nodrop.pred_jobs.fetch_add(1, std::memory_order_relaxed);
             {
@@ -1764,6 +1977,7 @@ std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::MakeLibraryJob(c
 }
 
 void PipelineCache::RunLibraryJob(AsyncPipelineJob& job) {
+    const SotcTrace::Scope trace{"gpl library job", job.hash, job.lib_origin}; // sotc: worker or CP
     // sotc: SOTC_GPL_PACK_LIBS: a pack job's library is compiled into the driver cache and destroyed.
     const bool pack = job.lib_origin == GplLibraryCache::OriginPack;
     const u64 built0 = GplLibraryCache::ThreadBuilt(), found0 = GplLibraryCache::ThreadFound(),
@@ -1772,12 +1986,14 @@ void PipelineCache::RunLibraryJob(AsyncPipelineJob& job) {
     GplLibraryCache::SetLibrariesOnly(true);
     GplLibraryCache::SetLibraryParts(job.lib_parts);
     GplLibraryCache::SetOrigin(static_cast<GplLibraryCache::Origin>(job.lib_origin));
+    GplLibraryCache::SetLibraryId(job.pack_id); // sotc: SOTC_GPL_PREDICT (0 for a draw's urgent job)
     // The constructor builds the parts of the mask, looks the others up and stops before the link (no handle).
     job.pipeline = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, layout_cache, StagesProfile(job.infos), job.key, *pipeline_cache, job.infos,
         job.runtime_infos, job.fetch_shader ? &*job.fetch_shader : nullptr, job.modules, job.sdata, false, true,
         &gpl_libs);
     job.pipeline.reset();
+    GplLibraryCache::SetLibraryId(0);
     GplLibraryCache::SetOrigin(GplLibraryCache::OriginDefault);
     GplLibraryCache::SetLibraryParts(0);
     GplLibraryCache::SetLibrariesOnly(false);
@@ -1789,6 +2005,9 @@ void PipelineCache::RunLibraryJob(AsyncPipelineJob& job) {
         if (ok) {
             std::scoped_lock lock{pack_mutex};
             pack_compiled.push_back(job.pack_id);
+            if (SotcNonBlocking::GplPackLean()) { // sotc: the command processor destroys the module (DrainPackModules)
+                pack_done_modules.emplace_back(job.pack_program, job.pack_perm);
+            }
         } else {
             pack_failed.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1804,6 +2023,8 @@ void PipelineCache::RunLibraryJob(AsyncPipelineJob& job) {
 }
 
 bool PipelineCache::BuildLibrariesParallel(u32 missing) {
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::LibraryWait,
+                                       std::hash<GraphicsPipelineKey>{}(graphics_key)}; // sotc: includes self-build
     using L = GplLibraryCache;
     constexpr u32 pre = 1u << L::PreRaster;
     constexpr u32 fs = 1u << L::Fragment;
@@ -1825,6 +2046,7 @@ bool PipelineCache::BuildLibrariesParallel(u32 missing) {
         q.push_front(std::move(vs_job));
     }
     async_cv.notify_all();
+    urgent_cv.notify_all(); // sotc: SOTC_GPL_URGENT_WORKERS
     // A job no worker has taken yet is run here (every worker may be in a long build).
     for (;;) {
         std::unique_ptr<AsyncPipelineJob> mine;
@@ -2249,12 +2471,18 @@ u32 PipelineCache::CappedCap() const {
 
 void PipelineCache::PushJobLocked(JobLane lane, std::unique_ptr<AsyncPipelineJob> job) {
     job_queues[lane].push_back(std::move(job));
+    if (UrgentLane(lane)) {
+        urgent_cv.notify_one(); // sotc: SOTC_GPL_URGENT_WORKERS (the caller notifies async_cv for the others)
+    }
 }
 
-bool PipelineCache::HasRunnableJobLocked() const {
+bool PipelineCache::HasRunnableJobLocked(bool urgent_only) const {
     for (size_t l = 0; l < static_cast<size_t>(JobLane::Count); ++l) {
         if (job_queues.lanes[l].empty()) {
             continue;
+        }
+        if (urgent_only && !UrgentLane(static_cast<JobLane>(l))) {
+            continue; // sotc: SOTC_GPL_URGENT_WORKERS
         }
         if (static_cast<JobLane>(l) == JobLane::Background && job_queues.background_running >= BackgroundCap()) {
             continue;
@@ -2268,13 +2496,16 @@ bool PipelineCache::HasRunnableJobLocked() const {
     return false;
 }
 
-std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::PopJobLocked(JobLane& lane) {
+std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::PopJobLocked(JobLane& lane, bool urgent_only) {
     for (size_t l = 0; l < static_cast<size_t>(JobLane::Count); ++l) {
         auto& q = job_queues.lanes[l];
         if (q.empty()) {
             continue;
         }
         lane = static_cast<JobLane>(l);
+        if (urgent_only && !UrgentLane(lane)) {
+            continue; // sotc: SOTC_GPL_URGENT_WORKERS
+        }
         // sotc: SOTC_NB_WORKER_CAP: a capped lane waits while its quota of workers is busy (checked before any count).
         if (CappedLane(lane) && job_queues.capped_running >= CappedCap()) {
             continue;
@@ -2310,8 +2541,11 @@ std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::PopJobLocked(Job
     return nullptr;
 }
 
-void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
-    Common::SetCurrentThreadName("shadPS4:PipelineWorker");
+void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only, bool extra) {
+    Common::SetCurrentThreadName(urgent_only ? "shadPS4:PipelineUrgent" : extra ? "shadPS4:PipelinePack"
+                                                                                 : "shadPS4:PipelineWorker");
+    // sotc: allocate the trace ring before any shader, resource fault or ledger scope runs.
+    SotcTrace::ThreadInit();
     // sotc: up to 12 workers compile while new areas stream in; below normal they no longer take
     // CPU time from the command processor, draw and game threads. Off by default (review of
     // 2026-10-27): the recorder (high priority) blocks on compute pipelines a worker claimed, and
@@ -2331,7 +2565,16 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         JobLane lane = JobLane::Graphics;
         {
             std::unique_lock lock{async_mutex};
-            async_cv.wait(lock, token, [this] { return HasRunnableJobLocked(); });
+            // sotc: SOTC_GPL_URGENT_WORKERS: a reserved worker waits on urgent_cv (notified by pushes to its lanes);
+            // SOTC_GPL_PACK_LEAN: an extra worker of the pack hold leaves when told, without draining anything.
+            auto& cv = urgent_only ? urgent_cv : async_cv;
+            cv.wait(lock, token, [this, urgent_only, extra] {
+                return HasRunnableJobLocked(urgent_only) ||
+                       (extra && extra_workers_quit.load(std::memory_order_acquire));
+            });
+            if (extra && extra_workers_quit.load(std::memory_order_acquire)) {
+                return;
+            }
             if (token.stop_requested()) {
                 // A queued compute pipeline may be waited for by the recording thread: build
                 // those before leaving.
@@ -2346,7 +2589,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                 }
                 return;
             }
-            job = PopJobLocked(lane);
+            job = PopJobLocked(lane, urgent_only);
             if (!job) {
                 continue;
             }
@@ -2412,6 +2655,12 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         // sotc: SOTC_BLOCK_LEDGER job queue report: the wait ends here, the run ends when the job is done.
         const u64 job_taken_ns = SotcJobClockNs();
         const u64 job_wait_ns = job_taken_ns - std::min(job_taken_ns, job->created_ns);
+        if (SotcTrace::kOn && job->created_ns != 0) {
+            // sotc: queue latency on the worker track, distinct from execution (same monotonic clock).
+            SotcTrace::Span("pipeline job queued", job_taken_ns - job_wait_ns, job_taken_ns,
+                            job->hash, static_cast<u64>(job_class));
+        }
+        const SotcTrace::Scope job_trace{"pipeline job run", job->hash, static_cast<u64>(job_class)};
         const auto note_job = [&] {
             if (SotcBlockLedger::kOn) {
                 NoteJob(job_class, job_wait_ns, SotcJobClockNs() - job_taken_ns);
@@ -2445,6 +2694,15 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             if (job->pre_compute) { // sotc: SOTC_PRETRANSLATE_COMPUTE: done when the pipeline is built (or refused)
                 job->compute->WaitBuilt();
                 SotcPretranslate::NoteBuilt(2, job->compute->Handle() != vk::Pipeline{});
+                if (job->pack_compute) { // sotc: SOTC_COMPUTE_PACK: the last pack build's time and the worker time
+                    const auto now = std::chrono::steady_clock::now();
+                    pack_compute_last_ns.store(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
+                        std::memory_order_relaxed);
+                    pack_compute_build_ns.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count(),
+                        std::memory_order_relaxed);
+                }
                 pre_builds_pending.fetch_sub(1, std::memory_order_relaxed);
             }
             if (job->manifest) { // sotc: SOTC_PIPE_MANIFEST: the hold counts it as done (built or refused)
@@ -2467,12 +2725,16 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             g_sched_cancelled.fetch_add(1, std::memory_order_relaxed);
         } else {
             GplLibraryCache::SetLibrariesOnly(job->manifest_libs); // sotc: SOTC_GPL_NODROP boot libraries, no link
+            if (job->manifest_libs) {
+                GplLibraryCache::SetOrigin(GplLibraryCache::OriginManifest); // sotc: SOTC_GPL_PREDICT: never evicted
+            }
             job->pipeline = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, layout_cache, StagesProfile(job->infos), job->key, *pipeline_cache,
                 job->infos,
                 job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
                 job->sdata, job->preloaded, true, job->link_only ? &gpl_libs : nullptr);
             GplLibraryCache::SetLibrariesOnly(false);
+            GplLibraryCache::SetOrigin(GplLibraryCache::OriginDefault);
             SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         }
         note_job();
@@ -2525,6 +2787,8 @@ bool PipelineCache::NoDropLinkable() {
 // sotc: SOTC_GPL_NODROP. TryFastLink with the missing libraries built here (a library is far cheaper than the full
 // pipeline; the manifest's boot hold built those of every known stage), counted and timed apart from the link.
 bool PipelineCache::NoDropLink(std::unique_ptr<GraphicsPipeline>& slot) {
+    const SotcBlockLedger::Scope ledger{SotcBlockLedger::GplLink,
+                                       std::hash<GraphicsPipelineKey>{}(graphics_key)}; // sotc: inclusive
     const auto start = std::chrono::steady_clock::now();
     const u64 libs_before = GplLibraryCache::ThreadBuilt();
     const u64 link_before = g_gpl_counters.link_ns.load(std::memory_order_relaxed);
@@ -2553,6 +2817,14 @@ bool PipelineCache::NoDropLink(std::unique_ptr<GraphicsPipeline>& slot) {
     }
     GplLibraryCache::SetDrawUse(false);
     const u64 libs = GplLibraryCache::ThreadBuilt() - libs_before - par_libs;
+    if (par_ns != 0 || libs != 0) {
+        // sotc: plan step 3: the command processor waited for the driver to build this draw's libraries (parallel
+        // jobs or its own builds). Counted always, SOTC_FPS_LEAN included, in "cp blocked" and "cp libwait".
+        const u64 wait_ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        SotcStats::cp_libwait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+        SotcStats::cp_blocked_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+    }
     if (libs != 0) {
         const u64 elapsed_ns = static_cast<u64>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -2590,6 +2862,9 @@ void PipelineCache::CollectAsyncPipelines() {
             continue;
         }
         if (job->lib_parts != 0) { // sotc: SOTC_GPL_PREDICT / SOTC_GPL_PARALLEL_LIBS: only its libraries mattered
+            if (lib_predict && job->lib_origin == GplLibraryCache::OriginPredicted) {
+                lib_predict->inflight.erase(job->pack_id); // sotc: evictable from now on
+            }
             continue;
         }
         if (job->addr_table && !job->compute) { // sotc: SOTC_ADDR_FALLBACK: installed below for the next draw
@@ -2938,11 +3213,12 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
         } fetch_scope{manifest_job && t.manifest_fetch ? &*t.manifest_fetch : nullptr};
         // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS: a compute prebuild takes the fields its program's last miss recorded,
         // looked up by the game's hash (a variant's job carries it in guest_hash).
-        SotcPretranslate::HintScope hint_scope{
-            manifest_job ? t.manifest_hint
-            : t.pretranslate && t.sw_stage == SwStage::Compute
-                ? SotcPretranslate::AcquireHint(t.guest_hash != 0 ? t.guest_hash : t.hash)
-                : SotcPretranslate::HintPtr{}};
+        SotcPretranslate::HintPtr compute_hint;
+        if (!manifest_job && t.pretranslate && t.sw_stage == SwStage::Compute) {
+            compute_hint = SotcPretranslate::AcquireHint(t.guest_hash != 0 ? t.guest_hash : t.hash);
+            t.hinted = compute_hint != nullptr; // sotc: SOTC_COMPUTE_PACK report (hints / synthetic)
+        }
+        SotcPretranslate::HintScope hint_scope{manifest_job ? t.manifest_hint : compute_hint};
         t.new_program = std::make_unique<Program>(t.hw_stage, t.sw_stage, params);
         t.new_program->info.sotc_synthetic = t.pretranslate; // sotc: SOTC_PRETRANSLATE
         t.new_program->info.sotc_synthetic_variant = t.synthetic_variant;
@@ -3558,6 +3834,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
     // its own descriptor-mode fallback).
     const bool nodrop = SotcNonBlocking::GplNoDrop();
     if (!keyed && translation_pending && nodrop && !AddrFallbackOn()) {
+        const SotcBlockLedger::Scope ledger{SotcBlockLedger::StageDemand}; // sotc: cold fallback
         const auto xlate_start = std::chrono::steady_clock::now();
         async_translate_ok = false;
         translation_pending = false;
@@ -3903,8 +4180,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
     last_graphics_size = graphics_pipelines.size();
     // sotc: SOTC_PIPE_MANIFEST: the pipeline's first full lookup this session: recorded when no manifest holds it.
     if (manifest && it->second && !it->second->manifest_noted) {
-        it->second->manifest_noted = true;
-        CaptureManifestGraphics();
+        it->second->manifest_noted = CaptureManifestGraphics();
     }
     return it->second.get();
 }
@@ -4009,7 +4285,7 @@ void PipelineCache::NoteRecentPipeline(u64 id) {
 // sotc: SOTC_PIPE_FAST: the full lookup; GetComputePipelineLookup runs it unless a record applies.
 const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
     if (SotcPipeManifest::On()) { // sotc: SOTC_PIPE_MANIFEST (see GetGraphicsPipelineLookupSlow)
-        MaybeHoldForManifest();
+        MaybeHoldForManifest(true); // sotc: SOTC_MANIFEST_HOLD_FAST: compute (only installs finished translations)
     }
     // sotc: SOTC_ADDR_FALLBACK. The table key first (RefreshComputeKey queues a missing table translation on a worker);
     // when its stage is pending or its pipeline not ready (AddrTableComputeReady queues it), the dispatch takes the
@@ -4065,16 +4341,21 @@ const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
         // The presenter's Finish at shutdown runs every deferred bind before the workers stop.
         const bool deferred = !async_workers.empty() && AsyncComputeEnabled() &&
                               scheduler.HasRecordThread() && !EmulatorSettings.IsShaderCollect();
+        // sotc: SOTC_COMPUTE_PACK: a pipeline the pack list names is in the pack cache (a hit of ~1 ms): it is built
+        // from that cache, and a deferred one by the recorder at its first bind, without the worker round trip.
+        const bool pack_listed = SotcNonBlocking::ComputePack() && PackComputeListed(compute_key.value);
         const auto sync_start = std::chrono::steady_clock::now();
         {
             const SotcBlockLedger::Scope ledger{SotcBlockLedger::ComputeBuild};
             it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap,
                                                            layout_cache, StageProfile(infos[0]->variant),
-                                                           *pipeline_cache,
+                                                           pack_listed ? PackPipelineCache() : *pipeline_cache,
                                                            compute_key, *infos[0],
                                                            modules[0], sdata, false, deferred);
         }
-        if (deferred) {
+        if (deferred && pack_listed) {
+            it.value()->sotc_inline = true;
+        } else if (deferred) {
             auto job = std::make_unique<AsyncPipelineJob>();
             job->compute = it.value().get();
             {
@@ -4108,8 +4389,7 @@ const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
     }
     // sotc: SOTC_PIPE_MANIFEST: the pipeline's first full lookup this session: recorded when no manifest holds it.
     if (manifest && result && !result->manifest_noted) {
-        result->manifest_noted = true;
-        CaptureManifestCompute();
+        result->manifest_noted = CaptureManifestCompute();
     }
     return result;
 }
@@ -5548,9 +5828,27 @@ void PipelineCache::PrecompileCheck() {
     }
     const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
     const s64 last_request = SotcPretranslate::LastRequestNs();
-    if (queued == 0 || done < queued || SotcPretranslate::Pending() || !pre_deferred.empty() || last_request == 0 ||
-        now_ns - last_request < 5'000'000'000LL) {
+    const SotcCache::PreparationStatus status{
+        .queued = queued,
+        .completed = done,
+        .translating = pre_in_flight,
+        .compute_builds = pre_builds_pending.load(std::memory_order_acquire),
+        .backlog = pre_backlog.size(),
+        .requests_waiting = SotcPretranslate::Pending(),
+        .deferred = !pre_deferred.empty(),
+        .last_request_ns = last_request,
+        .now_ns = now_ns,
+    };
+    if (!status.ReadyToFinalize()) {
         return;
+    }
+    // sotc: precompile bypasses MaybeHoldForPretranslate: prepare resident stage libraries here too,
+    // before PrePackFinish / _Exit destroys their only opportunity to populate the driver cache.
+    if (!BuildPackLibraries()) {
+        std::fprintf(stderr, "SOTC PRECOMPILE failed: GPL library preparation incomplete\n");
+        std::fflush(stderr);
+        Storage::DataBase::Instance().Close();
+        std::_Exit(1); // sotc: the launcher must not stamp a failed preparation
     }
     // Every program the game loaded is translated and in the cache: the pack, the index, the cache files, and out.
     PrePackFinish();
@@ -5612,7 +5910,11 @@ void PipelineCache::DrainPretranslate() {
             if (r.deferred_ns == 0) {
                 SotcPretranslate::NoteDropped(stage, 0);
             }
-            if (SotcNonBlocking::Prefetch()) { // sotc: loaded from the pack by a worker before its first draw
+            if (SotcPretranslate::Precompile()) {
+                // sotc: a forced preparation of warm SPIR-V must recreate its modules too, otherwise
+                // the GPL pack sees only drawn programs and a missing driver cache stays unprepared.
+                LoadLazyProgram(r.hash); // loading-only process: no gameplay deadline to block
+            } else if (SotcNonBlocking::Prefetch()) {
                 QueueLazyPrefetch(r.hash);
             }
             continue;
@@ -5779,6 +6081,13 @@ void PipelineCache::QueueComputePrebuild(SotcPretranslate::Request& r) {
         SotcPretranslate::NoteDropped(2, 3);
         return;
     }
+    // sotc: SOTC_COMPUTE_PACK_MAX: a shader set beyond the cap is not prebuilt (the rest build at their dispatch).
+    if (SotcNonBlocking::ComputePackRequested() && pack_compute_queued >= SotcNonBlocking::ComputePackMax()) {
+        ++pack_compute_capped;
+        SotcPretranslate::NoteDropped(2, 3);
+        return;
+    }
+    ++pack_compute_queued;
     const SotcPretranslate::ComputeFields f = SotcPretranslate::ComputeFieldsOf(r.regs, r.cs_layout);
     // The registers as the dispatch's ComputeProgram holds them: settings is RSRC1 then RSRC2 (regs_shader.h).
     AmdGpu::ComputeProgram cs{};
@@ -5860,15 +6169,34 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
     }
     // The ComputePipeline is made on the command processor (its layouts and the heap state are CP-only); a worker
     // builds it (Build). Ordinary pipeline: SerializationSupport, RegisterPipelineData, the same as a draw's.
+    // sotc: SOTC_COMPUTE_PACK: a prebuild of the hold (or of the preparation run) is compiled into the pack cache and
+    // destroyed by the compute pack; its pipeline key is not registered (the next session must not warm it up: its
+    // dispatch builds it from the pack cache, inline).
+    const bool pack_candidate = SotcNonBlocking::ComputePack() &&
+                                (pre_holding || !pre_hold_done || SotcPretranslate::Precompile());
     ComputePipeline::SerializationSupport sdata{};
     auto pipe = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache,
                                                   StageProfile(program->info.variant),
-                                                  *pipeline_cache, key, program->info, program->modules[0].module,
-                                                  sdata, false, true);
+                                                  pack_candidate ? PackPipelineCache() : *pipeline_cache, key,
+                                                  program->info, program->modules[0].module, sdata, false, true);
     ComputePipeline* raw = pipe.get();
     auto [cit, cnew] = compute_pipelines.try_emplace(key);
     cit.value() = std::move(pipe);
-    RegisterPipelineData(key, sdata);
+    if (pack_candidate) {
+        raw->sotc_pack = true;
+        raw->sotc_pack_program = t.hash;
+        if (t.hinted) {
+            pack_compute_hinted.insert(t.hash);
+        }
+        s64 expected = 0;
+        pack_compute_first_ns.compare_exchange_strong(
+            expected,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count(),
+            std::memory_order_relaxed);
+    } else {
+        RegisterPipelineData(key, sdata);
+    }
     ++num_new_pipelines;
     if (async_workers.empty()) {
         raw->Build();
@@ -5878,6 +6206,7 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
     auto job = std::make_unique<AsyncPipelineJob>();
     job->compute = raw;
     job->pre_compute = true;
+    job->pack_compute = pack_candidate;
     pre_builds_pending.fetch_add(1, std::memory_order_relaxed);
     {
         std::scoped_lock lock{async_mutex};
@@ -5923,7 +6252,7 @@ namespace {
 // voids it): a header with the driver identity, then the ids (PackLibraryId) of the stage libraries whose compiled code
 // the saved driver cache holds. Bump kPackLibVersion when the library create infos change.
 constexpr u32 kPackLibMagic = 0x42494C50; // "PLIB"
-constexpr u32 kPackLibVersion = 1;
+constexpr u32 kPackLibVersion = 3; // sotc: 2 bound the list to the persisted cache bytes; 3 adds the kind bit (compute)
 struct PackLibHeader {
     u32 magic{kPackLibMagic};
     u32 version{kPackLibVersion};
@@ -5933,9 +6262,31 @@ struct PackLibHeader {
     u32 dyn_bits{};
     std::array<u8, VK_UUID_SIZE> uuid{};
     u64 count{};
+    u64 cache_hash{};
 };
 std::filesystem::path PackLibListPath() {
     return Storage::DataBase::Instance().CachePath() / "sotc_pack_libraries.bin";
+}
+// sotc: writes the list (header h with count and cache_hash set, then the ids) through a temporary file.
+bool WritePackLibList(PackLibHeader h, const std::vector<u64>& ids) {
+    h.count = ids.size();
+    const auto path = PackLibListPath();
+    auto tmp = path;
+    tmp += ".tmp";
+    std::FILE* f = _wfopen(tmp.c_str(), L"wb");
+    if (!f) {
+        return false;
+    }
+    const bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
+                    (ids.empty() || std::fwrite(ids.data(), sizeof(u64), ids.size(), f) == ids.size());
+    const bool closed = std::fclose(f) == 0;
+    std::error_code ec;
+    if (ok && closed) {
+        std::filesystem::rename(tmp, path, ec);
+        return !ec;
+    }
+    std::filesystem::remove(tmp, ec);
+    return false;
 }
 PackLibHeader PackLibIdentity(const Instance& instance) {
     PackLibHeader h;
@@ -5950,37 +6301,97 @@ PackLibHeader PackLibIdentity(const Instance& instance) {
     std::copy(uuid.begin(), uuid.end(), h.uuid.begin());
     return h;
 }
+// sotc: reads the ids of the list file into `out` when its header is `identity` with the cache hash `cache_hash`
+// (the caller checked PackLibraryListMatches). False when the file is missing or another identity.
+bool ReadPackLibList(const PackLibHeader& identity, u64 cache_hash, std::unordered_set<u64>& out) {
+    std::FILE* f = _wfopen(PackLibListPath().c_str(), L"rb");
+    if (!f) {
+        return false;
+    }
+    PackLibHeader h;
+    bool ok = std::fread(&h, sizeof h, 1, f) == 1 && h.magic == identity.magic && h.version == identity.version &&
+              h.vendor == identity.vendor && h.device == identity.device && h.driver == identity.driver &&
+              h.dyn_bits == identity.dyn_bits && h.uuid == identity.uuid && h.cache_hash == cache_hash;
+    if (ok) {
+        std::vector<u64> ids(static_cast<size_t>(std::min<u64>(h.count, u64{1} << 22)));
+        if (!ids.empty() && std::fread(ids.data(), sizeof(u64), ids.size(), f) == ids.size()) {
+            out.insert(ids.begin(), ids.end());
+        }
+    }
+    std::fclose(f);
+    return ok;
+}
 } // namespace
 
-void PipelineCache::BuildPackLibraries() {
+// sotc: a valid list must describe this exact driver-cache snapshot and a complete list file.
+// Header compatibility alone does not prove that the driver retained any particular library.
+bool PipelineCache::PackLibraryListMatches() const {
+    if (!driver_cache_loaded) {
+        return false;
+    }
+    std::FILE* f = _wfopen(PackLibListPath().c_str(), L"rb");
+    if (!f) {
+        return false;
+    }
+    PackLibHeader h{};
+    const bool read = std::fread(&h, sizeof h, 1, f) == 1;
+    std::fclose(f);
+    const PackLibHeader identity = PackLibIdentity(instance);
+    std::error_code ec;
+    const auto bytes = std::filesystem::file_size(PackLibListPath(), ec);
+    return read && !ec && h.magic == identity.magic && h.version == identity.version &&
+           h.vendor == identity.vendor && h.device == identity.device && h.driver == identity.driver &&
+           h.dyn_bits == identity.dyn_bits && h.uuid == identity.uuid && h.cache_hash == loaded_driver_cache_hash &&
+           h.count <= (u64{1} << 22) && bytes == sizeof h + h.count * sizeof(u64);
+}
+
+bool PipelineCache::BuildPackLibraries() {
     using Clock = std::chrono::steady_clock;
     using L = GplLibraryCache;
-    if (!SotcNonBlocking::GplPackLibs() || !DriverCacheEnabled() || async_workers.empty() ||
-        instance.IsDescriptorHeapEnabled() || !instance.IsVertexInputDynamicState() ||
-        EmulatorSettings.IsShaderCollect()) {
-        return;
+    // sotc: distinguish deliberate/unsupported skips from a successful pack build in every run.
+    const char* skip = !SotcNonBlocking::GplPackLibs() ? "GPL pack disabled or shader-only keys unavailable"
+                       : !DriverCacheEnabled() ? "SOTC_DRIVER_CACHE=0 (pack persistence requires the driver cache)"
+                       : async_workers.empty() ? "no pipeline workers"
+                       : instance.IsDescriptorHeapEnabled() ? "descriptor heap mode"
+                       : !instance.IsVertexInputDynamicState() ? "dynamic vertex input unavailable"
+                       : EmulatorSettings.IsShaderCollect() ? "shader collection mode" : nullptr;
+    if (skip) {
+        std::fprintf(stderr, "SOTC GPL PACK LIBS: skipped: %s\n", skip);
+        return true; // deliberate or unsupported: no claim that libraries were prepared
     }
     const auto start = Clock::now();
     const uint64_t private_start = SotcPipeManifest::ProcessPrivateBytes();
+    // sotc: SOTC_GPL_PACK_LEAN: the pack runs after the manifest pipelines and the compute prebuilds, which are already
+    // on the workers (collected here; the manifest's translations wait for its own pump and are not waited for).
+    const bool lean = SotcNonBlocking::GplPackLean();
+    if (lean) {
+        const auto busy = [&] {
+            if (pre_builds_pending.load(std::memory_order_acquire) != 0) {
+                return true;
+            }
+            if (!manifest) {
+                return false;
+            }
+            const auto& m = *manifest;
+            return m.graphics_building != 0 || m.libs_building != 0 ||
+                   g_manifest_stats.compute_built.load(std::memory_order_relaxed) < m.compute_queued;
+        };
+        while (busy() && Clock::now() - start < std::chrono::seconds{120}) {
+            if (async_done_count.load(std::memory_order_acquire) != 0) {
+                CollectAsyncPipelines();
+            }
+            std::unique_lock lock{async_mutex};
+            translate_done_cv.wait_for(lock, std::chrono::milliseconds{20},
+                                       [this] { return async_done_count.load(std::memory_order_relaxed) != 0; });
+        }
+    }
+    const auto wait_end = Clock::now();
     // The list is trusted only with the driver cache it describes (loaded and accepted at startup) and the same driver.
     const PackLibHeader identity = PackLibIdentity(instance);
     std::unordered_set<u64> listed;
-    bool list_void = !driver_cache_loaded;
-    if (!list_void) {
-        if (std::FILE* f = _wfopen(PackLibListPath().c_str(), L"rb")) {
-            PackLibHeader h;
-            if (std::fread(&h, sizeof h, 1, f) == 1 && h.magic == identity.magic && h.version == identity.version &&
-                h.vendor == identity.vendor && h.device == identity.device && h.driver == identity.driver &&
-                h.dyn_bits == identity.dyn_bits && h.uuid == identity.uuid) {
-                std::vector<u64> ids(static_cast<size_t>(std::min<u64>(h.count, u64{1} << 22)));
-                if (!ids.empty() && std::fread(ids.data(), sizeof(u64), ids.size(), f) == ids.size()) {
-                    listed.insert(ids.begin(), ids.end());
-                }
-            } else {
-                list_void = true;
-            }
-            std::fclose(f);
-        }
+    bool list_void = !PackLibraryListMatches();
+    if (!list_void && !ReadPackLibList(identity, loaded_driver_cache_hash, listed)) {
+        list_void = true;
     }
     // A partner per stage variant for the other stage of each job: a vertex and a pixel program that a per-shader link
     // can take (no bindless samplers). Its own libraries are only looked up.
@@ -5989,6 +6400,7 @@ void PipelineCache::BuildPackLibraries() {
         size_t perm{};
     };
     std::unordered_map<u32, std::array<Partner, 2>> partners; // variant -> {vertex, pixel}
+    std::unordered_set<const Program*> partner_programs; // sotc: SOTC_GPL_PACK_LEAN: their modules stay (every job)
     const auto usable = [](const Program& p, size_t& perm) {
         // Hardware VS and PS only: an export/local vertex stage is linked with geometry or tessellation stages, which a
         // pack job does not have (its library would never match a draw's).
@@ -6014,7 +6426,14 @@ void PipelineCache::BuildPackLibraries() {
         auto& slot = partners[u32{p.info.variant}][p.info.sw_stage == Shader::SwStage::Vertex ? 0 : 1];
         if (!slot.program) {
             slot = Partner{&p, perm};
+            partner_programs.insert(&p);
         }
+    }
+    if (lean) {
+        StartExtraWorkers(); // sotc: SOTC_GPL_PACK_LEAN: every hardware thread while the screen is held
+        pack_touched.clear();
+        std::scoped_lock lock{pack_mutex};
+        pack_done_modules.clear();
     }
     const GraphicsPipelineKey rest = DefaultLibraryRest();
     u64 queued = 0, skipped = 0, no_partner = 0, unlinkable = 0, queued_vs = 0;
@@ -6023,7 +6442,7 @@ void PipelineCache::BuildPackLibraries() {
         pack_compiled.clear();
     }
     pack_failed.store(0, std::memory_order_relaxed);
-    const u32 pending_before = lib_jobs_pending.load(std::memory_order_relaxed);
+    // sotc: pack_compiled + pack_failed counts this batch only; other library jobs may complete too.
     for (auto it = program_cache.begin(); it != program_cache.end(); ++it) {
         Program& p = *it.value();
         size_t first = 0;
@@ -6056,6 +6475,8 @@ void PipelineCache::BuildPackLibraries() {
                 continue;
             }
             job->pack_id = id;
+            job->pack_program = it.key(); // sotc: SOTC_GPL_PACK_LEAN
+            job->pack_perm = static_cast<u32>(perm);
             ++queued;
             queued_vs += vertex;
             lib_jobs_pending.fetch_add(1, std::memory_order_relaxed);
@@ -6066,15 +6487,50 @@ void PipelineCache::BuildPackLibraries() {
         }
     }
     async_cv.notify_all();
+    urgent_cv.notify_all(); // sotc: SOTC_GPL_URGENT_WORKERS: the Predict lane is theirs too
+    const auto queued_end = Clock::now();
     // The loading screen stays up until every job ran (they hold the modules the eviction destroys).
     SotcStats::prep_total.store(static_cast<u32>(queued), std::memory_order_relaxed);
     auto last_log = start;
-    while (lib_jobs_pending.load(std::memory_order_relaxed) > pending_before &&
-           Clock::now() - start < std::chrono::minutes{30}) {
+    const auto completed = [&]() -> u64 {
+        std::scoped_lock lock{pack_mutex};
+        return pack_compiled.size() + pack_failed.load(std::memory_order_relaxed);
+    };
+    // sotc: SOTC_GPL_PACK_LEAN: a pack job's module leaves memory as soon as its library is compiled. Not a partner's
+    // (every job looks the partner up), not a drawn program's (sotc_pre_checked), not one with a translation in flight.
+    // The eviction at the end of the hold sends the touched programs back to the index (lazy_programs) as it does for
+    // every prepared program; it skips the destroyed handles (null).
+    u64 modules_destroyed = 0;
+    const auto drain_modules = [&] {
+        std::vector<std::pair<u64, u32>> done;
+        {
+            std::scoped_lock lock{pack_mutex};
+            done.swap(pack_done_modules);
+        }
+        for (const auto& [hash, perm] : done) {
+            const auto found = program_cache.find(hash);
+            if (found == program_cache.end()) {
+                continue;
+            }
+            Program& p = *found.value();
+            if (!p.sotc_pre || p.sotc_pre_checked || !p.pending_specs.empty() || partner_programs.contains(&p) ||
+                perm >= p.modules.size() || !p.modules[perm].module) {
+                continue;
+            }
+            instance.GetDevice().destroyShaderModule(p.modules[perm].module);
+            p.modules[perm].module = vk::ShaderModule{};
+            pack_touched.insert(hash);
+            ++modules_destroyed;
+        }
+    };
+    while (completed() < queued && Clock::now() - start < std::chrono::minutes{30}) {
         if (async_done_count.load(std::memory_order_acquire) != 0) {
             CollectAsyncPipelines();
         }
-        const u64 left = lib_jobs_pending.load(std::memory_order_relaxed) - pending_before;
+        if (lean) {
+            drain_modules();
+        }
+        const u64 left = queued - std::min(queued, completed());
         SotcStats::prep_done.store(static_cast<u32>(queued - std::min<u64>(queued, left)), std::memory_order_relaxed);
         if (Clock::now() - last_log > std::chrono::seconds{5}) {
             last_log = Clock::now();
@@ -6089,48 +6545,107 @@ void PipelineCache::BuildPackLibraries() {
     if (async_done_count.load(std::memory_order_acquire) != 0) {
         CollectAsyncPipelines();
     }
+    const size_t extra_count = extra_workers.size();
+    if (lean) {
+        drain_modules();
+        StopExtraWorkers(); // back to the normal worker count for play
+    }
+    if (completed() < queued) {
+        std::fprintf(stderr, "SOTC GPL PACK LIBS: incomplete: %llu of %llu jobs finished; no list published\n",
+                     static_cast<unsigned long long>(completed()), static_cast<unsigned long long>(queued));
+        return false;
+    }
     const auto compiled_end = Clock::now();
     std::vector<u64> compiled;
     {
         std::scoped_lock lock{pack_mutex};
         compiled.swap(pack_compiled);
     }
-    // The driver cache is written now (synchronously: the list may only name code the file holds), then the list.
+    // sotc: SOTC_COMPUTE_PACK: the hold's compute prebuilds (already in the pack cache) join the list; their pipelines
+    // and modules leave memory here, before the publication names them.
+    if (lean && SotcNonBlocking::ComputePack()) {
+        PackComputePipelines(listed, compiled, start);
+    }
+    // The driver cache is written now (the list may only name code the file holds), then the list.
     bool list_written = false;
-    size_t cache_kb = saved_driver_cache_size >> 10;
+    bool publish_background = false; // sotc: SOTC_GPL_PACK_LEAN: the saver thread finishes it after the screen drops
+    size_t cache_kb = 0; // sotc: only read the persisted size under the saver mutex
+    const auto publish_start = Clock::now();
     if (!compiled.empty() || (list_void && !listed.empty())) {
-        // The size with every pack library in it; a save from here on holds them (other pipelines built meanwhile
-        // only make it larger).
-        size_t size = 0;
-        const bool sized = instance.GetDevice().getPipelineCacheData(*pipeline_cache, &size, nullptr) ==
-                           vk::Result::eSuccess;
-        SaveDriverCache(true);
-        const bool saved = sized && size != 0 && saved_driver_cache_size >= size;
-        cache_kb = saved_driver_cache_size >> 10;
-        if (saved) {
-            if (list_void) {
-                listed.clear();
+        if (list_void) {
+            listed.clear();
+        }
+        listed.insert(compiled.begin(), compiled.end());
+        std::vector<u64> ids(listed.begin(), listed.end());
+        if (lean && driver_cache_saver.joinable()) {
+            // sotc: SOTC_GPL_PACK_LEAN: on the saver thread, the cache then the list. The hold waits for it while it is
+            // short (3 s); a longer write finishes in the background (the order is kept: same thread). The precompile
+            // run waits for it whole (it exits right after).
+            {
+                std::scoped_lock lk{driver_cache_cv_mutex};
+                pack_publish_ids = std::move(ids);
+                pack_publish_header.resize(sizeof identity);
+                std::memcpy(pack_publish_header.data(), &identity, sizeof identity);
+                pack_publish_state.store(1, std::memory_order_release);
+                driver_cache_save_requested = true;
             }
-            listed.insert(compiled.begin(), compiled.end());
-            PackLibHeader h = identity;
-            h.count = listed.size();
-            std::vector<u64> ids(listed.begin(), listed.end());
-            const auto path = PackLibListPath();
-            auto tmp = path;
-            tmp += ".tmp";
-            if (std::FILE* f = _wfopen(tmp.c_str(), L"wb")) {
-                const bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
-                                (ids.empty() || std::fwrite(ids.data(), sizeof(u64), ids.size(), f) == ids.size());
-                std::fclose(f);
-                std::error_code ec;
-                if (ok) {
-                    std::filesystem::rename(tmp, path, ec);
-                    list_written = !ec;
+            driver_cache_cv.notify_all();
+            {
+                std::unique_lock lk{driver_cache_cv_mutex};
+                const auto done = [this] { return pack_publish_state.load(std::memory_order_acquire) >= 2; };
+                if (SotcPretranslate::Precompile()) {
+                    pack_publish_cv.wait(lk, done);
                 } else {
-                    std::filesystem::remove(tmp, ec);
+                    pack_publish_cv.wait_for(lk, std::chrono::seconds{3}, done);
                 }
             }
+            const u32 state = pack_publish_state.load(std::memory_order_acquire);
+            list_written = state == 2;
+            publish_background = state == 1;
+            if (list_written) {
+                std::scoped_lock lk{driver_cache_save_mutex};
+                cache_kb = saved_driver_cache_size >> 10;
+            }
+        } else {
+            // The size with every pack library in it; a save from here on holds them (other pipelines built meanwhile
+            // only make it larger).
+            size_t written_size = 0;
+            u64 written_hash = 0;
+            const bool saved = SaveDriverCache(true, &written_size, &written_hash);
+            cache_kb = written_size >> 10; // sotc: success is the actual write, never a size comparison
+            if (saved) {
+                PackLibHeader h = identity;
+                h.cache_hash = written_hash;
+                list_written = WritePackLibList(h, ids);
+            }
         }
+    }
+    if (!list_void) {
+        // sotc: SOTC_PLAY_QUIET: the exit publication rewrites this list (with the pack cache's new hash); a pending
+        // publication replaces it with the full list.
+        std::scoped_lock lk{driver_cache_cv_mutex};
+        if (pack_listed_ids.empty()) {
+            pack_listed_ids.assign(listed.begin(), listed.end());
+        }
+    }
+    // sotc: SOTC_COMPUTE_PACK: the dispatches of this session see the compiled set (in the pack cache object now,
+    // whatever the state of the file); an earlier lazy load of the file is replaced.
+    pack_listed_set = listed;
+    pack_listed_set_loaded = true;
+    if (lean) {
+        std::fprintf(stderr,
+                     "SOTC GPL PACK LEAN: waited for manifest/compute builds %.1f s; queued %llu jobs in %.2f s; "
+                     "compiled %.1f s on %zu workers (%zu extra for the hold); modules destroyed %llu (programs %zu); "
+                     "publish %s (%.1f s)\n",
+                     std::chrono::duration<double>(wait_end - start).count(), static_cast<unsigned long long>(queued),
+                     std::chrono::duration<double>(queued_end - wait_end).count(),
+                     std::chrono::duration<double>(compiled_end - queued_end).count(),
+                     async_workers.size() + extra_count, extra_count, static_cast<unsigned long long>(modules_destroyed),
+                     pack_touched.size(),
+                     list_written ? "written on the saver thread"
+                     : publish_background ? "finishing in the background (list after the cache)"
+                                          : "not needed or failed",
+                     std::chrono::duration<double>(Clock::now() - publish_start).count());
     }
     const uint64_t private_end = SotcPipeManifest::ProcessPrivateBytes();
     std::fprintf(stderr,
@@ -6145,10 +6660,227 @@ void PipelineCache::BuildPackLibraries() {
                  static_cast<unsigned long long>(skipped),
                  list_void ? " (no valid list: driver cache missing, rejected or another driver)" : "",
                  static_cast<unsigned long long>(no_partner), static_cast<unsigned long long>(unlinkable),
-                 cache_kb >> 10, list_written ? "written" : "unchanged",
+                 cache_kb >> 10, list_written ? "written" : publish_background ? "writing in the background" : "unchanged",
                  static_cast<double>(private_end) / 1048576.0,
                  (static_cast<double>(private_end) - static_cast<double>(private_start)) / 1048576.0,
                  std::chrono::duration<double>(Clock::now() - start).count());
+    return pack_failed.load(std::memory_order_relaxed) == 0 && no_partner == 0 && unlinkable == 0 &&
+           (compiled.empty() || list_written || publish_background);
+}
+
+// sotc: SOTC_COMPUTE_PACK. The compute prebuilds of the hold are already compiled (the lean pack waited for
+// pre_builds_pending == 0 before its library jobs; a straggler installed since is waited for here, bounded). Each one
+// is listed when the driver accepted it; its pipeline and module are destroyed unless a dispatch bound the program
+// (sotc_pre_checked) or a permutation is in flight; the program is then evicted to the index with the others.
+void PipelineCache::PackComputePipelines(const std::unordered_set<u64>& listed, std::vector<u64>& compiled,
+                                         std::chrono::steady_clock::time_point start) {
+    using Clock = std::chrono::steady_clock;
+    const auto wait_start = Clock::now();
+    while (pre_builds_pending.load(std::memory_order_acquire) != 0 &&
+           Clock::now() - wait_start < std::chrono::seconds{60}) {
+        if (async_done_count.load(std::memory_order_acquire) != 0) {
+            CollectAsyncPipelines();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    u64 programs = 0, built = 0, hinted = 0, synthetic = 0, failed = 0, already = 0, resident = 0, destroyed = 0;
+    std::vector<ComputePipelineKey> gone;
+    for (auto it = compute_pipelines.begin(); it != compute_pipelines.end(); ++it) {
+        ComputePipeline& pipe = *it.value();
+        if (!pipe.sotc_pack) {
+            continue; // a dispatch's, the manifest's or the warm-up's: resident as before, and not in the pack cache
+        }
+        ++programs;
+        const u64 id = PackComputeId(it.key().value);
+        if (!pipe.IsReady()) {
+            ++failed; // still on a worker after the bounded wait: not listed (its build may still land in the cache)
+            continue;
+        }
+        const bool ok = pipe.Handle() != vk::Pipeline{};
+        if (!ok) {
+            ++failed;
+        } else if (listed.contains(id)) {
+            ++already;
+        } else {
+            ++built;
+            compiled.push_back(id);
+            if (pack_compute_hinted.contains(pipe.sotc_pack_program)) {
+                ++hinted;
+            } else {
+                ++synthetic;
+            }
+        }
+        const auto found = program_cache.find(pipe.sotc_pack_program);
+        Program* program = found == program_cache.end() ? nullptr : found.value().get();
+        if (!program || !program->sotc_pre || program->sotc_pre_checked || !program->pending_specs.empty() ||
+            program->modules.empty()) {
+            ++resident; // bound by a dispatch (or a translation in flight): the pipeline stays, as before
+            continue;
+        }
+        // The pipeline (made, never bound) and the module leave memory; the program follows at the eviction.
+        gone.push_back(it.key());
+        if (ok) {
+            for (auto& module : program->modules) {
+                if (module.module) {
+                    instance.GetDevice().destroyShaderModule(module.module);
+                    module.module = vk::ShaderModule{};
+                }
+            }
+            pack_touched.insert(pipe.sotc_pack_program);
+        }
+        ++destroyed;
+    }
+    for (const auto& key : gone) {
+        compute_pipelines.erase(key);
+    }
+    if (!gone.empty()) {
+        last_compute_pipeline = nullptr; // the memo and the fast record see a smaller map
+    }
+    pack_compute_hinted.clear();
+    const s64 first = pack_compute_first_ns.load(std::memory_order_relaxed);
+    const s64 last = pack_compute_last_ns.load(std::memory_order_relaxed);
+    const double seconds = first != 0 && last > first ? static_cast<double>(last - first) / 1e9 : 0.0;
+    char capped[96] = "";
+    if (pack_compute_capped != 0) {
+        std::snprintf(capped, sizeof capped, "; capped: %llu programs beyond SOTC_COMPUTE_PACK_MAX=%u not prebuilt",
+                      static_cast<unsigned long long>(pack_compute_capped), SotcNonBlocking::ComputePackMax());
+    }
+    std::fprintf(stderr,
+                 "SOTC COMPUTE PACK: programs %llu, built %llu (hints %llu, synthetic %llu) in %.1f s (first install "
+                 "to last build; worker time %.1f s), failed %llu, already listed %llu, kept resident %llu (destroyed "
+                 "%llu; pack step %.2f s, %.1f s into the pack)%s\n",
+                 static_cast<unsigned long long>(programs), static_cast<unsigned long long>(built),
+                 static_cast<unsigned long long>(hinted), static_cast<unsigned long long>(synthetic), seconds,
+                 static_cast<double>(pack_compute_build_ns.load(std::memory_order_relaxed)) / 1e9,
+                 static_cast<unsigned long long>(failed), static_cast<unsigned long long>(already),
+                 static_cast<unsigned long long>(resident), static_cast<unsigned long long>(destroyed),
+                 std::chrono::duration<double>(Clock::now() - wait_start).count(),
+                 std::chrono::duration<double>(Clock::now() - start).count(), capped);
+}
+
+vk::PipelineCache PipelineCache::PackPipelineCache() const {
+    return pack_cache ? *pack_cache : *pipeline_cache;
+}
+
+bool PipelineCache::PackComputeListed(u64 compute_key_value) {
+    if (!pack_listed_set_loaded) {
+        // Once: the list of the loaded pack cache, when it describes it (else nothing is listed until this session's
+        // pack publishes one, BuildPackLibraries).
+        pack_listed_set_loaded = true;
+        if (PackLibraryListMatches()) {
+            ReadPackLibList(PackLibIdentity(instance), loaded_driver_cache_hash, pack_listed_set);
+        }
+    }
+    return !pack_listed_set.empty() && pack_listed_set.contains(PackComputeId(compute_key_value));
+}
+
+// sotc: SOTC_GPL_PACK_LEAN. Saver thread: the driver cache first, then the list bound to the written cache's hash, so
+// the list never names a library the saved cache lacks.
+void PipelineCache::RunPackPublish() {
+    std::vector<u64> ids;
+    std::vector<u8> header;
+    {
+        std::scoped_lock lk{driver_cache_cv_mutex};
+        ids.swap(pack_publish_ids);
+        header.swap(pack_publish_header);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    size_t written_size = 0;
+    u64 written_hash = 0;
+    // sotc: SOTC_PLAY_QUIET: the libraries live in the pack cache; without the split, in the driver cache.
+    const u64 builds_before = GplLibraryCache::LibraryBuilds();
+    bool ok = header.size() == sizeof(PackLibHeader) &&
+              (pack_cache ? SavePackCache(&written_size, &written_hash)
+                          : SaveDriverCache(true, &written_size, &written_hash));
+    const auto cache_end = std::chrono::steady_clock::now();
+    if (ok) {
+        PackLibHeader h;
+        std::memcpy(&h, header.data(), sizeof h);
+        h.cache_hash = written_hash;
+        ok = WritePackLibList(h, ids);
+        pack_cache_published = builds_before;
+        std::scoped_lock lk{driver_cache_cv_mutex};
+        pack_listed_ids = ids;
+    }
+    std::fprintf(stderr, "SOTC GPL PACK LIBS: publish on the saver thread: driver cache %zu MB in %.1f s, list of %zu "
+                         "libraries %s (%.2f s)\n",
+                 written_size >> 20, std::chrono::duration<double>(cache_end - start).count(), ids.size(),
+                 ok ? "written" : "not written", std::chrono::duration<double>(std::chrono::steady_clock::now() - cache_end).count());
+    {
+        std::scoped_lock lk{driver_cache_cv_mutex};
+        pack_publish_state.store(ok ? 2 : 3, std::memory_order_release);
+    }
+    pack_publish_cv.notify_all();
+}
+
+// sotc: SOTC_PLAY_QUIET. At exit (the saver joined): the pack cache is written again when libraries were created
+// since its publication (a draw's urgent ones, predicted ones of programs the pack did not know), and the list is
+// written after it, with the new hash, so the next launch accepts it ("already compiled (listed)").
+void PipelineCache::FinalPackPublish() {
+    if (!pack_cache) {
+        return;
+    }
+    if (pack_publish_state.load(std::memory_order_acquire) == 1) {
+        RunPackPublish(); // the saver did not get to it
+        return;
+    }
+    const u64 builds = GplLibraryCache::LibraryBuilds();
+    if (builds == pack_cache_published) {
+        return;
+    }
+    size_t written_size = 0;
+    u64 written_hash = 0;
+    if (!SavePackCache(&written_size, &written_hash)) {
+        return;
+    }
+    std::vector<u64> ids;
+    {
+        std::scoped_lock lk{driver_cache_cv_mutex};
+        ids = pack_listed_ids;
+    }
+    bool list_ok = false;
+    if (!ids.empty()) {
+        PackLibHeader h = PackLibIdentity(instance);
+        h.cache_hash = written_hash;
+        list_ok = WritePackLibList(h, ids);
+    }
+    const u64 since = builds - std::min(builds, pack_cache_published);
+    pack_cache_published = builds;
+    std::fprintf(stderr, "SOTC GPL PACK LIBS: pack cache written at exit (%zu MB, %llu libraries created since its "
+                         "publication), list of %zu libraries %s\n",
+                 written_size >> 20, static_cast<unsigned long long>(since), ids.size(),
+                 list_ok ? "rewritten" : "not written");
+}
+
+// sotc: SOTC_GPL_PACK_LEAN. Workers added for the pack compile, up to the hardware thread count (the draw and command
+// processor threads idle at the loading screen), and their stop (they leave at the next idle moment; a job they run
+// finishes first; nothing is drained).
+void PipelineCache::StartExtraWorkers() {
+    const size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
+    if (hw <= async_workers.size() || !extra_workers.empty()) {
+        return;
+    }
+    extra_workers_quit.store(false, std::memory_order_release);
+    for (size_t i = async_workers.size(); i < hw; ++i) {
+        extra_workers.emplace_back([this](std::stop_token token) { AsyncPipelineWorker(token, false, true); });
+    }
+}
+
+void PipelineCache::StopExtraWorkers() {
+    if (extra_workers.empty()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{async_mutex};
+        extra_workers_quit.store(true, std::memory_order_release);
+    }
+    async_cv.notify_all();
+    urgent_cv.notify_all();
+    for (auto& worker : extra_workers) {
+        worker.join();
+    }
+    extra_workers.clear();
+    extra_workers_quit.store(false, std::memory_order_release);
 }
 
 void PipelineCache::MaybeHoldForPretranslate() {
@@ -6161,7 +6893,26 @@ void PipelineCache::MaybeHoldForPretranslate() {
         pre_hold_done = true; // past the boot: the backlog is fed slowly, never held for
         return;
     }
-    if (pre_backlog.size() + pre_in_flight < 300) {
+    // sotc: warm SPIR-V with a missing/rejected/replaced driver cache still needs its GPL pack.
+    // This work must not depend on accumulating 300 new translations.
+    if (!pack_list_checked && warmup_done.load(std::memory_order_acquire)) {
+        pack_list_checked = true;
+        pack_list_valid = PackLibraryListMatches();
+    }
+    const bool restore_pack = pack_list_checked && !pack_list_valid && SotcNonBlocking::GplPackLibs() &&
+                              DriverCacheEnabled() && !lazy_programs.empty() &&
+                              SotcPipeManifest::LastProgramNs() != 0;
+    if (pre_backlog.size() + pre_in_flight < 300 && !restore_pack) {
+        return;
+    }
+    if (SotcNonBlocking::PlayQuiet() && !BbOverlay::LoadingShown()) {
+        // sotc: SOTC_PLAY_QUIET: the hold starts only while the loading screen is shown (the game not flipping); until
+        // then the backlog is fed in the background. After the 2-minute boot window it never runs.
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "SOTC PRETRANSLATE: hold deferred: the game is drawing (waiting for a loading screen)\n");
+        }
         return;
     }
     pre_hold_done = true;
@@ -6206,19 +6957,45 @@ void PipelineCache::MaybeHoldForPretranslate() {
         translate_done_cv.wait_for(lock, std::chrono::milliseconds{50},
                                    [this] { return async_done_count.load(std::memory_order_relaxed) != 0; });
     }
+    if (restore_pack) {
+        // sotc: these cached modules were never needed by this session's translations, but are required
+        // to restore the driver pack. Keep existing/drawn programs intact; newly loaded ones may leave
+        // memory at the normal eviction below, after every library job has finished.
+        std::vector<u64> hashes;
+        hashes.reserve(lazy_programs.size());
+        for (const auto& [hash, count] : lazy_programs) {
+            hashes.push_back(hash);
+        }
+        size_t loaded = 0;
+        for (const u64 hash : hashes) {
+            const bool resident = program_cache.contains(hash);
+            loaded += LoadLazyProgram(hash);
+            if (!resident) {
+                if (const auto found = program_cache.find(hash); found != program_cache.end()) {
+                    found.value()->sotc_pre = true;
+                }
+            }
+        }
+        std::fprintf(stderr, "SOTC GPL PACK LIBS: restored modules for %zu of %zu cached programs before play\n",
+                     loaded, hashes.size());
+    }
     // sotc: SOTC_NB_GPL: the libraries of the full-screen passes earlier sessions met, while the screen is still up.
     if (SotcNonBlocking::Gpl()) {
         BuildTinyLibraries();
     }
     // sotc: SOTC_GPL_PACK_LIBS: the stage libraries of every translated program, compiled into the driver cache while
     // the screen is still up and the modules are resident (the eviction below destroys them).
-    BuildPackLibraries();
+    if (!BuildPackLibraries()) {
+        std::fprintf(stderr, "SOTC PRETRANSLATE: GPL pack incomplete; remaining first-use builds are not covered\n");
+        // sotc: the eviction below already waits for library jobs and preserves all modules if jobs remain.
+        // A finished but failed/unlinkable pack must not pin every shader module for the whole session.
+    }
     pre_holding = false;
     PrePackFinish(); // the variants of the hold, in one file; read back for their first draws
     // sotc: the driver's pipelines of the hold are written now, not at the 60 s timer. SOTC_NB_IO: by the saver
     // thread, so the hold screen does not wait for it (17.6 s on the CP in the P0 baseline).
-    if (SotcNonBlocking::Io()) {
-        RequestDriverCacheSave();
+    if (SotcNonBlocking::Io() || SotcNonBlocking::PlayQuiet()) {
+        RequestDriverCacheSave(); // sotc: SOTC_PLAY_QUIET: never on the command processor
     } else {
         SaveDriverCache();
     }
@@ -6239,8 +7016,9 @@ void PipelineCache::MaybeHoldForPretranslate() {
         for (auto it = program_cache.begin(); it != program_cache.end();) {
             Program& program = *it.value();
             if (!program.sotc_pre || program.sotc_pre_checked || !program.pending_specs.empty() ||
-                program.info.sw_stage == Shader::SwStage::Compute) { // sotc: a compute pipeline keeps its module
-                ++it;
+                (program.info.sw_stage == Shader::SwStage::Compute &&
+                 !pack_touched.contains(it.key()))) { // sotc: a compute pipeline keeps its module, unless the
+                ++it;                                   // compute pack destroyed both (SOTC_COMPUTE_PACK)
                 continue;
             }
             for (auto& module : program.modules) {
@@ -6865,17 +7643,22 @@ void ReportPipeGpl(std::string& out, double seconds) {
             // predicted materials) and how many a draw's link found, the pack libraries compiled for the driver cache
             // (destroyed), the libraries held now, and the command processor's library waits of this window (target 0).
             const size_t held = static_cast<size_t>(g_gpl_counters.held.load(std::memory_order_relaxed));
-            char lline[512];
+            char lline[768];
             std::snprintf(lline, sizeof(lline),
                           "SOTC gpl libraries: shader-only keys %s; built ahead of draws %llu, used by a draw %llu "
                           "(since start); pack compiled for the driver cache %llu; held %zu; command processor "
-                          "library waits %llu (%.1f ms), stage libraries built for a draw %llu (%.1f ms)\n",
+                          "library waits %llu (%.1f ms), stage libraries built for a draw %llu (%.1f ms); predicted: "
+                          "built before the draw %llu, after the draw %llu, evicted %llu, referenced by materials %zu\n",
                           SotcNonBlocking::GplShaderKeys() ? "on" : "off",
                           static_cast<unsigned long long>(g_gpl_counters.prebuilt_built.load(std::memory_order_relaxed)),
                           static_cast<unsigned long long>(g_gpl_counters.prebuilt_used.load(std::memory_order_relaxed)),
                           static_cast<unsigned long long>(g_gpl_counters.pack_discarded.load(std::memory_order_relaxed)),
                           held, static_cast<unsigned long long>(pwait), static_cast<double>(pwait_ns) / 1e6,
-                          static_cast<unsigned long long>(libs), static_cast<double>(lib_ns) / 1e6);
+                          static_cast<unsigned long long>(libs), static_cast<double>(lib_ns) / 1e6,
+                          static_cast<unsigned long long>(pused), // sotc: SOTC_GPL_PREDICT (plan step 2 counters)
+                          static_cast<unsigned long long>(g_gpl_counters.predicted_late.load(std::memory_order_relaxed)),
+                          static_cast<unsigned long long>(g_gpl_counters.predicted_evicted.load(std::memory_order_relaxed)),
+                          GplLibraryCache::Referenced());
             out += lline;
         }
     }
@@ -7088,6 +7871,10 @@ void PipelineCache::LoadManifest() {
         index_of.emplace(st.rec.id, static_cast<u32>(m.stages.size()));
         m.stages.push_back(std::move(st));
     }
+    // sotc: SOTC_MANIFEST_HOLD_FAST: every stage starts Pending (StageRt's default); SetState keeps the counts.
+    m.pending = static_cast<u32>(
+        std::ranges::count(m.stages, ManifestState::St::Pending, &ManifestState::StageRt::state));
+    m.waiting = 0;
     Common::g_assert_throws = throws;
     u32 graphics = 0, compute = 0;
     for (const auto& rec : data.pipes) {
@@ -7216,7 +8003,7 @@ void PipelineCache::ManifestQueueTranslate(u32 index, const std::vector<u32>& co
     if (!st.spec.fetch_shader_data.Empty()) {
         t.manifest_fetch = st.spec.fetch_shader_data;
     }
-    st.state = ManifestState::St::Queued;
+    m.SetState(st, ManifestState::St::Queued);
     ++m.translating;
     {
         std::scoped_lock lock{async_mutex};
@@ -7229,7 +8016,7 @@ bool PipelineCache::ManifestResolveStage(u32 index, bool may_translate) {
     auto& m = *manifest;
     auto& st = m.stages[index];
     const auto fail = [&](const char* reason, bool remember) {
-        st.state = ManifestState::St::Failed;
+        m.SetState(st, ManifestState::St::Failed);
         st.reason = reason;
         if (remember) {
             SotcPipeManifest::NoteSkip(st.rec.id, SotcPipeManifest::SkipKind::Failed, reason);
@@ -7251,7 +8038,7 @@ bool PipelineCache::ManifestResolveStage(u32 index, bool may_translate) {
     if (found != program_cache.end()) {
         Program& program = *found.value();
         if (const auto perm = ManifestFindPerm(program, st.spec)) {
-            st.state = ManifestState::St::Ready;
+            m.SetState(st, ManifestState::St::Ready);
             st.program = &program;
             st.perm = *perm;
             ++m.stage_cached;
@@ -7279,12 +8066,12 @@ bool PipelineCache::ManifestResolveStage(u32 index, bool may_translate) {
     const auto code = SotcPipeManifest::Code(st.rec.hash);
     if (!code) {
         if (st.state != ManifestState::St::Waiting) {
-            st.state = ManifestState::St::Waiting;
+            m.SetState(st, ManifestState::St::Waiting);
         }
         return false;
     }
     if (!may_translate) {
-        st.state = ManifestState::St::Pending; // its code is here: translated when a slot frees
+        m.SetState(st, ManifestState::St::Pending); // its code is here: translated when a slot frees
         return false;
     }
     ManifestQueueTranslate(index, *code, m.boot_lanes);
@@ -7306,7 +8093,7 @@ void PipelineCache::ManifestInstallStage(AsyncPipelineJob::Translate& t) {
     };
     const auto fail = [&](const char* reason) {
         destroy();
-        st.state = ManifestState::St::Failed;
+        m.SetState(st, ManifestState::St::Failed);
         st.reason = reason;
         SotcPipeManifest::NoteSkip(st.rec.id, SotcPipeManifest::SkipKind::Failed, reason);
     };
@@ -7323,11 +8110,12 @@ void PipelineCache::ManifestInstallStage(AsyncPipelineJob::Translate& t) {
             std::fprintf(stderr,
                          "SOTC PIPE MANIFEST: stage %016llx (program %#llx, sw stage %u) not rebuilt: its translation's "
                          "specialization differs from the draw's (buffers %zu/%zu, images %zu/%zu, samplers %zu/%zu, "
-                         "fetch %d)\n",
+                         "fetch %d, diff mask %08x)\n",
                          static_cast<unsigned long long>(st.rec.id), static_cast<unsigned long long>(st.rec.hash),
                          static_cast<u32>(t.sw_stage), t.spec->buffers.size(), st.spec.buffers.size(),
                          t.spec->images.size(), st.spec.images.size(), t.spec->samplers.size(),
-                         st.spec.samplers.size(), int{t.spec->fetch_shader_data == st.spec.fetch_shader_data});
+                         st.spec.samplers.size(), int{t.spec->fetch_shader_data == st.spec.fetch_shader_data},
+                         PretranslateDiff(*t.spec, st.spec)); // sotc: DiffBit in pretranslate.h, never accept a mismatch
         }
         fail("specialization differs");
         return;
@@ -7366,7 +8154,7 @@ void PipelineCache::ManifestInstallStage(AsyncPipelineJob::Translate& t) {
         }
     }
     t.module = vk::ShaderModule{};
-    st.state = ManifestState::St::Ready;
+    m.SetState(st, ManifestState::St::Ready);
     st.program = program;
     st.perm = perm;
     ++m.stage_translated;
@@ -7396,7 +8184,7 @@ void PipelineCache::ManifestSchedulePipes(bool holding) {
                 const auto found = program_cache.find(st.cache_hash);
                 if (found == program_cache.end() || st.perm >= found.value()->modules.size() ||
                     !found.value()->modules[st.perm].module) {
-                    st.state = ManifestState::St::Pending;
+                    m.SetState(st, ManifestState::St::Pending);
                     st.program = nullptr;
                 } else {
                     st.program = found.value().get();
@@ -7495,7 +8283,11 @@ void PipelineCache::ManifestSchedulePipes(bool holding) {
             } else {
                 {
                     std::scoped_lock lock{async_mutex};
-                    PushJobLocked(holding ? JobLane::Graphics : JobLane::Background, std::move(job));
+                    // sotc: SOTC_PLAY_QUIET: a late stage's libraries go to the Predict lane (never the capped one).
+                    PushJobLocked(holding                        ? JobLane::Graphics
+                                  : SotcNonBlocking::PlayQuiet() ? JobLane::Predict
+                                                                 : JobLane::Background,
+                                  std::move(job));
                 }
                 async_cv.notify_one();
             }
@@ -7526,7 +8318,11 @@ void PipelineCache::ManifestSchedulePipes(bool holding) {
         }
         {
             std::scoped_lock lock{async_mutex};
-            PushJobLocked(holding ? JobLane::Graphics : JobLane::Background, std::move(job));
+            // sotc: SOTC_PLAY_QUIET: a late stage's build goes to the Predict lane (ahead of the optimized builds).
+            PushJobLocked(holding                        ? JobLane::Graphics
+                          : SotcNonBlocking::PlayQuiet() ? JobLane::Predict
+                                                         : JobLane::Background,
+                          std::move(job));
         }
         async_cv.notify_one();
         p.state = ManifestState::Ps::Queued;
@@ -7550,23 +8346,38 @@ void PipelineCache::ManifestPump(bool holding) {
     const u64 arrivals = SotcPipeManifest::CodeArrivals();
     const bool new_code = arrivals != m.seen_arrivals;
     m.seen_arrivals = arrivals;
-    u32 waiting = 0;
-    for (u32 i = 0; i < m.stages.size(); ++i) {
-        auto& st = m.stages[i];
-        if (st.state == ManifestState::St::Pending ||
-            (st.state == ManifestState::St::Waiting && new_code)) {
-            ManifestResolveStage(i, m.translating < cap);
+    // sotc: SOTC_MANIFEST_HOLD_FAST: no pass when no stage is Pending and no Waiting stage can have got its code (the
+    // pass would resolve nothing); the Waiting count is kept by SetState.
+    if (SotcNonBlocking::ManifestHoldFast()) {
+        if (m.pending != 0 || (new_code && m.waiting != 0)) {
+            for (u32 i = 0; i < m.stages.size(); ++i) {
+                auto& st = m.stages[i];
+                if (st.state == ManifestState::St::Pending ||
+                    (st.state == ManifestState::St::Waiting && new_code)) {
+                    ManifestResolveStage(i, m.translating < cap);
+                }
+            }
         }
-        waiting += st.state == ManifestState::St::Waiting;
+        g_manifest_stats.waiting_code.store(m.waiting, std::memory_order_relaxed);
+    } else {
+        u32 waiting = 0;
+        for (u32 i = 0; i < m.stages.size(); ++i) {
+            auto& st = m.stages[i];
+            if (st.state == ManifestState::St::Pending ||
+                (st.state == ManifestState::St::Waiting && new_code)) {
+                ManifestResolveStage(i, m.translating < cap);
+            }
+            waiting += st.state == ManifestState::St::Waiting;
+        }
+        g_manifest_stats.waiting_code.store(waiting, std::memory_order_relaxed);
     }
-    g_manifest_stats.waiting_code.store(waiting, std::memory_order_relaxed);
     if (m.dirty) {
         m.dirty = false;
         ManifestSchedulePipes(m.boot_lanes);
     }
 }
 
-void PipelineCache::MaybeHoldForManifest() {
+void PipelineCache::MaybeHoldForManifest(bool compute) {
     using Clock = std::chrono::steady_clock;
     if (!manifest) {
         if (!warmup_done.load(std::memory_order_acquire)) {
@@ -7575,6 +8386,12 @@ void PipelineCache::MaybeHoldForManifest() {
         LoadManifest();
     }
     auto& m = *manifest;
+    // sotc: SOTC_MANIFEST_HOLD_FAST: a compute lookup only installs finished translations; the timed pump and the hold
+    // decisions run on the graphics lookups (a loading screen draws).
+    const bool fast = SotcNonBlocking::ManifestHoldFast();
+    if (fast && compute && m.finished.empty()) {
+        return;
+    }
     const auto now = Clock::now();
     if (SotcPretranslate::Precompile()) {
         return; // the shader preparation run: it only records (and exits by itself)
@@ -7626,8 +8443,20 @@ void PipelineCache::MaybeHoldForManifest() {
         // The first hold: as soon as the manifest has work (translations, builds) and the game loads shader files.
         work = m.translating != 0 || m.graphics_building != 0 || !m.finished.empty() || m.libs_building != 0 ||
                g_manifest_stats.compute_built.load(std::memory_order_relaxed) < m.compute_queued;
-        for (size_t i = 0; i < m.stages.size() && !work; ++i) {
+        if (fast) {
+            work = work || m.pending != 0; // sotc: SOTC_MANIFEST_HOLD_FAST (kept by SetState)
+        }
+        for (size_t i = 0; i < m.stages.size() && !work && !fast; ++i) {
             work = m.stages[i].state == ManifestState::St::Pending;
+        }
+    } else if (fast) {
+        // sotc: SOTC_MANIFEST_HOLD_FAST: the same decision as below from the kept Pending count.
+        if (m.pending >= 32) {
+            if (SotcNonBlocking::PlayQuiet() && !BbOverlay::LoadingShown()) {
+                g_manifest_stats.quiet_deferred.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                work = true;
+            }
         }
     } else {
         // After it, only a burst of code (another loading screen in the window: 32 stages or more ready to translate);
@@ -7637,6 +8466,12 @@ void PipelineCache::MaybeHoldForManifest() {
             ready += st.state == ManifestState::St::Pending;
         }
         work = ready >= 32;
+        // sotc: SOTC_PLAY_QUIET: never a hold while the game draws; the stages go to the Predict lane instead
+        // (ManifestSchedulePipes with holding false).
+        if (work && SotcNonBlocking::PlayQuiet() && !BbOverlay::LoadingShown()) {
+            work = false;
+            g_manifest_stats.quiet_deferred.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (work) {
         RunManifestHold();
@@ -7758,8 +8593,8 @@ void PipelineCache::RunManifestHold() {
     // Written before play, as the pretranslate hold does: the shader index and the driver's pipelines.
     SaveShaderIndex();
     if (built_new) {
-        if (SotcNonBlocking::Io()) {
-            RequestDriverCacheSave();
+        if (SotcNonBlocking::Io() || SotcNonBlocking::PlayQuiet()) {
+            RequestDriverCacheSave(); // sotc: SOTC_PLAY_QUIET: never on the command processor
         } else {
             SaveDriverCache();
         }
@@ -7814,7 +8649,7 @@ void PipelineCache::RunManifestHold() {
 }
 
 
-void PipelineCache::CaptureManifestGraphics() {
+bool PipelineCache::CaptureManifestGraphics() {
     SotcPipeManifest::Pipe pipe;
     pipe.compute = false;
     GraphicsPipelineKey key = graphics_key;
@@ -7833,11 +8668,17 @@ void PipelineCache::CaptureManifestGraphics() {
         const auto found = program_cache.find(info->CacheHash());
         const auto perm = PermOfStage(graphics_key.stage_hashes[slot], info->CacheHash());
         if (found == program_cache.end() || !perm || *perm >= found.value()->modules.size()) {
-            return;
+            return true;
         }
         const auto& spec = found.value()->modules[*perm].spec;
         if (!ManifestStageSupported(spec.runtime_info)) {
-            return;
+            return true;
+        }
+        // sotc: a module can match a draw with null bindings. Those hints cannot reproduce
+        // its stored specialization: retry at a later matching use instead of recording bad data.
+        const Shader::StageSpecialization current{*info, spec.runtime_info, StageProfile(info->variant), spec.start};
+        if (!SotcCache::CanCaptureSpecialization(spec, current)) {
+            return false;
         }
         SotcPipeManifest::Stage st;
         st.hash = info->pgm_hash;
@@ -7850,29 +8691,34 @@ void PipelineCache::CaptureManifestGraphics() {
         stages.push_back(std::move(st));
     }
     if (stages.empty()) {
-        return;
+        return true;
     }
     pipe.id = SotcPipeManifest::PipeId(false, pipe.key, pipe.stages);
     if (SotcPipeManifest::Known(pipe.id)) {
-        return;
+        return true;
     }
     for (const auto& st : stages) {
         SotcPipeManifest::AppendStage(header, st);
     }
     SotcPipeManifest::AppendPipe(header, pipe);
+    return true;
 }
 
-void PipelineCache::CaptureManifestCompute() {
+bool PipelineCache::CaptureManifestCompute() {
     const Shader::Info* info = infos[0];
     if (!info || info->sw_stage != Shader::SwStage::Compute) {
-        return;
+        return true;
     }
     const auto found = program_cache.find(info->CacheHash());
     const auto perm = PermOfStage(compute_key.value, info->CacheHash());
     if (found == program_cache.end() || !perm || *perm >= found.value()->modules.size()) {
-        return;
+        return true;
     }
     const auto& spec = found.value()->modules[*perm].spec;
+    const Shader::StageSpecialization current{*info, spec.runtime_info, StageProfile(info->variant), spec.start};
+    if (!SotcCache::CanCaptureSpecialization(spec, current)) {
+        return false; // sotc: do not mix a cached spec with unrelated live descriptor hints
+    }
     SotcPipeManifest::Stage st;
     st.hash = info->pgm_hash;
     st.variant = info->variant;
@@ -7884,10 +8730,11 @@ void PipelineCache::CaptureManifestCompute() {
     pipe.stages.emplace_back(u8{0}, st.id);
     pipe.id = SotcPipeManifest::PipeId(true, pipe.key, pipe.stages);
     if (SotcPipeManifest::Known(pipe.id)) {
-        return;
+        return true;
     }
     SotcPipeManifest::AppendStage(manifest->header, st);
     SotcPipeManifest::AppendPipe(manifest->header, pipe);
+    return true;
 }
 
 void ReportPipeManifest(std::string& out, double seconds) {

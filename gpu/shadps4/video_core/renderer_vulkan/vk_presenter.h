@@ -205,6 +205,39 @@ public:
     /// 0 when it has not (or is too old to be kept: the last 64 presents are).
     u64 PresentDoneNs(u64 id) const;
 
+    /// sotc: display cadence (always on). True when the display waiter thread waits for every
+    /// tagged present (VK_KHR_present_wait) and records when it is on screen, so PresentDoneNs is
+    /// exact to the waiter's wake-up instead of the vblank thread's next poll. Started by the first
+    /// tagged present; false before that and on devices without present wait.
+    bool DisplayClockAvailable() const {
+        return display_clock_on.load(std::memory_order_acquire);
+    }
+
+    /// sotc: the display's vblank period in ns: the primary display's refresh rate, refined from
+    /// the intervals between present completions that are within 25% of a whole number of vblanks.
+    double DisplayVblankNs() const;
+
+    /// sotc: SOTC_PACER. The display time (host steady-clock ns) the next tagged present is planned
+    /// for: TagPresent stores it with that present and clears it, and the SOTC DISPLAY line
+    /// measures the phase error when the present is seen on screen. 0 for none.
+    void SetNextPresentTarget(u64 target_ns) {
+        next_present_target_ns.store(target_ns, std::memory_order_relaxed);
+    }
+
+    /// sotc: SOTC_PACER. A game frame superseded by a newer one before it was presented: its GPU
+    /// work is waited for on the present queue, as a present would, and it goes back to the free
+    /// queue without being shown. Call on the presenting thread.
+    void DiscardFrame(Frame* frame);
+
+    /// sotc: SOTC_PACER state for the SOTC DISPLAY line: whether the pacer paces now, and frames it
+    /// dropped (superseded before their present).
+    void NotePacer(bool active, u32 dropped) {
+        pacer_active.store(active, std::memory_order_relaxed);
+        if (dropped) {
+            pacer_dropped.fetch_add(dropped, std::memory_order_relaxed);
+        }
+    }
+
 private:
     /// sotc: SOTC_FLIP_THREAD: one of the port-owned images a flip is copied into (SOTC_FLIP_IMAGES).
     /// busy: from the draw thread's copy until the flip thread's submit that reads it; read_tick is
@@ -268,7 +301,13 @@ private:
         u64 id{};
         VkSwapchainKHR swapchain{};
         u64 done_ns{};
+        u64 queued_ns{}; ///< sotc: host time the id was taken, just before vkQueuePresentKHR
+        u64 target_ns{}; ///< sotc: SOTC_PACER planned display time, 0 for none
     };
+
+    /// sotc: the display waiter thread (display cadence log): waits for each tagged present in
+    /// order and records when it is on screen.
+    void DisplayWaitMain(std::stop_token token);
 
     /// sotc: takes the id of the present about to be queued. Call under Scheduler::submit_mutex.
     u64 TagPresent();
@@ -345,6 +384,15 @@ private:
     /// null while off, or when the GPU cannot blit the swapchain format (sotc_frame_hash_tried).
     std::shared_ptr<SotcFrameHashRing> sotc_frame_hash;
     bool sotc_frame_hash_tried{};
+    /// sotc: display cadence log and SOTC_PACER (see DisplayClockAvailable, DisplayWaitMain).
+    std::atomic<bool> display_clock_on{false};
+    std::atomic<double> display_vblank_ns{0.0};
+    std::atomic<u64> next_present_target_ns{0};
+    std::atomic<bool> pacer_active{false};
+    std::atomic<u32> pacer_dropped{0};
+    std::mutex display_wait_mutex;            ///< guards the display_wait_cv predicate
+    std::condition_variable_any display_wait_cv; ///< TagPresent wakes the waiter
+    std::jthread display_thread;              ///< last member: stopped first (also in ~Presenter)
 };
 
 /// sotc: SOTC_FPS (B5). Appends one line per window: the draw thread's flip wait split by cause

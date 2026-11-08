@@ -39,6 +39,7 @@
 #include "shader_recompiler/ir/passes/srt.h"
 #include "video_core/page_manager.h"
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
+#include "../../sotc/nonblocking.h"    // sotc: SOTC_PROTECT_ASYNC_UNPROTECT
 #include "video_core/sotc_stats.h"
 #include "video_core/buffer_cache/async_upload.h" // sotc: SOTC_WRITE_DECL waits for the copies
 #include "video_core/buffer_cache/buffer_cache.h" // sotc: SOTC_FPS readbacks by guest RIP (B6)
@@ -280,6 +281,8 @@ bool ProtectAsyncOn() {
 }
 // sotc: set on the draw thread by PageManager::SetProtectAsyncThread.
 thread_local bool tl_protect_offload_thread = false;
+// sotc: SOTC_PROTECT_ASYNC_UNPROTECT (PageManager::GpuOnlyScope): open scopes on this thread.
+thread_local u32 tl_gpu_only_depth = 0;
 
 // sotc: one queued protect: pages [address, address + size) get perms.
 struct ProtectRequest {
@@ -690,11 +693,23 @@ struct PageManager::Impl {
     /// sotc: SOTC_PROTECT_ASYNC. The host protection of [address, address + size) as the tracker asks
     /// for it. A restriction made by the draw thread (outside a fault) is queued for the worker; every
     /// other protect is applied at once, after the queue is flushed, so it cannot be overtaken.
+    /// sotc: SOTC_PROTECT_ASYNC_UNPROTECT: inside a GpuOnlyScope of the draw thread an unprotect is queued too
+    /// (in order with the restrictions, so the final state of every page is the tracker's). A guest write that
+    /// meets such a page before the worker gets there faults; the handler flushes the queue and retries
+    /// (GuestFaultSignalHandler).
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) {
+        const bool unprotect = perms == Core::MemoryPermission::ReadWrite;
         if (g_protect_async && tl_protect_offload_thread && tl_protect_batch.suspended == 0 &&
-            perms != Core::MemoryPermission::ReadWrite) {
+            (!unprotect || (tl_gpu_only_depth != 0 && SotcNonBlocking::ProtectAsyncUnprotect()))) {
+            if (unprotect) {
+                SotcStats::pb_unprotect_queued.fetch_add(1, std::memory_order_relaxed);
+            }
             g_protect_async->Enqueue(address, size, perms);
             return;
+        }
+        if (unprotect && g_protect_async && tl_protect_offload_thread &&
+            SotcNonBlocking::ProtectAsyncUnprotect()) {
+            SotcStats::pb_unprotect_sync.fetch_add(1, std::memory_order_relaxed);
         }
         FlushProtectQueue();
         ProtectNow(address, size, perms);
@@ -1840,6 +1855,21 @@ struct SignalImpl : public PageManager::Impl {
             return true;
         }
         if (Common::IsWriteError(context)) {
+            // sotc: SOTC_PROTECT_ASYNC_UNPROTECT: the page's unprotect may still be in the worker's queue (the tracker
+            // already says read-write). The queue is applied first; a page writable after it was that case, and the
+            // write is retried with nothing invalidated (the tracker saw no watcher on it). Otherwise the fault is a
+            // tracked write, handled below as before.
+            if (SotcNonBlocking::ProtectAsyncUnprotect() && ProtectsPending()) {
+                FlushProtectQueue();
+#ifdef _WIN32
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(fault_address, &info, sizeof(info)) &&
+                    (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
+                                     PAGE_EXECUTE_WRITECOPY)) != 0) {
+                    return true;
+                }
+#endif
+            }
             // sotc: SOTC_FPS: the time from the entry of bbgpu_handle_fault to here is dispatch.
             SotcStats::FaultStat::NoteHandlerEntry();
             // sotc: SOTC_FPS (0b): write faults by the class of the code that faulted.
@@ -2355,6 +2385,15 @@ void PageManager::EnsureFaultPageWritable(VAddr page) {
     if (g_fault_page_fix) {
         g_fault_page_fix(page);
     }
+}
+
+// sotc: SOTC_PROTECT_ASYNC_UNPROTECT (page_manager.h).
+PageManager::GpuOnlyScope::GpuOnlyScope() noexcept {
+    ++tl_gpu_only_depth;
+}
+
+PageManager::GpuOnlyScope::~GpuOnlyScope() {
+    --tl_gpu_only_depth;
 }
 
 // sotc: SOTC_PROTECT_COALESCE (page_manager.h). Per thread; the tracker has a single instance,
