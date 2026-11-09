@@ -57,6 +57,13 @@ enum MissKind : uint32_t {
     kMissImage = 2,   ///< S3: a T# not in the table. words[0..7] = T#, view_class = the binding's ViewClass
     kMissSampler = 3, ///< S3: an S# not in the table. words[0..3] = S#, view_class = its SamplerClass
 };
+// sotc: kMissPage payload beyond the page: view_class = flags below, words[2..3] = the access's V# guest base (lo, hi),
+// words[4] = its block size in bytes (the V# size). The host makes the whole binding resident for a formatted or
+// written access (as its bind does) and only the page for a plain read.
+inline constexpr uint32_t kMissPageFormatted = 1u; ///< the buffer is a formatted (texel) one
+inline constexpr uint32_t kMissPageWritten = 2u;   ///< the buffer is written by the shader
+// sotc: the stamp is stored with an atomic store of Release semantics (Device scope, UniformMemory) after the body, so
+// a host that sees the stamp also sees the body (the host reads the stamp, an acquire fence, then the body).
 struct MissRecord {
     uint32_t stamp; ///< ring index + 1, written last
     uint32_t kind; ///< MissKind

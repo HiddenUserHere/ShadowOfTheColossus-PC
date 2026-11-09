@@ -150,8 +150,9 @@ inline bool VsDrawKindOn() {
 /// The start instance SGPR of SotC's indirect draws: SPI_SHADER_USER_DATA_VS_0 (0x4c) + 2, user SGPR 2.
 constexpr uint16_t kVsDrawKindInstanceSgpr = 0x4c + 2;
 
-/// sotc: SOTC_GCN_MISS_EMIT=0 (diagnostic): table-mode loads do not emit the S2 page-miss record (gcn_layout.h).
-/// Only to measure the driver compile cost of that code; a page that is not resident then reads zero unrecorded.
+/// sotc: SOTC_GCN_MISS_EMIT=1 (default off: only '1' turns it on): with SOTC_GCN_BUF, table-mode accesses emit the S2
+/// page-miss record (gcn_layout.h). Off, no miss code is emitted (cheaper driver compiles) and a page that is not
+/// resident reads zero unrecorded: the host binds (BindAddressed / Touch) are the only placement.
 inline bool GcnMissEmit() {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_GCN_MISS_EMIT");
@@ -171,10 +172,10 @@ inline bool GcnBufFormatted() {
     return on;
 }
 
-/// sotc: SOTC_SPV_FUNCS=0 (default on): table-mode buffer loads call one DontInline SPIR-V function (gcn_table_addr,
-/// spirv_emit_context.cpp) for the element addresses, instead of emitting that code at every load. 0 keeps the inline
-/// code: the A/B baseline for the first-run compile cost. Changes the emitted SPIR-V, so the shader cache version
-/// carries it.
+/// sotc: SOTC_SPV_FUNCS=1 (default off: only '1' turns it on): table-mode buffer loads call one DontInline SPIR-V
+/// function (gcn_table_addr, spirv_emit_context.cpp) for the element addresses, instead of emitting that code at every
+/// load. Off keeps the inline code: the A/B baseline for the first-run compile cost. Changes the emitted SPIR-V, so the
+/// shader cache version carries it.
 inline bool SpvFuncs() {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_SPV_FUNCS");

@@ -212,9 +212,9 @@ void OnSubmitStart(VideoCore::BufferCache& cache, VideoCore::TextureCache& textu
         MissContext ctx{cache, texture_cache, scheduler};
         Globals::MissSink sink;
         sink.user = &ctx;
-        sink.page = [](void* user, VAddr page_addr) {
+        sink.page = [](void* user, VAddr page_addr, u32 flags, VAddr base, u32 size) {
             auto& c = *static_cast<MissContext*>(user);
-            Buf::OnPageMiss(c.cache, c.scheduler, page_addr);
+            Buf::OnPageMiss(c.cache, c.scheduler, page_addr, flags, base, size); // sotc: flags and V# (gcn_layout.h)
         };
         sink.image = [](void* user, const u32 (&tsharp)[8], u32 view_class) {
             auto& c = *static_cast<MissContext*>(user);

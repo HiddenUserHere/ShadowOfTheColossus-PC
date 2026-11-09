@@ -97,11 +97,18 @@ static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 44u : 141
                                        (SotcGcn::Mode(SotcGcn::Stage::Buf) != 0 ? 256000u : 0u) +
                                        (SotcGcn::Mode(SotcGcn::Stage::Tex) != 0 ? 512000u : 0u) +
                                        (AddrTableRequested() ? 1024000u : 0u) +
-                                       // sotc: SOTC_SPV_SALT (info.h) and SOTC_GCN_MISS_EMIT=0: diagnostic caches apart.
+                                       // sotc: SOTC_SPV_SALT (info.h) apart. SOTC_GCN_MISS_EMIT is off unless set to 1
+                                       // (info.h), so the +2048000 term is in every run without it: the miss-record
+                                       // caches (=1) are the ones without the term.
                                        Shader::SpvSalt() * 4096000u + (Shader::GcnMissEmit() ? 0u : 2048000u) +
-                                       // sotc: SOTC_SPV_FUNCS (on by default): the generic buffer decode and the table
-                                       // loads are DontInline functions (first-run compile cost); 0 keeps them inline.
+                                       // sotc: SOTC_SPV_FUNCS (off unless set to 1, info.h): =1 makes the table loads
+                                       // DontInline functions (first-run compile cost); the default keeps them inline,
+                                       // and carries the +512 term.
                                        (Shader::SpvFuncs() ? 0u : 512u) +
+                                       // sotc: table mode / gcn tex (+3): the miss record carries flags and the V#,
+                                       // its stamp is a Release atomic store, gcn_table_addr takes the miss flags.
+                                       // Zero in descriptor mode: those caches stay valid.
+                                       ((AddrTableRequested() || SotcGcn::Mode(SotcGcn::Stage::Tex) != 0) ? 3u : 0u) +
                                        // sotc: SOTC_GCN_BUF_FMT=0 (info.h): formatted buffers kept on descriptors, apart.
                                        (Shader::GcnBufFormatted() ? 0u : 0x40000000u) +
                                        // sotc: SOTC_SPV_PROGRAM_IDS=1 (info.h): modules with the program hash, apart.

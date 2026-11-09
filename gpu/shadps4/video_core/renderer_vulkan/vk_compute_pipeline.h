@@ -58,6 +58,10 @@ struct ComputeSpecFreeStats {
     std::atomic<u64> perms_queued{0};
     std::atomic<u64> not_prebuilt{0};
     std::atomic<u64> programs{0}, variants{0}, compile_ns{0};
+    /// sotc: SOTC_SHADER_ADDR (table mode): compute translations the CP routed to a worker and waited for
+    /// (TranslateComputeOnWorker), the CP's wait time, waits that timed out, and translations still made inline on the
+    /// CP (a worker failure or timeout). Always 0 in descriptor mode.
+    std::atomic<u64> cp_worker{0}, cp_worker_ns{0}, cp_worker_timeouts{0}, cp_inline{0};
     std::atomic<u32> logged{0};
 };
 extern ComputeSpecFreeStats g_specfree;

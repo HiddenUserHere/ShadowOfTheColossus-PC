@@ -3203,6 +3203,87 @@ void PipelineCache::WaitPendingTranslation(u64 hash) {
         std::memory_order_relaxed);
 }
 
+// sotc: SOTC_SHADER_ADDR (table mode). The compute lookup may not return without a module (RefreshComputeKey passes
+// async_ok false), so a program or permutation it lacks was translated inline: TranslateProgram, EmitSPIRV and the
+// driver's module compile on the command processor (the cold table-mode runs showed the CP inside nvgpucomp64.dll).
+// The translation goes to a worker on the Urgent lane instead and the CP waits for it, installing finished jobs as
+// WaitPendingTranslation does. Descriptor mode never calls this (byte-identical).
+bool PipelineCache::TranslateComputeOnWorker(const Shader::ShaderParams& params, const Shader::RuntimeInfo& rt,
+                                             const Shader::Backend::Bindings& start, Program* program,
+                                             const Shader::StageSpecialization* spec, size_t perm_idx) {
+    if (profile.shader_addr == 0 || async_workers.empty() || EmulatorSettings.IsShaderCollect() ||
+        (program && !spec)) {
+        return false;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    auto job = std::make_unique<AsyncPipelineJob>();
+    auto& t = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
+    t.hw_stage = HwStage::Compute;
+    t.sw_stage = SwStage::Compute;
+    t.hash = params.hash;
+    t.variant = params.variant;
+    t.guest_hash = params.guest_hash;
+    std::ranges::copy(params.user_data, t.user_data.begin()); // the worker reads a copy (as QueueAsyncTranslate)
+    t.code = params.code;
+    t.runtime_info = rt;
+    t.start = start;
+    t.program = program;
+    t.perm_idx = perm_idx;
+    if (program) {
+        t.spec = *spec;
+        program->pending_specs.push_back(*spec); // InstallTranslation removes it (installed, stale or failed)
+    } else {
+        pending_programs.insert(params.hash); // InstallTranslation erases it (installed or failed)
+    }
+    {
+        std::scoped_lock lock{async_mutex};
+        PushJobLocked(JobLane::Urgent, std::move(job));
+    }
+    async_cv.notify_all();
+    const auto done = [&] {
+        return program ? std::ranges::find(program->pending_specs, *spec) == program->pending_specs.end()
+                       : !pending_programs.contains(params.hash);
+    };
+    // The deadline only guards against a worker that never finishes; past it the CP translates inline as before (the
+    // worker's copy is dropped when installed).
+    const auto deadline = begin + std::chrono::seconds{30};
+    bool timed_out = false;
+    for (;;) {
+        if (async_done_count.load(std::memory_order_acquire) != 0) {
+            last_graphics_pipeline = nullptr; // a refused preloaded pipeline may be erased
+            pipe_fast_gfx.valid = false;
+            CollectAsyncPipelines();
+        }
+        if (done()) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            timed_out = true;
+            break;
+        }
+        std::unique_lock lock{async_mutex};
+        translate_done_cv.wait_for(lock, std::chrono::milliseconds{20}, [this] {
+            return async_done_count.load(std::memory_order_relaxed) != 0;
+        });
+    }
+    g_specfree.cp_worker.fetch_add(1, std::memory_order_relaxed);
+    g_specfree.cp_worker_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                           std::chrono::steady_clock::now() - begin)
+                                                           .count()),
+                                      std::memory_order_relaxed);
+    if (timed_out) {
+        g_specfree.cp_worker_timeouts.fetch_add(1, std::memory_order_relaxed);
+        if (program) {
+            // The inline translation below adds the permutation; the worker's copy then finds it there.
+            if (const auto it = std::ranges::find(program->pending_specs, *spec); it != program->pending_specs.end()) {
+                program->pending_specs.erase(it);
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
 void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
     static thread_local Shader::Pools worker_pools;
     const auto start_time = std::chrono::steady_clock::now();
@@ -5575,6 +5656,9 @@ SpecMemoStats g_spec_memo;
 thread_local std::vector<u32> t_spec_words;
 thread_local Shader::Gcn::FetchShaderData t_spec_fetch;
 thread_local std::vector<u32> t_spec_check;
+// sotc: SOTC_SHADER_ADDR (table mode): set while GetProgram looks a compute stage up again after its permutation was
+// translated on a worker (TranslateComputeOnWorker): that second lookup does not queue another one.
+thread_local bool t_cs_perm_retry = false;
 
 constexpr u32 kSpecNone = SpecMemoEntry::None;
 
@@ -5958,12 +6042,21 @@ void PipelineCache::DrainPretranslate() {
     if (requests.empty()) {
         return;
     }
-    // A program variant (SOTC_SHADER_ADDR) mixes its variant into the hash: those keys are not made here. The
+    // A program variant (SOTC_SHADER_ADDR) mixes its variant into the hash: those graphics keys are not made here. The
     // requests are counted as dropped (before this check they vanished silently: queued 0 in every such run).
+    // sotc: SOTC_SHADER_ADDR (table mode): compute requests are prebuilt with the table key (QueueComputePrebuild
+    // makes the StageVariantPlain hash RefreshComputeKey looks up). A spec-free compute program is determined by its
+    // code, so all of them are built at the loading hold, as in descriptor mode (the drop left 0 prebuilt programs and
+    // every first dispatch compiled cold).
     if (profile.shader_addr != 0) {
-        for (const auto& r : requests) {
-            SotcPretranslate::NoteDropped(r.stage == 1 ? 1 : 0, 2);
+        for (auto& r : requests) {
+            if (r.stage == 2) {
+                QueueComputePrebuild(r);
+            } else {
+                SotcPretranslate::NoteDropped(r.stage == 1 ? 1 : 0, 2);
+            }
         }
+        FeedPretranslate();
         return;
     }
     // sotc: SOTC_PRETRANSLATE_COMPUTE: compute requests take their own path (QueueComputePrebuild).
@@ -6144,11 +6237,17 @@ void PipelineCache::FeedPretranslate() {
 // sotc: SOTC_PRETRANSLATE_COMPUTE. A compute program's first dispatch computes its key with the stage's plain
 // params (RefreshComputeKey); the prebuilt pipeline uses the same key: HashCombine(hash, 0), the first permutation.
 void PipelineCache::QueueComputePrebuild(SotcPretranslate::Request& r) {
-    const ComputePipelineKey key{HashCombine(r.hash, size_t{0})};
-    if (IsProgramKnown(r.hash) || lazy_programs.contains(r.hash) || compute_pipelines.contains(key)) {
+    // sotc: SOTC_SHADER_ADDR (table mode): the dispatch looks the program up by its plain variant (RefreshComputeKey:
+    // variant StageVariantPlain, guest_hash the game's hash, hash HashCombine(hash, variant)); the prebuild uses that
+    // program hash for the program cache, the pack, the index and the pipeline key. Descriptor mode: the game's hash.
+    const bool table = profile.shader_addr != 0;
+    const u8 variant = table ? Shader::StageVariantPlain : Shader::StageVariantDefault;
+    const u64 program_hash = table ? HashCombine(r.hash, variant) : r.hash;
+    const ComputePipelineKey key{HashCombine(program_hash, size_t{0})};
+    if (IsProgramKnown(program_hash) || lazy_programs.contains(program_hash) || compute_pipelines.contains(key)) {
         SotcPretranslate::NoteDropped(2, 0); // known: a warm session has it (as the other requests)
         if (SotcNonBlocking::Prefetch()) { // sotc: loaded from the pack by a worker before its first dispatch
-            QueueLazyPrefetch(r.hash);
+            QueueLazyPrefetch(program_hash);
         }
         return;
     }
@@ -6185,7 +6284,9 @@ void PipelineCache::QueueComputePrebuild(SotcPretranslate::Request& r) {
     auto& t = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
     t.hw_stage = HwStage::Compute;
     t.sw_stage = SwStage::Compute;
-    t.hash = r.hash;
+    t.hash = program_hash;
+    t.variant = variant;                // sotc: SOTC_SHADER_ADDR (0 in descriptor mode)
+    t.guest_hash = table ? r.hash : 0;  // sotc: Info::pgm_hash stays the game's hash
     t.owned_code = r.code;
     t.code = t.owned_code;
     t.runtime_info = rt;
@@ -6209,7 +6310,7 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
     const auto fail = [&] {
         SotcPretranslate::NoteBuilt(2, false);
         if (t.synthetic_variant == 0) {
-            pre_compute_pred.erase(t.hash);
+            pre_compute_pred.erase(t.guest_hash != 0 ? t.guest_hash : t.hash); // sotc: keyed by the game's hash
         }
         if (t.module) {
             instance.GetDevice().destroyShaderModule(t.module);
@@ -6318,6 +6419,8 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
         v.hw_stage = t.hw_stage;
         v.sw_stage = t.sw_stage;
         v.hash = t.hash;
+        v.variant = t.variant;       // sotc: SOTC_SHADER_ADDR: the table variant of the first prebuild
+        v.guest_hash = t.guest_hash;
         v.owned_code = t.owned_code;
         v.code = v.owned_code;
         v.runtime_info = t.runtime_info;
@@ -7452,10 +7555,22 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         translation_pending = true;
         return {nullptr, vk::ShaderModule{}, 0};
     }
+    // sotc: SOTC_SHADER_ADDR (table mode): a compute program the lookup lacks is translated on a worker (the CP waits),
+    // not inline here. Before the program cache is read: the wait installs finished jobs (the map may move).
+    if (sw_stage == SwStage::Compute && !async_ok && profile.shader_addr != 0 &&
+        !program_cache.contains(params.hash) && !in_place_programs.contains(params.hash) &&
+        TranslateComputeOnWorker(params, rt, binding, nullptr, nullptr, 0) && program_cache.contains(params.hash)) {
+        if (Shader::ComputeSpecFree()) {
+            g_specfree.not_prebuilt.fetch_add(1, std::memory_order_relaxed); // sotc: first translated by a dispatch
+        }
+    }
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         if (sw_stage == SwStage::Compute && Shader::ComputeSpecFree()) {
             g_specfree.not_prebuilt.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_COMPUTE_SPECFREE
+        }
+        if (sw_stage == SwStage::Compute && profile.shader_addr != 0) {
+            g_specfree.cp_inline.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_SHADER_ADDR, still on the CP
         }
         CacheDiagNoteProgram(params.hash);
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
@@ -7700,8 +7815,26 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         }
         return {nullptr, vk::ShaderModule{}, 0};
     }
+    if (it == program->modules.end() && sw_stage == SwStage::Compute && !async_ok && profile.shader_addr != 0 &&
+        !program->translate_in_place && !t_cs_perm_retry &&
+        std::ranges::find(program->pending_specs, spec) == program->pending_specs.end()) {
+        // sotc: SOTC_SHADER_ADDR (table mode): the permutation is translated on a worker (the CP waits), then the
+        // lookup runs again from its start (the wait installed jobs: `program` may have moved in the map) and finds it.
+        // Once: a second miss (the guest tables changed meanwhile, or a stale worker result) is translated inline.
+        Program* const owner = program.get();
+        if (TranslateComputeOnWorker(params, rt, spec_start, owner, &spec, perm_idx)) {
+            binding = spec_start;
+            t_cs_perm_retry = true;
+            const auto result = GetProgram(hw_stage, sw_stage, params, binding, async_ok);
+            t_cs_perm_retry = false;
+            return result;
+        }
+    }
     if (it == program->modules.end()) {
         CacheDiagNotePerm(false);
+        if (sw_stage == SwStage::Compute && profile.shader_addr != 0) {
+            g_specfree.cp_inline.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_SHADER_ADDR, still on the CP
+        }
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         auto runtime_info = rt;
         const auto binding_before = binding;

@@ -43,6 +43,14 @@ constexpr u64 kStreamSize = 8ULL << 20; ///< staging of the chunk uploads (a Map
 std::atomic<u64> g_placed[kWords]{};
 std::atomic<u64> g_clean[kWords]{};
 std::atomic<u64> g_dirty_seq{0};
+// sotc: GPU-modified marks (NoteGpuWrite): bit p is set when a GPU write marked placed table page p GPU-modified and no
+// slow sync has run over it since. Buf::BindAddressed's placed-page fast path refuses a marked range (AnyGpuModified);
+// Touch's fast path is refused by the clean bit, which the same hook clears. Cleared by a slow Touch or MarkClean whose
+// sequence did not move (ClearGpuModAfterSync).
+std::atomic<u64> g_gpu_mod[kWords]{};
+// sotc: set while Touch runs its own ObtainBuffer: the GPU-modified marking that bind makes (a native written sync) is
+// the sync that sets the clean bits (proof at Touch, step 3), so NoteGpuWrite ignores it.
+thread_local bool t_in_touch = false;
 
 struct State {
     vk::UniqueBuffer buffer;             ///< the table: NumPages u64 entries, device-local, with a device address
@@ -82,6 +90,10 @@ std::atomic<u64> g_reverts{};        // slow Touch calls whose clean bits a conc
 std::atomic<u64> g_dirty_calls{};    // ClearClean calls (Dirty, DirtyPages, OnPlace, OnRemove, written binds)
 std::atomic<u64> g_would_fast{};     // SOTC_SHADER_ADDR=2: reads the fast path would have answered
 std::atomic<u64> g_would_fast_bad{}; // SOTC_SHADER_ADDR=2: of those, the slow path wrote other entries
+std::atomic<u64> g_gpu_marks{};      // sotc: NoteGpuWrite calls that marked placed pages GPU-modified
+std::atomic<u64> g_slow_gpu{};       // sotc: slow Touch calls (read or written) over placed pages with a GPU-modified mark
+std::atomic<u64> g_texel_touch{};    // sotc: formatted read Touch calls (never fast: ObtainBuffer syncs them from images)
+std::atomic<u64> g_texel_syncs{};    // sotc: of those, image copies into the arena (SynchronizeMemoryFromImage)
 
 // sotc: SOTC_ADDR_VERTEX counters, per VertexPath (ObtainRead). table: answered by the table; fallback: ObtainBuffer ran
 // (outside the window, a page not resident or of another owner, a refused Touch); verify_*: mode 2's comparison.
@@ -134,6 +146,23 @@ void ClearClean(VAddr addr, u64 size) {
     ForWords(first, last, [](u64 w, u64 mask) {
         g_clean[w].fetch_and(~mask, std::memory_order_seq_cst);
     });
+}
+
+// sotc: after a sync of table pages [first, last] that started at sequence seq_before: the GPU-modified marks of the
+// range are dropped when no clean-state change happened since (the hook bumps the sequence before it sets a mark). A
+// change seen after the drop puts the marks back (conservative: one more refused fast path).
+void ClearGpuModAfterSync(u64 first, u64 last, u64 seq_before) {
+    if (g_dirty_seq.load(std::memory_order_seq_cst) != seq_before) {
+        return;
+    }
+    ForWords(first, last, [](u64 w, u64 mask) {
+        g_gpu_mod[w].fetch_and(~mask, std::memory_order_seq_cst);
+    });
+    if (g_dirty_seq.load(std::memory_order_seq_cst) != seq_before) {
+        ForWords(first, last, [](u64 w, u64 mask) {
+            g_gpu_mod[w].fetch_or(mask, std::memory_order_seq_cst);
+        });
+    }
 }
 
 // The owner index of buffer (g_mutex held). 0 for nullptr; a new buffer is appended to the registry.
@@ -414,12 +443,16 @@ bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr ad
     // NoteWrittenFast keeps runs. Every other written bind takes the full ObtainBuffer path.
     bool all_placed = true;
     bool all_clean = true;
+    bool any_gpu = false; // sotc: a GPU-modified mark (NoteGpuWrite) in the range, for the refusal counter
     ForWords(first, last, [&](u64 w, u64 mask) {
         if ((g_placed[w].load(std::memory_order_seq_cst) & mask) != mask) {
             all_placed = false;
         }
         if ((g_clean[w].load(std::memory_order_seq_cst) & mask) != mask) {
             all_clean = false;
+        }
+        if ((g_gpu_mod[w].load(std::memory_order_seq_cst) & mask) != 0) {
+            any_gpu = true;
         }
     });
     const bool placed_clean = all_placed && all_clean;
@@ -462,10 +495,24 @@ bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr ad
     } else if (!read_fast) {
         (all_placed ? g_slow_dirty : g_slow_unplaced).fetch_add(1, std::memory_order_relaxed);
     }
+    if (all_placed && !all_clean && any_gpu) {
+        g_slow_gpu.fetch_add(1, std::memory_order_relaxed); // sotc: the fast path was refused by a GPU write
+    }
+    if (is_texel && !is_written) {
+        g_texel_touch.fetch_add(1, std::memory_order_relaxed);
+    }
     const u64 seq_before = g_dirty_seq.load(std::memory_order_seq_cst); // s1
     // The buffer cache makes the range resident and synchronized, and serves ring-8 binds from their run. Called
     // without g_mutex: ObtainBuffer places blocks, and the placements call OnPlace.
-    const auto [buffer, offset] = cache.ObtainBuffer(addr, static_cast<u32>(size), is_written, is_texel);
+    // sotc: t_in_touch: the GPU-modified marking of this bind is not a GPU write the clean state must see (see above).
+    struct InTouch {
+        InTouch() { t_in_touch = true; }
+        ~InTouch() { t_in_touch = false; }
+    };
+    const auto [buffer, offset] = [&] {
+        const InTouch in_touch;
+        return cache.ObtainBuffer(addr, static_cast<u32>(size), is_written, is_texel);
+    }();
     if (!buffer || !buffer->HasBufferDeviceAddress()) {
         g_failed.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -506,8 +553,61 @@ bool Touch(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr ad
             g_reverts.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    // sotc: the sync ran after every GPU-modified mark set before s1: those marks are dropped (ClearGpuModAfterSync).
+    if (any_gpu) {
+        ClearGpuModAfterSync(first, last, seq_before);
+    }
     g_served.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+void GpuWriteRange(VAddr addr, u64 size) noexcept {
+    if (t_in_touch) {
+        return; // Touch's own ObtainBuffer: that sync sets the bits itself
+    }
+    u64 first = 0;
+    u64 last = 0;
+    if (!WindowPages(addr, size, first, last)) {
+        return;
+    }
+    // Only placed pages can be answered by a fast path; a range with none placed costs these loads only.
+    bool any_placed = false;
+    ForWords(first, last, [&](u64 w, u64 mask) {
+        if ((g_placed[w].load(std::memory_order_seq_cst) & mask) != 0) {
+            any_placed = true;
+        }
+    });
+    if (!any_placed) {
+        return;
+    }
+    g_gpu_marks.fetch_add(1, std::memory_order_relaxed);
+    // The sequence moves BEFORE the marks are set (ClearGpuModAfterSync relies on it), then the clean bits go.
+    g_dirty_seq.fetch_add(1, std::memory_order_seq_cst);
+    ForWords(first, last, [](u64 w, u64 mask) {
+        g_gpu_mod[w].fetch_or(mask, std::memory_order_seq_cst);
+    });
+    ClearClean(addr, size);
+}
+
+void TexelImageSynced() noexcept {
+    if (t_in_touch) {
+        g_texel_syncs.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool AnyGpuModified(VAddr addr, u64 size) noexcept {
+    u64 first = 0;
+    u64 last = 0;
+    if (!WindowPages(addr, size, first, last)) {
+        return false;
+    }
+    bool any = false;
+    ForWords(first, last, [&](u64 w, u64 mask) {
+        if ((g_gpu_mod[w].load(std::memory_order_seq_cst) & mask) != 0) {
+            any = true;
+        }
+    });
+    return any;
 }
 
 void DirtyRange(VAddr addr, u64 size) noexcept {
@@ -559,6 +659,9 @@ void OnRemove(VAddr addr, u64 size) {
     const u64 first = (addr - WindowBase) >> PageShift;
     const u64 last = (addr - WindowBase + size - 1) >> PageShift;
     ClearClean(addr, size);
+    ForWords(first, last, [](u64 w, u64 mask) { // sotc: no entry, no GPU-modified mark (a new placement starts fresh)
+        g_gpu_mod[w].fetch_and(~mask, std::memory_order_seq_cst);
+    });
     std::scoped_lock lock{g_mutex};
     for (u64 page = first; page <= last; ++page) {
         SetEntryLocked(*s, page, 0, 0);
@@ -669,6 +772,7 @@ bool MarkClean(VAddr addr, u64 size, u64 sequence) noexcept {
         g_reverts.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    ClearGpuModAfterSync(first, last, sequence); // sotc: the batch sync ran after the marks set before `sequence`
     return true;
 }
 
@@ -817,6 +921,10 @@ void Report(char* out, u32 size, double seconds) {
     const u64 dirty_calls = g_dirty_calls.exchange(0, std::memory_order_relaxed);
     const u64 would_fast = g_would_fast.exchange(0, std::memory_order_relaxed);
     const u64 would_fast_bad = g_would_fast_bad.exchange(0, std::memory_order_relaxed);
+    const u64 gpu_marks = g_gpu_marks.exchange(0, std::memory_order_relaxed);
+    const u64 slow_gpu = g_slow_gpu.exchange(0, std::memory_order_relaxed);
+    const u64 texel_touch = g_texel_touch.exchange(0, std::memory_order_relaxed);
+    const u64 texel_syncs = g_texel_syncs.exchange(0, std::memory_order_relaxed);
     const int n = std::snprintf(
         out, size,
         "SOTC ADDR_TABLE: %llu entries live (%llu MiB of guest pages), table %llu MiB device + %llu MiB host "
@@ -830,7 +938,7 @@ void Report(char* out, u32 size, double seconds) {
     if (n < 0 || static_cast<u32>(n) >= size) {
         return;
     }
-    std::snprintf(out + n, size - static_cast<u32>(n),
+    const int m = std::snprintf(out + n, size - static_cast<u32>(n),
                   ". CLEAN: fast %llu, slow not placed %llu, slow dirty %llu, reverts %llu, "
                   "dirty marks %llu (%.0f/s), written fast %llu, written slow %llu (untracked %llu, not placed %llu, "
                   "dirty %llu, first %llu, SHADER_ADDR=2 %llu), SHADER_ADDR=2 would-be fast %llu (entries differ %llu)",
@@ -842,6 +950,15 @@ void Report(char* out, u32 size, double seconds) {
                   static_cast<unsigned long long>(w_dirty), static_cast<unsigned long long>(w_new),
                   static_cast<unsigned long long>(w_verify), static_cast<unsigned long long>(would_fast),
                   static_cast<unsigned long long>(would_fast_bad));
+    // sotc: GPU-modified marks (NoteGpuWrite) and the slow Touches they caused; formatted read Touches and the image
+    // copies their ObtainBuffer made.
+    if (m < 0 || static_cast<u32>(n + m) >= size) {
+        return;
+    }
+    std::snprintf(out + n + m, size - static_cast<u32>(n + m),
+                  ". GPU marks %llu, slow on GPU-modified %llu. TEXEL reads %llu, image syncs %llu",
+                  static_cast<unsigned long long>(gpu_marks), static_cast<unsigned long long>(slow_gpu),
+                  static_cast<unsigned long long>(texel_touch), static_cast<unsigned long long>(texel_syncs));
 }
 
 } // namespace SotcArch::AddrTable

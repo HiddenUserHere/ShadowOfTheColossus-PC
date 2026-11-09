@@ -599,11 +599,18 @@ public:
     Id GcnHash(std::span<const Id> words, u32 seed);
     /// sotc: SOTC_GCN_BUF. Appends a kMissPage record for the page-aligned guest address `page` (U64), once until the
     /// host drains. Call only inside a branch that runs for a missing page (TableAddresses does).
-    void GcnPageMiss(Id page);
+    /// sotc: flags (U32, kMissPageFormatted / kMissPageWritten), guest_base (U64) and block_size (U32): the V# of the
+    /// access, so the host can make the whole binding resident the way its bind does (gcn_layout.h).
+    void GcnPageMiss(Id page, Id flags, Id guest_base, Id block_size);
+    /// sotc: SOTC_GCN_BUF: the miss flags of buffer `handle` (a U32 constant from its BufferResource).
+    Id GcnPageMissFlags(u32 handle);
+    /// sotc: SOTC_GCN_BUF / SOTC_GCN_TEX: stores a miss record's stamp (record_address U64) with Release semantics.
+    void GcnStoreStamp(Id record_address, Id stamp);
     /// sotc: SOTC_GCN_BUF: the function that runs GcnPageMiss (DefineFunctions; 0 when the shader records no miss).
     Id gcn_page_miss_func{};
-    /// sotc: SOTC_SPV_FUNCS: gcn_table_addr(guest_base U64, block_size U32, index U32, elem_shift U32, count U32), the
-    /// per-element addresses and validity of a table-mode load (DefineFunctions; 0 when not defined).
+    /// sotc: SOTC_SPV_FUNCS: gcn_table_addr(guest_base U64, block_size U32, index U32, elem_shift U32, count U32,
+    /// miss_flags U32), the per-element addresses and validity of a table-mode load (DefineFunctions; 0 when not
+    /// defined).
     Id gcn_table_addr_func{};
     /// sotc: SOTC_SPV_FUNCS: its return type { u64vec4 addresses; u32vec4 ok } and the u64vec4 type of its first member.
     Id gcn_table_addr_result{};

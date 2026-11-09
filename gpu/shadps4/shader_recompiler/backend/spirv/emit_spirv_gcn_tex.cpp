@@ -235,7 +235,7 @@ void EmitContext::GcnTexRecordMiss(Id globals, u32 kind, std::span<const Id> key
     for (u32 w = 0; w < 8; ++w) {
         body(16 + 4 * w, w < key.size() ? key[w] : u32_zero_value);
     }
-    body(0, OpIAdd(U32[1], idx, ConstU32(1u))); // stamp, last
+    GcnStoreStamp(record, OpIAdd(U32[1], idx, ConstU32(1u))); // stamp, last (sotc: atomic store, Release)
     BdaEndIf(fresh_merge);
 }
 

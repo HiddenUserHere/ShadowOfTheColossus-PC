@@ -1388,6 +1388,8 @@ private:
     /// Returns true when the epoch moved from seen_epoch (a notification), false on the timeout.
     bool CpRoundSleep(u64 seen_epoch);
     void WakeCpRound() noexcept;
+    /// sotc: SOTC_CP_LABEL_SLEEP: logs a sleep run of run_ns without progress (command processor thread).
+    void LogCpSleepRun(u64 run_ns);
 };
 
 } // namespace AmdGpu

@@ -35,11 +35,25 @@ std::atomic<u64> g_page{};      // page misses drained (kMissPage)
 std::atomic<u64> g_image{};     // image misses drained (kMissImage)
 std::atomic<u64> g_sampler{};   // sampler misses drained (kMissSampler)
 std::atomic<u64> g_overflows{}; // records the shaders wrote that the host never saw (ring lapped)
+// sotc: cumulative totals since start (never reset by Report), and the last drain's view of the ring.
+std::atomic<u64> g_page_total{};
+std::atomic<u64> g_image_total{};
+std::atomic<u64> g_sampler_total{};
+std::atomic<u64> g_overflow_total{};
+std::atomic<u64> g_pending_stops{}; // drains that stopped at a slot whose stamp was not there yet (record in flight)
+std::atomic<u32> g_last_write{};    // write_index seen by the last drain
+std::atomic<u32> g_last_read{};     // read_index after the last drain
 
 // The shaders write these words and the host reads them (and the reverse for the header's page table pointer):
 // volatile accesses keep the compiler from caching or merging them across the polling loop.
 u32 LoadWord(const u32* p) {
     return *static_cast<const volatile u32*>(p);
+}
+
+// sotc: an acquire load of a word the shaders write atomically (write_index, a record's stamp): the reads after it
+// (the record body) are not moved before it. Pairs with the shader's Release stamp store (gcn_layout.h).
+u32 LoadAcquire(const u32* p) {
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
 }
 
 // The header, filled in full at creation; page_table_address alone is refreshed later (Address).
@@ -186,17 +200,19 @@ void DrainMisses(const MissSink& sink) {
 
     // A snapshot of the producer's index. Records below it may still be in flight: their stamp is not there yet and
     // the loop stops there, so a later drain takes them.
-    const u32 write = LoadWord(&ring_header->write_index);
-    std::atomic_thread_fence(std::memory_order_acquire);
+    const u32 write = LoadAcquire(&ring_header->write_index); // sotc: acquire (was a volatile load + fence)
     if (write - s->read_index > Shader::Gcn::kMissRingCapacity) {
         // The ring lapped the host: the records in between are gone. Count them and skip to the oldest one kept.
-        g_overflows.fetch_add(write - s->read_index - Shader::Gcn::kMissRingCapacity, std::memory_order_relaxed);
+        const u32 lost = write - s->read_index - Shader::Gcn::kMissRingCapacity;
+        g_overflows.fetch_add(lost, std::memory_order_relaxed);
+        g_overflow_total.fetch_add(lost, std::memory_order_relaxed);
         s->read_index = write - Shader::Gcn::kMissRingCapacity;
     }
 
     for (u32 i = s->read_index; i != write; ++i) {
         const MissRecord* rec = &ring[i & kMask];
-        if (LoadWord(&rec->stamp) != i + 1) {
+        if (LoadAcquire(&rec->stamp) != i + 1) { // sotc: acquire, pairs with the shader's Release stamp store
+            g_pending_stops.fetch_add(1, std::memory_order_relaxed);
             break; // not written yet (incomplete): the next drain retries from here
         }
         // Seqlock-style read: the body is valid only when the stamp is the same before and after it.
@@ -215,19 +231,24 @@ void DrainMisses(const MissSink& sink) {
         switch (kind) {
         case Shader::Gcn::kMissPage:
             g_page.fetch_add(1, std::memory_order_relaxed);
+            g_page_total.fetch_add(1, std::memory_order_relaxed);
             if (sink.page) {
                 const VAddr page = static_cast<VAddr>(words[0]) | (static_cast<VAddr>(words[1]) << 32);
-                sink.page(sink.user, page);
+                // sotc: view_class holds the page flags, words[2..4] the access's V# (gcn_layout.h).
+                const VAddr base = static_cast<VAddr>(words[2]) | (static_cast<VAddr>(words[3]) << 32);
+                sink.page(sink.user, page, view_class, base, words[4]);
             }
             break;
         case Shader::Gcn::kMissImage:
             g_image.fetch_add(1, std::memory_order_relaxed);
+            g_image_total.fetch_add(1, std::memory_order_relaxed);
             if (sink.image) {
                 sink.image(sink.user, words, view_class);
             }
             break;
         case Shader::Gcn::kMissSampler: {
             g_sampler.fetch_add(1, std::memory_order_relaxed);
+            g_sampler_total.fetch_add(1, std::memory_order_relaxed);
             if (sink.sampler) {
                 const u32 ssharp[4] = {words[0], words[1], words[2], words[3]};
                 sink.sampler(sink.user, ssharp, view_class);
@@ -239,6 +260,8 @@ void DrainMisses(const MissSink& sink) {
         }
         s->read_index = i + 1;
     }
+    g_last_write.store(write, std::memory_order_relaxed); // sotc: for the report (the ring's state, not a rate)
+    g_last_read.store(s->read_index, std::memory_order_relaxed);
 
     // Dedup starts over for the next submit. Records of work still in flight are re-appended if they miss again.
     std::memset(base + Shader::Gcn::kSeenOffset, 0, Shader::Gcn::kSeenBits / 8);
@@ -256,9 +279,23 @@ void Report(char* out, u32 size, double seconds) {
     const u64 image = g_image.exchange(0, std::memory_order_relaxed);
     const u64 sampler = g_sampler.exchange(0, std::memory_order_relaxed);
     const u64 overflows = g_overflows.exchange(0, std::memory_order_relaxed);
-    std::snprintf(out, size, "SOTC GCN GLOBALS: misses page %.1f/s image %.1f/s sampler %.1f/s, overflows %llu",
+    // sotc: the rates are per window; the totals are since start, and write/read index are the ring as the last drain
+    // saw it (write_index read live from the mapping too), so a window with no drained record is not "no misses".
+    const u32 live_write = LoadAcquire(&reinterpret_cast<const MissRingHeader*>(
+                                            g_state->mapped + Shader::Gcn::kMissRingOffset)->write_index);
+    std::snprintf(out, size,
+                  "SOTC GCN GLOBALS: misses page %.1f/s image %.1f/s sampler %.1f/s, overflows %llu; totals page %llu "
+                  "image %llu sampler %llu overflows %llu, in-flight stops %llu, ring write_index %u (live %u) "
+                  "read_index %u",
                   seconds > 0.0 ? page / seconds : 0.0, seconds > 0.0 ? image / seconds : 0.0,
-                  seconds > 0.0 ? sampler / seconds : 0.0, static_cast<unsigned long long>(overflows));
+                  seconds > 0.0 ? sampler / seconds : 0.0, static_cast<unsigned long long>(overflows),
+                  static_cast<unsigned long long>(g_page_total.load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_image_total.load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_sampler_total.load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_overflow_total.load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_pending_stops.load(std::memory_order_relaxed)),
+                  g_last_write.load(std::memory_order_relaxed), live_write,
+                  g_last_read.load(std::memory_order_relaxed));
 }
 
 } // namespace SotcGcn::Globals

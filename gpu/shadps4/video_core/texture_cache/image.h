@@ -20,6 +20,7 @@
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_TEX (MarkGpuModified)
 #include "video_core/sotc_arch/sotc_arch.h" // sotc: SOTC_LAYOUT_UNIFIED (SotcArch::Layouts)
 #include "video_core/sotc_arch/bindset_events.h" // sotc: SOTC_BINDSET (the first GPU write moves candidates' Range)
+#include "video_core/sotc_arch/addr_table_hooks.h" // sotc: SOTC_ADDR_TABLE (MarkGpuModified: NoteGpuWrite)
 
 namespace Vulkan {
 class Instance;
@@ -339,6 +340,9 @@ inline void MarkGpuModified(Image& image, bool bump_epoch = true) {
                                      image.info.guest_address + image.info.guest_size);
     }
     image.flags |= ImageFlagBits::GpuModified;
+    // sotc: SOTC_ADDR_TABLE: every GPU write of the image (not only the first) over placed table pages refuses their
+    // address fast paths until a slow Touch syncs them (addr_table_hooks.h). One relaxed load with the table off.
+    SotcArch::AddrTable::NoteGpuWrite(image.info.guest_address, image.info.guest_size);
 }
 
 } // namespace VideoCore

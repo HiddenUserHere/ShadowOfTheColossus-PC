@@ -33,4 +33,26 @@ inline void DirtyMask(VAddr base, u64 mask) noexcept {
     }
 }
 
+/// sotc: out of line: a GPU write marked [addr, addr + size) GPU-modified (see NoteGpuWrite).
+void GpuWriteRange(VAddr addr, u64 size) noexcept;
+/// sotc: out of line: a formatted (texel) read inside Touch copied an aliasing image into the arena (counted).
+void TexelImageSynced() noexcept;
+
+/// sotc: the buffer cache (AddGpuModified) or the texture cache (MarkGpuModified) marked a range GPU-modified. Its
+/// placed pages lose their clean bit and get a GPU-modified mark, so no fast path (Touch, Buf::BindAddressed) answers
+/// them before a slow Touch has synchronized them again. Ignored inside Touch's own ObtainBuffer (that sync is the one
+/// that sets the bits). Table mode only: one relaxed load while the table is off.
+inline void NoteGpuWrite(VAddr addr, u64 size) noexcept {
+    if (g_hooks_on.load(std::memory_order_relaxed) && size != 0) {
+        GpuWriteRange(addr, size);
+    }
+}
+
+/// sotc: SynchronizeMemoryFromImage copied an image into the arena (counted only inside Touch, table mode only).
+inline void NoteTexelImageSync() noexcept {
+    if (g_hooks_on.load(std::memory_order_relaxed)) {
+        TexelImageSynced();
+    }
+}
+
 } // namespace SotcArch::AddrTable

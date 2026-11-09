@@ -6479,6 +6479,9 @@ u64 BufferCache::AddGpuModified(VAddr addr, u64 size) {
     // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA: a GPU write invalidates the bind memo of its range (the
     // memo never reads GPU bits, so this is conservative). Before any early return below.
     SotcGen::Bump(addr, size);
+    // sotc: SOTC_ADDR_TABLE: a GPU write over placed table pages makes their address fast paths refuse until a slow
+    // Touch syncs them (addr_table_hooks.h). Ignored inside Touch's own bind; one relaxed load with the table off.
+    SotcArch::AddrTable::NoteGpuWrite(addr, size);
     if (SotcProbes::FaultOwnersOn()) { // sotc: SOTC_FAULT_OWNERS: the age of the mark at a later write fault
         SotcProbes::NoteGpuWriteStamp(addr, size);
     }
@@ -10150,6 +10153,7 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     auto& tile_manager = texture_cache.GetTileManager();
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
     RecordCurrentWrite(device_addr, size);
+    SotcArch::AddrTable::NoteTexelImageSync(); // sotc: SOTC_ADDR_TABLE counter (formatted reads of Touch only)
     return true;
 }
 

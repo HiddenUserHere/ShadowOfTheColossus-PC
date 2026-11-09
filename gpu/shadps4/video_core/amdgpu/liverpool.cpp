@@ -177,6 +177,14 @@ static std::atomic<u64> g_lbl_waits{}, g_lbl_skippable{}, g_lbl_skipped{}, g_lbl
 static std::atomic<u64> g_bw_exact_ops{};
 // SOTC_CP_LABEL_SLEEP: futex sleeps of the CP round loop, those ended by a wake (progress seen) and by the timeout.
 static std::atomic<u64> g_cp_sleeps{}, g_cp_sleep_wakes{}, g_cp_sleep_timeouts{}, g_cp_sleep_ns{};
+// sotc: SOTC_CP_LABEL_SLEEP long streaks: runs of CP sleeps with no progress between them that lasted 100 ms or more
+// (count and longest, per report window), and the start of the run in progress (0: none), so a hang that never ends
+// still shows in the report. Written by the command processor, read by the 5 s report.
+static std::atomic<u64> g_cp_sleep_long{}, g_cp_sleep_long_max_ns{}, g_cp_sleep_run_start_ns{};
+// sotc: the last WAIT_REG_MEM a task yielded in during the current no-progress streak (command processor thread only;
+// the packet lives in a command buffer of a pending task while it waits), for the long-streak log line.
+static const PM4CmdWaitRegMem* g_cp_last_wait = nullptr;
+static u32 g_cp_last_wait_q = 0;
 // SOTC_RING8_CACHE: submit lookaheads served from the cache, walked, and cache entries refused (content changed).
 static std::atomic<u64> g_ring8_hits{}, g_ring8_walks{}, g_ring8_stale{};
 // sotc: SOTC_BACK_WRITE_EXACT: the writes_memory flag of an op that provably writes no guest memory.
@@ -376,6 +384,19 @@ static void ReportPlanC(std::string& out, double seconds) {
                       static_cast<unsigned long long>(wakes), static_cast<unsigned long long>(timeouts),
                       static_cast<double>(ns) / 1e6 * per_s);
         out += line;
+        // sotc: sleep runs of 100 ms or more without progress (a hang shows as a run still in progress).
+        const u64 long_n = g_cp_sleep_long.exchange(0, std::memory_order_relaxed);
+        const u64 long_max = g_cp_sleep_long_max_ns.exchange(0, std::memory_order_relaxed);
+        const u64 run_start = g_cp_sleep_run_start_ns.load(std::memory_order_relaxed);
+        const u64 now = SotcStats::NowNs();
+        if (long_n || run_start) {
+            std::snprintf(line, sizeof line,
+                          "SOTC CP label sleep long runs (>=100 ms without progress): %llu, longest %.1f ms, "
+                          "asleep now %.1f ms in a row\n",
+                          static_cast<unsigned long long>(long_n), static_cast<double>(long_max) / 1e6,
+                          run_start && now > run_start ? static_cast<double>(now - run_start) / 1e6 : 0.0);
+            out += line;
+        }
     }
     if (SotcNonBlocking::Ring8Cache()) {
         const u64 hits = g_ring8_hits.exchange(0, std::memory_order_relaxed);
@@ -4080,6 +4101,36 @@ bool Liverpool::CpRoundSleep(u64 seen_epoch) {
     return notified;
 }
 
+// sotc: SOTC_CP_LABEL_SLEEP. What the command processor waits on after a long run of sleeps: the last WAIT_REG_MEM
+// a task yielded in during the streak (address, value now, function, reference, mask), and the writers it may wait
+// for: queued draw thread ops (back_tail/back_head, back_write_seq), deferred GPU labels (eop_outstanding), submits.
+void Liverpool::LogCpSleepRun(u64 run_ns) {
+    char wait[192] = "no WAIT_REG_MEM in the streak (semaphore, rewind or counter wait)";
+    if (const PM4CmdWaitRegMem* w = g_cp_last_wait) {
+        if (w->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+            const u32* addr = w->Address<const u32*>();
+            std::snprintf(wait, sizeof wait,
+                          "queue %u WAIT_REG_MEM mem %#llx value %#x func %u ref %#x mask %#x%s", g_cp_last_wait_q,
+                          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(addr)), *addr,
+                          static_cast<unsigned>(w->function.Value()), w->ref, w->mask,
+                          vo_port && vo_port->IsVoLabel(w->Address<u64*>()) ? " (VO label)" : "");
+        } else {
+            std::snprintf(wait, sizeof wait, "queue %u WAIT_REG_MEM reg %#x value %#x func %u ref %#x mask %#x",
+                          g_cp_last_wait_q, w->Reg(), regs.reg_array[w->Reg()],
+                          static_cast<unsigned>(w->function.Value()), w->ref, w->mask);
+        }
+    }
+    std::fprintf(stderr,
+                 "SOTC CP label sleep: %.1f ms asleep without progress; %s; draw ops tail %llu head %llu "
+                 "write_seq %llu; deferred labels %u; submits %u\n",
+                 static_cast<double>(run_ns) / 1e6, wait,
+                 static_cast<unsigned long long>(back_tail.load(std::memory_order_acquire)),
+                 static_cast<unsigned long long>(back_head.load(std::memory_order_acquire)),
+                 static_cast<unsigned long long>(back_write_seq),
+                 static_cast<unsigned>(eop_outstanding.load(std::memory_order_acquire)),
+                 static_cast<unsigned>(num_submits.load(std::memory_order_acquire)));
+}
+
 void Liverpool::WakeCpRound() noexcept {
 #ifdef _WIN32
     ::WakeByAddressAll(&cp_wake_epoch);
@@ -4226,6 +4277,8 @@ void Liverpool::Process(std::stop_token stoken) {
         u64 streak_start_ns = 0; // start of the streak, or of the spin window after a wake
         u64 pending_rounds = 0;  // SOTC_FPS rounds not yet added to the counters
         u32 still_rounds = 0;    // sotc: SOTC_CP_LABEL_SLEEP: whole rounds without progress in the streak
+        u64 sleep_run_start = 0; // sotc: SOTC_CP_LABEL_SLEEP: first sleep of the streak (0: none yet)
+        u64 sleep_run_logged = 0; // sotc: the run length (ns) at which the last long-run line was logged
         std::array<u64, SotcStats::CpSpinKinds> pending_kinds{};
         const auto publish_rounds = [&] {
             if (pending_rounds) {
@@ -4247,6 +4300,22 @@ void Liverpool::Process(std::stop_token stoken) {
             idle_due = false;
             idle_iters = 0;
             still_rounds = 0; // sotc: SOTC_CP_LABEL_SLEEP
+            // sotc: SOTC_CP_LABEL_SLEEP: a run of sleeps ends at the first progress; 100 ms or more is counted.
+            if (sleep_run_start) {
+                const u64 run = SotcStats::NowNs() - sleep_run_start;
+                if (run >= 100'000'000) {
+                    g_cp_sleep_long.fetch_add(1, std::memory_order_relaxed);
+                    SotcStats::GateStoreMax(g_cp_sleep_long_max_ns, run);
+                }
+                if (sleep_run_logged) {
+                    std::fprintf(stderr, "SOTC CP label sleep: progress after %.1f ms asleep without progress\n",
+                                 static_cast<double>(run) / 1e6);
+                }
+                sleep_run_start = 0;
+                sleep_run_logged = 0;
+                g_cp_sleep_run_start_ns.store(0, std::memory_order_relaxed);
+            }
+            g_cp_last_wait = nullptr;
         };
 
         while (num_submits || (num_commands && !back_threaded) || num_ordered) {
@@ -4311,10 +4380,21 @@ void Liverpool::Process(std::stop_token stoken) {
                             }
                             publish_rounds();
                         }
+                        if (!sleep_run_start) {
+                            sleep_run_start = SotcStats::NowNs();
+                            g_cp_sleep_run_start_ns.store(sleep_run_start, std::memory_order_relaxed);
+                        }
                         const bool notified = CpRoundSleep(round_epoch);
                         mark_ns = SotcStats::NowNs();
                         streak_resumes = 0;
                         since_progress = 0;
+                        // sotc: a run of 1 s without progress is logged (then at 2, 4, 8 s ...) with what the CP
+                        // waits on: the last WAIT_REG_MEM of the streak and the state of its possible writers.
+                        if (const u64 run = mark_ns - sleep_run_start;
+                            run >= 1'000'000'000 && run >= 2 * sleep_run_logged) {
+                            sleep_run_logged = run;
+                            LogCpSleepRun(run);
+                        }
                         // After a notification the rounds before the next sleep run again (the
                         // condition probably just changed); after a timeout one round re-tests the
                         // waits the guest CPU writes, then the thread sleeps again.
@@ -4708,8 +4788,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // sotc: ARCH-GCN-NATIVE (gcn_native.h). The miss drain and the per-submit freshness batch, on the draw thread
     // before this submit's ops (outermost gfx submit only).
     if (pc_ring_top && rasterizer && (SotcGcn::Mem::On() || SotcGcn::Tex::On())) {
-        // sotc: SOTC_BACK_WRITE_EXACT: miss drain (residency, uploads) and sync batch, no guest write.
-        BackOrRun([r = rasterizer] { r->GcnSubmitStart(); }, BackWritesFor(true));
+        // sotc: SOTC_BACK_WRITE_EXACT: miss drain (residency, uploads) and sync batch, no guest write while no guest
+        // page is tracked (SOTC_NATIVE). In the tracked modes a miss Touch goes through ObtainBuffer, whose sync can
+        // read GPU-written bytes back into guest memory, so the op keeps its write there.
+        BackOrRun([r = rasterizer] { r->GcnSubmitStart(); }, BackWritesFor(!SotcNative::TracksGuestPages()));
     }
 
     // TODO: potentially, ASCs also can depend on CE and in this case the
@@ -5777,6 +5859,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         cp_wait_kind = MemWaitKind(*wait_reg_mem, vo_port->IsVoLabel(wait_addr));
                     }
                     spin_scope.Round(); // sotc: SOTC_CMD_COUNTERS
+                    g_cp_last_wait = wait_reg_mem; // sotc: SOTC_CP_LABEL_SLEEP long-run log
+                    g_cp_last_wait_q = GfxQueueId;
                     YIELD_GFX();
                 }
                 ++cp_wait_exits; // sotc: progress marker (Process)
@@ -5939,8 +6023,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     }
     // sotc: ARCH-GCN-NATIVE: a compute submit gets the same submit-start batch (outermost call only).
     if (pc_ring_asc.top && rasterizer && (SotcGcn::Mem::On() || SotcGcn::Tex::On())) {
-        // sotc: SOTC_BACK_WRITE_EXACT: miss drain (residency, uploads) and sync batch, no guest write.
-        BackOrRun([r = rasterizer] { r->GcnSubmitStart(); }, BackWritesFor(true));
+        // sotc: SOTC_BACK_WRITE_EXACT: miss drain (residency, uploads) and sync batch, no guest write while no guest
+        // page is tracked (SOTC_NATIVE). In the tracked modes a miss Touch goes through ObtainBuffer, whose sync can
+        // read GPU-written bytes back into guest memory, so the op keeps its write there.
+        BackOrRun([r = rasterizer] { r->GcnSubmitStart(); }, BackWritesFor(!SotcNative::TracksGuestPages()));
     }
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
@@ -6268,6 +6354,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     cp_wait_kind = MemWaitKind(
                         *wait_reg_mem, vo_port && vo_port->IsVoLabel(wait_reg_mem->Address<u64*>()));
                 }
+                g_cp_last_wait = wait_reg_mem; // sotc: SOTC_CP_LABEL_SLEEP long-run log
+                g_cp_last_wait_q = vqid + 1;   // the mapped queue (0 is graphics)
                 YIELD_ASC(vqid);
             }
             ++cp_wait_exits; // sotc: progress marker (Process)

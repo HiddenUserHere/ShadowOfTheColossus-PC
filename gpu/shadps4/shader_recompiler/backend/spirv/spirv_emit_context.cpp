@@ -1572,7 +1572,7 @@ Id EmitContext::TableAddresses(u32 handle, Id index, u32 elem_size, u32 count,
 
     // sotc: SOTC_GCN_BUF. An access in the block with a page that is not resident appends one page miss (the first
     // missing page; gcn_layout.h). Only the lanes with a zero entry run the branch; the record code is one function.
-    if (profile.gcn_buf != 0 && GcnMissEmit()) { // sotc: SOTC_GCN_MISS_EMIT=0 is a measurement switch (info.h)
+    if (profile.gcn_buf != 0 && GcnMissEmit()) { // sotc: only with SOTC_GCN_MISS_EMIT=1 (default off, info.h)
         const Id first_missing{OpIEqual(U1[1], entry_first, u64_zero_value)};
         const Id any_missing{count > 1 ? OpLogicalOr(U1[1], first_missing,
                                                      OpIEqual(U1[1], entry_last, u64_zero_value))
@@ -1582,10 +1582,11 @@ Id EmitContext::TableAddresses(u32 handle, Id index, u32 elem_size, u32 count,
                                                 OpBitwiseAnd(U64, guest_last, page_mask))
                                      : page_first};
         const Id miss_merge{BdaBeginIf(miss)};
+        const Id miss_flags{GcnPageMissFlags(handle)}; // sotc: formatted / written, and the V#, in the record
         if (Sirit::ValidId(gcn_page_miss_func)) {
-            OpFunctionCall(void_id, gcn_page_miss_func, miss_page);
+            OpFunctionCall(void_id, gcn_page_miss_func, miss_page, miss_flags, guest_base, block_size);
         } else {
-            GcnPageMiss(miss_page);
+            GcnPageMiss(miss_page, miss_flags, guest_base, block_size);
         }
         BdaEndIf(miss_merge);
     }
@@ -1649,7 +1650,18 @@ Id EmitContext::GcnHash(std::span<const Id> words, u32 seed) {
 // record is appended: index from atomicIAdd on write_index, body first, stamp (index + 1) last (gcn_layout.h).
 // Called inside a branch that runs only for a missing page; the record is dropped when the ring is full (the slot
 // wraps, the host counts the overflow).
-void EmitContext::GcnPageMiss(Id page) {
+// sotc: the flags of a page miss of buffer `handle`: what the host bind passes to Touch (is_formatted, is_written).
+Id EmitContext::GcnPageMissFlags(u32 handle) {
+    u32 flags = 0;
+    if (handle < info.buffers.size()) {
+        const auto& desc = info.buffers[handle];
+        flags = (desc.is_formatted ? Shader::Gcn::kMissPageFormatted : 0u) |
+                (desc.is_written ? Shader::Gcn::kMissPageWritten : 0u);
+    }
+    return ConstU32(flags);
+}
+
+void EmitContext::GcnPageMiss(Id page, Id flags, Id guest_base, Id block_size) {
     const Id globals{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64),
                                                push_data_block, ConstU32(shader_addr_member + 2)))};
     const auto field = [&](u32 offset) { // a u32 field of the globals buffer
@@ -1683,12 +1695,27 @@ void EmitContext::GcnPageMiss(Id page) {
                 spv::MemoryAccessMask::Aligned, 4u);
     };
     body(4, ConstU32(static_cast<u32>(Shader::Gcn::kMissPage))); // kind
-    body(8, u32_zero_value);                                     // view_class
+    body(8, flags);                                              // view_class: the page miss flags (sotc)
     body(12, u32_zero_value);                                    // reserved
     body(16, lo);                                                // words[0]
     body(20, hi);                                                // words[1]
-    body(0, OpIAdd(U32[1], idx, ConstU32(1u)));                  // stamp, last
+    // sotc: words[2..4]: the V# guest base and block size (gcn_layout.h, kMissPage payload).
+    body(24, OpUConvert(U32[1], guest_base));
+    body(28, OpUConvert(U32[1], OpShiftRightLogical(U64, guest_base, Constant(U64, 32ULL))));
+    body(32, block_size);
+    // sotc: the stamp, last, as an atomic store with Release semantics: the body stores above are made available
+    // before it (a plain store gave no order, so the host could see the stamp with a stale body).
+    GcnStoreStamp(record, OpIAdd(U32[1], idx, ConstU32(1u)));
     BdaEndIf(fresh_merge);
+}
+
+// sotc: SOTC_GCN_BUF / SOTC_GCN_TEX. The stamp of a miss record (U64 address of the record's first word): an
+// OpAtomicStore, Device scope, Release | UniformMemory (UniformMemory covers PhysicalStorageBuffer in Vulkan).
+void EmitContext::GcnStoreStamp(Id record_address, Id stamp) {
+    const Id scope{ConstU32(static_cast<u32>(spv::Scope::Device))};
+    const Id semantics{ConstU32(static_cast<u32>(spv::MemorySemanticsMask::Release |
+                                                 spv::MemorySemanticsMask::UniformMemory))};
+    OpAtomicStore(BdaPointer(record_address, U32[1]), scope, semantics, stamp);
 }
 
 // sotc: SOTC_ADDR_TABLE. BdaLoad with one translated address per element (TableAddresses). Each element is valid on
@@ -1703,7 +1730,8 @@ Id EmitContext::BdaLoadTable(u32 handle, Id index, u32 elem_size, Id elem_type, 
         const auto [guest_base, block_size] = hoisted ? bda_blocks[handle] : LoadBdaBlock(handle);
         const u32 elem_shift = static_cast<u32>(std::countr_zero(elem_size));
         const Id packed{OpFunctionCall(gcn_table_addr_result, gcn_table_addr_func, guest_base, block_size, index,
-                                       ConstU32(elem_shift), ConstU32(count))};
+                                       ConstU32(elem_shift), ConstU32(count),
+                                       GcnPageMissFlags(handle))}; // sotc: the miss flags (gcn_table_addr)
         const Id addresses{OpCompositeExtract(gcn_table_u64x4, packed, 0u)};
         const Id oks{OpCompositeExtract(U32[4], packed, 1u)};
         for (u32 i = 0; i < count; i++) {
@@ -2550,12 +2578,16 @@ void EmitContext::DefineFunctions() {
     }
     // sotc: SOTC_GCN_BUF: the page-miss record as one function, called from every table access (TableAddresses).
     if (profile.gcn_buf != 0 && GcnMissEmit() && ShaderAddrTableMode(profile) && UsesShaderAddr(profile, info)) {
-        const Id func_type{TypeFunction(void_id, U64)};
+        // sotc: gcn_page_miss(page U64, flags U32, guest_base U64, block_size U32) (GcnPageMiss).
+        const Id func_type{TypeFunction(void_id, U64, U32[1], U64, U32[1])};
         gcn_page_miss_func = OpFunction(void_id, spv::FunctionControlMask::DontInline, func_type);
         const Id page{OpFunctionParameter(U64)};
+        const Id miss_flags{OpFunctionParameter(U32[1])};
+        const Id miss_base{OpFunctionParameter(U64)};
+        const Id miss_size{OpFunctionParameter(U32[1])};
         Name(gcn_page_miss_func, "gcn_page_miss");
         AddLabel();
-        GcnPageMiss(page);
+        GcnPageMiss(page, miss_flags, miss_base, miss_size);
         OpReturn();
         OpFunctionEnd();
     }
@@ -2567,13 +2599,15 @@ void EmitContext::DefineFunctions() {
     if (SpvFuncs() && ShaderAddrTableMode(profile) && UsesShaderAddr(profile, info) && Sirit::ValidId(U64)) {
         gcn_table_u64x4 = TypeVector(U64, 4);
         gcn_table_addr_result = TypeStruct(gcn_table_u64x4, U32[4]);
-        const Id func_type{TypeFunction(gcn_table_addr_result, U64, U32[1], U32[1], U32[1], U32[1])};
+        // sotc: the last parameter is the page-miss flags of the calling access (GcnPageMissFlags).
+        const Id func_type{TypeFunction(gcn_table_addr_result, U64, U32[1], U32[1], U32[1], U32[1], U32[1])};
         gcn_table_addr_func = OpFunction(gcn_table_addr_result, spv::FunctionControlMask::DontInline, func_type);
         const Id guest_base{OpFunctionParameter(U64)};
         const Id block_size{OpFunctionParameter(U32[1])};
         const Id index{OpFunctionParameter(U32[1])};
         const Id elem_shift{OpFunctionParameter(U32[1])};
         const Id count{OpFunctionParameter(U32[1])};
+        const Id miss_flags{OpFunctionParameter(U32[1])};
         Name(gcn_table_addr_func, "gcn_table_addr");
         AddLabel();
 
@@ -2624,7 +2658,7 @@ void EmitContext::DefineFunctions() {
             const Id miss_page{
                 OpSelect(U64, first_missing, page_first, OpBitwiseAnd(U64, guest_last, page_mask))};
             const Id miss_merge{BdaBeginIf(miss)};
-            OpFunctionCall(void_id, gcn_page_miss_func, miss_page);
+            OpFunctionCall(void_id, gcn_page_miss_func, miss_page, miss_flags, guest_base, block_size);
             BdaEndIf(miss_merge);
         }
 

@@ -75,7 +75,8 @@ vk::DeviceAddress Address();
 u8* Mapped();
 /// Kind-specific consumers of the drained records.
 struct MissSink {
-    void (*page)(void* user, VAddr page_addr) = nullptr;                           ///< kMissPage
+    /// kMissPage. sotc: flags (Shader::Gcn::kMissPage*), base and size: the access's V# (gcn_layout.h).
+    void (*page)(void* user, VAddr page_addr, u32 flags, VAddr base, u32 size) = nullptr;
     void (*image)(void* user, const u32 (&tsharp)[8], u32 view_class) = nullptr;   ///< kMissImage
     void (*sampler)(void* user, const u32 (&ssharp)[4], u32 sampler_class) = nullptr; ///< kMissSampler
     void* user = nullptr;
@@ -122,7 +123,11 @@ u8 ProfileValue();
 bool BindAddressed(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr addr, u64 size,
                    bool is_written, bool is_texel = false);
 /// MissSink::page target: makes the page resident through AddrTable::Touch (counted). Takes no lock itself.
-void OnPageMiss(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr page_addr);
+/// sotc: a formatted or written access (flags) touches its whole V# range [base, base + size) with its own is_texel /
+/// is_written, as the bind does; a plain read touches the page only, and not at all when the page is placed by then
+/// (its entry is valid: a miss Touch must not rewrite it).
+void OnPageMiss(VideoCore::BufferCache& cache, Vulkan::Scheduler& scheduler, VAddr page_addr, u32 flags, VAddr base,
+                u32 size);
 void Report(char* out, u32 size, double seconds);
 } // namespace Buf
 

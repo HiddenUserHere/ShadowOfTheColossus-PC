@@ -870,6 +870,13 @@ private:
     std::condition_variable_any urgent_cv;
     /// sotc: SOTC_ASYNC_COMPUTE_XLATE: waits for (or takes back) a prefetched translation.
     void WaitPendingTranslation(u64 hash);
+    /// sotc: SOTC_SHADER_ADDR (table mode). A compute translation the command processor would make inline (a new
+    /// program, or a new permutation of `program` for `spec`) is queued on the Urgent lane and waited for here, so
+    /// the SPIR-V emit and the driver's module compile run on a worker. True when the translation was installed (the
+    /// lookup then finds it); false when it does not apply (descriptor mode, no workers) or timed out. CP only.
+    bool TranslateComputeOnWorker(const Shader::ShaderParams& params, const Shader::RuntimeInfo& rt,
+                                  const Shader::Backend::Bindings& start, Program* program,
+                                  const Shader::StageSpecialization* spec, size_t perm_idx);
     /// sotc: urgent_only (SOTC_GPL_URGENT_WORKERS): serves the Urgent and Predict lanes only. extra (SOTC_GPL_PACK_LEAN):
     /// a worker of the pack hold, which leaves when extra_workers_quit is set.
     void AsyncPipelineWorker(std::stop_token token, bool urgent_only = false, bool extra = false);

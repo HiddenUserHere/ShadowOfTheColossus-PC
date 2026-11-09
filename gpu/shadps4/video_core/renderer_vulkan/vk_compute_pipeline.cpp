@@ -109,6 +109,19 @@ void ReportComputeSpecFree(std::string& out, double seconds) {
                   static_cast<unsigned long long>(g_specfree.perms_queued.load(std::memory_order_relaxed)),
                   static_cast<unsigned long long>(g_specfree.fallback_int_capped.load(std::memory_order_relaxed)));
     out += line;
+    // sotc: SOTC_SHADER_ADDR (table mode): the CP's compute translations (totals); never printed in descriptor mode.
+    const u64 cp_worker = g_specfree.cp_worker.load(std::memory_order_relaxed);
+    const u64 cp_inline = g_specfree.cp_inline.load(std::memory_order_relaxed);
+    if (cp_worker != 0 || cp_inline != 0) {
+        std::snprintf(line, sizeof(line),
+                      "SOTC COMPUTE CP TRANSLATE: on a worker %llu (CP waited %.1f ms, timeouts %llu), inline on the "
+                      "CP %llu\n",
+                      static_cast<unsigned long long>(cp_worker),
+                      static_cast<double>(g_specfree.cp_worker_ns.load(std::memory_order_relaxed)) / 1e6,
+                      static_cast<unsigned long long>(g_specfree.cp_worker_timeouts.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(cp_inline));
+        out += line;
+    }
 }
 
 // sotc: SOTC_COMPUTE_FAST, the 5 s report line (window counts). Nothing while the switch is off or the window was empty.

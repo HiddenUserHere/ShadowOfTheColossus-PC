@@ -91,6 +91,9 @@ vk::DeviceAddress Translate(VAddr addr);
 /// sotc: SOTC_GCN_MEM. True when every table page of [addr, addr + size) is placed (non-zero entry). False for size 0
 /// and for a range that is not wholly inside the window. Any thread, lock-free.
 bool AllPlaced(VAddr addr, u64 size) noexcept;
+/// sotc: true when a page of [addr, addr + size) carries a GPU-modified mark (NoteGpuWrite) that no slow Touch has
+/// synchronized since. Buf::BindAddressed's placed-page fast path refuses such a range. Any thread, lock-free.
+bool AnyGpuModified(VAddr addr, u64 size) noexcept;
 /// sotc: SOTC_GCN_SYNC. Calls fn(user, addr, size) for every maximal run of table pages that are placed and not clean
 /// (merged across adjacent pages). Draw thread, once per submit. Lock-free scan of the bit words (64 pages each,
 /// all-zero words skipped); no lock is held while fn runs. A page that changes during the scan is either reported or
