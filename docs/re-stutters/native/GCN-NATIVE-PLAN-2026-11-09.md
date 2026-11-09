@@ -161,6 +161,29 @@ The slow frames are not bind cost:
 - **S2 alone is slower:** draw 37 ms against 24 ms, about 21 FPS in the user's session. The bind is not skipped
   yet, and every buffer read pays the table lookup. The gain needs steps 2 and 4.
 
+## Step 2 status (9 Nov, code only, not run)
+
+- **Registration ahead of draws** behind `SOTC_GCN_TEX_REGISTER=1` (needs `SOTC_GCN_TEX`; off by default). Hooks in
+  `scripts/hooks.d/gcn_tex_register.py`, handlers in `gpu/sotc/gcn_tex_register.cpp`, queue and drain in `gcn_tex.cpp`.
+  - Material blocks: read at the factory post-phase through the existing `PIPE_PREDICT_MATERIAL` wrap (the loader
+    turns it on for this switch). Block data T#s, plus the payload T#s when they differ.
+  - In-place rewrites: `0x881e60` (wrap) and a site inside `0x880c30` (`0x880c46`, so `TEXLIFE_LEVEL` can stay on the
+    entry). The new T# takes the view classes of the old one, and the old entries become tombstones. A rewrite of a T#
+    the table does not hold is only counted. The block walkers are not hooked: they copy words these two write.
+  - Render targets: `0x97a50` wrap. Pass textures: entries of the T# setters `0x861fe0` and `0x862160` (every caller).
+  - The draw thread resolves the queue at submit start (`Globals::DrainMisses` → `Tex::DrainRegistered` →
+    `OnImageMiss`), at most `SOTC_GCN_TEX_REGISTER_BUDGET` (64) views per submit. Registered entries may take at most
+    half of each heap array (`slot-cap` counter), because every live entry pins its slot.
+  - The view class is learned from the per-op resolves per T# shape; before that it is guessed (not depth; array for
+    array and cube types).
+- `SOTC_GCN_TEX_REGISTER_SOURCES` (mask: 1 material, 2 refresh, 4 render target, 8 pass) and
+  `SOTC_GCN_TEX_REGISTER_LOG=1` (one-time render-target log: the per-op T# next to the object's `+0xc4`, `+0xe4`,
+  `+0x124`, `+0x164`; it settles the `+0xe4` question).
+- 5 s line `SOTC GCN TEX REGISTER`: queued, inserted, present and failed per source, refreshes, table size, and the
+  per-op lookups that found a registered entry (the gate for step 4).
+- Not covered: a material whose list entry was still the pool default at parse gets the real T# later through the
+  walkers; that T# is not registered (the per-op path still inserts it).
+
 ## Plan
 
 Each step is behind a switch, off by default, with a verify mode where one exists. Measure one round per config
@@ -220,3 +243,28 @@ logic: shadows, G-buffer, lighting, post, water, fur and particles, about 30–4
 graphics and 4,252 compute shaders could be kept, translated as today. No PS4 project has done it; RT64 shows the
 pattern works when the renderer is a separate component that replays the game's draw calls. Steps 1–4 deliver
 most of the bind saving without it, so the rewrite stays a later option. Step 6 is its prerequisite.
+
+## S3 (texture table on the heap) measured, 9 Nov 2026
+
+Warm route, one round each (`user/prof/m0/*.out`), after the heap compute prebuild fix (compute: 4,253 programs
+prebuilt, 1 at first dispatch) and the sampled verify (mapping read for 1 resolve in 64, the host shadow otherwise;
+reading the ReBAR mapping on every resolve cost 100-250 ms/s of draw time):
+
+| Run | CP ms | Draw ms | p50 | p99 | >50 ms |
+|---|---|---|---|---|---|
+| descriptor mode, smooth set (`e_desc_base`) | 16.0 | 22.3 | 33.3 | 41.7 | 0 |
+| S2 table + sync (`f_s2sync`) | 10.7 | 21.3 | 33.4 | 50.4 | 6 |
+| S2 + bind skip, GCN_BUF=1 (`g_buf1_skip`) | 14.5 | 23.8 | 33.4 | 50.1 | 4 |
+| + heap stack, no texture table (`k_heap_only_warm`) | 17.7 | 26.5 | 33.4 | 74.4 | 31 |
+| + texture table verify + register (`l_tex2_reg`) | 13.4 | 29.2 | 41.6 | 84.1 | 39 |
+| + texture table skip (`l_tex1_skip`) | 21.5 | 30.5 | 41.7 | 101.3 | 52 |
+
+Texture table verify: 0 mismatches in every run. But the heap stack (HEAP + N5_BINDLESS + BINDLESS_SAMP +
+LAYOUT_UNIFIED) costs more draw time than the texture skip saves, and the skip itself shows no gain over verify.
+S3 on the heap is not a lever as built; descriptor mode stays the play default. The first `k_heap_tex_warm` run
+(2.4 FPS) was confounded by ~434 pipelines missing from the manifest, not by a key mismatch.
+
+Found on the way, all configurations: 134 stages are never prebuilt ("specialization differs", diff masks
+00300100 / 00200180 / 00300180 = image swizzle + conversion, buffers) because `BuildHint`
+(`gpu/sotc/pretranslate.cpp:255-258`) drops images whose raw T# is not valid, so the manifest translation uses the
+synthetic default T#. Fix: record invalid images in the hint (hint format change).

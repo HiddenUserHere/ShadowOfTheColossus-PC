@@ -133,6 +133,15 @@ constexpr u32 StageDescriptorSet(SwStage stage) {
     }
 }
 
+/// sotc: the descriptor set of the bindless heap (SOTC_BINDLESS_SAMP / SOTC_N5_BINDLESS / SOTC_HEAP). A pipeline with
+/// one set (set 0, compute included) has it at set 1. With a set per stage (SOTC_STAGE_BINDINGS) it follows every
+/// stage set, at MaxStageDescriptorSets: the stage sets are fixed per stage, so a stage's SPIR-V names the same set in
+/// every pipeline, and the graphics layout pads its unused stage sets with empty layouts up to it. `stage_sets` is
+/// Profile::stage_bindings for a graphics stage, false for compute (Pipeline::BindlessSetIndex on the host side).
+constexpr u32 BindlessDescriptorSet(bool stage_sets) {
+    return stage_sets ? MaxStageDescriptorSets : 1u;
+}
+
 constexpr auto MaxEmulatedClipDistances = 4u;
 
 constexpr HwStage StageFromIndex(size_t index) noexcept {

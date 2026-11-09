@@ -58,12 +58,153 @@
 #include "video_core/sotc_arch/addr_table.h" // sotc: ARCH-GCN-NATIVE (Init before the profile)
 #include "video_core/sotc_arch/gcn_native.h" // sotc: ARCH-GCN-NATIVE (Profile::gcn_buf, gcn_tex)
 #include "bbport_threads.h"
+#ifdef _WIN32
+#include <psapi.h> // sotc: SOTC RAM lines (GetProcessMemoryInfo)
+#endif
 
 // sotc: generation of the runtime memory table (src/runtime_memory.c); odd while a change is in
 // progress. Same declaration as vk_rasterizer.cpp and sotc_bininfo.cpp.
 extern "C" uint64_t runtime_memory_generation(void);
 
 namespace Vulkan {
+
+namespace {
+// sotc: SOTC_COMPILE_THREADS. The physical cores of the machine (GetLogicalProcessorInformation), else half the
+// hardware threads.
+unsigned PhysicalCoreCount() {
+#ifdef _WIN32
+    DWORD bytes = 0;
+    GetLogicalProcessorInformation(nullptr, &bytes);
+    if (bytes != 0) {
+        std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(bytes / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) +
+                                                               1);
+        bytes = static_cast<DWORD>(info.size() * sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+        if (GetLogicalProcessorInformation(info.data(), &bytes)) {
+            unsigned cores = 0;
+            const size_t n = bytes / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
+            for (size_t i = 0; i < n; ++i) {
+                cores += info[i].Relationship == RelationProcessorCore ? 1u : 0u;
+            }
+            if (cores != 0) {
+                return cores;
+            }
+        }
+    }
+#endif
+    return std::max(1u, std::thread::hardware_concurrency() / 2);
+}
+
+// sotc: SOTC_COMPILE_THREADS=<n> (default: the physical cores, at least 2; 0: off, the former behaviour). While a
+// loading hold is active (pretranslate hold with its pack step and compute prebuilds, manifest hold), at most n jobs
+// run on the pipeline workers at once, below normal priority; the extra pack workers are not started beyond n. Play
+// keeps the normal worker count and priority. Read once.
+unsigned CompileThreadCap() {
+    static const unsigned n = [] {
+        const char* v = std::getenv("SOTC_COMPILE_THREADS");
+        if (v != nullptr && v[0] != '\0') {
+            const long parsed = std::strtol(v, nullptr, 10);
+            return parsed <= 0 ? 0u : static_cast<unsigned>(parsed);
+        }
+        return std::max(2u, PhysicalCoreCount());
+    }();
+    return n;
+}
+
+// sotc: "SOTC RAM <where>: private X MB, working set Y MB" (PrivateUsage and WorkingSetSize of the process), at the
+// cache load and at the start and end of each loading hold, so a cold run shows where the memory grows.
+void LogRam(const char* where) {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        std::fprintf(stderr, "SOTC RAM %s: private %llu MB, working set %llu MB\n", where,
+                     static_cast<unsigned long long>(counters.PrivateUsage >> 20),
+                     static_cast<unsigned long long>(counters.WorkingSetSize >> 20));
+    }
+#else
+    (void)where;
+#endif
+}
+
+// sotc: SOTC_CACHE_MAP. The bytes of a saved pipeline cache file: a read-only view of the file (mapped), or the
+// former vector read (SOTC_CACHE_MAP=0, or the mapping failed). Release drops either right after vkCreatePipelineCache.
+class CacheFileBytes {
+public:
+    CacheFileBytes() = default;
+    CacheFileBytes(const CacheFileBytes&) = delete;
+    CacheFileBytes& operator=(const CacheFileBytes&) = delete;
+    ~CacheFileBytes() {
+        Release();
+    }
+    std::vector<u8> data;
+    bool Empty() const {
+        return Size() == 0;
+    }
+    size_t Size() const {
+        return view ? view_size : data.size();
+    }
+    const u8* Data() const {
+        return view ? view : data.data();
+    }
+    /// The whole file mapped read-only; false (nothing held) on failure.
+    bool Map(const std::filesystem::path& path, size_t bytes) {
+#ifdef _WIN32
+        Release();
+        if (bytes == 0) {
+            return false;
+        }
+        file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            file = nullptr;
+            return false;
+        }
+        mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (mapping) {
+            view = static_cast<const u8*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, bytes));
+        }
+        if (!view) {
+            Release();
+            return false;
+        }
+        view_size = bytes;
+        return true;
+#else
+        (void)path;
+        (void)bytes;
+        return false;
+#endif
+    }
+    void Release() {
+        data.clear();
+        data.shrink_to_fit();
+#ifdef _WIN32
+        if (view) {
+            UnmapViewOfFile(view);
+        }
+        if (mapping) {
+            CloseHandle(mapping);
+        }
+        if (file) {
+            CloseHandle(file);
+        }
+        file = nullptr;
+        mapping = nullptr;
+#endif
+        view = nullptr;
+        view_size = 0;
+    }
+
+private:
+#ifdef _WIN32
+    HANDLE file{};
+    HANDLE mapping{};
+#endif
+    const u8* view{};
+    size_t view_size{};
+};
+} // namespace
 
 // sotc: SOTC_PIPE_MANIFEST state (gpu/sotc/pipe_manifest.h; the steps are at the end of this file). Command processor
 // only, except the counters the workers and the report read (g_manifest_stats).
@@ -768,8 +909,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // driver checks the header (vendor, device, driver version) and ignores a stale copy.
     // SOTC_DRIVER_CACHE=0 turns it off.
     // sotc: one saved cache file -> its bytes (empty: none, truncated, another GPU or driver).
-    const auto load_cache = [&](const std::filesystem::path& path, const char* what, size_t max_bytes = 0) {
-        std::vector<u8> data;
+    // sotc: SOTC_CACHE_MAP: the file is mapped (read in place) instead of copied into a vector; see CacheFileBytes.
+    const auto load_cache = [&](CacheFileBytes& out, const std::filesystem::path& path, const char* what,
+                                size_t max_bytes = 0) {
+        std::vector<u8>& data = out.data;
         // sotc: SOTC_DRIVER_CACHE_MAX_MB: an oversize live cache is renamed to <name>.oversize (one backup, an older
         // one is overwritten) and not loaded; the caller then creates an empty cache.
         if (max_bytes) {
@@ -784,7 +927,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              "SOTC driver cache: %llu MB exceeds SOTC_DRIVER_CACHE_MAX_MB=%zu, starting a fresh cache "
                              "(old file kept as .oversize)\n",
                              static_cast<unsigned long long>(file_bytes >> 20), max_bytes >> 20);
-                return data;
+                return;
             }
         }
         if (std::FILE* f = _wfopen(path.c_str(), L"rb")) {
@@ -799,6 +942,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                                              instance.GetPipelineCacheUUID());
             if (mismatch) {
                 std::fprintf(stderr, "SOTC %s: %s; starting empty\n", what, mismatch);
+            } else if (!size_ec && bytes >= header.size() && SotcNonBlocking::CacheMap() &&
+                       out.Map(path, static_cast<size_t>(bytes))) {
+                // sotc: SOTC_CACHE_MAP: read in place (the vector read below is the fallback)
             } else if (!size_ec && bytes >= header.size() && bytes <= data.max_size()) {
                 data.resize(static_cast<size_t>(bytes));
                 std::copy(header.begin(), header.end(), data.begin());
@@ -809,52 +955,68 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
             std::fclose(f);
         }
-        return data;
     };
     // sotc: the VkPipelineCache from those bytes (empty on rejection; data cleared then).
-    const auto create_cache = [&](std::vector<u8>& data, const char* what) {
+    const auto create_cache = [&](CacheFileBytes& data, const char* what) {
         vk::PipelineCacheCreateInfo cache_ci{
-            .initialDataSize = data.size(),
-            .pInitialData = data.empty() ? nullptr : data.data(),
+            .initialDataSize = data.Size(),
+            .pInitialData = data.Empty() ? nullptr : data.Data(),
         };
         auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(cache_ci);
-        if (cache_result != vk::Result::eSuccess && !data.empty()) {
+        if (cache_result != vk::Result::eSuccess && !data.Empty()) {
             std::fprintf(stderr, "SOTC %s: saved copy rejected (%s), starting empty\n", what,
                          vk::to_string(cache_result).c_str());
-            data.clear();
+            data.Release();
             auto retry = instance.GetDevice().createPipelineCacheUnique({});
             cache_result = retry.result;
             cache = std::move(retry.value);
         }
         ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                    vk::to_string(cache_result));
-        if (!data.empty()) {
-            std::fprintf(stderr, "SOTC %s: %zu MB loaded\n", what, data.size() >> 20); // sotc: MB
+        if (!data.Empty()) {
+            std::fprintf(stderr, "SOTC %s: %zu MB loaded%s\n", what, data.Size() >> 20, // sotc: MB
+                         data.data.empty() ? " (file mapped)" : "");
         }
         return std::move(cache);
     };
-    std::vector<u8> driver_cache_data;
+    // sotc: SOTC_CACHE_MAP: each file's bytes are dropped right after its cache object exists (size and hash taken
+    // first), so neither file stays resident beside the driver's copy. 0: both buffers live to the end, as before.
+    const bool release_early = SotcNonBlocking::CacheMap();
+    const bool split_cache = DriverCacheEnabled() && SotcNonBlocking::PlayQuiet();
+    CacheFileBytes driver_cache_data;
     if (DriverCacheEnabled()) {
-        driver_cache_data = load_cache(DriverCachePath(), "driver cache", DriverCacheMaxBytes());
+        load_cache(driver_cache_data, DriverCachePath(), "driver cache", DriverCacheMaxBytes());
     }
     pipeline_cache = create_cache(driver_cache_data, "driver cache");
-    saved_driver_cache_size = driver_cache_data.size();
+    saved_driver_cache_size = driver_cache_data.Size();
+    bool source_loaded = false; // sotc: the pack list's source: the pack cache when split, else the driver cache
+    u64 source_hash = 0;
+    if (!split_cache) {
+        source_loaded = !driver_cache_data.Empty();
+        source_hash = source_loaded ? XXH3_64bits(driver_cache_data.Data(), driver_cache_data.Size()) : 0;
+    }
+    if (release_early) {
+        driver_cache_data.Release();
+    }
     // sotc: SOTC_PLAY_QUIET: the stage libraries get their own cache object and file (sotc_vk_pack.bin): the pack
     // publication writes it once per pack compile (and the exit, when it grew), so the periodic saver's
     // vkGetPipelineCacheData reads only the live cache. Libraries are VkPipeline objects: a link made from them with
     // the live cache does not care which cache created them. (A merge into one cache at startup would keep the
     // periodic save as large as before; the split keeps it small.) The pack library list is bound to this file.
-    std::vector<u8> pack_data;
-    const bool split_cache = DriverCacheEnabled() && SotcNonBlocking::PlayQuiet();
+    CacheFileBytes pack_data;
     if (split_cache) {
-        pack_data = load_cache(PackCachePath(), "pack cache");
+        load_cache(pack_data, PackCachePath(), "pack cache");
         pack_cache = create_cache(pack_data, "pack cache");
-        saved_pack_cache_size = pack_data.size();
+        saved_pack_cache_size = pack_data.Size();
         GplLibraryCache::SetLibraryCache(*pack_cache);
+        source_loaded = !pack_data.Empty();
+        source_hash = source_loaded ? XXH3_64bits(pack_data.Data(), pack_data.Size()) : 0;
+        if (release_early) {
+            pack_data.Release();
+        }
     }
-    const std::vector<u8>& pack_source = split_cache ? pack_data : driver_cache_data;
-    driver_cache_loaded = !pack_source.empty(); // sotc: compatible header; feedback still proves individual hits
-    loaded_driver_cache_hash = driver_cache_loaded ? XXH3_64bits(pack_source.data(), pack_source.size()) : 0;
+    driver_cache_loaded = source_loaded; // sotc: compatible header; feedback still proves individual hits
+    loaded_driver_cache_hash = source_hash;
     if (DriverCacheEnabled()) {
         // New pipelines (first visits) are saved every minute while playing: the game is often
         // closed by killing the process, which skips the destructor.
@@ -924,6 +1086,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     }
     // sotc: SOTC_ASYNC_COMPUTE_XLATE=1 (off by default), see ComputePrefetchEnabled.
     const uint64_t private_after_cache_load = SotcPipeManifest::ProcessPrivateBytes();
+    LogRam("after cache load"); // sotc: SOTC RAM
     compute_prefetch = !async_workers.empty() && [] {
         const char* v = std::getenv("SOTC_ASYNC_COMPUTE_XLATE");
         return v && v[0] == '1';
@@ -1010,15 +1173,69 @@ bool PipelineCache::SaveCacheFile(vk::PipelineCache cache, const std::filesystem
                          size >> 20, DriverCacheMaxBytes() >> 20);
         }
     }
+    // Written next to it and renamed: a crash while writing keeps the old copy.
+    auto tmp = path;
+    tmp += L".tmp";
+#ifdef _WIN32
+    // sotc: SOTC_CACHE_MAP: the driver writes the blob straight into a mapping of the .tmp file (file-backed pages, no
+    // private copy of the cache's size); the file is cut to the size written, then renamed as below. A mapping failure
+    // falls back to the vector path.
+    if (SotcNonBlocking::CacheMap()) {
+        HANDLE file = CreateFileW(tmp.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE mapping = file == INVALID_HANDLE_VALUE
+                             ? nullptr
+                             : CreateFileMappingW(file, nullptr, PAGE_READWRITE, static_cast<DWORD>(u64{size} >> 32),
+                                                  static_cast<DWORD>(size & 0xffffffffu), nullptr);
+        void* view = mapping ? MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, size) : nullptr;
+        if (view) {
+            size_t got = size;
+            bool ok = device.getPipelineCacheData(cache, &got, view) == vk::Result::eSuccess && got <= size;
+            get_timer.reset();
+            const u64 hash = ok && written_hash ? XXH3_64bits(view, got) : 0;
+            ok = ok && FlushViewOfFile(view, 0);
+            UnmapViewOfFile(view);
+            CloseHandle(mapping);
+            if (ok && got < size) {
+                LARGE_INTEGER end{};
+                end.QuadPart = static_cast<LONGLONG>(got);
+                ok = SetFilePointerEx(file, end, nullptr, FILE_BEGIN) && SetEndOfFile(file);
+            }
+            ok = CloseHandle(file) && ok;
+            std::error_code ec;
+            if (ok) {
+                std::filesystem::rename(tmp, path, ec);
+            }
+            if (!ok || ec) {
+                std::filesystem::remove(tmp, ec);
+                return false;
+            }
+            saved_size = got;
+            if (written_size) {
+                *written_size = got;
+            }
+            if (written_hash) {
+                *written_hash = hash;
+            }
+            std::fprintf(stderr, "SOTC %s: %zu KB saved (file mapped)\n", what, got >> 10);
+            return true;
+        }
+        if (mapping) {
+            CloseHandle(mapping);
+        }
+        if (file != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+        }
+    }
+#endif
     std::vector<u8> data(size);
     if (device.getPipelineCacheData(cache, &size, data.data()) != vk::Result::eSuccess) {
         return false;
     }
     get_timer.reset();
     data.resize(size);
-    // Written next to it and renamed: a crash while writing keeps the old copy.
-    auto tmp = path;
-    tmp += L".tmp";
     std::FILE* f = _wfopen(tmp.c_str(), L"wb");
     if (!f) {
         return false;
@@ -2506,7 +2723,36 @@ void PipelineCache::PushJobLocked(JobLane lane, std::unique_ptr<AsyncPipelineJob
     }
 }
 
+bool PipelineCache::HoldCapActive() const {
+    return CompileThreadCap() != 0 && compile_holds.load(std::memory_order_acquire) > 0;
+}
+
+void PipelineCache::SetCompileHold(bool active, const char* what) {
+    LogRam(what); // sotc: SOTC RAM at each hold start and end
+    if (CompileThreadCap() == 0 || async_workers.empty()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{async_mutex};
+        compile_holds.fetch_add(active ? 1 : -1, std::memory_order_acq_rel);
+    }
+    if (active) {
+        std::fprintf(stderr,
+                     "SOTC COMPILE THREADS: %s: at most %u compile jobs at once (of %zu workers), below normal "
+                     "priority\n",
+                     what, CompileThreadCap(), async_workers.size());
+    } else {
+        // The cap is lifted (or stays for an enclosing hold): the workers it held back look again.
+        async_cv.notify_all();
+        urgent_cv.notify_all();
+    }
+}
+
 bool PipelineCache::HasRunnableJobLocked(bool urgent_only) const {
+    // sotc: SOTC_COMPILE_THREADS: during a loading hold, nothing more runs while the cap's jobs are running.
+    if (HoldCapActive() && job_queues.hold_running >= CompileThreadCap()) {
+        return false;
+    }
     for (size_t l = 0; l < static_cast<size_t>(JobLane::Count); ++l) {
         if (job_queues.lanes[l].empty()) {
             continue;
@@ -2526,7 +2772,13 @@ bool PipelineCache::HasRunnableJobLocked(bool urgent_only) const {
     return false;
 }
 
-std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::PopJobLocked(JobLane& lane, bool urgent_only) {
+std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::PopJobLocked(JobLane& lane, bool urgent_only,
+                                                                         bool* hold_slot) {
+    // sotc: SOTC_COMPILE_THREADS: the hold cap (checked before any count), as in HasRunnableJobLocked.
+    const bool hold_cap = HoldCapActive();
+    if (hold_cap && job_queues.hold_running >= CompileThreadCap()) {
+        return nullptr;
+    }
     for (size_t l = 0; l < static_cast<size_t>(JobLane::Count); ++l) {
         auto& q = job_queues.lanes[l];
         if (q.empty()) {
@@ -2566,6 +2818,12 @@ std::unique_ptr<PipelineCache::AsyncPipelineJob> PipelineCache::PopJobLocked(Job
         }
         auto job = std::move(*pick);
         q.erase(pick);
+        if (hold_cap) {
+            ++job_queues.hold_running; // sotc: SOTC_COMPILE_THREADS: released by HoldSlot in AsyncPipelineWorker
+            if (hold_slot) {
+                *hold_slot = true;
+            }
+        }
         return job;
     }
     return nullptr;
@@ -2593,6 +2851,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only,
         std::unique_ptr<AsyncPipelineJob> job;
         JobClass job_class = JobGraphics;
         JobLane lane = JobLane::Graphics;
+        bool hold_job = false; // sotc: SOTC_COMPILE_THREADS: counted against the hold cap (PopJobLocked)
         {
             std::unique_lock lock{async_mutex};
             // sotc: SOTC_GPL_URGENT_WORKERS: a reserved worker waits on urgent_cv (notified by pushes to its lanes);
@@ -2619,7 +2878,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only,
                 }
                 return;
             }
-            job = PopJobLocked(lane, urgent_only);
+            job = PopJobLocked(lane, urgent_only, &hold_job);
             if (!job) {
                 continue;
             }
@@ -2682,6 +2941,40 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only,
                 cache.async_cv.notify_all();
             }
         } capped_slot{*this, CappedLane(lane)};
+        // sotc: SOTC_COMPILE_THREADS: a job taken during a loading hold runs below normal priority (the game's loader
+        // threads and the loading screen first; the command processor waits through the hold) and frees its hold slot
+        // in every exit path. The priority the worker had before is restored (normal for play).
+        struct HoldSlot {
+            PipelineCache& cache;
+            bool active;
+            int previous{};
+            HoldSlot(PipelineCache& c, bool a) : cache(c), active(a) {
+#ifdef _WIN32
+                if (active) {
+                    previous = GetThreadPriority(GetCurrentThread());
+                    if (previous != THREAD_PRIORITY_ERROR_RETURN && previous > THREAD_PRIORITY_BELOW_NORMAL) {
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    }
+                }
+#endif
+            }
+            ~HoldSlot() {
+                if (!active) {
+                    return;
+                }
+#ifdef _WIN32
+                if (previous != THREAD_PRIORITY_ERROR_RETURN && previous > THREAD_PRIORITY_BELOW_NORMAL) {
+                    SetThreadPriority(GetCurrentThread(), previous);
+                }
+#endif
+                {
+                    std::scoped_lock lock{cache.async_mutex};
+                    --cache.job_queues.hold_running;
+                }
+                cache.async_cv.notify_all();
+                cache.urgent_cv.notify_all();
+            }
+        } hold_slot{*this, hold_job};
         // sotc: SOTC_BLOCK_LEDGER job queue report: the wait ends here, the run ends when the job is done.
         const u64 job_taken_ns = SotcJobClockNs();
         const u64 job_wait_ns = job_taken_ns - std::min(job_taken_ns, job->created_ns);
@@ -3015,6 +3308,7 @@ void PipelineCache::CollectAsyncPipelines() {
         RegisterPipelineData(job->key, job->hash, job->sdata);
         ++num_new_pipelines;
     }
+    ReleaseBuiltComputeModules(false); // sotc: SOTC_COMPUTE_RELEASE, at most once per second (no-op when empty)
 }
 
 // sotc: N5. The graphics pipelines of the boot prebuild are built by the workers in the order WarmUp
@@ -4496,12 +4790,25 @@ const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
         // sotc: SOTC_COMPUTE_PACK: a pipeline the pack list names is in the pack cache (a hit of ~1 ms): it is built
         // from that cache, and a deferred one by the recorder at its first bind, without the worker round trip.
         const bool pack_listed = SotcNonBlocking::ComputePack() && PackComputeListed(compute_key.value);
+        // sotc: SOTC_COMPILE_STREAM: a released pipeline its dispatch needs before any rebuild: built from the pack
+        // cache (a hit), on a worker as any dispatch's, and counted (the gap of the stream: the recorder waits for it).
+        const bool stream_miss = !stream_released_keys.empty() && stream_released_keys.erase(compute_key.value) != 0;
+        if (stream_miss) {
+            ++stream_inline;
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr, "SOTC COMPILE STREAM: dispatch rebuilds released compute pipeline %#llx itself\n",
+                             static_cast<unsigned long long>(compute_key.value));
+            }
+            StreamLog(false);
+        }
         const auto sync_start = std::chrono::steady_clock::now();
         {
             const SotcBlockLedger::Scope ledger{SotcBlockLedger::ComputeBuild};
             it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap,
                                                            layout_cache, StageProfile(infos[0]->variant),
-                                                           pack_listed ? PackPipelineCache() : *pipeline_cache,
+                                                           pack_listed || stream_miss ? PackPipelineCache()
+                                                                                      : *pipeline_cache,
                                                            compute_key, *infos[0],
                                                            modules[0], sdata, false, deferred);
         }
@@ -4533,6 +4840,13 @@ const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
         if (EmulatorSettings.IsShaderCollect()) {
             auto& m = modules[0];
             module_related_pipelines[m].emplace_back(compute_key);
+        }
+    } else if (it.value()->sotc_rehydrated) {
+        // sotc: SOTC_COMPILE_STREAM: the first lookup of a rebuilt pipeline; late when its worker build is not done.
+        it.value()->sotc_rehydrated = false;
+        if (!it.value()->IsReady()) {
+            ++stream_late;
+            StreamLog(false);
         }
     }
     const ComputePipeline* result = it->second.get();
@@ -5531,6 +5845,8 @@ bool PipelineCache::RefreshComputeKey() {
             if (!compute_bound) {
                 NoteHeapRefused(infos[0]->CacheHash());
                 binding = {};
+            } else if (!pre_compute_pred.empty()) {
+                NoteComputeDispatch(cs_pgm, cs_params.hash); // sotc: SOTC_HEAP, the heap prebuild's verify (once)
             }
         }
     }
@@ -6241,19 +6557,26 @@ void PipelineCache::QueueComputePrebuild(SotcPretranslate::Request& r) {
     // variant StageVariantPlain, guest_hash the game's hash, hash HashCombine(hash, variant)); the prebuild uses that
     // program hash for the program cache, the pack, the index and the pipeline key. Descriptor mode: the game's hash.
     const bool table = profile.shader_addr != 0;
-    const u8 variant = table ? Shader::StageVariantPlain : Shader::StageVariantDefault;
-    const u64 program_hash = table ? HashCombine(r.hash, variant) : r.hash;
+    // sotc: SOTC_HEAP: a heap profile binds the heap variant first (RefreshComputeKey: variant StageVariantHeap, hash
+    // HashCombine(hash, variant)) unless the candidate was refused before (heap_refused); the prebuild makes that key.
+    // A candidate the translated Info refuses (Heap::StageRefused) is prebuilt again as the plain variant at install
+    // (InstallComputePrebuild), as the dispatch falls back. Heap off: as before (descriptor and plain table mode).
+    const bool heap_candidate = profile.heap_images && profile.support_int64 &&
+                                !heap_refused.contains(HashCombine(r.hash, Shader::StageVariantHeap));
+    const u8 variant = heap_candidate ? Shader::StageVariantHeap
+                       : table        ? Shader::StageVariantPlain
+                                      : Shader::StageVariantDefault;
+    const u64 program_hash = variant != Shader::StageVariantDefault ? HashCombine(r.hash, variant) : r.hash;
     const ComputePipelineKey key{HashCombine(program_hash, size_t{0})};
     if (IsProgramKnown(program_hash) || lazy_programs.contains(program_hash) || compute_pipelines.contains(key)) {
         SotcPretranslate::NoteDropped(2, 0); // known: a warm session has it (as the other requests)
-        if (SotcNonBlocking::Prefetch()) { // sotc: loaded from the pack by a worker before its first dispatch
-            QueueLazyPrefetch(program_hash);
+        // sotc: loaded from the pack by a worker before its first dispatch. SOTC_COMPILE_STREAM: a released program's
+        // file loaded again: the pack load is queued in any case, and its install rebuilds the pipelines on workers.
+        if (SotcNonBlocking::Prefetch() || stream_released_programs.contains(program_hash)) {
+            if (!QueueLazyPrefetch(program_hash)) {
+                StreamRehydrate(program_hash); // resident already (no pack load needed)
+            }
         }
-        return;
-    }
-    // A heap profile looks up the heap variant first (RefreshComputeKey): its key is not the plain one made here.
-    if (profile.heap_images && profile.support_int64) {
-        SotcPretranslate::NoteDropped(2, 3);
         return;
     }
     // sotc: SOTC_COMPUTE_PACK_MAX: a shader set beyond the cap is not prebuilt (the rest build at their dispatch).
@@ -6285,8 +6608,8 @@ void PipelineCache::QueueComputePrebuild(SotcPretranslate::Request& r) {
     t.hw_stage = HwStage::Compute;
     t.sw_stage = SwStage::Compute;
     t.hash = program_hash;
-    t.variant = variant;                // sotc: SOTC_SHADER_ADDR (0 in descriptor mode)
-    t.guest_hash = table ? r.hash : 0;  // sotc: Info::pgm_hash stays the game's hash
+    t.variant = variant; // sotc: SOTC_SHADER_ADDR / SOTC_HEAP (0 in descriptor mode)
+    t.guest_hash = variant != Shader::StageVariantDefault ? r.hash : 0; // sotc: Info::pgm_hash stays the game's hash
     t.owned_code = r.code;
     t.code = t.owned_code;
     t.runtime_info = rt;
@@ -6320,6 +6643,45 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
     if (t.failed || !t.new_program || !t.spec ||
         (t.synthetic_variant == 0 && compute_pipelines.contains(ComputePipelineKey{HashCombine(t.hash, size_t{0})}))) {
         fail();
+        return;
+    }
+    // sotc: SOTC_HEAP: the heap candidate's decision is made from its translated Info, as RefreshComputeKey makes it. A
+    // refused candidate is noted (its dispatch then binds the plain variant without translating it) and its program is
+    // prebuilt again as the variant that dispatch binds: plain in table mode, the default in descriptor mode.
+    if (t.variant == Shader::StageVariantHeap && t.synthetic_variant == 0 &&
+        SotcArch::Heap::StageRefused(t.new_program->info)) {
+        NoteHeapRefused(t.new_program->info.CacheHash());
+        if (t.module) {
+            instance.GetDevice().destroyShaderModule(t.module);
+            t.module = vk::ShaderModule{};
+        }
+        const u64 guest = t.guest_hash;
+        const u8 plain_variant = profile.shader_addr != 0 ? Shader::StageVariantPlain : Shader::StageVariantDefault;
+        const u64 plain_hash = plain_variant != Shader::StageVariantDefault ? HashCombine(guest, plain_variant) : guest;
+        if (IsProgramKnown(plain_hash) || lazy_programs.contains(plain_hash) ||
+            compute_pipelines.contains(ComputePipelineKey{HashCombine(plain_hash, size_t{0})})) {
+            SotcPretranslate::NoteDropped(2, 0); // known: a warm session has the plain variant
+            if (SotcNonBlocking::Prefetch() || stream_released_programs.contains(plain_hash)) {
+                if (!QueueLazyPrefetch(plain_hash)) {
+                    StreamRehydrate(plain_hash); // sotc: SOTC_COMPILE_STREAM, resident already
+                }
+            }
+            return;
+        }
+        auto job = std::make_unique<AsyncPipelineJob>();
+        auto& v = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
+        v.hw_stage = t.hw_stage;
+        v.sw_stage = t.sw_stage;
+        v.hash = plain_hash;
+        v.variant = plain_variant;
+        v.guest_hash = plain_variant != Shader::StageVariantDefault ? guest : 0;
+        v.owned_code = t.owned_code;
+        v.code = v.owned_code;
+        v.runtime_info = t.runtime_info;
+        v.start = t.start;
+        v.pretranslate = true;
+        g_specfree.heap_refused_prebuilds.fetch_add(1, std::memory_order_relaxed);
+        pre_backlog.push_back(std::move(job)); // counted queued once, as the candidate (FeedNext sends it)
         return;
     }
     // sotc: SOTC_COMPUTE_SPECFREE: a program whose images the code alone does not type (sotc_synthetic_reads) gets the
@@ -6387,6 +6749,9 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
             g_specfree.programs.fetch_add(1, std::memory_order_relaxed);
             g_specfree.variants.fetch_add(1, std::memory_order_relaxed);
         }
+        if (t.variant == Shader::StageVariantHeap) {
+            g_specfree.heap_prebuilds.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_HEAP
+        }
     }
     // sotc: SOTC_COMPUTE_SPECFREE: the variant masks of the program (0: the all-flipped variant 1 of an over-cap one).
     boost::container::small_vector<u8, 8> variant_masks;
@@ -6438,8 +6803,13 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
     // sotc: SOTC_COMPUTE_PACK: a prebuild of the hold (or of the preparation run) is compiled into the pack cache and
     // destroyed by the compute pack; its pipeline key is not registered (the next session must not warm it up: its
     // dispatch builds it from the pack cache, inline).
-    const bool pack_candidate = SotcNonBlocking::ComputePack() &&
-                                (pre_holding || !pre_hold_done || SotcPretranslate::Precompile());
+    // sotc: SOTC_COMPILE_STREAM: the hold's prebuilds take the same path (the pack step releases them), but their key
+    // is registered as an ordinary prebuild's: the next session's warm-up builds them at its loading screen, since
+    // without SOTC_COMPUTE_PACK no dispatch builds them from the pack cache.
+    const bool stream_candidate = SotcNonBlocking::CompileStream() && !SotcNonBlocking::ComputePack() &&
+                                  (pre_holding || !pre_hold_done || SotcPretranslate::Precompile());
+    const bool pack_candidate = stream_candidate || (SotcNonBlocking::ComputePack() &&
+                                                     (pre_holding || !pre_hold_done || SotcPretranslate::Precompile()));
     ComputePipeline::SerializationSupport sdata{};
     auto pipe = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache,
                                                   StageProfile(program->info.variant),
@@ -6461,8 +6831,13 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
                 .count(),
             std::memory_order_relaxed);
-    } else {
+    }
+    if (!pack_candidate || stream_candidate) {
         RegisterPipelineData(key, sdata);
+    }
+    if (SotcNonBlocking::ComputeRelease()) {
+        // sotc: SOTC_COMPUTE_RELEASE: its module leaves once the pipeline is built (ReleaseBuiltComputeModules).
+        compute_release_queue.push_back({t.hash, static_cast<u32>(perm_idx), key.value});
     }
     ++num_new_pipelines;
     if (async_workers.empty()) {
@@ -6628,6 +7003,7 @@ bool PipelineCache::BuildPackLibraries() {
     }
     const auto start = Clock::now();
     const uint64_t private_start = SotcPipeManifest::ProcessPrivateBytes();
+    LogRam("pack step start"); // sotc: SOTC RAM
     // sotc: SOTC_GPL_PACK_LEAN: the pack runs after the manifest pipelines and the compute prebuilds, which are already
     // on the workers (collected here; the manifest's translations wait for its own pump and are not waited for).
     const bool lean = SotcNonBlocking::GplPackLean();
@@ -6855,7 +7231,8 @@ bool PipelineCache::BuildPackLibraries() {
     }
     // sotc: SOTC_COMPUTE_PACK: the hold's compute prebuilds (already in the pack cache) join the list; their pipelines
     // and modules leave memory here, before the publication names them.
-    if (lean && SotcNonBlocking::ComputePack()) {
+    // sotc: SOTC_COMPILE_STREAM: the same step releases the stream prebuilds (PackComputePipelines records them).
+    if (lean && (SotcNonBlocking::ComputePack() || SotcNonBlocking::CompileStream())) {
         PackComputePipelines(listed, compiled, start);
     }
     // The driver cache is written now (the list may only name code the file holds), then the list.
@@ -6940,6 +7317,7 @@ bool PipelineCache::BuildPackLibraries() {
                      std::chrono::duration<double>(Clock::now() - publish_start).count());
     }
     const uint64_t private_end = SotcPipeManifest::ProcessPrivateBytes();
+    LogRam("pack step end"); // sotc: SOTC RAM
     std::fprintf(stderr,
                  "SOTC GPL PACK LIBS: %llu stage libraries compiled into the driver cache (vertex %llu, pixel %llu) in "
                  "%.1f s, failed %llu; already compiled (listed) %llu%s; skipped: no partner %llu, not linkable %llu; "
@@ -7034,6 +7412,15 @@ void PipelineCache::PackComputePipelines(const std::unordered_set<u64>& listed, 
         }
         // The pipeline (made, never bound) and the module leave memory; the program follows at the eviction.
         gone.push_back(it.key());
+        if (ok && SotcNonBlocking::CompileStream()) {
+            // sotc: SOTC_COMPILE_STREAM: rebuilt from the pack cache on the workers when its program loads again
+            // (StreamRehydrate); its shader file's next load requests it again.
+            stream_released_keys.insert(it.key().value);
+            if (stream_released_programs.insert(pipe.sotc_pack_program).second) {
+                SotcPretranslate::Forget(program->info.pgm_hash);
+            }
+            ++stream_released;
+        }
         if (ok) {
             for (auto& module : program->modules) {
                 if (module.module) {
@@ -7071,6 +7458,135 @@ void PipelineCache::PackComputePipelines(const std::unordered_set<u64>& listed, 
                  static_cast<unsigned long long>(resident), static_cast<unsigned long long>(destroyed),
                  std::chrono::duration<double>(Clock::now() - wait_start).count(),
                  std::chrono::duration<double>(Clock::now() - start).count(), capped);
+    if (SotcNonBlocking::CompileStream()) {
+        StreamLog(true);
+    }
+}
+
+bool PipelineCache::ProgramHasComputePipeline(u64 program_key, const Program& program) const {
+    // Both keys a compute pipeline of the program can carry: the program cache key (prebuilds, dispatches) and its
+    // cache hash (the manifest's); they are equal unless a variant mixed its hash in differently.
+    const u64 cache_hash = program.info.CacheHash();
+    for (size_t perm = 0; perm < std::max<size_t>(program.modules.size(), 1); ++perm) {
+        if (compute_pipelines.contains(ComputePipelineKey{HashCombine(program_key, perm)}) ||
+            (cache_hash != program_key && compute_pipelines.contains(ComputePipelineKey{HashCombine(cache_hash, perm)}))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void PipelineCache::ReleaseBuiltComputeModules(bool force) {
+    if (!SotcNonBlocking::ComputeRelease() || compute_release_queue.empty() || EmulatorSettings.IsShaderCollect()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - compute_release_last < std::chrono::seconds{1}) {
+        return;
+    }
+    compute_release_last = now;
+    u64 released = 0;
+    size_t keep = 0;
+    for (size_t i = 0; i < compute_release_queue.size(); ++i) {
+        const ComputeRelease e = compute_release_queue[i];
+        const auto prog = program_cache.find(e.program);
+        const auto pipe = compute_pipelines.find(ComputePipelineKey{e.key});
+        if (prog == program_cache.end() || pipe == compute_pipelines.end() ||
+            e.perm >= prog.value()->modules.size()) {
+            continue; // the program or the pipeline left (pack step, eviction): nothing to release
+        }
+        Program& program = *prog.value();
+        auto& m = program.modules[e.perm];
+        if (!m.module) {
+            continue; // released already, or destroyed by the compute pack
+        }
+        ComputePipeline& pipeline = *pipe.value();
+        if (!program.pending_specs.empty() || !pipeline.IsReady() || pipeline.OnFastBuild()) {
+            compute_release_queue[keep++] = e; // still building (or a translation of the program in flight)
+            continue;
+        }
+        if (!pipeline.ModuleReleasable()) {
+            continue; // refused by the driver: the module stays (a later build of the key may need it)
+        }
+        instance.GetDevice().destroyShaderModule(m.module);
+        m.module = vk::ShaderModule{};
+        m.sotc_released = true;
+        pipeline.ReleaseModule();
+        ++released;
+    }
+    compute_release_queue.resize(keep);
+    if (released != 0) {
+        pipe_fast_cs.valid = false; // the record holds the module handle of its stage
+        compute_modules_released += released;
+    }
+    if (force) {
+        std::fprintf(stderr,
+                     "SOTC COMPUTE RELEASE: %llu modules destroyed now (%llu this session; pipelines built), %zu "
+                     "waiting for their build\n",
+                     static_cast<unsigned long long>(released),
+                     static_cast<unsigned long long>(compute_modules_released), compute_release_queue.size());
+    }
+}
+
+void PipelineCache::StreamRehydrate(u64 program_hash) {
+    if (!SotcNonBlocking::CompileStream() || async_workers.empty() || !stream_released_programs.contains(program_hash)) {
+        return;
+    }
+    const auto found = program_cache.find(program_hash);
+    if (found == program_cache.end()) {
+        return; // not loaded (a read failure): its dispatch loads and builds it (counted as inline then)
+    }
+    Program& program = *found.value();
+    for (size_t perm = 0; perm < program.modules.size(); ++perm) {
+        const ComputePipelineKey key{HashCombine(program_hash, perm)};
+        if (!stream_released_keys.contains(key.value) || !program.modules[perm].module) {
+            continue;
+        }
+        stream_released_keys.erase(key.value);
+        if (compute_pipelines.contains(key)) {
+            continue; // a dispatch or the manifest built it meanwhile
+        }
+        // The ComputePipeline is made here (CP: layouts), its build runs on a worker from the pack cache (a hit).
+        ComputePipeline::SerializationSupport sdata{};
+        auto pipe = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache,
+                                                      StageProfile(program.info.variant), PackPipelineCache(), key,
+                                                      program.info, program.modules[perm].module, sdata, false, true);
+        ComputePipeline* raw = pipe.get();
+        raw->sotc_rehydrated = true;
+        compute_pipelines.try_emplace(key).first.value() = std::move(pipe);
+        last_compute_pipeline = nullptr;
+        if (SotcNonBlocking::ComputeRelease()) {
+            compute_release_queue.push_back({program_hash, static_cast<u32>(perm), key.value});
+        }
+        auto job = std::make_unique<AsyncPipelineJob>();
+        job->compute = raw;
+        {
+            std::scoped_lock lock{async_mutex};
+            PushJobLocked(JobLane::Compute, std::move(job)); // ahead of graphics: a dispatch may come soon
+        }
+        async_cv.notify_one();
+        ++stream_rehydrated;
+    }
+    stream_released_programs.erase(program_hash);
+    StreamLog(false);
+}
+
+void PipelineCache::StreamLog(bool force) {
+    const auto now = std::chrono::steady_clock::now();
+    static u64 last_sum = ~u64{0};
+    const u64 sum = stream_released + stream_rehydrated + stream_inline + stream_late;
+    if (!force && (sum == last_sum || now - stream_logged < std::chrono::seconds{5})) {
+        return;
+    }
+    stream_logged = now;
+    last_sum = sum;
+    std::fprintf(stderr,
+                 "SOTC COMPILE STREAM: released %llu compute pipelines to the pack cache (%zu keys, %zu programs still "
+                 "out); rebuilt on workers %llu; built by a dispatch first (inline) %llu; dispatched before their "
+                 "rebuild was ready %llu\n",
+                 static_cast<unsigned long long>(stream_released), stream_released_keys.size(),
+                 stream_released_programs.size(), static_cast<unsigned long long>(stream_rehydrated),
+                 static_cast<unsigned long long>(stream_inline), static_cast<unsigned long long>(stream_late));
 }
 
 vk::PipelineCache PipelineCache::PackPipelineCache() const {
@@ -7235,7 +7751,11 @@ void PipelineCache::FinalPackPublish() {
 // processor threads idle at the loading screen), and their stop (they leave at the next idle moment; a job they run
 // finishes first; nothing is drained).
 void PipelineCache::StartExtraWorkers() {
-    const size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
+    size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
+    // sotc: SOTC_COMPILE_THREADS: no extra worker beyond the hold cap (on 8C/16T: 8 < 12 workers, so none start).
+    if (CompileThreadCap() != 0) {
+        hw = std::min<size_t>(hw, CompileThreadCap());
+    }
     if (hw <= async_workers.size() || !extra_workers.empty()) {
         return;
     }
@@ -7296,6 +7816,7 @@ void PipelineCache::MaybeHoldForPretranslate() {
     }
     pre_hold_done = true;
     pre_holding = true;
+    SetCompileHold(true, "pretranslate hold start"); // sotc: SOTC_COMPILE_THREADS, SOTC RAM
     const auto start = Clock::now();
     std::fprintf(stderr, "SOTC PRETRANSLATE: preparing the game's shaders (%zu translations) before play\n",
                  pre_backlog.size() + pre_in_flight);
@@ -7370,6 +7891,7 @@ void PipelineCache::MaybeHoldForPretranslate() {
         // A finished but failed/unlinkable pack must not pin every shader module for the whole session.
     }
     pre_holding = false;
+    SetCompileHold(false, "pretranslate hold end"); // sotc: SOTC_COMPILE_THREADS, SOTC RAM
     PrePackFinish(); // the variants of the hold, in one file; read back for their first draws
     // sotc: the driver's pipelines of the hold are written now, not at the 60 s timer. SOTC_NB_IO: by the saver
     // thread, so the hold screen does not wait for it (17.6 s on the CP in the P0 baseline).
@@ -7390,16 +7912,30 @@ void PipelineCache::MaybeHoldForPretranslate() {
            Clock::now() - lib_wait_start < std::chrono::seconds{30}) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
-    if (lib_jobs_pending.load(std::memory_order_relaxed) == 0) {
-        size_t evicted = 0;
+    // sotc: SOTC_COMPUTE_RELEASE: the modules of the hold's built compute pipelines leave memory first.
+    ReleaseBuiltComputeModules(true);
+    // sotc: library jobs hold pointers to graphics programs only, so with SOTC_COMPUTE_RELEASE the compute programs
+    // are evicted even when the wait above timed out (a pack-touched program whose modules are gone must not stay).
+    const bool libs_idle = lib_jobs_pending.load(std::memory_order_relaxed) == 0;
+    if (libs_idle || SotcNonBlocking::ComputeRelease()) {
+        size_t evicted = 0, evicted_compute = 0;
         for (auto it = program_cache.begin(); it != program_cache.end();) {
             Program& program = *it.value();
+            // sotc: a compute pipeline keeps a pointer to its program's Info, so a compute program stays while one
+            // exists. It leaves when the compute pack destroyed its pipelines (SOTC_COMPUTE_PACK, SOTC_COMPILE_STREAM:
+            // pack_touched) or, with SOTC_COMPUTE_RELEASE, when no compute pipeline names any of its permutations
+            // (checked for pack-touched ones too: a manifest pipeline of the program keeps it).
+            const bool compute = program.info.sw_stage == Shader::SwStage::Compute;
+            const bool release = SotcNonBlocking::ComputeRelease();
+            const bool compute_free =
+                compute && (pack_touched.contains(it.key()) || release) &&
+                (!release || !ProgramHasComputePipeline(it.key(), program));
             if (!program.sotc_pre || program.sotc_pre_checked || !program.pending_specs.empty() ||
-                (program.info.sw_stage == Shader::SwStage::Compute &&
-                 !pack_touched.contains(it.key()))) { // sotc: a compute pipeline keeps its module, unless the
-                ++it;                                   // compute pack destroyed both (SOTC_COMPUTE_PACK)
+                (compute && !compute_free) || (!compute && !libs_idle)) {
+                ++it;
                 continue;
             }
+            evicted_compute += compute ? 1 : 0;
             for (auto& module : program.modules) {
                 if (module.module) {
                     instance.GetDevice().destroyShaderModule(module.module);
@@ -7409,9 +7945,23 @@ void PipelineCache::MaybeHoldForPretranslate() {
             it = program_cache.erase(it);
             ++evicted;
         }
-        std::fprintf(stderr, "SOTC PRETRANSLATE: %zu prepared programs left for their first draw (on disk)\n",
-                     evicted);
+        std::fprintf(stderr,
+                     "SOTC PRETRANSLATE: %zu prepared programs left for their first draw (on disk; compute %zu)\n",
+                     evicted, evicted_compute);
     }
+    if (SotcNonBlocking::CompileStreamAll() && !stream_released_programs.empty()) {
+        // sotc: SOTC_COMPILE_STREAM=2: every released program is loaded back by the workers (2 pack loads at a time) and
+        // its pipelines rebuilt from the pack cache, without waiting for its shader file to load again.
+        std::vector<u64> programs(stream_released_programs.begin(), stream_released_programs.end());
+        size_t queued = 0;
+        for (const u64 hash : programs) {
+            queued += QueueLazyPrefetch(hash) ? 1 : 0;
+        }
+        std::fprintf(stderr, "SOTC COMPILE STREAM: %zu of %zu released programs queued for their rebuild after the "
+                             "hold\n",
+                     queued, programs.size());
+    }
+    LogRam("after pretranslate eviction"); // sotc: SOTC RAM
     std::fprintf(stderr, "SOTC PRETRANSLATE: shaders prepared in %.1f s (%llu translations)\n",
                  std::chrono::duration<double>(Clock::now() - start).count(),
                  static_cast<unsigned long long>(SotcPretranslate::JobsDone()));
@@ -8274,7 +8824,8 @@ namespace {
 std::optional<u32> ManifestFindPerm(const Program& program, Shader::StageSpecialization& spec) {
     spec.info = &program.info;
     for (size_t p = 0; p < program.modules.size(); ++p) {
-        if (program.modules[p].module && program.modules[p].spec == spec) {
+        // sotc: SOTC_COMPUTE_RELEASE: a released compute permutation is found too (its pipeline exists).
+        if (program.modules[p].Present() && program.modules[p].spec == spec) {
             return static_cast<u32>(p);
         }
     }
@@ -8673,8 +9224,14 @@ void PipelineCache::ManifestSchedulePipes(bool holding) {
             // eviction at the end of the SOTC_PRETRANSLATE hold); the stage is then resolved again.
             if (st.state == ManifestState::St::Ready) {
                 const auto found = program_cache.find(st.cache_hash);
-                if (found == program_cache.end() || st.perm >= found.value()->modules.size() ||
-                    !found.value()->modules[st.perm].module) {
+                // sotc: SOTC_COMPUTE_RELEASE: a released compute permutation stays ready while its pipeline exists.
+                const bool present =
+                    found != program_cache.end() && st.perm < found.value()->modules.size() &&
+                    (found.value()->modules[st.perm].module ||
+                     (found.value()->modules[st.perm].sotc_released &&
+                      compute_pipelines.contains(
+                          ComputePipelineKey{HashCombine(found.value()->info.CacheHash(), u64{st.perm})})));
+                if (!present) {
                     m.SetState(st, ManifestState::St::Pending);
                     st.program = nullptr;
                 } else {
@@ -8710,6 +9267,9 @@ void PipelineCache::ManifestSchedulePipes(bool holding) {
             last_compute_pipeline = nullptr;
             RegisterPipelineData(key, sdata);
             ++num_new_pipelines;
+            if (SotcNonBlocking::ComputeRelease()) { // sotc: its module leaves once built (ReleaseBuiltComputeModules)
+                compute_release_queue.push_back({st.cache_hash, st.perm, key.value});
+            }
             auto job = std::make_unique<AsyncPipelineJob>();
             job->compute = raw;
             job->manifest = true;
@@ -8992,6 +9552,7 @@ void PipelineCache::RunManifestHold() {
     const auto start = Clock::now();
     const uint64_t private_start = SotcPipeManifest::ProcessPrivateBytes(); // sotc: SOTC_GPL_NODROP line below
     manifest_holding = true;
+    SetCompileHold(true, "manifest hold start"); // sotc: SOTC_COMPILE_THREADS, SOTC RAM
     if (m.hold_start == Clock::time_point{}) {
         m.hold_start = start;
     }
@@ -9092,6 +9653,8 @@ void PipelineCache::RunManifestHold() {
     }
     SotcPipeManifest::Flush();
     manifest_holding = false;
+    SetCompileHold(false, "manifest hold end"); // sotc: SOTC_COMPILE_THREADS, SOTC RAM
+    ReleaseBuiltComputeModules(true);           // sotc: SOTC_COMPUTE_RELEASE: the manifest's compute modules
     m.held_once = true;
     const auto end = Clock::now();
     m.held += end - start;

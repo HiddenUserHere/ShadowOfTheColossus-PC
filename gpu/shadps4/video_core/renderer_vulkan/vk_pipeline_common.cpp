@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic> // sotc: BindSets guard counter
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <boost/container/static_vector.hpp>
 
 #include "common/assert.h"
+#include "common/logging/log.h" // sotc: BindSets guard
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_heap.h" // sotc: SOTC_DESCRIPTOR_HEAP
@@ -640,10 +642,13 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
                              &bindless_slots);
     }
 
-    // sotc: SOTC_BINDLESS_SAMP: the global sampler set is bound beside set 0, before any early out.
+    // sotc: SOTC_BINDLESS_SAMP: the global sampler set is bound beside set 0, before any early out. Its index is the
+    // one the SPIR-V names (BindlessSetIndex): set 1, or the set after the stage sets with SOTC_STAGE_BINDINGS (a
+    // fixed set 1 there was the vertex stage's set: an invalid bind, and with dynamic flat buffers in that set NVIDIA
+    // read the null pDynamicOffsets).
     if (uses_bindless_samplers) {
         const auto bindless_set = desc_heap.BindlessSamplerSet();
-        cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 1, 1, &bindless_set, 0, nullptr);
+        BindSets(cmdbuf, bind_point, BindlessSetIndex(), 1, &bindless_set, 0, nullptr);
     }
 
     // Bind descriptor set.
@@ -684,7 +689,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
     // sotc: SOTC_BIND_DESC_REUSE: the set of the last write of this bind-cache entry, bound again unwritten.
     if (want_reuse && reuse_in.count == 1 && reuse_in.sets[0]) {
         const u32 num_dyn = PrepareDynamicFlat(set_writes, write_sets, dyn_offsets, nullptr);
-        cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, 1, &reuse_in.sets[0], num_dyn, dyn_offsets.data());
+        BindSets(cmdbuf, bind_point, 0, 1, &reuse_in.sets[0], num_dyn, dyn_offsets.data());
         *reuse = reuse_in;
         reuse->reuse = true;
         reuse->last_tick = scheduler.CurrentTick();
@@ -700,7 +705,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
     const u32 num_dyn = dyn_flat.empty() ? 0u : PrepareDynamicFlat(set_writes, write_sets, dyn_offsets, &patch);
     instance.GetDevice().updateDescriptorSets(set_writes, {});
     RestoreDynamicWrites(set_writes, patch);
-    cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, 1, &desc_set, num_dyn, dyn_offsets.data());
+    BindSets(cmdbuf, bind_point, 0, 1, &desc_set, num_dyn, dyn_offsets.data());
     if (reuse) { // sotc: SOTC_BIND_DESC_REUSE: kept for the entry
         reuse->sets[0] = desc_set;
         reuse->layouts[0] = desc_layout;
@@ -716,7 +721,11 @@ void Pipeline::BindStageSets(DescriptorWrites& set_writes, std::span<const u32> 
                              DescriptorSetReuse* reuse_out) const {
     ASSERT_MSG(write_sets.size() == set_writes.size(), "Descriptor write without a set");
     const auto cmdbuf = scheduler.CommandBuffer();
-    const u32 num_sets = static_cast<u32>(set_layouts.size());
+    // sotc: only the stage sets: the layout's padding sets and its bindless set (BindlessSetIndex) are not committed
+    // here; BindResources binds the global bindless set at its index.
+    const u32 num_sets = num_stage_sets;
+    ASSERT_MSG(num_sets != 0 && num_sets <= DescriptorSetReuse::MaxSets && num_sets <= set_layouts.size(),
+               "Stage set count {} for a layout of {} sets", num_sets, set_layouts.size());
     static_assert(DescriptorSetReuse::MaxSets == Shader::MaxStageDescriptorSets);
     // sotc: SOTC_BIND_DESC_REUSE: the flat buffer bindings of a dynamic layout take their offsets at bind time.
     std::array<u32, MaxDynamicFlat> dyn_offsets{};
@@ -724,8 +733,7 @@ void Pipeline::BindStageSets(DescriptorWrites& set_writes, std::span<const u32> 
     // per layout set, bound again without a write; a record of another shape is written below instead.
     if (reuse_in && reuse_out && reuse_in->count == num_sets) {
         const u32 num_dyn = PrepareDynamicFlat(set_writes, write_sets, dyn_offsets, nullptr);
-        cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, num_sets, reuse_in->sets.data(), num_dyn,
-                                  dyn_offsets.data());
+        BindSets(cmdbuf, bind_point, 0, num_sets, reuse_in->sets.data(), num_dyn, dyn_offsets.data());
         *reuse_out = *reuse_in;
         reuse_out->reuse = true;
         reuse_out->last_tick = scheduler.CurrentTick();
@@ -756,8 +764,33 @@ void Pipeline::BindStageSets(DescriptorWrites& set_writes, std::span<const u32> 
     const u32 num_dyn = dyn_flat.empty() ? 0u : PrepareDynamicFlat(set_writes, write_sets, dyn_offsets, &patch);
     instance.GetDevice().updateDescriptorSets(set_writes, {});
     RestoreDynamicWrites(set_writes, patch);
-    cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, num_sets, desc_sets.data(), num_dyn,
-                              dyn_offsets.data());
+    BindSets(cmdbuf, bind_point, 0, num_sets, desc_sets.data(), num_dyn, dyn_offsets.data());
+}
+
+void Pipeline::BindSets(vk::CommandBuffer cmdbuf, vk::PipelineBindPoint bind_point, u32 first, u32 count,
+                        const vk::DescriptorSet* sets, u32 num_dyn, const u32* offsets) const {
+    // sotc: the dynamic descriptors of the bound sets, one offset each (dyn_flat is sorted by set, then binding).
+    u32 expected = 0;
+    for (const auto& dyn : dyn_flat) {
+        expected += dyn.set >= first && dyn.set - first < count ? 1u : 0u;
+    }
+    if (expected == num_dyn && (num_dyn == 0 || offsets)) [[likely]] {
+        cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, first, count, sets, num_dyn, offsets);
+        return;
+    }
+    static std::atomic<u64> mismatches{0};
+    const u64 n = mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0) {
+        LOG_ERROR(Render_Vulkan,
+                  "descriptor bind with wrong dynamic offsets (bind #{}): sets {}..{} of a {}-set layout need {}, "
+                  "got {} (offsets {}), stage sets {} ({}), bindless {} at set {}, pipeline {}; zero offsets used",
+                  n, first, first + count - 1, set_layouts.size(), expected, num_dyn, offsets ? "given" : "null",
+                  stage_sets, num_stage_sets, uses_bindless_samplers, BindlessSetIndex(), GetDebugString());
+    }
+    // A valid bind (offset 0 stays inside each buffer) instead of the driver reading past or through null offsets.
+    ASSERT_MSG(expected <= MaxDynamicFlat, "{} dynamic offsets in one bind", expected);
+    const std::array<u32, MaxDynamicFlat> zeros{};
+    cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, first, count, sets, expected, zeros.data());
 }
 
 std::string Pipeline::GetDebugString() const {

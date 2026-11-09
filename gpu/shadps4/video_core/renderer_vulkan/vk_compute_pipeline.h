@@ -62,6 +62,9 @@ struct ComputeSpecFreeStats {
     /// (TranslateComputeOnWorker), the CP's wait time, waits that timed out, and translations still made inline on the
     /// CP (a worker failure or timeout). Always 0 in descriptor mode.
     std::atomic<u64> cp_worker{0}, cp_worker_ns{0}, cp_worker_timeouts{0}, cp_inline{0};
+    /// sotc: SOTC_HEAP: prebuilt programs installed as the heap variant, and heap candidates the translated Info refused
+    /// (prebuilt again as the plain variant). Always 0 with the heap off.
+    std::atomic<u64> heap_prebuilds{0}, heap_refused_prebuilds{0};
     std::atomic<u32> logged{0};
 };
 extern ComputeSpecFreeStats g_specfree;
@@ -143,8 +146,22 @@ public:
     bool sotc_inline{};
     /// sotc: SOTC_COMPUTE_SPECFREE: compiled by a dispatch's lookup (not a prebuild, not from the pack cache).
     bool sotc_dispatch_built{};
+    /// sotc: SOTC_COMPILE_STREAM: rebuilt from the pack cache by StreamRehydrate (its first lookup counts a late
+    /// rehydrate when it is not built yet, and clears this).
+    bool sotc_rehydrated{};
     u64 KeyValue() const {
         return compute_key.value;
+    }
+
+    /// sotc: SOTC_COMPUTE_RELEASE: the module is no longer read: the optimized pipeline is built and installed (no
+    /// SOTC_COMPUTE_FAST build is live or running, so no BuildOptimized or BuildFastBeside follows).
+    [[nodiscard]] bool ModuleReleasable() const noexcept {
+        return IsReady() && compute_handle.load(std::memory_order_acquire) != VkPipeline{} &&
+               !sotc_fast_live.load(std::memory_order_acquire) && !sotc_fast_running.load(std::memory_order_acquire);
+    }
+    /// sotc: SOTC_COMPUTE_RELEASE: forgets the module handle (the owner destroys it). Only after ModuleReleasable.
+    void ReleaseModule() noexcept {
+        module = vk::ShaderModule{};
     }
 
 private:

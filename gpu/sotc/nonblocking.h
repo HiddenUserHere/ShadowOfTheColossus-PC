@@ -186,7 +186,7 @@ inline bool GplPackLean() {
     return on;
 }
 
-/// SOTC_COMPUTE_PACK (on unless set to 0; with SOTC_GPL_PACK_LEAN): the first-launch loading hold also compiles every
+/// SOTC_COMPUTE_PACK (default off; =1 on, with SOTC_GPL_PACK_LEAN): the first-launch loading hold also compiles every
 /// compute program of the loaded shader files (the SOTC_PRETRANSLATE_COMPUTE prebuild, turned on by this switch when
 /// its own is unset: the hint of user/shader_predict/compute_hints.tsv when there is one, the synthetic perm-0
 /// specialization otherwise) into the pack's VkPipelineCache (sotc_vk_pack.bin), then destroys the pipeline and its
@@ -202,6 +202,46 @@ inline bool ComputePackRequested() {
 }
 inline bool ComputePack() {
     return ComputePackRequested() && GplPackLibs();
+}
+
+/// sotc: SOTC_CACHE_MAP (on unless set to 0). The saved driver and pack caches are read through a read-only file
+/// mapping that is unmapped right after vkCreatePipelineCache, and written through a mapping of the .tmp file, so no
+/// cache-size vector is held next to the driver's own copy (0.4-1.1 GB transient per load or save in the 9 Nov cold
+/// run). 0: the former vector read and write.
+inline bool CacheMap() {
+    static const bool on = SwitchOnByDefault("SOTC_CACHE_MAP");
+    return on;
+}
+
+/// sotc: SOTC_COMPUTE_RELEASE (on unless set to 0). Once a compute pipeline of a prebuild or of the manifest is built
+/// (optimized, not a SOTC_COMPUTE_FAST build), its VkShaderModule (the driver's SPIR-V copy) is destroyed: the
+/// permutation stays in the program (marked released), and the pipeline serves every later lookup. The end-of-hold
+/// eviction also sends compute programs that have no pipeline back to the index. 0: modules stay for the session.
+inline bool ComputeRelease() {
+    static const bool on = SwitchOnByDefault("SOTC_COMPUTE_RELEASE");
+    return on;
+}
+
+/// sotc: SOTC_COMPILE_STREAM=1 (default off, experimental). The hold's compute prebuilds are compiled into the pack
+/// cache (sotc_vk_pack.bin) and, at the pack step, the ones no dispatch bound are destroyed with their modules (the
+/// PackComputePipelines rule of SOTC_COMPUTE_PACK, without its inline recorder builds). A released program comes back
+/// when the game loads its shader file again (the pretranslate request queues the pack load, and its pipelines are
+/// rebuilt from the pack cache on the workers); a dispatch that comes first builds it itself and is counted
+/// ("SOTC COMPILE STREAM" line). Needs SOTC_GPL_PACK_LEAN and the GPL pack. The pretranslate request of a program is
+/// made once per session (pretranslate.cpp), so a released program's shader file must load again (Forget) for the
+/// request to come; a program whose file stays loaded is only rebuilt by its dispatch. =2: every released program is
+/// also queued for its rebuild right after the hold (pack loads 2 at a time on the workers): the hold's peak is lower,
+/// and the memory comes back during the first minutes of play.
+inline bool CompileStream() {
+    static const bool on = SwitchOn("SOTC_COMPILE_STREAM") && GplPackLean();
+    return on && GplPackLibs();
+}
+inline bool CompileStreamAll() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_COMPILE_STREAM");
+        return v != nullptr && v[0] == '2';
+    }();
+    return on && CompileStream();
 }
 
 /// sotc: SOTC_COMPUTE_FAST=1 (default off). A compute pipeline a dispatch needs and that is not built yet gets a first

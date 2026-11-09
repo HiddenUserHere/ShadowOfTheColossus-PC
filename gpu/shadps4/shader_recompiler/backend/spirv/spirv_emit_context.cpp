@@ -1991,7 +1991,8 @@ void EmitContext::DefineImagesAndSamplers() {
                 bindless_image_arrays[key] =
                     AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant);
                 Decorate(bindless_image_arrays[key], spv::Decoration::Binding, 1U + key);
-                Decorate(bindless_image_arrays[key], spv::Decoration::DescriptorSet, 1U);
+                // sotc: the bindless set follows the stage sets with SOTC_STAGE_BINDINGS (BindlessSetIndex).
+                Decorate(bindless_image_arrays[key], spv::Decoration::DescriptorSet, BindlessSetIndex());
                 Name(bindless_image_arrays[key],
                      fmt::format("{}_bindless_img{}", hw_stage, key));
                 interfaces.push_back(bindless_image_arrays[key]);
@@ -2066,7 +2067,8 @@ void EmitContext::DefineImagesAndSamplers() {
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, array_type)};
         bindless_sampler_array = AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant);
         Decorate(bindless_sampler_array, spv::Decoration::Binding, 0U);
-        Decorate(bindless_sampler_array, spv::Decoration::DescriptorSet, 1U);
+        // sotc: set 1, or the set after the stage sets with SOTC_STAGE_BINDINGS (BindlessSetIndex).
+        Decorate(bindless_sampler_array, spv::Decoration::DescriptorSet, BindlessSetIndex());
         Name(bindless_sampler_array, fmt::format("{}_bindless_samp", hw_stage));
         interfaces.push_back(bindless_sampler_array);
         return;

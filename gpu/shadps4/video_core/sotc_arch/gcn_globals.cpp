@@ -265,6 +265,10 @@ void DrainMisses(const MissSink& sink) {
 
     // Dedup starts over for the next submit. Records of work still in flight are re-appended if they miss again.
     std::memset(base + Shader::Gcn::kSeenOffset, 0, Shader::Gcn::kSeenBits / 8);
+
+    // sotc: SOTC_GCN_TEX_REGISTER. The T#s the engine hooks queued go through the same sink as an image miss (no-op
+    // unless the switch is set).
+    Tex::DrainRegistered(sink);
 }
 
 void Report(char* out, u32 size, double seconds) {

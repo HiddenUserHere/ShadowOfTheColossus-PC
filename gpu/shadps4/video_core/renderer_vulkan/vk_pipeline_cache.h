@@ -80,6 +80,13 @@ struct Program {
     struct Module {
         vk::ShaderModule module;
         Shader::StageSpecialization spec;
+        /// sotc: SOTC_COMPUTE_RELEASE: a compute permutation whose module was destroyed once its pipeline was built
+        /// (module is null; the pipeline in compute_pipelines serves it). It counts as present for the lookups.
+        bool sotc_released{};
+        /// sotc: the permutation exists: a module, or a released one (SOTC_COMPUTE_RELEASE).
+        bool Present() const {
+            return module || sotc_released;
+        }
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
@@ -592,6 +599,8 @@ private:
         u32 background_running{}; ///< background jobs taken by workers and not finished
         /// sotc: jobs of the capped lanes (Shadow, Graphics, Background; CappedLane) taken by workers and not finished
         u32 capped_running{};
+        /// sotc: SOTC_COMPILE_THREADS: jobs taken while a loading hold is active and not finished (any lane)
+        u32 hold_running{};
         std::deque<std::unique_ptr<AsyncPipelineJob>>& operator[](JobLane lane) {
             return lanes[static_cast<size_t>(lane)];
         }
@@ -608,7 +617,22 @@ private:
     void PushJobLocked(JobLane lane, std::unique_ptr<AsyncPipelineJob> job);
     /// sotc: the job a worker takes now (async_mutex held), or null when only capped background jobs wait.
     /// urgent_only (SOTC_GPL_URGENT_WORKERS): the Urgent and Predict lanes only.
-    std::unique_ptr<AsyncPipelineJob> PopJobLocked(JobLane& lane, bool urgent_only = false);
+    /// sotc: SOTC_COMPILE_THREADS: hold_slot is set when the job counts against the hold cap (HoldSlot releases it).
+    std::unique_ptr<AsyncPipelineJob> PopJobLocked(JobLane& lane, bool urgent_only = false, bool* hold_slot = nullptr);
+    /// sotc: SOTC_COMPILE_THREADS: the hold cap applies now (a loading hold is active and the cap is not 0).
+    bool HoldCapActive() const;
+    /// sotc: SOTC_COMPILE_THREADS: a loading hold starts or ends (CP). The end wakes the workers the cap held back.
+    void SetCompileHold(bool active, const char* what);
+    /// sotc: SOTC_COMPUTE_RELEASE (CP): destroys the modules of the queued compute permutations whose pipeline is built.
+    /// force: the whole queue now (the hold ends); otherwise at most once per second.
+    void ReleaseBuiltComputeModules(bool force);
+    /// sotc: SOTC_COMPUTE_RELEASE: a compute pipeline exists for a permutation of the program (keyed by its cache key).
+    bool ProgramHasComputePipeline(u64 program_key, const Program& program) const;
+    /// sotc: SOTC_COMPILE_STREAM (CP): the released pipelines of a program whose permutations are loaded again are
+    /// rebuilt from the pack cache on the workers.
+    void StreamRehydrate(u64 program_hash);
+    /// sotc: SOTC_COMPILE_STREAM: the counters line (every 5 s when they changed, or now with force).
+    void StreamLog(bool force);
     /// sotc: a worker can take a job now (async_mutex held).
     bool HasRunnableJobLocked(bool urgent_only = false) const;
     /// sotc: SOTC_GPL_URGENT_WORKERS: a lane the reserved workers serve.
@@ -1045,6 +1069,26 @@ private:
     /// sotc: notified (under async_mutex) when a translation job is done.
     std::condition_variable_any translate_done_cv;
     bool compute_prefetch{}; ///< SOTC_ASYNC_COMPUTE_XLATE=1 and workers exist
+    /// sotc: SOTC_COMPILE_THREADS: loading holds in progress (pretranslate, manifest), set by SetCompileHold on the CP
+    /// and read by the workers under async_mutex.
+    std::atomic<int> compile_holds{0};
+    /// sotc: SOTC_COMPUTE_RELEASE (CP only): compute permutations whose pipeline was created and whose module may be
+    /// destroyed once it is built: program cache key, permutation, pipeline key.
+    struct ComputeRelease {
+        u64 program{};
+        u32 perm{};
+        u64 key{};
+    };
+    std::vector<ComputeRelease> compute_release_queue;
+    std::chrono::steady_clock::time_point compute_release_last{};
+    u64 compute_modules_released{};
+    /// sotc: SOTC_COMPILE_STREAM (CP only): pipeline keys the pack step destroyed, and their programs; the counters of
+    /// the "SOTC COMPILE STREAM" line (rebuilt on workers, built by a dispatch first, dispatched before the rebuild was
+    /// ready).
+    std::unordered_set<u64> stream_released_keys;
+    std::unordered_set<u64> stream_released_programs;
+    u64 stream_released{}, stream_rehydrated{}, stream_inline{}, stream_late{};
+    std::chrono::steady_clock::time_point stream_logged{};
     std::vector<std::jthread> async_workers;
     unsigned reserved_workers{}; ///< sotc: SOTC_GPL_URGENT_WORKERS: of them, the Urgent/Predict-only ones
 };

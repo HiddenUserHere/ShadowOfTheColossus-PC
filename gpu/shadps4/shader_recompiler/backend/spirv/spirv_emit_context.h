@@ -115,6 +115,12 @@ public:
         return profile.stage_bindings ? StageDescriptorSet(info.sw_stage) : 0u;
     }
 
+    /// sotc: the descriptor set of the bindless heap arrays (BindlessDescriptorSet): after the stage sets with
+    /// Profile::stage_bindings on a graphics stage, set 1 otherwise (compute has no stage sets).
+    [[nodiscard]] u32 BindlessSetIndex() const {
+        return BindlessDescriptorSet(profile.stage_bindings && info.sw_stage != SwStage::Compute);
+    }
+
     [[nodiscard]] Id DefineUniformConst(Id type, u32 set, u32 binding, bool readonly = false) {
         const Id uniform_id{DefineVar(type, spv::StorageClass::UniformConstant)};
         Decorate(uniform_id, spv::Decoration::DescriptorSet, set);

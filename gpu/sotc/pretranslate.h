@@ -99,6 +99,9 @@ inline ComputeFields ComputeFieldsOf(const std::array<uint32_t, 16>& regs, uint8
 
 /// Loader thread: queues a request (a hash already queued once is ignored).
 void Push(Request&& request) noexcept;
+/// sotc: SOTC_COMPILE_STREAM. Command processor: the next load of this program's shader file queues a request again
+/// (its pipelines were released to the pack cache; the request brings them back on the workers).
+void Forget(uint64_t hash) noexcept;
 /// Command processor: true when requests wait.
 bool Pending() noexcept;
 /// Command processor: the waiting requests.

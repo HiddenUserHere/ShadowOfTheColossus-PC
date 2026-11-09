@@ -184,6 +184,41 @@ void StampLiveSlots();
 bool SkipResolve();
 void ForEachReferencedImage(VideoCore::TextureCache& texture_cache, void (*fn)(void* user, VideoCore::Image&),
                             void* user);
+
+// sotc: SOTC_GCN_TEX_REGISTER (GCN-NATIVE-PLAN-2026-11-09.md step 2; needs SOTC_GCN_TEX; off by default). The engine
+// tells the table which T#s exist before any draw samples them: engine hooks (gpu/sotc/gcn_tex_register.cpp,
+// scripts/hooks.d/gcn_tex_register.py) queue T#s from the material blocks (factory 0xf9390), from render-target
+// creation (0x97a50) and from the two pass-texture setters (0x861fe0, 0x862160), and queue in-place rewrites of a
+// CTexture's T# (0x881e60 base, 0x880c30 levels). The queue is drained on the draw thread at submit start
+// (DrainRegistered, called by Globals::DrainMisses), through the same texture cache resolution as a GPU image miss.
+// SOTC_GCN_TEX_REGISTER_SOURCES = bit mask of the sources (1 material, 2 refresh, 4 render target, 8 pass; default 15).
+// SOTC_GCN_TEX_REGISTER_BUDGET = view resolutions per submit (default 64; the rest waits for the next submit).
+// SOTC_GCN_TEX_REGISTER_LOG=1: one-time log of the first draws that sample a render target (T# seen by the per-op
+// resolve next to the render target object's candidate fields +0xc4, +0xe4, +0x124, +0x164).
+enum class Source : u8 { Op = 0, Material = 1, Refresh = 2, RenderTarget = 3, Pass = 4, Count = 5 };
+/// The switch is set (with SOTC_GCN_TEX set) and the source is in SOTC_GCN_TEX_REGISTER_SOURCES. Environment only,
+/// read once: any thread, also before the device exists (hooks.cpp decides which hooks to install with it).
+bool RegisterRequested(Source source);
+/// RegisterRequested and the Tex stage is not refused (Mode(Stage::Tex) != 0). Any thread; one relaxed load after the
+/// first call.
+bool RegisterOn(Source source);
+/// SOTC_GCN_TEX_REGISTER_LOG=1 (with RegisterRequested). Read once.
+bool RegisterLog();
+/// Hook side, any thread, no texture cache lock: queues one T# for registration. A T# queued recently is dropped
+/// (lock-free seen set, cleared by Report). Invalid words (base 0, invalid format) are dropped.
+void QueueRegister(const u32 (&tsharp)[8], Source source);
+/// Hook side: the T# at guest address tsharp_addr was rewritten in place from `old` to `now`. Coalesced per address
+/// (the first old, the last now). At the drain, when `old` has live table entries, `now` is registered with the same
+/// view classes and the old entries become tombstones. A rewrite of a T# the table does not hold is counted only.
+void QueueRefresh(u64 tsharp_addr, const u32 (&old)[8], const u32 (&now)[8]);
+/// Hook side: a render target object (CTexture, 0x1c0 bytes) was created. Recorded for SOTC_GCN_TEX_REGISTER_LOG
+/// under the base addresses of its candidate descriptors.
+void NoteRenderTarget(u64 object);
+/// Draw thread, once per submit (Globals::DrainMisses, after the miss records): resolves up to the budget of queued
+/// registrations through sink.image (Tex::OnImageMiss, which creates the image and view as the per-op resolve does)
+/// and applies the queued refreshes. No-op unless RegisterRequested.
+void DrainRegistered(const Globals::MissSink& sink);
+
 void Report(char* out, u32 size, double seconds);
 } // namespace Tex
 
@@ -255,6 +290,49 @@ void NoteDispatchPrepared(bool taken);
 /// Mode 2 and SOTC_VERIFY: a prepared dispatch compared with the inline computation.
 void NoteDispatchVerify(bool match);
 void Report(char* out, u32 size, double seconds);
+
+// sotc: SOTC_GCN_SKIP (GCN-NATIVE-PLAN step 4, "a real skip path"). An eligible op does not call BindBuffers (its guest
+// buffers are read by address, S2) and, when its heap stages are table-resolved (SOTC_GCN_TEX_SKIP_RESOLVE path), not
+// BindHeapImages either; a stage whose images are not table-resolved keeps BindTextures (buffer-only skip). The op
+// takes no bind cache (as the commit lane). Modes: 0 off (default), 1 skip, 2 verify (the full bind runs and is compared
+// with what the skip path would have made). Needs SOTC_GCN_BUF in table mode and SOTC_GCN_SYNC; does not need
+// SOTC_GCN_COMMIT. Read once (refused with one log line when Buf or Sync is off).
+int SkipMode();
+/// Why an op does not take the skip path (None: it does). Pipeline reasons are cached on Pipeline::sotc_gcn_skip.
+enum class SkipReason : u8 {
+    None,        ///< eligible
+    Global,      ///< Buf (table mode) or Sync off or refused, or SOTC_SHADER_ADDR=2
+    Profile,     ///< pipeline without gcn_buf or without the packet range
+    Dma,         ///< a stage with DMA reads, sharp tables or fmasks
+    Special,     ///< a special buffer other than the flat buffer, clip planes or LOD feedback (GDS, BDA, LDS, ...)
+    Unaddressed, ///< a guest buffer the shader reads through a descriptor
+    Count
+};
+/// The pipeline part (cached) and the global terms (read on every call). Draw thread.
+SkipReason SkipEligible(const Vulkan::Pipeline& pipeline);
+/// One op's decision (BindResources, before any early return).
+void NoteSkipDecision(SkipReason reason);
+/// An eligible op reached the end of its bind: skipped (mode 1) or would have been (mode 2); with_images: every stage
+/// with image or sampler bindings was table-resolved (BindHeapImages and BindTextures skipped too).
+void NoteSkipDone(bool with_images);
+/// A formatted read the skip path answered by the placed-page test (fast) or by GcnTouch (slow). Mode 2: would-be.
+void NoteSkipFormatted(bool fast);
+/// Draw-thread time of one BindResources call (TSC ticks): kind 0 a refused op, 1 a skipped op, 2 an eligible op that
+/// ran the full bind (mode 2).
+void NoteSkipBindTime(u32 kind, u64 ticks);
+/// Mode 2 categories of a stage's comparison (bits of the mask).
+enum SkipMismatch : u32 {
+    SkipMmPush = 1u << 0,        ///< BindBuffers changed the push data (the skip path never does)
+    SkipMmPacket = 1u << 1,      ///< BindBuffers changed a packet word other than the flat buffer addresses
+    SkipMmRanges = 1u << 2,      ///< the addressed ranges (base, size, written, formatted) differ from the plan
+    SkipMmWritten = 1u << 3,     ///< the written ranges marked differ from the plan's
+    SkipMmDescriptors = 1u << 4, ///< BindBuffers wrote a descriptor that is not a special's
+    SkipMmBindings = 1u << 5,    ///< the binding counters advanced differently
+    SkipMmCount = 6
+};
+/// Mode 2: one stage compared (mask 0: match). The first 32 mismatches are logged (stderr).
+void NoteSkipVerify(u32 mask, u64 pgm_hash, u32 stage_index);
+void SkipReport(char* out, u32 size, double seconds);
 } // namespace Commit
 
 // ---------------------------------------------------------------------------------------------------------------

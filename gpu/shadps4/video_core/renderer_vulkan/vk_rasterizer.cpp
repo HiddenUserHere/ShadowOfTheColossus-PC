@@ -4729,6 +4729,20 @@ u64 BindCacheFrameKey(const Pipeline* pipeline, u64 hash, u64 targets_key);
 static void PlanBReport(DescriptorHeap& heap); // sotc: plan B 5 s line (defined before BindCacheDropFrame)
 
 bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* prepared) {
+    // sotc: SOTC_GCN_SKIP: the draw-thread time of this call by kind (0 refused, 1 skipped, 2 eligible with the full
+    // bind of mode 2), for the 5 s line. One TSC read per edge, only with the switch on.
+    struct SkipBindTimer {
+        bool on;
+        u32 kind;
+        u64 start;
+        ~SkipBindTimer() {
+            if (on) {
+                SotcGcn::Commit::NoteSkipBindTime(kind, SotcStats::Ticks() - start);
+            }
+        }
+    };
+    const int skip_mode = SotcGcn::Commit::SkipMode();
+    SkipBindTimer skip_timer{skip_mode != 0, 0u, skip_mode != 0 ? SotcStats::Ticks() : 0u};
     // sotc: SOTC_SHADER_ADDR / SOTC_HEAP: the pipeline's profile, read by BindBuffers (ShaderAddrBuffer) below.
     SotcArch::ShaderAddr::SetBindProfile(&pipeline->GetProfile());
     if (SotcStats::kFpsLog && SotcStats::kBindCache) { // sotc: SOTC_FPS bind eligibility (sotc_stats.h)
@@ -4776,6 +4790,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         if (commit_bypass) {
             SotcGcn::Commit::NoteBypass();
         }
+    }
+    // sotc: SOTC_GCN_SKIP (GCN-NATIVE-PLAN step 4). An op whose pipeline is skip-eligible (every guest buffer of every
+    // stage shader-addressed, only skippable specials, SotcGcn::Commit::SkipEligible) does not call BindBuffers: its
+    // stages take BindBuffersSkip (specials, residency and written-range bookkeeping only), and its table-resolved heap
+    // stages skip BindHeapImages. Other image stages keep BindTextures (buffer-only skip). The op takes no bind cache and
+    // no fast bind, as the commit lane. Mode 2 takes the same cache-free lane, runs the full bind and compares.
+    const SotcGcn::Commit::SkipReason skip_reason =
+        skip_mode != 0 ? SotcGcn::Commit::SkipEligible(*pipeline) : SotcGcn::Commit::SkipReason::Global;
+    const bool skip_op = skip_mode != 0 && skip_reason == SotcGcn::Commit::SkipReason::None;
+    const bool skip_bind = skip_op && skip_mode == 1;
+    if (skip_mode != 0) {
+        SotcGcn::Commit::NoteSkipDecision(skip_reason);
+        skip_timer.kind = skip_op ? (skip_bind ? 1u : 2u) : 0u;
     }
     // sotc: the register-only inputs below (push data, hashes, eligibility, heap keys) come from the slot, for a draw
     // (PrepareDraw) and a dispatch (PrepareDispatch, SOTC_GCN_COMMIT) alike. CheckPreparedDispatch passes a dispatch's
@@ -4955,7 +4982,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     const bool cache_sync_eligible =
         SotcStats::kBindCache && packet_cacheable &&
         (reg_prepared ? reg_prepared->cache_eligible : BindCacheEligible(pipeline));
-    const bool cache_eligible = cache_sync_eligible && !commit_bypass; // sotc: SOTC_GCN_COMMIT (lane: no caches)
+    // sotc: SOTC_GCN_COMMIT (lane: no caches); SOTC_GCN_SKIP: a skip op takes the same lane (both modes).
+    const bool cache_eligible = cache_sync_eligible && !commit_bypass && !skip_op;
     // sotc: SOTC_BIND_CACHE_HEAP. The heap resolutions of a packet op the frame cache may take are made on a miss only:
     // a hit replays the ones its entry holds (TryBindCacheFrame). Any other op resolves them here, as before.
     const u32 heap_mask_op = (heap_stage ? 1u : 0u) | (heap_vs_stage ? 2u : 0u);
@@ -5095,6 +5123,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // sotc: SOTC_PACKET: a packet op takes the fast bind unless it has a heap stage (its index table is per op). Its
     // hits replay the addressed ranges (PacketAddrReplay) and the barrier rule (packet_barrier).
     const bool fast_eligible = (!packet_op || packet_heap_free) && !commit_bypass && // sotc: SOTC_GCN_COMMIT (lane)
+                               !skip_op && // sotc: SOTC_GCN_SKIP (the lane too)
                                (reg_prepared ? reg_prepared->fast_static && !attachment_feedback_loop
                                              : FastBindEligible(pipeline));
     u64 fast_hash = 0;
@@ -5472,6 +5501,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         }
     }
     bind_pred_slot = reg_prepared; // sotc: SOTC_PR_PRED (E1): BindBuffers reads this op's predicates
+    bool skip_images_all = true;   // sotc: SOTC_GCN_SKIP: every image stage of the op is table-resolved
     for (const auto* stage : pipeline->GetStages()) {
         ++stage_counter;
         if (!stage) {
@@ -5502,7 +5532,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         {
             const SotcTrace::BindScope trace_step{"bind buffers"}; // sotc: a = bytes, b = protects
             const SotcStats::SplitTimer buffers_split{SotcStats::SplitBindBuffers};
-            BindBuffers(*stage, binding, push_data, set, pr_stage ? resolved : nullptr, pr_stage);
+            if (skip_bind) { // sotc: SOTC_GCN_SKIP=1: no BindBuffers
+                BindBuffersSkip(*stage, binding, set, pr_stage ? resolved : nullptr, pr_stage);
+            } else if (skip_op) { // sotc: SOTC_GCN_SKIP=2: BindBuffers, compared with the skip path's plan
+                BindBuffersSkipVerify(*stage, binding, push_data, set, pr_stage ? resolved : nullptr, pr_stage,
+                                      stage_counter);
+            } else {
+                BindBuffers(*stage, binding, push_data, set, pr_stage ? resolved : nullptr, pr_stage);
+            }
         }
         {
             const SotcTrace::ScopeMin trace_step{"bind textures", stage->images.size()}; // sotc
@@ -5511,7 +5548,18 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             // sotc: SOTC_HEAP. The heap stage of the op takes its images from the index table in real mode; the classic
             // bind runs when BindHeapImages declines (counted there) and in the GPU verify (counted here).
             bool textures_done = false;
-            if (stage == heap_stage) {
+            // sotc: SOTC_GCN_SKIP. A heap stage that is table-resolved (gcn_tex_skip: no per-op Resolve, so heap_binds is
+            // empty and BindHeapImages would make nothing) skips BindHeapImages in mode 1; the op counts as buffers+images
+            // only when every stage with image or sampler bindings is such a stage.
+            const bool table_images = skip_op && gcn_tex_skip && pipeline->GetProfile().heap_images == 1 &&
+                                      (stage == heap_stage || stage == heap_vs_stage);
+            if (skip_op && !table_images &&
+                (!stage->images.empty() || !stage->samplers.empty() || stage->has_storage_images)) {
+                skip_images_all = false;
+            }
+            if (skip_bind && table_images) {
+                textures_done = true;
+            } else if (stage == heap_stage) {
                 if (heap_real) {
                     textures_done = BindHeapImages(*stage, heap_binds);
                 } else {
@@ -5533,6 +5581,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             }
         }
         uses_dma |= stage->uses_dma;
+    }
+    if (skip_op) { // sotc: SOTC_GCN_SKIP: skipped (mode 1) or would have been (mode 2), by tier
+        SotcGcn::Commit::NoteSkipDone(skip_images_all);
     }
     // sotc: SOTC_HEAP: the heap block of this op, after every stage's textures are bound (the classic slots of the
     // verify exist only then). The debug buffer address goes in every heap op; the words only in GPU verify.
@@ -8950,6 +9001,92 @@ static const bool kBindMarkOnce = [] {
     return v && v[0] == '1';
 }();
 
+// sotc: SOTC_GCN_SKIP. The special buffers a skip-eligible stage may have (SotcGcn::Commit::SkipEligible), moved out of
+// BindBuffers unchanged so that BindBuffersSkip binds them the same way: the flat buffer (its copy, packet address and
+// bind cache record), the clip planes and the LOD feedback buffer. Each pushes one buffer info; the caller writes the set
+// write after it, as for any buffer.
+void Rasterizer::BindSkippableSpecial(const Shader::Info& stage, const Shader::BufferResource& desc, u64 alignment) {
+    if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+        auto& vk_buffer = buffer_cache.GetStreamBuffer();
+        const u32 ubo_size = stage.FlatBuf().size() * sizeof(u32);
+        const u32* flat = FlatForBind(stage);
+        // sotc: SOTC_BIND_CACHE: flat buffers changed by live settings are not cached.
+        if (bind_cache_recording &&
+            (flat != stage.FlatBuf().data() || stage.pgm_hash == kTaaResolveHash ||
+             stage.pgm_hash == kTonemapHash)) {
+            bind_cache_uncacheable = true;
+        }
+        // sotc: SOTC_FLAT_ARENA: the table's arena place when the arena has it or has room (else the ring).
+        vk::Buffer flat_buffer = vk_buffer.Handle();
+        vk::DeviceAddress flat_base = vk_buffer.BufferDeviceAddress();
+        u64 offset = 0;
+        u64 flat_hash = 0;
+        bool hashed = false;
+        bool in_arena = false;
+        if (auto* arena = buffer_cache.GetFlatArena()) {
+            flat_hash = XXH3_64bits(flat, ubo_size);
+            hashed = true;
+            VideoCore::FlatArena::Ref ref{};
+            bool uploaded = false;
+            if (arena->Obtain(flat_hash, flat, ubo_size, alignment, scheduler.CurrentTick(), ref,
+                              uploaded)) {
+                offset = ref.offset;
+                flat_buffer = ref.buffer;
+                flat_base = ref.address;
+                in_arena = true;
+                if (SotcStats::kFpsLog) {
+                    (uploaded ? SotcStats::pb_flat_uploaded : SotcStats::pb_flat_reused)
+                        .fetch_add(1, std::memory_order_relaxed);
+                }
+            } else if (SotcStats::kFpsLog) {
+                SotcStats::pb_flat_stream.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!in_arena) {
+            offset = vk_buffer.Copy(flat, ubo_size, alignment);
+            bind_cache_stream_rec = true; // sotc: SOTC_BIND_CACHE_FRAME: a copy in the ring
+        }
+        buffer_infos.emplace_back(flat_buffer, offset, ubo_size);
+        // sotc: SOTC_PACKET: the flat buffer's device address for the packet (flat buffers are per stage:
+        // the fragment one has its own word, the vertex and compute one shares flatbuf_address).
+        if (stage.sw_stage == Shader::SwStage::Fragment) {
+            draw_packet.flatbuf_fragment_address = flat_base + offset;
+        } else if (stage.sw_stage == Shader::SwStage::Vertex ||
+                   stage.sw_stage == Shader::SwStage::Compute) {
+            draw_packet.flatbuf_address = flat_base + offset;
+        }
+        if (bind_cache_recording && SotcStats::kBindCacheFrame) {
+            bind_cache_flat_rec.push_back({cur_bind_stage,
+                                           static_cast<u32>(buffer_infos.size() - 1),
+                                           ubo_size, hashed ? flat_hash : XXH3_64bits(flat, ubo_size),
+                                           offset, buffer_cache.StreamGeneration(),
+                                           scheduler.CurrentTick(), flat_buffer, flat_base, in_arena});
+        }
+    } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
+        // Permutations compiled without enabled planes never read the buffer, so the
+        // declared binding is satisfied with a null descriptor instead of a copy.
+        if (liverpool->DrawRegs().clipper_control.user_clip_plane_enable == 0) {
+            buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+        } else {
+            auto& vk_buffer = buffer_cache.GetStreamBuffer();
+            std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+            for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+                const auto& plane = liverpool->DrawRegs().clip_user_data[i];
+                planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
+                planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
+                planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
+                planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
+            }
+            const u32 ubo_size = static_cast<u32>(sizeof(planes));
+            const u64 offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
+            buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+        }
+    } else if (desc.buffer_type == Shader::BufferType::LodFeedback) {
+        buffer_infos.emplace_back(sotc_lod_feedback->Handle(), 0,
+                                  SotcLodFeedbackBytes + sizeof(u32));
+    }
+}
+
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32 set, const PreparedResources* pr,
                              const PrStage* pr_stage) {
@@ -9120,81 +9257,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     BarrierStatic::BufferChecks() &&
                     runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written));
                 bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
-            } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
-                auto& vk_buffer = buffer_cache.GetStreamBuffer();
-                const u32 ubo_size = stage.FlatBuf().size() * sizeof(u32);
-                const u32* flat = FlatForBind(stage);
-                // sotc: SOTC_BIND_CACHE: flat buffers changed by live settings are not cached.
-                if (bind_cache_recording &&
-                    (flat != stage.FlatBuf().data() || stage.pgm_hash == kTaaResolveHash ||
-                     stage.pgm_hash == kTonemapHash)) {
-                    bind_cache_uncacheable = true;
-                }
-                // sotc: SOTC_FLAT_ARENA: the table's arena place when the arena has it or has room (else the ring).
-                vk::Buffer flat_buffer = vk_buffer.Handle();
-                vk::DeviceAddress flat_base = vk_buffer.BufferDeviceAddress();
-                u64 offset = 0;
-                u64 flat_hash = 0;
-                bool hashed = false;
-                bool in_arena = false;
-                if (auto* arena = buffer_cache.GetFlatArena()) {
-                    flat_hash = XXH3_64bits(flat, ubo_size);
-                    hashed = true;
-                    VideoCore::FlatArena::Ref ref{};
-                    bool uploaded = false;
-                    if (arena->Obtain(flat_hash, flat, ubo_size, alignment, scheduler.CurrentTick(), ref,
-                                      uploaded)) {
-                        offset = ref.offset;
-                        flat_buffer = ref.buffer;
-                        flat_base = ref.address;
-                        in_arena = true;
-                        if (SotcStats::kFpsLog) {
-                            (uploaded ? SotcStats::pb_flat_uploaded : SotcStats::pb_flat_reused)
-                                .fetch_add(1, std::memory_order_relaxed);
-                        }
-                    } else if (SotcStats::kFpsLog) {
-                        SotcStats::pb_flat_stream.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-                if (!in_arena) {
-                    offset = vk_buffer.Copy(flat, ubo_size, alignment);
-                    bind_cache_stream_rec = true; // sotc: SOTC_BIND_CACHE_FRAME: a copy in the ring
-                }
-                buffer_infos.emplace_back(flat_buffer, offset, ubo_size);
-                // sotc: SOTC_PACKET: the flat buffer's device address for the packet (flat buffers are per stage:
-                // the fragment one has its own word, the vertex and compute one shares flatbuf_address).
-                if (stage.sw_stage == Shader::SwStage::Fragment) {
-                    draw_packet.flatbuf_fragment_address = flat_base + offset;
-                } else if (stage.sw_stage == Shader::SwStage::Vertex ||
-                           stage.sw_stage == Shader::SwStage::Compute) {
-                    draw_packet.flatbuf_address = flat_base + offset;
-                }
-                if (bind_cache_recording && SotcStats::kBindCacheFrame) {
-                    bind_cache_flat_rec.push_back({cur_bind_stage,
-                                                   static_cast<u32>(buffer_infos.size() - 1),
-                                                   ubo_size, hashed ? flat_hash : XXH3_64bits(flat, ubo_size),
-                                                   offset, buffer_cache.StreamGeneration(),
-                                                   scheduler.CurrentTick(), flat_buffer, flat_base, in_arena});
-                }
-            } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
-                // Permutations compiled without enabled planes never read the buffer, so the
-                // declared binding is satisfied with a null descriptor instead of a copy.
-                if (liverpool->DrawRegs().clipper_control.user_clip_plane_enable == 0) {
-                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
-                } else {
-                    auto& vk_buffer = buffer_cache.GetStreamBuffer();
-                    std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
-                    for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
-                        const auto& plane = liverpool->DrawRegs().clip_user_data[i];
-                        planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
-                        planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
-                        planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
-                        planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
-                    }
-                    const u32 ubo_size = static_cast<u32>(sizeof(planes));
-                    const u64 offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
-                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
-                }
+            } else if (desc.buffer_type == Shader::BufferType::Flatbuf ||
+                       desc.buffer_type == Shader::BufferType::ClipPlanes) {
+                BindSkippableSpecial(stage, desc, alignment); // sotc: shared with BindBuffersSkip (SOTC_GCN_SKIP)
             } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
                 const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
                 buffer_infos.emplace_back(bda_buffer->Handle(), 0, bda_buffer->SizeBytes());
@@ -9202,8 +9267,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::LodFeedback) {
-                buffer_infos.emplace_back(sotc_lod_feedback->Handle(), 0,
-                                          SotcLodFeedbackBytes + sizeof(u32));
+                BindSkippableSpecial(stage, desc, alignment); // sotc: shared with BindBuffersSkip (SOTC_GCN_SKIP)
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->DrawCsRegs();
@@ -9778,6 +9842,209 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
     }
+}
+
+// sotc: SOTC_GCN_SKIP (GCN-NATIVE-PLAN step 4). The range BindBuffers' shader-addressed branch uses for a guest buffer:
+// the prepared base and size (SOTC_PR_RESOLVE) or the V# read here and clamped to mapped memory, then the BPE check of
+// a written range. Same calls in the same order as BindBuffers, so mode 2 can compare the two.
+Rasterizer::SkipRange Rasterizer::SkipRangeOf(const Shader::Info& stage, const Shader::BufferResource& desc,
+                                              const PreparedResources* pr, const PrStage* pr_stage) {
+    static const bool clamp1 = [] { // the same switch as BindBuffers' (SOTC_BIND_CLAMP1=0: the three calls)
+        const char* v = std::getenv("SOTC_BIND_CLAMP1");
+        return !v || v[0] != '0';
+    }();
+    const u32 buf_index = static_cast<u32>(&desc - stage.buffers.data());
+    const PrBuffer* pb = pr && pr_stage && pr->buffers[pr_stage->buf_first + buf_index].computed
+                             ? &pr->buffers[pr_stage->buf_first + buf_index]
+                             : nullptr;
+    AmdGpu::Buffer vsharp{};
+    if (!pb) {
+        vsharp = desc.GetSharp(stage);
+    }
+    const VAddr vbase = pb ? pb->base : vsharp.base_address;
+    const u32 vsize = pb ? static_cast<u32>(pb->vsize) : vsharp.GetSize();
+    u64 size = 0;
+    if (pb) {
+        size = pb->size;
+    } else if (clamp1) {
+        if (vbase != 0 && vsize != 0) {
+            size = memory->ClampRangeSize(vbase, vsize);
+        }
+    } else if (vbase != 0 && vsize != 0 && memory->IsValidMapping(vbase) &&
+               (!desc.is_written || memory->IsMappedAddress(vbase))) {
+        size = memory->ClampRangeSize(vbase, vsize);
+    }
+    if (desc.is_written && size != 0) {
+        size = VideoCore::BpeNative::Check(vbase, size, VideoCore::BpeNative::Kind::Bind, stage.pgm_hash,
+                                           SotcPcRing::HostServed(vbase, size), true);
+    }
+    return {vbase, size, desc.is_written, desc.is_formatted};
+}
+
+// sotc: SOTC_GCN_SKIP=1. What a stage of a skip-eligible op still needs from the buffer phase. Every guest buffer of the
+// stage is shader-addressed (SotcGcn::Commit::SkipEligible), so BindBuffers would write no descriptor and take no
+// ObtainBuffer for it; this keeps, per guest buffer, only the work of its shader-addressed branch that is not about the
+// bind caches, the descriptor path or the predicates:
+//  - residency: GcnTouch (Buf::BindAddressed). A formatted read whose pages are placed, not GPU-marked, and that no image
+//    or metadata surface aliases is answered by the placed-page test as a plain read is (its ObtainBuffer would only
+//    have run SynchronizeMemoryFromImage, which finds no image there, and the CPU-dirty upload the S4 batch owns);
+//  - ordering: the overlap with earlier buffer writes, the op's own written ranges (MergeOpWrites, Passes);
+//  - a written range: the image invalidation, the host write note (mem_epoch), the bind cache range drop and the
+//    runtime's pending barrier for an addressed write.
+// The specials keep their descriptor writes (BindSkippableSpecial), with the binding numbers BindBuffers gives them.
+void Rasterizer::BindBuffersSkip(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set,
+                                 const PreparedResources* pr, const PrStage* pr_stage) {
+    const u64 alignment = instance.StorageMinAlignment();
+    const bool formatted_fast_on = SotcGcn::Sync::SkipOpSync() && !SotcGcn::Buf::Verify();
+    for (const auto& desc : stage.buffers) {
+        if (desc.IsSpecial()) {
+            BindSkippableSpecial(stage, desc, alignment);
+            set_write_sets[set_write_index] = set;
+            auto& set_write = set_writes[set_write_index++];
+            set_write.dstSet = VK_NULL_HANDLE;
+            set_write.dstBinding = binding.unified++;
+            set_write.dstArrayElement = 0;
+            set_write.descriptorCount = 1;
+            set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
+            set_write.pBufferInfo = &buffer_infos.back();
+            ++binding.buffer;
+            continue;
+        }
+        const SkipRange r = SkipRangeOf(stage, desc, pr, pr_stage);
+        bool touch_ok = true;
+        if (r.size != 0) {
+            if (r.formatted && !r.written) {
+                const bool fast = formatted_fast_on && SotcGcn::Mem::Placed(r.addr, r.size) &&
+                                  !SotcArch::AddrTable::AnyGpuModified(r.addr, r.size) &&
+                                  !texture_cache.HasImagesExact(r.addr, r.size) &&
+                                  !texture_cache.IsMeta(r.addr).has_value();
+                SotcGcn::Commit::NoteSkipFormatted(fast);
+                if (fast) {
+                    buffer_cache.NoteBindUse(r.addr, r.size); // the eviction stamp of BindAddressed's fast path
+                } else {
+                    touch_ok = GcnTouch(buffer_cache, scheduler, r.addr, r.size, false, true);
+                }
+            } else {
+                touch_ok = GcnTouch(buffer_cache, scheduler, r.addr, r.size, r.written, r.formatted);
+            }
+        }
+        if (!touch_ok) {
+            static std::atomic<u64> skip_touch_refused{};
+            if (skip_touch_refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_ERROR(Render_Vulkan, "SOTC GCN SKIP: table cannot hold {:#x}+{:#x} (pgm {:#x})", r.addr, r.size,
+                          stage.pgm_hash);
+            }
+        }
+        shader_addr_touch = true; // Passes::Decide: this op touches memory with no bound_buffers entry
+        if (r.size != 0) {
+            sotc_addr_hazard |= GuestWriteOverlap(r.addr, r.size);
+            if (r.written) {
+                sotc_op_writes.emplace_back(r.addr, r.addr + r.size);
+            }
+        }
+        if (r.written) {
+            Passes::NoteWrite();
+        }
+        SotcArch::ShaderAddr::NoteSkip(r.size, r.written);
+        if (r.written && r.size != 0) {
+            if (texture_cache.HasImagesExact(r.addr, r.size)) {
+                texture_cache.InvalidateMemoryFromGPU(r.addr, r.size);
+            }
+            Core::MemoryManager::NoteHostWrite(r.addr, r.size, 7, stage.pgm_hash);
+            if (SotcStats::kBindCacheRanges) {
+                BindCacheInvalidate(r.addr, r.size);
+            }
+            runtime.NoteAddressedWrite();
+        }
+        ++binding.unified;
+        ++binding.buffer;
+    }
+}
+
+// sotc: SOTC_GCN_SKIP=2. The full BindBuffers runs (its result is the one used); around it the skip path's plan of the
+// stage (SkipRangeOf of every guest buffer, the count of specials) is compared with what BindBuffers made:
+//  - push: BindBuffers changed the push data (only a descriptor-bound buffer adds an offset; the skip path adds none);
+//  - packet: a packet word other than the flat buffer addresses changed (BindSkippableSpecial writes those in both);
+//  - ranges: the shader-addressed ranges BindBuffers recorded (packet_addr_rec) differ from the plan in number, base,
+//    size or flags;
+//  - written: the written ranges BindBuffers marked for ordering (sotc_op_writes) differ from the plan's;
+//  - descriptors: BindBuffers wrote more or fewer descriptors than the stage has specials;
+//  - bindings: the binding counters did not advance by one per buffer.
+// The plan's BpeNative check runs twice (counting only); the plan has no other side effect.
+void Rasterizer::BindBuffersSkipVerify(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                                       Shader::PushData& push_data, u32 set, const PreparedResources* pr,
+                                       const PrStage* pr_stage, u32 stage_index) {
+    thread_local std::vector<SkipRange> plan;
+    plan.clear();
+    u32 specials = 0;
+    const bool formatted_fast_on = SotcGcn::Sync::SkipOpSync() && !SotcGcn::Buf::Verify();
+    for (const auto& desc : stage.buffers) {
+        if (desc.IsSpecial()) {
+            ++specials;
+            continue;
+        }
+        plan.push_back(SkipRangeOf(stage, desc, pr, pr_stage));
+        const SkipRange& r = plan.back();
+        if (r.size != 0 && r.formatted && !r.written) { // would-be answer of the skip path (counted, not checked)
+            SotcGcn::Commit::NoteSkipFormatted(formatted_fast_on && SotcGcn::Mem::Placed(r.addr, r.size) &&
+                                               !SotcArch::AddrTable::AnyGpuModified(r.addr, r.size) &&
+                                               !texture_cache.HasImagesExact(r.addr, r.size) &&
+                                               !texture_cache.IsMeta(r.addr).has_value());
+        }
+    }
+    const Shader::PushData push_before = push_data;
+    const SotcArch::DrawPacket packet_before = draw_packet;
+    const size_t ranges_before = packet_addr_rec.size();
+    const size_t writes_before = sotc_op_writes.size();
+    const u32 writes_index_before = set_write_index;
+    const Shader::Backend::Bindings binding_before = binding;
+
+    BindBuffers(stage, binding, push_data, set, pr, pr_stage);
+
+    u32 mask = 0;
+    if (std::memcmp(&push_before, &push_data, sizeof(push_data)) != 0) {
+        mask |= SotcGcn::Commit::SkipMmPush;
+    }
+    SotcArch::DrawPacket packet_expected = packet_before;
+    packet_expected.flatbuf_address = draw_packet.flatbuf_address;
+    packet_expected.flatbuf_fragment_address = draw_packet.flatbuf_fragment_address;
+    if (std::memcmp(&packet_expected, &draw_packet, sizeof(draw_packet)) != 0) {
+        mask |= SotcGcn::Commit::SkipMmPacket;
+    }
+    if (packet_addr_rec.size() - ranges_before != plan.size()) {
+        mask |= SotcGcn::Commit::SkipMmRanges;
+    } else {
+        for (size_t i = 0; i < plan.size(); ++i) {
+            const PacketAddr& got = packet_addr_rec[ranges_before + i];
+            const SkipRange& want = plan[i];
+            if (got.addr != want.addr || got.size != want.size || got.written != want.written ||
+                got.texel != want.formatted) {
+                mask |= SotcGcn::Commit::SkipMmRanges;
+                break;
+            }
+        }
+    }
+    size_t want_writes = 0;
+    bool writes_same = true;
+    for (const SkipRange& r : plan) {
+        if (!r.written || r.size == 0) {
+            continue;
+        }
+        const size_t at = writes_before + want_writes++;
+        writes_same = writes_same && at < sotc_op_writes.size() && sotc_op_writes[at].first == r.addr &&
+                      sotc_op_writes[at].second == r.addr + r.size;
+    }
+    if (!writes_same || sotc_op_writes.size() - writes_before != want_writes) {
+        mask |= SotcGcn::Commit::SkipMmWritten;
+    }
+    if (set_write_index - writes_index_before != specials) {
+        mask |= SotcGcn::Commit::SkipMmDescriptors;
+    }
+    const u32 nbuf = static_cast<u32>(stage.buffers.size());
+    if (binding.unified - binding_before.unified != nbuf || binding.buffer - binding_before.buffer != nbuf) {
+        mask |= SotcGcn::Commit::SkipMmBindings;
+    }
+    SotcGcn::Commit::NoteSkipVerify(mask, stage.pgm_hash, stage_index);
 }
 
 // sotc: the final composite samples the UI layer and the scene: UI first in the base game's

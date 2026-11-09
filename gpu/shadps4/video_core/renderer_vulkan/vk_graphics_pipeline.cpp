@@ -1419,6 +1419,16 @@ bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloa
             .flags = flags,
         });
     }
+    // sotc: BindStageSets commits and binds the stage sets alone. With a set per stage the bindless set sits at
+    // Shader::BindlessDescriptorSet (after every possible stage set, the index the SPIR-V names whichever stages the
+    // pipeline has), so the stage sets this pipeline lacks become empty set layouts up to it (never bound: no
+    // shader uses them). Without bindless, or without stage sets, the layout is as before.
+    num_stage_sets = num_sets;
+    if (stage_sets && uses_bindless_samplers) {
+        while (requests.size() < BindlessSetIndex()) {
+            requests.push_back({.flags = flags});
+        }
+    }
     // sotc: SOTC_NB_GPL: per-shader libraries need a layout with independent sets, on every such graphics pipeline
     // (linked or optimized, so both bind their sets the same way): one set per stage, vertex + fragment only.
     // sotc: SOTC_GPL_NODROP too (GplPerShader).

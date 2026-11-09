@@ -2448,6 +2448,7 @@ void VideoOutDriver::Flip(const Request& req) {
                     arch(SotcArch::GuestBarrier::Report);
                 }
                 arch(SotcGcn::Report); // sotc: ARCH-GCN-NATIVE, one line per stage that is on (empty when all are off)
+                arch(SotcGcn::Commit::SkipReport); // sotc: SOTC_GCN_SKIP, its own line (empty when off)
             }
             SotcGen::Report(report, seconds); // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA
             VideoCore::WriteSetFlat::Report(report, seconds); // sotc: SOTC_WRITE_SCOPE_FLAT (every 5 s)

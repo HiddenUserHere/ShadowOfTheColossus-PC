@@ -22,6 +22,7 @@ bool On() noexcept;
 /// The material factory hook is wanted: SOTC_PIPE_PREDICT=1, or the library prediction of SOTC_GPL_NODROP
 /// (SotcNonBlocking::GplPredictRequested, on by default), or SOTC_PACK_REFERENCED (the pack's program list).
 /// hooks.cpp turns PIPE_PREDICT_MATERIAL on for these, whose own switch (SOTC_PIPE_PREDICT) stays 0. Read once.
+/// sotc: also SOTC_GCN_TEX_REGISTER (gcn_tex_register.h): the post phase forwards each material there.
 bool MaterialsWanted() noexcept;
 
 /// One VS+PS pass slot of a material.

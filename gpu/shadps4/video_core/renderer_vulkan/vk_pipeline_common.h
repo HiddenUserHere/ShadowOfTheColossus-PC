@@ -62,8 +62,8 @@ public:
     struct Request {
         std::span<const SetRequest> sets;
         vk::PushConstantRange push_constants{};
-        /// sotc: an existing set layout placed after `sets` (the bindless sampler set, set 1).
-        /// Null for none.
+        /// sotc: an existing set layout placed after `sets` (the bindless sampler set: set 1, or
+        /// Shader::BindlessDescriptorSet with a set per stage). Null for none.
         vk::DescriptorSetLayout trailing_set{};
         /// sotc: a second push constant range (the bindless sampler slots, after PushData), used
         /// when its size is not zero.
@@ -72,8 +72,9 @@ public:
         vk::PipelineLayoutCreateFlags layout_flags{};
     };
 
+    // sotc: the stage sets plus the trailing bindless set (Shader::BindlessDescriptorSet).
     using SetLayouts = boost::container::static_vector<vk::DescriptorSetLayout,
-                                                       Shader::MaxStageDescriptorSets>;
+                                                       Shader::MaxStageDescriptorSets + 1>;
 
     /// Non-owning handles, valid while the cache lives. `created` tells whether this call made
     /// the pipeline layout (the caller names it then).
@@ -167,6 +168,12 @@ public:
     /// (SOTC_STAGE_BINDINGS): their writes name their set, see BindResources.
     bool UsesStageSets() const noexcept {
         return stage_sets;
+    }
+
+    /// sotc: the set index of the global bindless set in this pipeline's layout (Shader::BindlessDescriptorSet, the
+    /// index its SPIR-V names): 1 for a single-set layout (compute included), the set after the stage sets otherwise.
+    [[nodiscard]] u32 BindlessSetIndex() const noexcept {
+        return Shader::BindlessDescriptorSet(stage_sets);
     }
 
     /// sotc: true when the layout has the packet push range (PacketPushBytes): the shaders read the
@@ -267,6 +274,14 @@ protected:
     void BindDescriptorBuffer(const DescriptorWrites& set_writes,
                               vk::PipelineBindPoint bind_point) const;
 
+    /// sotc: every vkCmdBindDescriptorSets of a pipeline goes through here. Guard: a bind of sets [first, first +
+    /// count) must pass one dynamic offset per dynamic descriptor of those sets (the dyn_flat entries in the range).
+    /// Another count is invalid (VUID-vkCmdBindDescriptorSets-dynamicOffsetCount-00359) and NVIDIA reads a null
+    /// pDynamicOffsets (the recorder-thread crash of 9 Nov). Such a bind is counted, logged (first, then at powers of
+    /// two), and recorded with zero offsets of the right count instead.
+    void BindSets(vk::CommandBuffer cmdbuf, vk::PipelineBindPoint bind_point, u32 first, u32 count,
+                  const vk::DescriptorSet* sets, u32 num_dyn, const u32* offsets) const;
+
     const Instance& instance;
     Scheduler& scheduler;
     DescriptorHeap& desc_heap;
@@ -287,12 +302,15 @@ protected:
     bool uses_push_descriptors{};
     bool is_compute;
     /// sotc: SOTC_BINDLESS_SAMP: some stage reads its samplers from the global heap, so the layout
-    /// has set 1 (the heap) and BindResources binds it.
+    /// has the heap set (BindlessSetIndex) and BindResources binds it.
     bool uses_bindless_samplers{};
     /// sotc: SOTC_HEAP: some stage reads bindless slot words from the push constants (BindlessSamplerSlots). A heap
     /// stage reads its indices from the index table instead, so it needs the heap set but no slot words.
     bool uses_slot_words{};
     bool stage_sets{}; ///< sotc: a graphics pipeline with one descriptor set per stage
+    /// sotc: with stage_sets, the stage sets BindStageSets commits and binds (sets 0..n-1). The layout may hold more:
+    /// empty padding sets up to the bindless set and the bindless set itself (BindlessSetIndex), bound apart.
+    u32 num_stage_sets{};
     /// sotc: SOTC_DESCRIPTOR_HEAP: the pipeline is a heap pipeline (see UsesDescriptorHeap) and its mapping plan.
     bool heap_mode{};
     DescriptorHeapPlan heap_plan{};
@@ -313,6 +331,8 @@ protected:
 public:
     // sotc: SOTC_GCN_COMMIT: Commit::Eligible cached, -1 unknown
     mutable std::atomic<s8> sotc_gcn_commit{-1};
+    // sotc: SOTC_GCN_SKIP: the pipeline part of Commit::SkipEligible cached (a SkipReason), -1 unknown
+    mutable std::atomic<s8> sotc_gcn_skip{-1};
 };
 
 } // namespace Vulkan

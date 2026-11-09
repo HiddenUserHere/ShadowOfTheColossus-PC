@@ -28,6 +28,7 @@
 
 #include "native/native_particles.h"
 #include "pipe_predict.h"
+#include "gcn_tex_register.h" // sotc: SOTC_GCN_TEX_REGISTER (S3 registration hooks)
 #include "native/native_results.h"
 #include "native/native_sync.h"
 namespace SotcNativeHooks { // sotc: SOTC_NATIVE write hooks (gpu/sotc/native/native_hooks.cpp)
@@ -68,6 +69,7 @@ void RegisterAllHandlers() {
     SotcDecommitBudget::RegisterDecommitBudget();
     SotcMipBudget::RegisterMipBudget();
     SotcTexLife::RegisterTexLife(); // sotc: SOTC_TEX_LIFECYCLE (texture create/level/mip/destroy events)
+    SotcGcnTexRegister::Register(); // sotc: SOTC_GCN_TEX_REGISTER (T# registration ahead of draws)
     // sotc: trace v2, engine profiler scopes (SOTC_TRACE_SCOPES; the hook installs only when
     // SOTC_TRACE is also on, so the handler is harmless otherwise).
     SotcProbes::RegisterScopes();

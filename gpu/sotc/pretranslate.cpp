@@ -86,7 +86,7 @@ bool ComputeOn() noexcept {
         if (v && v[0] != '\0') {
             return v[0] == '1';
         }
-        // sotc: SOTC_COMPUTE_PACK (default on) prebuilds the compute programs through this path when the switch is unset.
+        // sotc: SOTC_COMPUTE_PACK (default off; =1 on) prebuilds the compute programs through this path when the switch is unset.
         // sotc: SOTC_COMPUTE_SPECFREE=1 too: its compute programs are made to be compiled at shader file load.
         return SotcNonBlocking::ComputePackRequested() || Shader::ComputeSpecFree();
     }();
@@ -130,6 +130,11 @@ void Push(Request&& request) noexcept {
     g_queue.push_back(std::move(request));
     g_pending.store(true, std::memory_order_release);
     g_last_request_ns.store(SteadyNs(), std::memory_order_relaxed);
+}
+
+void Forget(uint64_t hash) noexcept {
+    std::scoped_lock lock{g_mutex};
+    g_seen.erase(hash);
 }
 
 bool Pending() noexcept {

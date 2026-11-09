@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "gcn_tex_register.h" // sotc: SOTC_GCN_TEX_REGISTER reads the same materials
 #include "hooks.h"
 #include "nonblocking.h" // sotc: SOTC_GPL_PREDICT
 
@@ -125,11 +126,23 @@ std::atomic<uint64_t> g_queued{0}, g_read{0}, g_empty{0}, g_slots{0}, g_unreadab
 std::atomic<size_t> g_queue_size{0}; // g_queue.size(), read without the lock (Pending)
 std::unordered_set<uint64_t> g_referenced; // guarded by g_mutex: VS and PS hashes of the materials taken
 
+// The pipeline side wants the materials (MaterialsWanted without SOTC_GCN_TEX_REGISTER). Read once.
+bool PipeWanted() noexcept {
+    static const bool on = On() || SotcNonBlocking::GplPredictRequested() ||
+                           SotcNonBlocking::GplPackReferenced(); // sotc: SOTC_PACK_REFERENCED reads the queue
+    return on;
+}
+
 // PIPE_PREDICT_MATERIAL: post phase of the factory 0xf9390; rax is the material (0 when the parse failed).
 void PostFactory(SotcHooks::GuestRegs& regs, void*) {
     const auto material = static_cast<uintptr_t>(regs.rax);
     if (!material) {
         return;
+    }
+    // sotc: SOTC_GCN_TEX_REGISTER registers the material's T#s (its blocks are final here, texture-binding.md T8.7).
+    SotcGcnTexRegister::OnMaterial(material);
+    if (!PipeWanted()) {
+        return; // the hook is on for the T# registration only: no pipeline queue
     }
     g_queued.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -181,8 +194,8 @@ bool On() noexcept {
 }
 
 bool MaterialsWanted() noexcept {
-    static const bool on = On() || SotcNonBlocking::GplPredictRequested() ||
-                           SotcNonBlocking::GplPackReferenced(); // sotc: SOTC_PACK_REFERENCED reads the queue
+    // sotc: SOTC_GCN_TEX_REGISTER (gcn_tex_register.h) reads the materials of the same hook.
+    static const bool on = PipeWanted() || SotcGcnTexRegister::MaterialsWanted();
     return on;
 }
 

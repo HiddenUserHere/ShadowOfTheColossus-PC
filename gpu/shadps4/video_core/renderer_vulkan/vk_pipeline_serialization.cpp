@@ -44,6 +44,15 @@ static bool BindlessSamplersRequested() {
     const char* v = std::getenv("SOTC_BINDLESS_SAMP");
     return v && v[0] == '1';
 }
+// sotc: the bindless heap as vk_instance.cpp asks for it: SOTC_BINDLESS_SAMP=1, or SOTC_N5_BINDLESS with SOTC_NATIVE
+// (1 or 2 each). SOTC_HEAP needs both heaps, so it is covered.
+static bool BindlessHeapRequested() {
+    const auto on12 = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && (v[0] == '1' || v[0] == '2');
+    };
+    return BindlessSamplersRequested() || (on12("SOTC_N5_BINDLESS") && on12("SOTC_NATIVE"));
+}
 // sotc: SOTC_SRT_PHI=0 flattens Phi shaders the old way: +4000 so cached walkers of the other
 // setting are not reused (the A/B would be void otherwise).
 static bool SrtPhiDisabled() {
@@ -118,7 +127,11 @@ static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 44u : 141
                                        (Shader::VsDrawKindOn() ? 128u : 0u) +
                                        // sotc: SOTC_COMPUTE_SPECFREE=1 (info.h): compute modules read the descriptor
                                        // fields from the sharps at run time and their keys hold markers, apart.
-                                       (Shader::ComputeSpecFree() ? 0x20000000u : 0u);
+                                       (Shader::ComputeSpecFree() ? 0x20000000u : 0u) +
+                                       // sotc: bindless heap with a set per stage (+64): the graphics stages' heap
+                                       // arrays moved from set 1 (the vertex stage's set) to the set after the stage
+                                       // sets (Shader::BindlessDescriptorSet). Every other setting keeps its cache.
+                                       ((Shader::StageBindingsEnabled() && BindlessHeapRequested()) ? 64u : 0u);
 // sotc: 22 (from 21): the record ends with the stage variant (SOTC_HEAP). Without it a cached Plain or Heap
 // program came back as Default, so its layout disagreed with its binary (slot-word assert, device lost).
 // 23: a variant's pgm_hash is the game's hash again (Info::CacheHash keys the caches), so 22's variant records differ.
@@ -1216,7 +1229,7 @@ bool PipelineCache::LoadLazyProgram(u64 hash) {
     for (u32 idx = 0; idx < count; ++idx) {
         const auto existing = program_cache.find(hash);
         if (existing != program_cache.end() && idx < existing.value()->modules.size() &&
-            existing.value()->modules[idx].module) {
+            existing.value()->modules[idx].Present()) { // sotc: a released module (SOTC_COMPUTE_RELEASE) counts
             continue; // a warm-up pipeline loaded it
         }
         std::vector<u8> meta_blob;
@@ -1404,7 +1417,7 @@ void PipelineCache::InstallLazyLoad(AsyncPipelineJob::LazyLoad& load) {
     for (auto& perm : load.perms) {
         const auto existing = program_cache.find(load.hash);
         if (existing != program_cache.end() && perm.idx < existing.value()->modules.size() &&
-            existing.value()->modules[perm.idx].module) {
+            existing.value()->modules[perm.idx].Present()) { // sotc: a released module counts (SOTC_COMPUTE_RELEASE)
             ++g_lazy_stats.already_loaded;
         } else if (InstallLazyPerm(load.hash, perm)) {
             ++g_lazy_stats.installed;
@@ -1418,6 +1431,7 @@ void PipelineCache::InstallLazyLoad(AsyncPipelineJob::LazyLoad& load) {
         }
     }
     // A permutation the worker could not read is left to the program's draws (translated again if needed).
+    StreamRehydrate(load.hash); // sotc: SOTC_COMPILE_STREAM: its released pipelines, rebuilt on the workers
     const auto now = std::chrono::steady_clock::now();
     if (now - g_lazy_stats.last >= std::chrono::seconds(5)) {
         g_lazy_stats.last = now;

@@ -122,6 +122,15 @@ void ReportComputeSpecFree(std::string& out, double seconds) {
                       static_cast<unsigned long long>(cp_inline));
         out += line;
     }
+    // sotc: SOTC_HEAP: the compute prebuilds' variants (totals); never printed with the heap off.
+    const u64 heap_pre = g_specfree.heap_prebuilds.load(std::memory_order_relaxed);
+    const u64 heap_refused_pre = g_specfree.heap_refused_prebuilds.load(std::memory_order_relaxed);
+    if (heap_pre != 0 || heap_refused_pre != 0) {
+        std::snprintf(line, sizeof(line),
+                      "SOTC COMPUTE HEAP PREBUILD: heap variant %llu, refused candidates prebuilt as plain %llu\n",
+                      static_cast<unsigned long long>(heap_pre), static_cast<unsigned long long>(heap_refused_pre));
+        out += line;
+    }
 }
 
 // sotc: SOTC_COMPUTE_FAST, the 5 s report line (window counts). Nothing while the switch is off or the window was empty.

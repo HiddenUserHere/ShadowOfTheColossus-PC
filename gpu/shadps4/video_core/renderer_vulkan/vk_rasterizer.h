@@ -300,6 +300,27 @@ private:
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data, u32 set,
                      const PreparedResources* pr = nullptr, const PrStage* pr_stage = nullptr);
+    /// sotc: SOTC_GCN_SKIP (GCN-NATIVE-PLAN step 4). A shader-addressed guest buffer of a skip-eligible stage: its V#
+    /// range as BindBuffers computes it (prepared or read, clamped, BPE-checked when written).
+    struct SkipRange {
+        VAddr addr{};
+        u64 size{};
+        bool written{};
+        bool formatted{};
+    };
+    SkipRange SkipRangeOf(const Shader::Info& stage, const Shader::BufferResource& desc, const PreparedResources* pr,
+                          const PrStage* pr_stage);
+    /// sotc: SOTC_GCN_SKIP. The flat buffer, clip planes and LOD feedback buffer infos of a stage (the special buffers
+    /// SotcGcn::Commit::SkipEligible allows), shared by BindBuffers and BindBuffersSkip. No set write.
+    void BindSkippableSpecial(const Shader::Info& stage, const Shader::BufferResource& desc, u64 alignment);
+    /// sotc: SOTC_GCN_SKIP=1. Replaces BindBuffers for a stage of a skip-eligible op: the specials' descriptors, and per
+    /// guest buffer only the residency call and the written-range bookkeeping of BindBuffers' shader-addressed branch.
+    void BindBuffersSkip(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set,
+                         const PreparedResources* pr, const PrStage* pr_stage);
+    /// sotc: SOTC_GCN_SKIP=2. BindBuffers, compared with what BindBuffersSkip would have made (counted by category).
+    void BindBuffersSkipVerify(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                               Shader::PushData& push_data, u32 set, const PreparedResources* pr,
+                               const PrStage* pr_stage, u32 stage_index);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set,
                       const PreparedResources* pr = nullptr, const PrStage* pr_stage = nullptr);
     /// sotc: SOTC_HEAP real mode, the heap stage of an op. Makes what the classic bind's second pass makes for the

@@ -1087,7 +1087,10 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
                 properties.limits.maxPushConstantsSize >=
                     sizeof(Shader::PushData) + sizeof(Shader::BindlessSamplerSlots) &&
                 vk12_props.maxDescriptorSetUpdateAfterBindSamplers >= min_bindless_samplers &&
-                vk12_props.maxPerStageDescriptorUpdateAfterBindSamplers >= min_bindless_samplers;
+                vk12_props.maxPerStageDescriptorUpdateAfterBindSamplers >= min_bindless_samplers &&
+                // sotc: with a set per stage the bindless set follows every stage set (Shader::BindlessDescriptorSet).
+                (!Shader::StageBindingsEnabled() ||
+                 properties.limits.maxBoundDescriptorSets > Shader::BindlessDescriptorSet(true));
             if (bindless_samplers) {
                 LOG_INFO(Render_Vulkan, "Bindless sampler heap enabled (SOTC_BINDLESS_SAMP=1)");
             } else {
