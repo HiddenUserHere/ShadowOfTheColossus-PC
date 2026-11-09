@@ -29,10 +29,8 @@
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
-#include "sotc_backing_warm.h" // sotc: SOTC_BACKING_WARM (gpu/shim)
 #include "core/emulator_settings.h"
 #include "core/memory.h"
-#include "../../sotc/native/fault_emu.h" // sotc: SOTC_NATIVE_TRACK_EMU
 #include "../../sotc/probes.h"            // sotc: SOTC_FAULT_OWNERS
 #include "../../sotc/alloc_sites.h"       // sotc: SOTC_ALLOC_SITES
 #include "common/decoder.h"
@@ -166,7 +164,7 @@ std::atomic<u64> g_guest_stacks_generation{1};
 // Re-applies the tracker's protection to pages that stop being stack pages.
 std::function<void(VAddr, u64)> g_reapply_protection;
 
-// sotc: SOTC_LOCK_WATCH=1, or SOTC_PC_RING modes 6 and 7 (the page lock watch, the stall hang of
+// sotc: SOTC_PC_RING modes 6 and 7 (the page lock watch, the stall hang of
 // 2026-11-01). Every page lock taken through Impl::LockPage records its holder (thread id and the
 // function that took it) in a table keyed by page. A blocking acquire that passes 2 s prints one line
 // per thread: the holder, the table lock state and the region mutex's last taker. Off: plain locks.
@@ -183,10 +181,7 @@ constexpr u64 OWNER_SLOTS = 4096;
 Owner g_owners[OWNER_SLOTS];
 
 bool On() noexcept {
-    static const bool on = [] {
-        const char* v = std::getenv("SOTC_LOCK_WATCH");
-        return (v && v[0] == '1') || SotcPcRing::FullRingMode() >= 6;
-    }();
+    static const bool on = SotcPcRing::FullRingMode() >= 6;
     return on;
 }
 
@@ -1378,28 +1373,10 @@ struct SignalImpl : public PageManager::Impl {
         if (!SotcNative::TracksGuestPages() && !SotcN1Verify::On() && SotcNative::TrackMode() != 3) {
             return;
         }
-        // sotc: SOTC_NATIVE_TRACK_RANGE=<lo hex>-<hi hex>, diagnostic with SOTC_NATIVE_TRACK=1: only pages in [lo, hi)
-        // are protected (bisects the address of an unannounced write that only the protection catches).
-        static const std::pair<u64, u64> track_range = [] {
-            const char* v = std::getenv("SOTC_NATIVE_TRACK_RANGE");
-            if (!v || !*v) {
-                return std::pair<u64, u64>{0, ~u64{0}};
-            }
-            char* end = nullptr;
-            const u64 lo = std::strtoull(v, &end, 16);
-            const u64 hi = (end && *end == '-') ? std::strtoull(end + 1, nullptr, 16) : ~u64{0};
-            std::fprintf(stderr, "SOTC NATIVE TRACK RANGE: %#llx-%#llx\n", (unsigned long long)lo,
-                         (unsigned long long)hi);
-            return std::pair<u64, u64>{lo & ~u64{0xffff}, (hi + 0xffff) & ~u64{0xffff}};
-        }();
         if (SotcNative::TrackMode() == 1 || SotcNative::TrackMode() == 3) {
-            const u64 lo = std::max<u64>(address, track_range.first);
-            const u64 hi = std::min<u64>(address + size, track_range.second);
-            if (lo >= hi) {
+            if (size == 0) {
                 return;
             }
-            address = lo;
-            size = hi - lo;
             // sotc: mode 3 only catches writes: a page is never read-protected (readbacks are skipped in mode 1).
             if (SotcNative::TrackMode() == 3) {
                 perms = perms | Core::MemoryPermission::Read;
@@ -1663,31 +1640,9 @@ struct SignalImpl : public PageManager::Impl {
             repeats = 0;
         }
         last_ns = now_ns;
-        SotcN1Verify::Who who = SotcN1Verify::Classify(rip, gpu_side);
-        u64 writer = rip;
-#ifdef _WIN32
-        // sotc: SOTC_N1_HOSTCALLER=1, diagnostic: a port routine writing on a guest thread (the runtime's memcpy and
-        // memset are host code) is recorded under the guest return address found first on its stack, the game code
-        // that called it, instead of the host RIP every caller shares.
-        static const bool host_caller = [] {
-            const char* v = std::getenv("SOTC_N1_HOSTCALLER");
-            return v && v[0] == '1';
-        }();
-        if (host_caller && is_write && who == SotcN1Verify::Who::HostOther) {
-            const auto* sp = reinterpret_cast<const u64*>(
-                static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->Rsp);
-            for (int i = 0; i < 64; ++i) {
-                const u64 value = sp[i];
-                if (SotcN1Verify::Classify(value, false) == SotcN1Verify::Who::Guest) {
-                    writer = value;
-                    who = SotcN1Verify::Who::Guest;
-                    break;
-                }
-            }
-        }
-#endif
+        const SotcN1Verify::Who who = SotcN1Verify::Classify(rip, gpu_side);
         if (is_write) {
-            SotcN1Verify::NoteWriteFault(addr, writer, who);
+            SotcN1Verify::NoteWriteFault(addr, rip, who);
         } else {
             SotcN1Verify::NoteReadFault(addr, rip, who);
         }
@@ -1929,14 +1884,10 @@ struct SignalImpl : public PageManager::Impl {
                                                          FaultMayCoalesce(fault_page)};
             bool handled;
             {
-                // sotc: SOTC_GPUPAGE_WRITERS: the guest instruction of this write fault (a host routine: the guest
-                // return address found first on its stack), for the GPU-page writer counts (buffer_cache.cpp).
-                static const bool writers = [] {
-                    const char* v = std::getenv("SOTC_GPUPAGE_WRITERS");
-                    return v && v[0] == '1';
-                }();
+                // sotc: SOTC_TRACK_IGNORE_RIPS: the guest instruction of this write fault (a host routine: the guest
+                // return address found first on its stack).
                 u64 writer_rip = 0;
-                if ((writers || std::getenv("SOTC_TRACK_IGNORE_RIPS")) && !is_gpu_thread) {
+                if (std::getenv("SOTC_TRACK_IGNORE_RIPS") && !is_gpu_thread) {
                     writer_rip = reinterpret_cast<u64>(Common::GetRip(context));
 #ifdef _WIN32
                     if (SotcN1Verify::Classify(writer_rip, false) != SotcN1Verify::Who::Guest) {
@@ -1984,25 +1935,12 @@ struct SignalImpl : public PageManager::Impl {
                         return true;
                     }
                 }
-                // sotc: SOTC_NATIVE_TRACK_EMU=1 (fault_emu.h): a store into a GPU-written page is emulated through the
-                // backing view and announced, with no merge; the page stays protected.
                 // sotc: SOTC_FAULT_OWNERS: the allocation that owns the faulting page (probe_memtype.cpp).
                 if (!is_gpu_thread && SotcNative::TrackMode() == 3 && SotcProbes::FaultOwnersOn()) {
                     SotcProbes::NoteFaultOwner(addr);
                 }
                 if (!is_gpu_thread && SotcNative::TrackMode() == 3 && SotcAllocSites::On()) {
                     SotcAllocSites::NoteCpuFault(addr); // sotc: SOTC_ALLOC_SITES
-                }
-                if (static bool query_set = false; !query_set && SotcFaultEmu::On()) {
-                    SotcFaultEmu::SetGpuQuery([](uint64_t a, uint64_t s) {
-                        return rasterizer->GetBufferCache().IsRegionGpuModified(a, s);
-                    });
-                    query_set = true;
-                }
-                if (!is_gpu_thread && SotcFaultEmu::On() &&
-                    rasterizer->GetBufferCache().IsRegionGpuModified(addr, size) &&
-                    SotcFaultEmu::TryEmulate(context, addr)) {
-                    return true;
                 }
                 const SotcFaultRip::Scope fault_rip{writer_rip};
                 const SotcStats::FaultStat::StageScope stage{SotcStats::FaultStat::kStInval};
@@ -2062,11 +2000,6 @@ struct SignalImpl : public PageManager::Impl {
             if (track_fault) {
                 SotcStats::FaultStat::Done(extent_lo, extent_hi);
             }
-            // sotc: SOTC_BACKING_WARM: the backing view pages of what the guest writes next are
-            // touched by the warm thread, before an upload reads them (lock-free queue push).
-            if (!is_gpu_thread) {
-                SotcBackingWarm::Note(extent_lo, extent_hi - extent_lo);
-            }
             {
                 // sotc: SOTC_PROTECT_COALESCE: the page must be writable before the guest
                 // retries, and before RepairStuckWriteFault looks at it.
@@ -2100,25 +2033,8 @@ struct SignalImpl : public PageManager::Impl {
             }
             // sotc: SOTC_FPS (B6): the guest instruction of this read fault, for the readback
             // counts per RIP (ReportReadbackRips). Nothing is set unless SOTC_FPS is on.
-            u64 reader_rip = SotcStats::kFpsLog && !is_gpu_thread ? reinterpret_cast<u64>(Common::GetRip(context))
+            const u64 reader_rip = SotcStats::kFpsLog && !is_gpu_thread ? reinterpret_cast<u64>(Common::GetRip(context))
                                                                     : u64{0};
-#ifdef _WIN32
-            // sotc: a host routine reading on a guest thread (the runtime's memcpy): the guest return address found
-            // first on its stack, the game code that asked for the copy (SOTC_RB_CHANGED detail lines).
-            if (reader_rip != 0 && SotcN1Verify::Classify(reader_rip, false) != SotcN1Verify::Who::Guest &&
-                std::getenv("SOTC_RB_CHANGED")) {
-                const auto* sp = reinterpret_cast<const u64*>(
-                    static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->Rsp);
-                // Only the eboot's code (offsets below 16 MiB): the import thunks after it are skipped.
-                const u64 image = SotcTrace::ImageBase();
-                for (int i = 0; i < 128; ++i) {
-                    if (image && sp[i] > image && sp[i] - image < 0x1000000) {
-                        reader_rip = sp[i];
-                        break;
-                    }
-                }
-            }
-#endif
             const SotcFaultRip::Scope fault_rip{reader_rip};
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }

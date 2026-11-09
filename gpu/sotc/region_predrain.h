@@ -1,4 +1,4 @@
-// sotc: SOTC_REGION_PREDRAIN=1 and SOTC_BIG_BIND_LOG=1 (both off by default). See region_predrain.cpp
+// sotc: SOTC_REGION_PREDRAIN=1 (off by default). See region_predrain.cpp
 // and docs/re-backend/15-burst-stutters.md (fixes 1 and 2).
 #pragma once
 
@@ -10,10 +10,7 @@ namespace SotcRegionPredrain {
 /// SOTC_REGION_PREDRAIN=1, read once: queue new 16 MiB tracking regions and upload them in idle time.
 bool Enabled() noexcept;
 
-/// SOTC_BIG_BIND_LOG=1, read once: one log line per (pgm_hash, stage, binding) for a bind sync of 4 MiB or more.
-bool BigBindLogEnabled() noexcept;
-
-/// True when either switch is on: the pending-region bits and the bind counters are kept.
+/// True when the switch is on: the pending-region bits and the bind counters are kept.
 bool TrackOn() noexcept;
 
 /// Any thread. A 16 MiB tracking region (index = guest address >> 24) was created by
@@ -41,21 +38,13 @@ unsigned Idle(std::uint64_t budget_ns, std::uint64_t frame, DrainFn drain, StopF
 /// (mem_classes.h Snapshot, refreshed when the class table version moves). Such ranges are not predrained.
 bool InCpuOnlyClass(std::uint64_t addr, std::uint64_t size) noexcept;
 
-/// Draw thread, SOTC_BIG_BIND_LOG only: the shader and descriptor of the bind the next ObtainBuffer
-/// serves. Set by the rasterizer before the call and cleared after it.
-void SetBindContext(std::uint64_t pgm_hash, std::uint32_t hw_stage, std::uint32_t sw_stage,
-                    std::uint32_t binding, std::uint64_t base, std::uint32_t vsize,
-                    std::uint32_t num_records, std::uint32_t stride) noexcept;
-void ClearBindContext() noexcept;
-
 /// Draw thread, a bind's own sync (not an early one): `bytes` copied on the draw thread and `fresh`
-/// regions it touched. Counts the bind when bytes >= 4 MiB, and logs it once per key with
-/// SOTC_BIG_BIND_LOG (no behaviour change).
+/// regions it touched. Counts the bind when bytes >= 4 MiB (no behaviour change).
 void NoteBindSync(std::uint64_t addr, std::uint64_t size, std::uint64_t bytes,
                   std::uint32_t fresh) noexcept;
 
 /// Appends the SOTC_REGION_PREDRAIN and bind counters of the last `seconds` to `out` (driver.cpp 5 s
-/// report). Empty when both switches are off.
+/// report). Empty when the switch is off.
 void Report(std::string& out, double seconds);
 
 } // namespace SotcRegionPredrain

@@ -24,13 +24,10 @@
 #include "video_core/sotc_stats.h"
 #include "../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK=1 owns the untrack list (plan step 6)
 #include "../../../sotc/pc_ring.h"     // sotc: SotcPcRing::FullRingMode (stall guard in LockTimed)
-#include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "../../../sotc/nonblocking.h" // sotc: SOTC_WATCH_SKIP (cpu_chunks summary, walk counters)
 #include "../sotc_generation.h"      // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA granule generations
 #include "sync_events.h" // sotc: SOTC_SYNC_EVENTS (dirty journal hint on CPU rises)
 #include "video_core/sotc_arch/addr_table_hooks.h" // sotc: SOTC_ADDR_TABLE clean state (Dirty hooks)
-// sotc: SOTC_UNTRACK_MAX_MB (default 16 MiB), live (SotcLive): the cap of the untrack list.
-inline SotcLive::Int kUntrackMaxMb{"SOTC_UNTRACK_MAX_MB", 16};
 
 namespace VideoCore {
 
@@ -236,32 +233,12 @@ struct SotcUntrack {
     }
     inline static std::atomic<u64> pages_kept{0};
 
-    /// sotc: SOTC_UNTRACK_AUTO=1 (off by default; off too when SOTC_CP_AHEAD is set, as Parse()).
-    /// The flip thread publishes the live chunk list of the game's heap (driver.cpp,
-    /// UntrackAutoTick); the draw thread applies it to the regions (BufferCache::SynchronizeDmaBuffers).
-    /// Only the list is shared between the two threads.
-    /// sotc: SOTC_CLASS_TRACK=1 (plan step 6) also turns this on: the draw thread publishes the CPU-only
-    /// ranges of the chosen pools (PublishClass), so the same apply and self-check run for them.
-    /// Mode 1 is refused (Mode() == 0) with SOTC_UNTRACK_AUTO=1 or SOTC_CP_AHEAD.
+    /// sotc: SOTC_CLASS_TRACK=1 (plan step 6): the draw thread publishes the CPU-only ranges of the
+    /// chosen pools (PublishClass) and applies them to the regions (BufferCache::SynchronizeDmaBuffers),
+    /// with the self-check below. Mode 1 is refused (Mode() == 0) with SOTC_CP_AHEAD.
     static bool AutoOn() {
-        static const bool on = [] {
-            const char* v = std::getenv("SOTC_UNTRACK_AUTO");
-            const char* ahead = std::getenv("SOTC_CP_AHEAD");
-            return (v && v[0] == '1' && !(ahead && std::atoi(ahead) != 0)) ||
-                   SotcMemClasses::Mode() == 1;
-        }();
+        static const bool on = SotcMemClasses::Mode() == 1;
         return on;
-    }
-    /// sotc: flip thread. Publishes a live list, clipped in list order to SOTC_UNTRACK_MAX_MB (16
-    /// when unset). An unchanged list publishes nothing; nothing is published after a trip. With
-    /// SOTC_CLASS_TRACK=1 the class mode owns the list: the flip thread publishes nothing.
-    static void Publish(std::vector<Range> live) {
-        if (SotcMemClasses::Mode() == 1) {
-            return;
-        }
-        // Live (SotcLive): the cap is read on each publish.
-        const u64 cap = std::min<u64>(static_cast<u64>(std::max(kUntrackMaxMb.get(), 0)), 1024) << 20;
-        PublishCapped(std::move(live), cap, "untrack auto");
     }
     /// sotc: SOTC_CLASS_TRACK=1 (draw thread). Publishes the CPU-only ranges of the apply pools,
     /// clipped to SOTC_CLASS_MAX_MB (512 when unset). Same rules as Publish otherwise.
@@ -305,7 +282,7 @@ struct SotcUntrack {
                      static_cast<unsigned long long>(
                          faults_untracked.load(std::memory_order_relaxed)));
     }
-    /// sotc: SOTC_UNTRACK_AUTO report (SOTC FPS line).
+    /// sotc: SOTC_CLASS_TRACK=1 report (SOTC FPS line).
     static u64 AutoBytes() {
         return auto_bytes.load(std::memory_order_relaxed);
     }
@@ -450,7 +427,7 @@ public:
         ResetGrace();
     }
 
-    /// sotc: SOTC_UNTRACK_AUTO (draw thread, via MemoryTracker::ApplyUntracked). Replaces the
+    /// sotc: SOTC_CLASS_TRACK=1 (draw thread, via MemoryTracker::ApplyUntracked). Replaces the
     /// untracked mask of the whole region. A page that becomes untracked, has no GPU bit and is
     /// protected (CPU bit 0) is unprotected and CPU-modified now, and its sweep word is raised, so
     /// the next DMA sweep uploads it. A page that stops being untracked keeps its bits: the normal
@@ -494,7 +471,7 @@ public:
         return cpu_addr;
     }
 
-    /// sotc: SOTC_UNTRACK_AUTO self-check (region mutex held). Pages of [offset, offset + size)
+    /// sotc: SOTC_CLASS_TRACK=1 self-check (region mutex held). Pages of [offset, offset + size)
     /// that are untracked, have no GPU bit and are protected (CPU bit 0): a guest write fault on one
     /// of them means the untracking did not hold.
     u64 CountUntrackedFaultsLocked(u64 offset, u64 size) noexcept {
@@ -733,7 +710,7 @@ public:
         }
     }
 
-    /// sotc: retrack (SOTC_UNTRACK_AUTO): the GPU bits are cleared because a download just wrote
+    /// sotc: retrack (SOTC_CLASS_TRACK=1): the GPU bits are cleared because a download just wrote
     /// the GPU's bytes into guest memory (ApplyDownloads). Only then may an untracked page get its
     /// CPU bit back; a GPU bit dropped without a download must not, or the next bind would upload
     /// stale guest bytes over the GPU's data.
@@ -773,7 +750,7 @@ public:
         }
         if constexpr (cpu_op == StateOp::None && gpu_op == StateOp::Clear) {
             if (retrack) {
-                RetrackDownloadedLocked(bounds); // sotc: SOTC_UNTRACK_AUTO (after a download only)
+                RetrackDownloadedLocked(bounds); // sotc: SOTC_CLASS_TRACK=1 (after a download only)
             }
         }
         if constexpr (locked) {
@@ -1185,7 +1162,7 @@ private:
     // sotc: SOTC_SYNC_FAST write generations, one per 2 MiB (see UpdateStateAndProtection).
     std::array<std::atomic<u64>, NUM_SYNC_GENS> sync_gen{};
 public:
-    /// sotc: SOTC_UNTRACK_RANGES / SOTC_UNTRACK_AUTO. Pure mask builder: the pages of the region
+    /// sotc: SOTC_UNTRACK_RANGES / SOTC_CLASS_TRACK=1. Pure mask builder: the pages of the region
     /// based at cpu_addr that lie in one of the ranges.
     static RegionBits BuildUntrackedMask(VAddr cpu_addr,
                                          const std::vector<SotcUntrack::Range>& ranges) {
@@ -1220,7 +1197,7 @@ public:
     }
 
 private:
-    /// sotc: SOTC_UNTRACK_RANGES / SOTC_UNTRACK_AUTO. Marks the pages of this region (based at
+    /// sotc: SOTC_UNTRACK_RANGES / SOTC_CLASS_TRACK=1. Marks the pages of this region (based at
     /// cpu_addr) that lie in an untracked range. Called when the region is created or moved, before
     /// it is shared.
     void ComputeUntracked() {
@@ -1232,7 +1209,7 @@ private:
         untracked = BuildUntrackedMask(cpu_addr, SotcUntrack::Ranges());
     }
 
-    /// sotc: SOTC_UNTRACK_AUTO (region mutex held, after GPU bits were cleared over bounds by a
+    /// sotc: SOTC_CLASS_TRACK=1 (region mutex held, after GPU bits were cleared over bounds by a
     /// download or ChangeRegionState<None, Clear>). An untracked page with no GPU bit that is still
     /// protected (CPU bit 0) lost its GPU bit here: it is unprotected and CPU-modified again, as
     /// SetUntrackedMask does. Without this the self-check would count the next guest write to it.

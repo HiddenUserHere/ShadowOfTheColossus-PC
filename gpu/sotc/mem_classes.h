@@ -17,7 +17,7 @@
 //      count means a range the allocator called CPU-only was written by the GPU, so untracking it
 //      would be unsafe. No behaviour change. Needs SOTC_HOOK_ALLOC_PROBE=1 (the feed) and SOTC_FPS=1.
 //   1  apply: the CPU-only ranges of the pools in SOTC_CLASS_POOLS are published through SotcUntrack
-//      (region_manager.h) and kept unprotected, like SOTC_UNTRACK_AUTO. Unset (or "all"): every pool
+//      (region_manager.h) and kept unprotected. Unset (or "all"): every pool
 //      that passes the rules below, except the per-frame arenas ("TaggedArena", GPU-read every frame and
 //      kept tracked). "PageAllocator" reproduces the older default. An explicit list is used as written.
 //      A granule heap is listed as "memtype:<heap>" (its granules that are CPU_ONLY are published).
@@ -25,7 +25,7 @@
 //      20 s after its claim), no GPU bind or write fault ever touched any of its 64 KiB chunks, and it is
 //      not an image range (the caller checks images). A bind into a published range is a hit: the range
 //      is retracked and RetrackPending() turns true, so the caller publishes at once.
-//      Needs SOTC_HOOK_ALLOC_PROBE=1. Refused (mode 0, one log line) with SOTC_UNTRACK_AUTO=1 or
+//      Needs SOTC_HOOK_ALLOC_PROBE=1. Refused (mode 0, one log line) with
 //      SOTC_CP_AHEAD set. SotcUntrack's self-check still trips and releases everything on a bad fault.
 //   Mode 2 runs the same candidate rule every 250 ms ("would-be" list) and counts the bind hits and the
 //      write faults the list would have covered, without changing any tracking.
@@ -70,7 +70,7 @@ constexpr uint32_t kMaxOwners = 128;
 constexpr uint32_t kMaxGranuleEntries = 131072; // sotc: = kMaxGranules (probe_memtype.cpp)
 
 // 0 off, 1 apply, 2 shadow. Read once from SOTC_CLASS_TRACK. Mode 1 is refused (returns 0) when
-// SOTC_UNTRACK_AUTO=1 or SOTC_CP_AHEAD is set.
+// SOTC_CP_AHEAD is set.
 int Mode();
 inline bool On() {
     return Mode() != 0;

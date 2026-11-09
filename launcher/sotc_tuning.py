@@ -501,27 +501,6 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
    'left to the GPU. Off by default, experimental.'),
   '',
   ()),
- ('SOTC_UNTRACK_AUTO',
-  'flag',
-  'memory',
-  ('Deixar sem proteção a memória temporária', 'Leave temporary memory unprotected'),
-  ('Deixa sem proteção os blocos de memória temporária do jogo, achados sozinhos. Desligado por '
-   'padrão. Medido (29/10): não reduziu as faltas de escrita e a thread de desenho foi de 19,2 '
-   'para 22,1 ms.',
-   "Leaves the game's temporary memory blocks unprotected, found automatically. Off by default. "
-   'Measured (Oct 29): did not reduce write faults and the draw thread went from 19.2 to 22.1 ms.'),
-  '',
-  ()),
- ('SOTC_UNTRACK_MAX_MB',
-  'value',
-  'memory',
-  ('Limite de memória sem proteção (MB)', 'Unprotected memory cap (MB)'),
-  ('Tamanho máximo, em MB, das faixas que “Deixar sem proteção a memória temporária” deixa sem '
-   'proteção. Padrão 16. Só age com “Deixar sem proteção a memória temporária”.',
-   'Maximum size in MB of the ranges that "Leave temporary memory unprotected" leaves unprotected. '
-   'Default 16. Only has effect with "Leave temporary memory unprotected".'),
-  '16',
-  ()),
  ('SOTC_UNTRACK_RANGES',
   'value',
   'memory',
@@ -1851,7 +1830,6 @@ LIVE = {
     'SOTC_EOP_TICK_US': True,
     'SOTC_RB_WAIT_US': True,
     'SOTC_RB_SPIN_US': True,
-    'SOTC_UNTRACK_MAX_MB': True,
 }
 
 

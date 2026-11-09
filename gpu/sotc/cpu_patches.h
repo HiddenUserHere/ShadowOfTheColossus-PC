@@ -108,15 +108,6 @@ struct DetourRequest {
     u32 hook_id{};                  ///< passed to sotc_hook_dispatch
     std::span<const u8> pattern;    ///< bytes expected at address after all other patches
     std::span<const u8> mask;       ///< same length: 0xff compare, 0x00 wildcard (empty: all 0xff)
-    /// sotc: SOTC_NATIVE_TRACK_EMU=2 (Site only). Set: the stub calls this handler (GuestRegs*, hook_id, 0) instead of
-    /// sotc_hook_dispatch, and when it returns kStoreHookDone the first displaced instruction (the store the handler
-    /// did) is skipped.
-    const void* store_handler{};
-    /// sotc: other threads run: the jump is written with them paused, and refused while one is inside the span.
-    bool live{};
-    /// sotc: live only: also refused while this says a thread will resume inside [lo, hi) (a thread inside a fault
-    /// handler, whose context is not its current RIP; the calling thread itself).
-    bool (*live_busy)(u64 lo, u64 hi){};
 };
 
 struct DetourResult {
@@ -134,24 +125,6 @@ bool InstallGuestDetour(const DetourRequest& request, DetourResult* result);
 
 /// Trampoline bytes used so far by every CPU patch of the registered module.
 u64 TrampolineBytesUsed();
-
-/// sotc: SOTC_NATIVE_TRACK_EMU=2, live store hooks (gpu/sotc/native/fault_emu.cpp).
-/// The handler's return value that means "the store was done": the hooked instruction is skipped.
-constexpr u32 kStoreHookDone = 0x53544f52;
-/// Called for each store a function relocation instruments: the site id its stub passes to the handler, or ~0u to
-/// leave the instruction as it is.
-using StoreSiteRegister = u32 (*)(u64 address, const u8* bytes, u32 length);
-enum class StoreHookKind : u32 {
-    Refused = 0,
-    Detour = 1,           ///< a Site detour at the store
-    Relocated = 2,        ///< the function was copied with its stores instrumented, its entry jumps to the copy
-    AlreadyRelocated = 3, ///< the function had been relocated before (the store is instrumented in the copy)
-};
-/// Hooks the store at site: a Site detour (store_handler) when the installer accepts it, else the containing function
-/// is relocated (every store of it that register_site accepts is instrumented; the original stays as it was, but for
-/// its entry, for any path that still reaches it). live: other threads run (paused around each code write).
-StoreHookKind InstallStoreHook(u64 site, u32 site_id, const void* handler, StoreSiteRegister register_site,
-                               bool live, const char** reason, bool (*live_busy)(u64 lo, u64 hi) = nullptr);
 
 /// sotc: gives the registered module its function starts (host addresses) for the guest detours,
 /// without patching anything. The other passes merge theirs too, but they may not run.

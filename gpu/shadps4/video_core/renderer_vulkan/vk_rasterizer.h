@@ -101,9 +101,6 @@ public:
     /// sotc: SOTC_ASYNC_IMAGE_CREATE: command processor thread, right after the lookup of the
     /// pipeline of a draw or dispatch (its runtime data in slot 0): queues the creation of the
     /// images its T#s need that do not exist yet (TextureCache::PrefetchTexture).
-    /// sotc: SOTC_LOAD_WARM: early bind of a recorded texture (draw thread, idle).
-    void WarmTexture(const void* data, size_t size);
-
     void PrefetchImages(const Pipeline* pipeline) {
         if (pipeline && texture_cache.ImagePrefetchEnabled()) {
             PrefetchImagesImpl(pipeline);
@@ -725,11 +722,9 @@ private:
         /// sotc: tick of the copy. The ring keeps a region alive only for the tick that
         /// allocated it (StreamBuffer::AdvanceAndWatch), so a copy is reused only in that tick.
         u64 tick{~0ULL};
-        /// sotc: SOTC_FLAT_ARENA. The buffer the copy lives in (the arena or the stream ring) and its device
-        /// address base; arena: the copy is an arena entry (valid across ticks while the arena keeps it).
+        /// sotc: the buffer the copy lives in (the stream ring) and its device address base.
         vk::Buffer buffer{};
         vk::DeviceAddress base{};
-        bool arena{};
         /// sotc: SOTC_BIND_DESC_REUSE. The buffer and offset the entry's kept descriptor sets were written with
         /// for this slot (BindPipelineResources). A hit whose copy is in another buffer writes the sets again; one at
         /// another offset of the same buffer binds them with a dynamic offset when the pipeline's flat bindings are

@@ -9,7 +9,6 @@
 #include "probe_drawtag.h"
 #include "probe_shadow_cache.h" // sotc: SOTC_SHADOW_CACHE (docs/re-backend/12-shadow-cache.md)
 #include "probe_prepass.h"      // sotc: SOTC_PREPASS_PROBE (docs/re-backend/04-depth-prepass.md section 9)
-#include "probe_ops.h"          // sotc: SOTC_OPS_PROBE (docs/re-backend/14-draw-reduction.md, R4 and R6)
 #include "probe_frame_rings.h" // sotc: SOTC_FRAME_RINGS (docs/re-backend/10-ring-reuse.md)
 #include "probe_xpr_groups.h"  // sotc: SOTC_XPR_GROUPS (XPR_INDEX_CULL, observe only)
 #include "probe_csdr.h"        // sotc: SOTC_CSDR_PROBE (RES_DECOMPRESS, observe only)
@@ -50,7 +49,6 @@ void RegisterAllHandlers() {
     SotcProbes::RegisterRe();    // sotc: SOTC_RE_PROBE (probe_re.cpp), observe only
     SotcPipePredict::Register(); // sotc: SOTC_PIPE_PREDICT (pipe_predict.cpp), observe only
     SotcProbes::RegisterMemtype(); // sotc: PC memory model, wave B
-    SotcProbes::RegisterXprMem();
     SotcPcRing::Register(); // sotc: SOTC_PC_RING (PC memory model)
     SotcPcPool::Register();      // sotc: SOTC_PC_POOL=2
     // sotc: Wave D probes and optimizations (docs/re-stutters/reports2/00-PLAN.md).
@@ -59,7 +57,6 @@ void RegisterAllHandlers() {
     SotcProbes::RegisterDrawTag();
     SotcProbes::RegisterShadowCache(); // sotc: SOTC_SHADOW_CACHE
     SotcProbes::RegisterPrepassProbe(); // sotc: SOTC_PREPASS_PROBE (observe only)
-    SotcProbes::RegisterOpsProbe();     // sotc: SOTC_OPS_PROBE (observe only)
     SotcXprGroups::Register();          // sotc: SOTC_XPR_GROUPS (XPR_INDEX_CULL, observe only)
     SotcCsdrProbe::Register();          // sotc: SOTC_CSDR_PROBE (RES_DECOMPRESS, observe only)
     SotcResDump::Register();            // sotc: SOTC_RES_DUMP (RES_CREATE, CWKS_BODY; observe only)

@@ -1093,15 +1093,9 @@ int Mode() {
         }
         const int n = std::atoi(v);
         if (n == 1) {
-            // Mode 1 publishes through SotcUntrack's auto list, so it cannot share the switch with
-            // SOTC_UNTRACK_AUTO, and the CP ahead gate turns the untracking off (as Parse()).
-            const char* untrack_auto = std::getenv("SOTC_UNTRACK_AUTO");
+            // Mode 1 publishes through SotcUntrack's auto list, and the CP ahead gate turns the
+            // untracking off (as Parse()).
             const char* ahead = std::getenv("SOTC_CP_AHEAD");
-            if (untrack_auto && untrack_auto[0] == '1') {
-                std::fprintf(stderr, "SOTC CLASS: SOTC_CLASS_TRACK=1 refused, SOTC_UNTRACK_AUTO=1 "
-                                     "is set; class mode stays off\n");
-                return 0;
-            }
             if (ahead && std::atoi(ahead) != 0) {
                 std::fprintf(stderr, "SOTC CLASS: SOTC_CLASS_TRACK=1 refused, SOTC_CP_AHEAD is "
                                      "set; class mode stays off\n");

@@ -69,47 +69,6 @@ class TextureCache;
 class MemoryTracker;
 class PageManager;
 
-/// sotc: SOTC_FLAT_ARENA (gpu/sotc/nonblocking.h). A persistent home for flat constant tables keyed by content hash:
-/// a table seen before is bound at its arena offset, a new one is uploaded once (host-visible memory, as the stream
-/// ring). The arena is kChunks chunks of kChunkBytes, bump-allocated; when the current chunk is full the oldest
-/// chunk unused for kIdleTicks ticks whose last tick the GPU finished is emptied (its entries retired) and reused;
-/// with no such chunk the caller copies into the stream ring as before. Draw thread only.
-class FlatArena {
-public:
-    static constexpr u64 kChunkBytes = 2_MB;
-    static constexpr u32 kChunks = 32;
-    static constexpr u64 kIdleTicks = 64;
-    struct Ref {
-        vk::Buffer buffer{};
-        vk::DeviceAddress address{}; ///< device address of the arena buffer's byte 0
-        u64 offset{};
-    };
-    FlatArena(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler);
-    /// The place of the table `data` (`size` bytes, content hash `hash`): found, or uploaded now (`uploaded`).
-    /// `tick` is the tick of the command that reads it. false: no room (the caller uses the stream ring).
-    bool Obtain(u64 hash, const void* data, u32 size, u64 alignment, u64 tick, Ref& out, bool& uploaded);
-
-private:
-    struct Entry {
-        u32 chunk{};
-        u32 size{};
-        u64 offset{}; ///< in the arena buffer
-    };
-    struct Chunk {
-        u64 used{};
-        u64 last_tick{};
-        u32 entries{};
-    };
-    /// Makes another chunk current (empty or retired); false when every other chunk is in use.
-    bool OpenChunk(u64 tick);
-
-    Vulkan::Scheduler& scheduler;
-    Buffer buffer;
-    std::array<Chunk, kChunks> chunks{};
-    u32 current{};
-    std::unordered_map<u64, Entry> entries;
-};
-
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
     static constexpr u64 ARENA_PAGE_BITS = 32;
@@ -146,11 +105,6 @@ public:
     /// Retrieves the stream buffer.
     [[nodiscard]] StreamBuffer& GetStreamBuffer() noexcept {
         return stream_buffer;
-    }
-
-    /// sotc: SOTC_FLAT_ARENA: the flat constant arena, null without the switch.
-    [[nodiscard]] FlatArena* GetFlatArena() noexcept {
-        return flat_arena.get();
     }
 
     /// Returns minimum granularity of a sparse memory bind.
@@ -248,11 +202,6 @@ public:
                                                              u32 mark_offset = 0,
                                                              u32 mark_size = ~0u);
 
-    /// sotc: SOTC_HLE_COPY_EXACT. The arena and offset ObtainBuffer returns for [device_addr, +size),
-    /// with the residency it makes and nothing else: no synchronization, no GPU-modified mark, no
-    /// bind bookkeeping. The caller synchronizes the ranges it reads or writes with ObtainBuffer.
-    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferResident(VAddr device_addr, u32 size);
-
     /// Attempts to obtain a buffer without modifying the cache contents.
     /// sotc: pages_protected: the image's tracking write-protects all its pages (its guest copy
     /// may then run on the copy threads, SOTC_ASYNC_TEXTURE_UPLOAD).
@@ -270,9 +219,6 @@ public:
     /// sotc: SOTC_NATIVE=1. The byte ranges the GPU wrote (the written binds), without the page rounding of the
     /// tracker's GPU bits: bytes the CPU rewrote and announced since are not in them (NativeExactUpload).
     [[nodiscard]] bool IsRangeGpuWrittenPrecise(VAddr addr, size_t size);
-    /// sotc: SOTC_NATIVE_UNIFIED. True when [addr, +size) touches a unified granule (its GPU writes are in guest
-    /// memory and may still be pending on the GPU: a CPU copy of it must not run ahead of the GPU).
-    [[nodiscard]] bool IsNativeUnified(VAddr addr, u64 size);
     /// sotc: SOTC_NATIVE=1. The CPU replaced the contents of [addr, addr + size) (TextureCache::FindImage found a
     /// rewritten image there): its GPU-written state is forgotten as at an unmap, so its copies come from guest memory.
     /// sotc: SOTC_TRACK_IGNORE_RIPS: the GPU-written state of [addr, addr + size) is dropped and nothing is marked
@@ -960,7 +906,6 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
 
     StreamBuffer stream_buffer;
-    std::unique_ptr<FlatArena> flat_arena; ///< sotc: SOTC_FLAT_ARENA
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
     /// sotc: gpu_modified_ranges is changed on the GPU side (the draw thread, see
@@ -1008,21 +953,9 @@ private:
     /// base, the ring8 counters and the served-write record). Used by PcHostBind.
     [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> PcHostServe(
         VAddr device_addr, u32 size, bool is_written, const Vulkan::SotcGuestMemory::GuestView& view);
-    /// sotc: SOTC_NATIVE_UNIFIED (buffer_cache.cpp, before NativeUnifiedBind). A bind of a unified range is served
-    /// from the imported guest memory; a written bind makes its 2 MiB granules unified first. nullopt: the normal path.
-    [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> NativeUnifiedBind(VAddr device_addr, u32 size,
-                                                                                 bool is_written);
-    /// sotc: SOTC_NATIVE_UNIFIED. Copies the GPU-only bytes of [addr, +size) (the arena's GPU-written ranges) into
-    /// guest memory once, then drops their GPU-written state. Draw thread.
-    void NativeUnifiedFlush(VAddr addr, u64 size);
-    /// sotc: SOTC_NATIVE_UNIFIED=2. A CPU write fault on GPU-written memory: its granules become unified (pending: the
-    /// next bind copies their arena GPU bytes to guest memory). Any thread.
-    void NativeUnifiedNoteFault(VAddr addr, u64 size);
-    /// sotc: SOTC_NATIVE_UNIFIED=2: migration back of the granules the GPU binds often (draw thread, every 2 s).
-    void NativeUnifiedMaintain();
     /// sotc: SOTC_NATIVE frame ticket backend (SotcNative::SetFrameBackend), set in the constructor.
     static u64 NativeFrameSubmitted(void* ctx);
-    static void NativeDiscardFreed(void* ctx, u64 addr, u64 size); ///< sotc: SOTC_NATIVE_FREE_DISCARD
+    static void NativeDiscardFreed(void* ctx, u64 addr, u64 size); ///< sotc: SOTC_NATIVE (NativeForgetGpuWrites)
     /// sotc: SOTC_NATIVE_OWNER_DISCARD. A range changed owner: forgets its GPU-written state byte-exactly (partly
     /// covered pages stay GPU-modified while other bytes of them are). Bridge handler (SotcNative::SetOwnerDiscard).
     static void NativeDiscardOwner(void* ctx, u64 addr, u64 size);
@@ -1151,7 +1084,7 @@ private:
     /// found the run clean, valid while dma_run_valid is set. Reset with dma_runs.
     std::vector<u64> dma_run_gen;
     std::vector<bool> dma_run_valid;
-    u64 untrack_applied{0};  // sotc: SOTC_UNTRACK_AUTO, the published list version applied last
+    u64 untrack_applied{0};  // sotc: SOTC_CLASS_TRACK=1, the published list version applied last
     u64 class_shadow_version{0}; // sotc: SOTC_CLASS_TRACK=2, the classified version counted last
     u64 class_shadow_tick{0};    // sotc: SOTC_CLASS_TRACK=2, periodic recount counter
     u64 class_pub_version{~0ULL}; // sotc: SOTC_CLASS_TRACK=1, the classification version published last

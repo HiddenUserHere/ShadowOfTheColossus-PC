@@ -28,11 +28,6 @@
 // stack (committed, never GPU-tracked) and to the image's heap-id globals.
 
 #include "pc_ring.h"
-// sotc: SOTC_PC_RING_HEAPSTAT (pc_ring.cpp). Declared here; pc_ring.h should carry these two declarations.
-namespace SotcPcRing {
-bool HeapStatOn();
-void NoteHeapAlloc(uint32_t slot, uint64_t addr, uint64_t size);
-} // namespace SotcPcRing
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -573,11 +568,8 @@ HookAction AllocPre(GuestRegs& regs, void*) {
         ++t_pending_depth;
     }
     // sotc: with SOTC_GPU_PLACE the hook is on for the placement; the per-call statistics (SOTC MEMTYPE lines) then
-    // run only with SOTC_MEMTYPE_STATS=1.
-    static const bool stats = [] {
-        const char* v = std::getenv("SOTC_MEMTYPE_STATS");
-        return !SotcGpuSites::On() || (v && v[0] == '1');
-    }();
+    // do not run.
+    static const bool stats = !SotcGpuSites::On();
     if (stats) {
         SlotStats& s = g_slots[idx];
         s.calls.fetch_add(1, std::memory_order_relaxed);
@@ -784,8 +776,6 @@ void AllocPost(GuestRegs& regs, void*) {
     if (SotcNative::On() && static_cast<int64_t>(call.slot) == kRenderSingleFrameCpuSlot && regs.rax != 0) {
         SotcNativeHooks::NoteFrameBlock(regs.rax, call.size);
     }
-    // sotc: SOTC_PC_RING_HEAPSTAT: where the allocation landed relative to the served ranges, per slot.
-    SotcPcRing::NoteHeapAlloc(call.slot, regs.rax, call.size);
 }
 
 // sotc: SOTC_ALLOC_SITES: entry of the generic free 0x12af0 (MEMTYPE_FREE), rdi = the block 0x12820 returned.
@@ -1036,7 +1026,7 @@ void RegisterMemtype() {
     g_post_granules = g_classes_on || SotcPcPlaceGlue::On();
     // sotc: SOTC_NATIVE needs the post phase too (NoteFrameBlock runs there); the post phase then runs without the
     // granule claims unless the classes mode or the glue asks for them (g_post_granules).
-    g_post_on = g_post_granules || SotcNative::On() || SotcPcRing::HeapStatOn() || SotcAllocSites::On() ||
+    g_post_on = g_post_granules || SotcNative::On() || SotcAllocSites::On() ||
                 SotcAllocSites::CoreOn(); // SOTC_NATIVE_OWNER_DISCARD (env only: the native mode is set later)
 
     SotcHooks::Handler alloc;

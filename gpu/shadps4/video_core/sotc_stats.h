@@ -303,11 +303,6 @@ inline constexpr const char* PbDescRewriteName(uint32_t r) {
 inline std::atomic<uint64_t> pb_dyn_sets{0}, pb_dyn_fallback_sets{0};
 /// SOTC_SAMPLER_CACHE: per-tick sampler checks of a hit skipped / run.
 inline std::atomic<uint64_t> pb_sampler_skipped{0}, pb_sampler_checked{0};
-/// SOTC_HLE_FILL_SKIP: replicate fills skipped (same table in place) / run; run because no exact signal exists.
-inline std::atomic<uint64_t> pb_fill_skipped{0}, pb_fill_executed{0}, pb_fill_nosignal{0};
-/// SOTC_FLAT_ARENA: flat constant tables found in the arena / uploaded to it / retired with their chunk / sent to
-/// the stream ring (arena full or table too large).
-inline std::atomic<uint64_t> pb_flat_reused{0}, pb_flat_uploaded{0}, pb_flat_retired{0}, pb_flat_stream{0};
 /// SOTC_PROTECT_ASYNC_UNPROTECT: draw-thread unprotects queued for the worker / applied synchronously.
 inline std::atomic<uint64_t> pb_unprotect_queued{0}, pb_unprotect_sync{0};
 /// sotc: SOTC_BIND_CACHE_PACKET (default 0; needs SOTC_BIND_CACHE, _RANGES, _XTICK and _FRAME, read here on their own).

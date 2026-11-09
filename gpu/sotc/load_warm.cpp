@@ -132,75 +132,9 @@ bool WriteSet(const std::string& key, const std::vector<std::uint64_t>& pages) {
 #endif
 }
 
-// Texture records: one blob of the caller's fixed size per texture (the T# and the shader's image
-// resource), stored raw. The file header holds the blob size, so a build whose blob differs
-// ignores the file instead of misreading it.
-constexpr char kTexMagic[8] = {'S', 'O', 'T', 'C', 'W', 'T', 'X', '1'};
-constexpr std::size_t kMaxTexPerKey = 4096;
-
-std::filesystem::path TexPath(const std::string& key) {
-    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "load_warm" /
-           (key + ".tex.bin");
-}
-
-// blob_size 0: whatever the file says (the caller checks the size of each blob it replays).
-std::vector<std::string> ReadTex(const std::string& key, std::size_t& blob_size) {
-    std::vector<std::string> blobs;
-    std::ifstream in(TexPath(key), std::ios::binary);
-    char magic[8];
-    std::uint32_t size = 0, count = 0;
-    if (!in.read(magic, 8) || std::memcmp(magic, kTexMagic, 8) != 0 ||
-        !in.read(reinterpret_cast<char*>(&size), 4) || size == 0 || size > 4096 ||
-        (blob_size != 0 && size != blob_size) ||
-        !in.read(reinterpret_cast<char*>(&count), 4) || count > kMaxTexPerKey) {
-        return blobs;
-    }
-    blob_size = size;
-    std::string blob(blob_size, '\0');
-    for (std::uint32_t i = 0; i < count && in.read(blob.data(), blob_size); ++i) {
-        blobs.push_back(blob);
-    }
-    return blobs;
-}
-
-bool WriteTex(const std::string& key, const std::vector<std::string>& blobs,
-              std::size_t blob_size) {
-    std::error_code ec;
-    const auto path = TexPath(key);
-    std::filesystem::create_directories(path.parent_path(), ec);
-    auto tmp = path;
-    tmp += ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        const auto size = static_cast<std::uint32_t>(blob_size);
-        const auto count = static_cast<std::uint32_t>(blobs.size());
-        out.write(kTexMagic, 8);
-        out.write(reinterpret_cast<const char*>(&size), 4);
-        out.write(reinterpret_cast<const char*>(&count), 4);
-        for (const auto& b : blobs) {
-            out.write(b.data(), static_cast<std::streamsize>(b.size()));
-        }
-        if (!out) {
-            return false;
-        }
-    }
-#ifdef _WIN32
-    return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
-#else
-    std::filesystem::rename(tmp, path, ec);
-    return !ec;
-#endif
-}
-
 // Shared state, allocated once and never destroyed: the writer thread is detached and may still
 // run while the process exits. Lock order: mutex only (the writer copies under it, writes outside).
 struct State {
-    // Textures (blob_size 0 until the first NoteTexture or a read tells it).
-    std::size_t blob_size = 0;
-    std::unordered_map<std::string, std::unordered_set<std::string>> tex_sets;
-    std::vector<std::string> tex_dirty;
-    std::vector<std::string> tex_queue; // the current key's records
-    std::size_t tex_pos = 0;
     std::mutex mutex;
     std::condition_variable cv;
     std::unordered_map<std::string, std::unordered_set<std::uint64_t>> sets; // learned, per key
@@ -232,8 +166,6 @@ thread_local std::vector<std::uint64_t> t_pages;
 thread_local int t_in_warm = 0;
 thread_local std::uint64_t t_warm_frame = ~0ULL; // WarmIdle's frame and its uploads
 thread_local std::uint64_t t_warm_frame_bytes = 0;
-thread_local std::uint32_t t_warm_frame_tex = 0;
-constexpr std::uint32_t kFrameCapTextures = 32;
 // Ranges this thread already recorded in this window: the game binds the same buffers (some of
 // them whole 64 MiB pools) on every draw, and walking their pages again on every bind cost ~25 ms
 // of the first frame (samples, user/trace/_lw5). Direct-mapped by address and size.
@@ -244,13 +176,6 @@ struct RecentRange {
 };
 constexpr std::size_t kRecentRanges = 4096;
 thread_local RecentRange* t_recent = nullptr; // allocated on first use (the draw thread only)
-struct RecentTex {
-    std::uint64_t hash = 0;
-    std::uint64_t seq = 0;
-};
-constexpr std::size_t kRecentTex = 1024;
-thread_local RecentTex* t_recent_tex = nullptr;
-std::atomic<std::uint64_t> s_tex_warmed{0};
 
 std::atomic<std::uint64_t> s_noted{0}, s_warm_runs{0}, s_warm_bytes{0}, s_passes{0}, s_events{0},
     s_uploaded{0}, s_stops{0};
@@ -277,8 +202,6 @@ void WriterLoop() {
     State& s = S();
     for (;;) {
         std::vector<std::pair<std::string, std::vector<std::uint64_t>>> todo;
-        std::vector<std::pair<std::string, std::vector<std::string>>> tex_todo;
-        std::size_t blob_size = 0;
         {
             std::unique_lock lk{s.mutex};
             s.cv.wait_for(lk, std::chrono::seconds(5));
@@ -289,17 +212,6 @@ void WriterLoop() {
                 todo.emplace_back(key, std::move(pages));
             }
             s.dirty.clear();
-            for (const auto& key : s.tex_dirty) {
-                const auto& set = s.tex_sets[key];
-                tex_todo.emplace_back(key, std::vector<std::string>(set.begin(), set.end()));
-            }
-            s.tex_dirty.clear();
-            blob_size = s.blob_size;
-        }
-        for (const auto& [key, blobs] : tex_todo) {
-            const bool ok = blob_size != 0 && WriteTex(key, blobs, blob_size);
-            std::fprintf(stderr, "SOTC LOAD WARM: %s %s textures (%zu)\n",
-                         ok ? "saved" : "could not save", key.c_str(), blobs.size());
         }
         for (const auto& [key, pages] : todo) {
             const bool ok = WriteSet(key, pages);
@@ -309,15 +221,14 @@ void WriterLoop() {
         }
         std::fprintf(stderr,
                      "SOTC LOAD WARM: %llu events, %llu pages noted, %llu warm runs over %.0f MiB "
-                     "in %llu passes, %.0f MiB uploaded, %llu early stops, %llu textures\n",
+                     "in %llu passes, %.0f MiB uploaded, %llu early stops\n",
                      static_cast<unsigned long long>(s_events.load()),
                      static_cast<unsigned long long>(s_noted.load()),
                      static_cast<unsigned long long>(s_warm_runs.load()),
                      s_warm_bytes.load() / 1048576.0,
                      static_cast<unsigned long long>(s_passes.load()),
                      s_uploaded.load() / 1048576.0,
-                     static_cast<unsigned long long>(s_stops.load()),
-                     static_cast<unsigned long long>(s_tex_warmed.load()));
+                     static_cast<unsigned long long>(s_stops.load()));
         if (kStreamEnabled) {
             std::fprintf(stderr,
                          "SOTC LOAD STREAM: %.0f MiB drained in %llu uploads (%llu calls), %.0f MiB "
@@ -373,14 +284,6 @@ bool Enabled() noexcept {
     return kEnabled;
 }
 
-bool TexturesEnabled() noexcept {
-    static const bool on = [] {
-        const char* v = std::getenv("SOTC_LOAD_WARM_TEX");
-        return kEnabled && v && v[0] == '1';
-    }();
-    return on;
-}
-
 bool HasWork() noexcept {
     return g_has_work.load(std::memory_order_relaxed);
 }
@@ -418,20 +321,9 @@ void OnEvent(const char* name) {
         need_read = !s.loaded.count(key);
     }
     std::vector<std::uint64_t> from_disk = need_read ? ReadSet(key) : std::vector<std::uint64_t>{};
-    std::size_t tex_size = 0;
-    {
-        std::lock_guard lk{s.mutex};
-        tex_size = s.blob_size;
-    }
-    std::vector<std::string> tex_disk =
-        need_read && TexturesEnabled() ? ReadTex(key, tex_size) : std::vector<std::string>{};
     std::lock_guard lk{s.mutex};
     if (need_read && s.loaded.insert(key).second) {
         s.sets[key].insert(from_disk.begin(), from_disk.end());
-        if (!tex_disk.empty() && (s.blob_size == 0 || s.blob_size == tex_size)) {
-            s.blob_size = tex_size;
-            s.tex_sets[key].insert(tex_disk.begin(), tex_disk.end());
-        }
     }
     // The old window ends here; the draw thread's pages of it are flushed on its next NoteBind
     // or warm call into the previous key.
@@ -448,13 +340,10 @@ void OnEvent(const char* name) {
     s.next_pass = 0;
     s.pass_bytes = 0;
     s.window_bytes = 0;
-    const auto& tex = s.tex_sets[key];
-    s.tex_queue.assign(tex.begin(), tex.end());
-    s.tex_pos = 0;
-    g_has_work.store(!s.queue.empty() || !s.tex_queue.empty(), std::memory_order_relaxed);
+    g_has_work.store(!s.queue.empty(), std::memory_order_relaxed);
     s_events.fetch_add(1, std::memory_order_relaxed);
-    std::fprintf(stderr, "SOTC LOAD WARM: event %s, %zu pages (%.0f MiB) and %zu textures to warm\n",
-                 key.c_str(), s.queue.size(), s.queue.size() * 64.0 / 1024.0, s.tex_queue.size());
+    std::fprintf(stderr, "SOTC LOAD WARM: event %s, %zu pages (%.0f MiB) to warm\n",
+                 key.c_str(), s.queue.size(), s.queue.size() * 64.0 / 1024.0);
 }
 
 namespace {
@@ -540,63 +429,13 @@ void NoteBind(std::uint64_t addr, std::uint64_t size) noexcept {
     }
 }
 
-void SetTextureBlobSize(std::size_t size) noexcept {
-    State& s = S();
-    std::lock_guard lk{s.mutex};
-    s.blob_size = size;
-}
-
-void NoteTexture(const void* blob, std::size_t size) noexcept {
-    if (!TexturesEnabled() || t_in_warm || !blob || size == 0) {
-        return;
-    }
-    const std::uint64_t seq = g_seq.load(std::memory_order_acquire);
-    if (seq == 0 || seq == t_closed_seq || seq != t_seq ||
-        Now() >= g_window_end_atomic.load(std::memory_order_relaxed)) {
-        return; // no window, a closed or ended one, or NoteBind has not opened it on this thread
-    }
-    // FNV-1a of the blob: a texture is recorded once per window per thread cache slot.
-    std::uint64_t h = 0xCBF29CE484222325ULL;
-    const auto* p = static_cast<const unsigned char*>(blob);
-    for (std::size_t i = 0; i < size; ++i) {
-        h = (h ^ p[i]) * 0x100000001B3ULL;
-    }
-    if (!t_recent_tex) {
-        t_recent_tex = new RecentTex[kRecentTex]{};
-    }
-    RecentTex& slot = t_recent_tex[h & (kRecentTex - 1)];
-    if (slot.seq == seq && slot.hash == h) {
-        return;
-    }
-    slot = RecentTex{h, seq};
-    State& s = S();
-    std::lock_guard lk{s.mutex};
-    if (s.key.empty() || seq != g_seq.load(std::memory_order_relaxed)) {
-        return;
-    }
-    if (s.blob_size == 0) {
-        s.blob_size = size;
-    }
-    if (s.blob_size != size) {
-        return;
-    }
-    auto& set = s.tex_sets[s.key];
-    if (set.size() < kMaxTexPerKey &&
-        set.emplace(static_cast<const char*>(blob), size).second &&
-        std::find(s.tex_dirty.begin(), s.tex_dirty.end(), s.key) == s.tex_dirty.end()) {
-        s.tex_dirty.push_back(s.key);
-    }
-}
-
-unsigned WarmIdle(std::uint64_t budget_ns, std::uint64_t frame, WarmFn warm, TexWarmFn tex,
-                  StopFn stop, void* ctx) {
+unsigned WarmIdle(std::uint64_t budget_ns, std::uint64_t frame, WarmFn warm, StopFn stop, void* ctx) {
     if (!kEnabled) {
         return 0;
     }
     if (frame != t_warm_frame) {
         t_warm_frame = frame;
         t_warm_frame_bytes = 0;
-        t_warm_frame_tex = 0;
     }
     if (t_warm_frame_bytes >= kFrameCapBytes) {
         return 0; // this frame's share is used
@@ -612,32 +451,6 @@ unsigned WarmIdle(std::uint64_t budget_ns, std::uint64_t frame, WarmFn warm, Tex
     const std::uint64_t deadline = Now() + budget_ns;
     unsigned runs = 0;
     for (;;) {
-        // Textures first, once per window: creating, tracking (page protection) and uploading an
-        // image is the cost the first frame paid per new texture. A later guest write is tracked
-        // and uploaded again at the real bind, as for any image.
-        std::string blob;
-        {
-            std::lock_guard lk{s.mutex};
-            // At most kFrameCapTextures per presented frame (their uploads are not counted in
-            // bytes), so textures cannot take a gameplay frame's whole idle budget.
-            if (tex && TexturesEnabled() && s.tex_pos < s.tex_queue.size() && Now() < s.window_end &&
-                t_warm_frame_tex < kFrameCapTextures) {
-                blob = s.tex_queue[s.tex_pos++];
-                ++t_warm_frame_tex;
-            }
-        }
-        if (!blob.empty()) {
-            {
-                WarmScope scope;
-                tex(ctx, blob.data(), blob.size());
-            }
-            ++runs;
-            s_tex_warmed.fetch_add(1, std::memory_order_relaxed);
-            if (stop(ctx) || Now() >= deadline) {
-                return runs;
-            }
-            continue;
-        }
         std::uint64_t first = 0, count = 0;
         {
             std::lock_guard lk{s.mutex};

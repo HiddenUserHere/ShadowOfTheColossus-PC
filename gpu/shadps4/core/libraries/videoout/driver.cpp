@@ -69,11 +69,10 @@
 #include "../../../../sotc/hooks.h"      // sotc: SotcHookStats::Report
 #include "../../../../sotc/write_decl.h" // sotc: SotcWriteDecl::Report
 #include "../../../../sotc/probe_prepass.h" // sotc: SOTC_PREPASS_PROBE report
-#include "../../../../sotc/probe_ops.h"      // sotc: SOTC_OPS_PROBE report (observe only)
 #include "../../../../sotc/probes.h"     // sotc: engine probe report lines
 #include "video_core/sotc_prepass_probe.h" // sotc: SOTC_PREPASS_PROBE depth readers report
 #include "../../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK report (plan step 6)
-#include "../../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG report
+#include "../../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN report
 #include "../../../../sotc/probe_xpr_groups.h" // sotc: SOTC_XPR_GROUPS report
 #include "../../../../sotc/predict_probe.h" // sotc: SOTC_PREDICT_PROBE report
 #include "../../../../sotc/pretranslate.h" // sotc: SOTC_PRETRANSLATE report
@@ -147,7 +146,6 @@ void ReportComputeFast(std::string& out, double seconds); // sotc: SOTC_COMPUTE_
 void ReportComputeSpecFree(std::string& out, double seconds); // sotc: SOTC_COMPUTE_SPECFREE (vk_compute_pipeline.cpp)
 void ReportPipeManifest(std::string& out, double seconds); // sotc: SOTC_PIPE_MANIFEST
 void ReportPipeFeedback(std::string& out, double seconds); // sotc: SOTC_PIPE_FEEDBACK / SOTC_PIPE_COMPILE_CHECK
-void ReportHleCopyExact(std::string& out, double seconds); // sotc: SOTC_HLE_COPY_EXACT (vk_shader_hle.cpp)
 } // namespace Vulkan
 // sotc: src/runtime_kernel.c, SOTC USLEEP line (usleep histogram, SOTC_USLEEP_YIELD).
 extern "C" void runtime_usleep_stats(char* out, size_t size, double seconds);
@@ -311,69 +309,6 @@ static void UntrackLogChunks(u64 image, std::string& report) {
     if (line != last) {
         last = line;
         ReportPrintf(report, "%s", line.c_str());
-    }
-}
-
-// sotc: SOTC_UNTRACK_AUTO. The chunk list of UntrackLogChunks as ranges. False when a read fails,
-// the list does not end at the sentinel within 64 nodes, or a node is not a sane chunk (64 KiB
-// aligned, in user space, at most one 32 MiB chunk). The link is at +8 (see UntrackLogChunks); a
-// wrong link makes the walk fail, which publishes nothing.
-static bool UntrackAutoOneWalk(u64 parent, std::vector<VideoCore::SotcUntrack::Range>& out) {
-    const u64 head = parent + 0x38;
-    out.clear();
-    u64 node = 0;
-    if (!UntrackRead(parent + 0x48, &node, sizeof(node))) {
-        return false;
-    }
-    for (int n = 0; node != head && n < 64; ++n) {
-        u64 base = 0;
-        u64 size = 0;
-        u64 next = 0;
-        if (!UntrackRead(node + 0x60, &base, sizeof(base)) ||
-            !UntrackRead(node + 0x58, &size, sizeof(size)) ||
-            !UntrackRead(node + 8, &next, sizeof(next))) {
-            return false; // sotc: the link is at +8 (measured; +0 holds the node itself)
-        }
-        // sotc: chunk bases are guest addresses (the game's direct memory lives far above 2 GiB,
-        // e.g. 0x10xxxxxxxx): any user-space address, 64 KiB aligned, up to 32 MiB.
-        if (base < 0x10000ULL || base >= kUntrackUserEnd || (base & 0xFFFFULL) != 0 || size == 0 ||
-            size > (32ULL << 20) || base + size > kUntrackUserEnd) {
-            return false;
-        }
-        out.push_back(VideoCore::SotcUntrack::Range{base, size});
-        node = next;
-    }
-    return node == head;
-}
-
-// sotc: SOTC_UNTRACK_AUTO. The live chunks of the RenderSingleFrameGPU heap, read twice; false
-// unless both walks succeed and agree (a list changing during the walk is dropped).
-static bool UntrackAutoWalk(u64 image, std::vector<VideoCore::SotcUntrack::Range>& out) {
-    u32 id = 0;
-    u64 heap = 0;
-    u64 parent = 0;
-    u64 expected = 0;
-    if (!UntrackRead(image + 0x2ed1f54, &id, sizeof(id)) || id >= 4096 ||
-        !UntrackRead(image + 0x2dfaab0 + 8ULL * id, &heap, sizeof(heap)) ||
-        !UntrackRead(heap + 0x80, &parent, sizeof(parent)) ||
-        !UntrackRead(image + 0x2dfb2b8, &expected, sizeof(expected)) || parent != expected) {
-        return false;
-    }
-    std::vector<VideoCore::SotcUntrack::Range> second;
-    return UntrackAutoOneWalk(parent, out) && UntrackAutoOneWalk(parent, second) && out == second;
-}
-
-// sotc: SOTC_UNTRACK_AUTO. Every 30 flips the flip thread publishes the chunk list (only when
-// SOTC_CP_AHEAD is unset, see SotcUntrack::AutoOn). It touches no region: the draw thread applies it.
-static void UntrackAutoTick() {
-    static u32 flips = 0;
-    if (!VideoCore::SotcUntrack::AutoOn() || ++flips % 30 != 0) {
-        return;
-    }
-    const u64 image = UntrackImageBase();
-    std::vector<VideoCore::SotcUntrack::Range> live;
-    if (image != 0 && UntrackAutoWalk(image, live)) {
-        VideoCore::SotcUntrack::Publish(std::move(live));
     }
 }
 
@@ -690,7 +625,6 @@ void VideoOutDriver::Flip(const Request& req) {
     if (SotcDetFlip::kOn) { // sotc: SOTC_DET_FLIP, before the flip events so the clock is first
         SotcDetFlip::NoteFlipped(sotc_flip);
     }
-    UntrackAutoTick(); // sotc: SOTC_UNTRACK_AUTO (every 30 flips)
     {
         // sotc: a performance line in the event log every minute (average FPS, frames slower
         // than 50 ms, the slowest, video memory in use).
@@ -1238,8 +1172,8 @@ void VideoOutDriver::Flip(const Request& req) {
                         }
                     }
                 }
-                // sotc: SOTC_UNTRACK_AUTO (off by default): the published chunk list, the pages it
-                // kept per second (the SOTC_UNTRACK_LOG counter) and the self-check faults.
+                // sotc: SOTC_CLASS_TRACK=1: the published list, the pages it kept per second (the
+                // SOTC_UNTRACK_LOG counter) and the self-check faults.
                 if (VideoCore::SotcUntrack::AutoOn()) {
                     static u64 kept_seen = 0;
                     const u64 kept = VideoCore::SotcUntrack::PagesKept();
@@ -2350,70 +2284,6 @@ void VideoOutDriver::Flip(const Request& req) {
                 ReportPrintf(report, "SOTC CP back-write waits: %.0f/s, %.2f ms/s, max %.2f ms\n",
                              bw_n / seconds, bw_ns / 1e6 / seconds, bw_max / 1e6);
             }
-            {
-                // sotc: SOTC_CP_PRECISE_WAIT counters, per 5 s window.
-                using P = AmdGpu::Liverpool::CpPreciseStats;
-                const uint64_t pw_avoided = P::avoided.exchange(0), pw_ov = P::taken_overlap.exchange(0);
-                const uint64_t pw_unk = P::taken_unknown.exchange(0), pw_retry = P::retries.exchange(0);
-                const uint64_t pw_fb = P::fallback.exchange(0), pw_ver = P::verified.exchange(0);
-                const uint64_t pw_bad = P::violations.exchange(0), pw_ns = P::ns_blocked.exchange(0);
-                // sotc: SOTC_CP_SRT_PLAN: walker programs served by their plan, plans too big, reads outside a plan (=2).
-                const uint64_t sp_used = P::srt_plan_used.exchange(0), sp_big = P::srt_plan_big.exchange(0);
-                const uint64_t sp_miss = P::srt_plan_misses.exchange(0);
-                std::vector<uint64_t> sp_hashes;
-                P::TakeSrtPlanMisses(sp_hashes);
-                std::string sp_text;
-                for (size_t i = 0; i < sp_hashes.size(); ++i) {
-                    char buf[40];
-                    std::snprintf(buf, sizeof buf, "%s%#llx", i == 0 ? "" : " ",
-                                  static_cast<unsigned long long>(sp_hashes[i]));
-                    sp_text += buf;
-                }
-                // sotc: unknown waits by CpUnknown reason (None excluded, same order) and their blocked time.
-                static const char* const kUnkNames[] = {
-                    "null pipeline", "srt walker", "tess consts", "range table full",
-                    "ring overflow", "unknown write: held WRITE_DATA", "unknown write: no range",
-                    "srt plan too big"};
-                static_assert(sizeof(kUnkNames) / sizeof(kUnkNames[0]) == P::kUnknownReasons - 1,
-                              "one name per CpUnknown reason");
-                std::string unk_text;
-                for (uint32_t r = 1; r < P::kUnknownReasons; ++r) {
-                    const uint64_t n = P::unknown_n[r].exchange(0);
-                    const uint64_t ns = P::unknown_ns[r].exchange(0);
-                    char buf[128];
-                    std::snprintf(buf, sizeof buf, "%s%s %.0f/s (%.2f ms/s)", r == 1 ? "" : ", ",
-                                  kUnkNames[r - 1], n / seconds, ns / 1e6 / seconds);
-                    unk_text += buf;
-                }
-                // sotc: SRT walker programs of the window: distinct count, hits beyond the table, top 8 (pgm_hash:hits).
-                std::vector<std::pair<uint64_t, uint64_t>> srt_top;
-                uint64_t srt_distinct = 0, srt_dropped = 0;
-                P::TakeSrtWalkers(srt_top, srt_distinct, srt_dropped);
-                std::string srt_text;
-                for (size_t i = 0; i < srt_top.size() && i < 8; ++i) {
-                    char buf[64];
-                    std::snprintf(buf, sizeof buf, "%s%#llx:%llu", i == 0 ? "" : " ",
-                                  static_cast<unsigned long long>(srt_top[i].first),
-                                  static_cast<unsigned long long>(srt_top[i].second));
-                    srt_text += buf;
-                }
-                if (pw_avoided || pw_ov || pw_unk || pw_retry || pw_fb || pw_ver || pw_bad || pw_ns ||
-                    srt_distinct || sp_used || sp_big || sp_miss) {
-                    ReportPrintf(report,
-                                 "SOTC CP precise waits: avoided %.0f/s, taken overlap %.0f/s, unknown %.0f/s, "
-                                 "retries %.0f/s, fallback %.0f/s, verified %.0f/s, violations %llu, blocked %.2f ms/s"
-                                 " | unknown by reason: %s"
-                                 " | srt walker programs: %llu distinct, %llu hits beyond the table, top: %s"
-                                 " | srt plan: used %.0f/s, too big %.0f/s, misses %llu (programs: %s)\n",
-                                 pw_avoided / seconds, pw_ov / seconds, pw_unk / seconds, pw_retry / seconds,
-                                 pw_fb / seconds, pw_ver / seconds, static_cast<unsigned long long>(pw_bad),
-                                 pw_ns / 1e6 / seconds, unk_text.c_str(),
-                                 static_cast<unsigned long long>(srt_distinct),
-                                 static_cast<unsigned long long>(srt_dropped), srt_text.c_str(),
-                                 sp_used / seconds, sp_big / seconds,
-                                 static_cast<unsigned long long>(sp_miss), sp_text.c_str());
-                }
-            }
             // sotc: SOTC_FUTEX_WAIT counters, per 5 s window (liverpool.h, vk_recorder.h).
             const auto futex_line = [&](const char* who, auto& c) {
                 const uint64_t n = c.waits.exchange(0);
@@ -2440,7 +2310,6 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcHookStats::Report(report, seconds);
             SotcNoPrepass::Report(report, seconds); // sotc: SOTC_NO_PREPASS=2 (measurement only)
             SotcProbes::ReportPrepassProbe(report, seconds); // sotc: SOTC_PREPASS_PROBE (observe only)
-            SotcProbes::ReportOpsProbe(report, seconds);     // sotc: SOTC_OPS_PROBE (observe only)
             SotcPrepassProbe::ReportReaders(report);         // sotc: SOTC_PREPASS_PROBE (depth readers)
             SotcPrepassProbe::ReportArgs(report);            // sotc: SOTC_PREPASS_PROBE (XPR records)
             SotcPrepassProbe::ReportSkip(report);            // sotc: SOTC_NO_PREPASS=1
@@ -2456,7 +2325,6 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcProbes::ReportCvars(report, seconds);
             SotcProbes::ReportArea(report, seconds);
             SotcProbes::ReportMemtype(report, seconds); // sotc: PC memory model, wave B
-            SotcProbes::ReportXprMem(report, seconds);
             SotcPcRing::Report(report, seconds); // sotc: SOTC_PC_RING
             SotcNative::Report(report, seconds);      // sotc: SOTC_NATIVE
             SotcNativeHooks::Report(report, seconds); // sotc: SOTC_NATIVE write hooks
@@ -2570,7 +2438,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 }
             }
             SotcMemClasses::Report(report, seconds);
-            SotcRegionPredrain::Report(report, seconds); // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG
+            SotcRegionPredrain::Report(report, seconds); // sotc: SOTC_REGION_PREDRAIN
             SotcXprGroups::Report(report, seconds);      // sotc: SOTC_XPR_GROUPS (XPR draw groups, 5 s)
             SotcPredict::Report(report, seconds);        // sotc: SOTC_PREDICT_PROBE (shader translation predictability)
             SotcPretranslate::Report(report, seconds);
@@ -2597,7 +2465,6 @@ void VideoOutDriver::Flip(const Request& req) {
             Vulkan::ReportComputeFast(report, seconds); // sotc: SOTC_COMPUTE_FAST (prints only when on)
             Vulkan::ReportComputeSpecFree(report, seconds); // sotc: SOTC_COMPUTE_SPECFREE (prints only when on)
             Vulkan::ReportPipeManifest(report, seconds); // sotc: SOTC_PIPE_MANIFEST (user records, late builds)
-            Vulkan::ReportHleCopyExact(report, seconds); // sotc: SOTC_HLE_COPY_EXACT (prints only when on)
             AmdGpu::ReportCpLabelSkip(report, seconds);           // SOTC_CP_LABEL_SKIP
             SotcLabels::ReportLabels(report, seconds);            // SOTC_LABELS_HONEST
             // sotc: Wave D probes and optimizations (docs/re-stutters/reports2/00-PLAN.md); each

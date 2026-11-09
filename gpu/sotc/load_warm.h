@@ -25,11 +25,6 @@ namespace SotcLoadWarm {
 /// SOTC_LOAD_WARM=1, read once.
 bool Enabled() noexcept;
 
-/// SOTC_LOAD_WARM_TEX=1 (off by default, needs SOTC_LOAD_WARM=1): texture records and their warm.
-/// Measured 30 Oct: 16 of thousands of warmed textures were found by a real bind (the T#s of one
-/// session seldom match the next one's), and old records crashed before WarmTexture's range checks.
-bool TexturesEnabled() noexcept;
-
 /// An event: a load or an area change (any thread). Closes the current recording window (its
 /// pages join that key's set, saved by the writer thread) and opens a new one for `key`, whose
 /// saved set becomes the warm queue.
@@ -47,22 +42,9 @@ void NoteBind(std::uint64_t addr, std::uint64_t size) noexcept;
 /// `warm` and `stop` are plain function pointers with a context, so no allocation happens here.
 using WarmFn = std::uint64_t (*)(void* ctx, std::uint64_t addr, std::uint64_t size);
 using StopFn = bool (*)(void* ctx);
-/// A texture record (see NoteTexture), replayed as an early bind of that texture.
-using TexWarmFn = void (*)(void* ctx, const void* blob, std::size_t size);
 /// `frame`: the presented frame count; at most kFrameCapBytes are uploaded per frame, so warm
-/// copies stay a few ms of a gameplay frame once the world is drawn. Textures (once per window)
-/// go before the buffer runs.
-unsigned WarmIdle(std::uint64_t budget_ns, std::uint64_t frame, WarmFn warm, TexWarmFn tex,
-                  StopFn stop, void* ctx);
-
-/// The draw thread bound a texture: `blob` is what rebuilds its bind (the rasterizer packs the T#
-/// and the shader's image resource; one fixed size per build). Recorded once per window, like the
-/// buffer pages, into <key>.tex.bin.
-void NoteTexture(const void* blob, std::size_t size) noexcept;
-
-/// The size of this build's texture blob (the rasterizer, at static initialisation): a saved
-/// texture file with another size is ignored instead of fixing the size for the process.
-void SetTextureBlobSize(std::size_t size) noexcept;
+/// copies stay a few ms of a gameplay frame once the world is drawn.
+unsigned WarmIdle(std::uint64_t budget_ns, std::uint64_t frame, WarmFn warm, StopFn stop, void* ctx);
 
 // SOTC_LOAD_STREAM=1 (off by default; 2 = verify, see BufferCache::DrainRange). Not the learned
 // set: the draw thread keeps, for the whole session, the guest ranges it bound (NoteBind), and in

@@ -1356,13 +1356,6 @@ void TraceDispatch(const GuestRegs& regs) {
     trace.Note(regs.r15);
 }
 
-// sotc: SOTC_SETENTRY_PROBE (scripts/hooks.d/setentry_probe.py): every BPXPR_BuildSetEntry call, owner = rdi.
-HookAction OnSetEntry(GuestRegs& regs, void*) {
-    static OwnerTrace trace{"SETENTRY TRACE"};
-    trace.Note(regs.rdi);
-    return HookAction::Continue;
-}
-
 HookAction OnDispatch(GuestRegs& regs, void*) {
     TraceDispatch(regs);
     if (!SotcNativeMasks::Cpu() || !SotcNative::On()) {
@@ -1478,11 +1471,6 @@ void RegisterLod() {
     handler.post = nullptr;
     handler.user = nullptr;
     SotcHooks::RegisterHandler(kLodHook, handler);
-    SotcHooks::Handler entry;
-    entry.pre = &OnSetEntry;
-    entry.post = nullptr;
-    entry.user = nullptr;
-    SotcHooks::RegisterHandler("SETENTRY_PROBE", entry);
 }
 
 void DrainLodVerify(size_t limit) {

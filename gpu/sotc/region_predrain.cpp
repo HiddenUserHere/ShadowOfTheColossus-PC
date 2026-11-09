@@ -1,4 +1,4 @@
-// sotc: SOTC_REGION_PREDRAIN and SOTC_BIG_BIND_LOG, see region_predrain.h.
+// sotc: SOTC_REGION_PREDRAIN, see region_predrain.h.
 //
 // Why (docs/re-backend/15-burst-stutters.md, sections 2.2 and 2.3, fix 1A). A 16 MiB tracking region
 // starts with every CPU bit set (RegionManager's constructor), so the first bind that reaches a fresh
@@ -27,7 +27,6 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
-#include <unordered_set>
 #include <vector>
 
 #include "load_warm.h"
@@ -43,14 +42,9 @@ constexpr std::uint64_t kMaxRegions = std::uint64_t{1} << (40 - kRegionShift); /
 constexpr std::uint64_t kPendingWords = kMaxRegions / 64;
 constexpr std::uint64_t kBigSyncBytes = std::uint64_t{4} << 20; // a bind sync counted as big
 constexpr unsigned kCallsPerGap = 64;                           // pieces per idle gap, at most
-constexpr std::size_t kMaxLoggedKeys = 256;
 
 const bool kEnabled = [] {
     const char* v = std::getenv("SOTC_REGION_PREDRAIN");
-    return v && v[0] == '1';
-}();
-const bool kBigBindLog = [] {
-    const char* v = std::getenv("SOTC_BIG_BIND_LOG");
     return v && v[0] == '1';
 }();
 // SOTC_REGION_PREDRAIN_MB: uploads per presented frame, 1-256, default 8.
@@ -80,22 +74,6 @@ std::uint64_t s_frame_bytes = 0;
 std::atomic<std::uint64_t> s_pd_bytes{0}, s_pd_regions{0}, s_pd_calls{0}, s_pd_queued{0};
 std::atomic<std::uint64_t> s_bb_syncs{0}, s_bb_bytes{0}, s_bb_max{0}, s_bb_fresh{0};
 
-// SOTC_BIG_BIND_LOG: the bind context and the keys already logged.
-struct BindContext {
-    bool valid = false;
-    std::uint64_t pgm_hash = 0;
-    std::uint32_t hw_stage = 0;
-    std::uint32_t sw_stage = 0;
-    std::uint32_t binding = 0;
-    std::uint64_t base = 0;
-    std::uint32_t vsize = 0;
-    std::uint32_t num_records = 0;
-    std::uint32_t stride = 0;
-};
-thread_local BindContext t_ctx{};
-std::mutex g_log_mutex;
-std::unordered_set<std::uint64_t> g_logged;
-
 // SOTC_CLASS_TRACK CPU-only ranges, refreshed when the class table version moves (draw thread).
 std::vector<SotcMemClasses::Range> s_cpu_only;
 std::uint64_t s_cpu_only_version = ~0ULL;
@@ -112,12 +90,8 @@ bool Enabled() noexcept {
     return kEnabled;
 }
 
-bool BigBindLogEnabled() noexcept {
-    return kBigBindLog;
-}
-
 bool TrackOn() noexcept {
-    return kEnabled || kBigBindLog;
+    return kEnabled;
 }
 
 void NoteRegionCreated(std::uint64_t region_index) noexcept {
@@ -233,16 +207,6 @@ bool InCpuOnlyClass(std::uint64_t addr, std::uint64_t size) noexcept {
     return false;
 }
 
-void SetBindContext(std::uint64_t pgm_hash, std::uint32_t hw_stage, std::uint32_t sw_stage,
-                    std::uint32_t binding, std::uint64_t base, std::uint32_t vsize,
-                    std::uint32_t num_records, std::uint32_t stride) noexcept {
-    t_ctx = BindContext{true, pgm_hash, hw_stage, sw_stage, binding, base, vsize, num_records, stride};
-}
-
-void ClearBindContext() noexcept {
-    t_ctx.valid = false;
-}
-
 void NoteBindSync(std::uint64_t addr, std::uint64_t size, std::uint64_t bytes,
                   std::uint32_t fresh) noexcept {
     if (bytes < kBigSyncBytes) {
@@ -253,34 +217,6 @@ void NoteBindSync(std::uint64_t addr, std::uint64_t size, std::uint64_t bytes,
     s_bb_fresh.fetch_add(fresh, std::memory_order_relaxed);
     std::uint64_t cur = s_bb_max.load(std::memory_order_relaxed);
     while (bytes > cur && !s_bb_max.compare_exchange_weak(cur, bytes, std::memory_order_relaxed)) {
-    }
-    if (!kBigBindLog) {
-        return;
-    }
-    // Once per (pgm_hash, stage, binding). Without a context (a bind outside BindBuffers), once per region.
-    const std::uint64_t key =
-        t_ctx.valid ? (t_ctx.pgm_hash * 0x9E3779B97F4A7C15ULL) ^ (std::uint64_t{t_ctx.hw_stage} << 40) ^
-                          (std::uint64_t{t_ctx.sw_stage} << 48) ^ t_ctx.binding
-                    : ~(addr >> kRegionShift);
-    std::lock_guard lk{g_log_mutex};
-    if (g_logged.size() >= kMaxLoggedKeys || !g_logged.insert(key).second) {
-        return;
-    }
-    if (t_ctx.valid) {
-        std::fprintf(stderr,
-                     "SOTC BIG BIND: pgm %#llx hw stage %u sw stage %u binding %u, V# base %#llx "
-                     "size %#x num_records %u stride %u, request %#llx+%#llx, dirty %.1f MiB, "
-                     "fresh regions %u\n",
-                     static_cast<unsigned long long>(t_ctx.pgm_hash), t_ctx.hw_stage, t_ctx.sw_stage,
-                     t_ctx.binding, static_cast<unsigned long long>(t_ctx.base), t_ctx.vsize,
-                     t_ctx.num_records, t_ctx.stride, static_cast<unsigned long long>(addr),
-                     static_cast<unsigned long long>(size), bytes / 1048576.0, fresh);
-    } else {
-        std::fprintf(stderr,
-                     "SOTC BIG BIND: no shader context, request %#llx+%#llx, dirty %.1f MiB, "
-                     "fresh regions %u\n",
-                     static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size),
-                     bytes / 1048576.0, fresh);
     }
 }
 
@@ -310,14 +246,12 @@ void Report(std::string& out, double seconds) {
                       }());
         out += line;
     }
-    if (kBigBindLog || kEnabled) {
-        std::snprintf(line, sizeof line,
-                      "SOTC BIG BIND SYNCS: %.2f/s of 4 MiB or more, %.1f MiB/s copied by them "
-                      "(max %.1f MiB), %.2f fresh regions/s touched\n",
-                      bb_syncs / seconds, bb_bytes / 1048576.0 / seconds, bb_max / 1048576.0,
-                      bb_fresh / seconds);
-        out += line;
-    }
+    std::snprintf(line, sizeof line,
+                  "SOTC BIG BIND SYNCS: %.2f/s of 4 MiB or more, %.1f MiB/s copied by them "
+                  "(max %.1f MiB), %.2f fresh regions/s touched\n",
+                  bb_syncs / seconds, bb_bytes / 1048576.0 / seconds, bb_max / 1048576.0,
+                  bb_fresh / seconds);
+    out += line;
 }
 
 } // namespace SotcRegionPredrain

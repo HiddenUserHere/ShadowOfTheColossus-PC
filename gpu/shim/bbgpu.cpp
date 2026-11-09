@@ -10,7 +10,6 @@
 #include <sys/resource.h>
 #endif
 #include "bbport_toggles.h"
-#include "sotc_backing_warm.h" // sotc: SOTC_BACKING_WARM
 #include "../sotc/load_warm.h"   // sotc: SOTC_LOAD_WARM
 #include "../sotc/pc_ring.h"     // sotc: SOTC_PC_RING=8 flip wait (SetFlipWait)
 #include "video_core/sotc_fps_cap.h"
@@ -466,7 +465,6 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
 #endif
     g_sdk_version = config->sdk_version;
     SotcTrace::SetUserDir(config->user_dir); // sotc: SOTC_TRACE files go to <user dir>/trace
-    SotcBackingWarm::Start();                // sotc: SOTC_BACKING_WARM (no-op when off)
     Core::StartCopyGuestReport();            // sotc: SOTC_COPY_GUEST_VIEW counters
 #ifdef _WIN32
     if (config->user_dir && !std::getenv("BB_GPU_USER_DIR")) _putenv_s("BB_GPU_USER_DIR", config->user_dir);

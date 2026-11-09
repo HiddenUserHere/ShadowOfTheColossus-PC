@@ -2,6 +2,19 @@
 
 ## Em desenvolvimento
 
+**Primeira abertura mais leve (ligado por padrão)**
+- Durante o loading, a compilação de shaders usa no máximo um thread por núcleo físico, em prioridade
+  abaixo do normal (`SOTC_COMPILE_THREADS`; `=0` volta ao anterior). Os caches de pipeline são lidos e
+  gravados mapeando o arquivo, sem cópia inteira na RAM (`SOTC_CACHE_MAP`), e o código dos shaders de
+  compute é liberado assim que o pipeline existe (`SOTC_COMPUTE_RELEASE`). Primeira abertura medida:
+  loading de 407 para 294 s, pico de memória de ~12 para 7,4 GB, nenhuma compilação durante o jogo.
+
+**Limpeza de opções**
+- Removidas 34 variáveis de teste sem uso ou medidas como piores (lista em
+  `docs/SWITCH-AUDIT-2026-11-09.md`), entre elas `SOTC_FLAT_ARENA`, `SOTC_BIND_CACHE_WIDE`,
+  `SOTC_CP_PRECISE_WAIT`, `SOTC_NATIVE_UNIFIED`, `SOTC_NATIVE_TRACK_EMU`, `SOTC_UNTRACK_AUTO`,
+  `SOTC_LOAD_WARM_TEX` e `SOTC_BACKING_WARM`. O comportamento padrão não muda.
+
 **Cargas de área mais leves (ligado por padrão)**
 Medido em 30/10 numa rota de carga (spawn → home_north → cathedral → cathedral_north →
 cathedral_pool), uma sessão por configuração, contra a mesma rota sem as opções. Cada uma desliga

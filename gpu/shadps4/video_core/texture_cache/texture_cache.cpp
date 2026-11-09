@@ -531,15 +531,8 @@ void TextureCache::InvalidateImagesLocked(VAddr addr, size_t size, bool keep_gpu
             // from guest memory like a CPU-written one (mode 0 gets the same result through its readback).
             constexpr u64 native_reuse_idle_ticks = 120;
             const u64 idle = scheduler.CurrentTick() - image.tick_accessed_last;
-            // sotc: SOTC_NATIVE_REUSE_PARTIAL=1: any announce over an idle GPU-written image counts. New contents
-            // usually arrive in pieces (file reads in blocks, one mip at a time), none of which covers the whole
-            // image, so the image kept a picture of the old contents (no Shrine terrain after the opening).
-            static const bool reuse_partial = [] {
-                const char* v = std::getenv("SOTC_NATIVE_REUSE_PARTIAL");
-                return v && v[0] == '1';
-            }();
-            const bool covers = reuse_partial || (addr <= image.info.guest_address &&
-                                                  addr + size >= image.info.guest_address + image.info.guest_size);
+            const bool covers = addr <= image.info.guest_address &&
+                                addr + size >= image.info.guest_address + image.info.guest_size;
             if (!covers || idle < native_reuse_idle_ticks) {
                 return;
             }

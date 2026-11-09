@@ -126,7 +126,7 @@ static int lock_wake(void) {
     return v;
 }
 static volatile LONG lock_sleepers;
-/* sotc: SOTC_LOCK_WATCH=1 (or ring modes 6, 7): the holder of the table lock, for the watch lines below.
+/* sotc: lock watch (SOTC_PC_RING modes 6, 7): the holder of the table lock, for the watch lines below.
  * Written by the exclusive holder; read without the lock (diagnostics only). */
 static volatile LONG lock_writer_tid;  /* thread id of the exclusive holder, 0 when none */
 static const char *lock_last_write;    /* site of the last write lock taken */
@@ -134,10 +134,7 @@ int sotc_pc_ring_full6(void) __attribute__((weak));
 void runtime_memory_lock_watch_text(char *out, size_t capacity);
 static int lock_watch_on(void) {
     static int v=-1;
-    if (v<0) {
-        const char *e=getenv("SOTC_LOCK_WATCH");
-        v=(e && e[0]=='1') || (sotc_pc_ring_full6 && sotc_pc_ring_full6());
-    }
+    if (v<0) v=sotc_pc_ring_full6 && sotc_pc_ring_full6();
     return v;
 }
 /* sotc: a table lock wait that passes 2 s is reported once per thread, with the holder's state. */
@@ -211,7 +208,7 @@ void runtime_memory_lock_stats(uint64_t *writes, double *wait_ms, double *hold_m
     *hold_ms=(double)__atomic_exchange_n(&lock_hold_ticks,0,__ATOMIC_RELAXED)*ms;
     *worst_ms=(double)__atomic_exchange_n(&lock_worst_wait_ticks,0,__ATOMIC_RELAXED)*ms;
 }
-/* sotc: SOTC_LOCK_WATCH. The table lock's holder as text: the exclusive holder's thread id, the number of
+/* sotc: lock watch (SOTC_PC_RING modes 6, 7). The table lock's holder as text: the exclusive holder's thread id, the number of
  * readers, and the site of the last write lock (page_manager.cpp and the watch line above read it). */
 void runtime_memory_lock_watch_text(char *out, size_t capacity) {
     const char *site=__atomic_load_n(&lock_last_write,__ATOMIC_RELAXED);

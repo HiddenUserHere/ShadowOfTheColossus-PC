@@ -310,7 +310,7 @@ inline bool ManifestHoldFast() {
 /// SOTC_BACK_WRITE_EXACT=1 (off): the submit-start ops queued to the draw thread, which write no guest memory
 /// (PcRingCopy::OnSubmitStart, BufferCache::DrainSyncEvents, Rasterizer::GcnSubmitStart: uploads, imports, residency,
 /// protections), no longer advance back_write_seq, so a CP pipeline lookup after them does not wait for the draw thread
-/// (LookupAfterWrites with SOTC_CP_PRECISE_WAIT=0).
+/// (LookupAfterWrites).
 inline bool BackWriteExact() {
     static const bool on = SwitchOn("SOTC_BACK_WRITE_EXACT");
     return on;
@@ -360,25 +360,6 @@ inline bool SamplerCache() {
     return on;
 }
 
-/// SOTC_HLE_FILL_SKIP=1: a REPLICATE fill (vk_shader_hle.cpp) whose control words, pattern hash and generation sums
-/// (SotcGen::Sum of the destination, source and control ranges) are those of the last fill of the same destination,
-/// with none of the three ranges CPU- or GPU-modified, skips the page compare and the write-back: the destination
-/// already holds this table. Needs a generation source (SOTC_GEN_BIND or SOTC_GEN_DMA) and page tracking of guest
-/// writes (not SOTC_NATIVE without tracking); otherwise every fill runs as before and is counted as not skippable.
-inline bool HleFillSkip() {
-    static const bool on = SwitchOn("SOTC_HLE_FILL_SKIP");
-    return on;
-}
-
-/// SOTC_FLAT_ARENA=1: flat constant buffers go to a persistent arena keyed by content hash (BufferCache::FlatArena)
-/// instead of the stream ring: a table seen before is bound at its arena offset (no copy); a new one is uploaded
-/// once. The arena is 32 chunks of 2 MiB bump-allocated; a chunk unused for 64 ticks and finished by the GPU is
-/// emptied and reused (its entries retired). When no chunk is free the copy goes to the stream ring as before.
-inline bool FlatArena() {
-    static const bool on = SwitchOn("SOTC_FLAT_ARENA");
-    return on;
-}
-
 /// SOTC_PROTECT_ASYNC_UNPROTECT=1 (with SOTC_PROTECT_ASYNC=1): an unprotect (read-write) the draw thread makes while
 /// it binds resources for the GPU (PageManager::GpuOnlyScope, opened by Rasterizer::BindResources) is queued for the
 /// protect worker like a restriction, in order, instead of flushing the queue and running synchronously. Outside the
@@ -387,30 +368,6 @@ inline bool FlatArena() {
 /// a page covered by another thread's pending flush.
 inline bool ProtectAsyncUnprotect() {
     static const bool on = SwitchOn("SOTC_PROTECT_ASYNC_UNPROTECT");
-    return on;
-}
-
-/// SOTC_FILL_GPU=1 (off by default): the replicate fill of a table (vk_shader_hle.cpp FillTableGpu) writes the guest
-/// bytes inline and fills the arena on the GPU, with no page compare or per-run replace. Read once.
-inline bool FillGpu() {
-    static const bool on = SwitchOn("SOTC_FILL_GPU");
-    return on;
-}
-
-/// SOTC_BIND_CACHE_WIDE=1 (default off; needs SOTC_BIND_CACHE, _RANGES, _XTICK and _FRAME, read here on their own): the
-/// frame bind cache also takes compute dispatches and binds that write plain guest buffers, without SOTC_OP_COMPUTE_BIND
-/// being set. It applies the rules of SOTC_OP_COMPUTE_BIND=1 (vk_rasterizer.cpp, OpComputeMode): a hit replays the written
-/// bindings' side effects (Rasterizer::ReplayOwnWrites). Storage images, fmasks and written images stay refused, counted by
-/// gate in the "SOTC BIND WIDE" 5 s line. With SOTC_OP_COMPUTE_BIND=2 set as well, the verify mode runs instead of hits.
-inline bool BindCacheWide() {
-    static const bool on = [] {
-        const auto one = [](const char* name) {
-            const char* v = std::getenv(name);
-            return v != nullptr && v[0] == '1';
-        };
-        return one("SOTC_BIND_CACHE_WIDE") && one("SOTC_BIND_CACHE") && one("SOTC_BIND_CACHE_RANGES") &&
-               one("SOTC_BIND_CACHE_XTICK") && one("SOTC_BIND_CACHE_FRAME");
-    }();
     return on;
 }
 

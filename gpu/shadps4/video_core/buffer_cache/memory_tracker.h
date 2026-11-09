@@ -13,7 +13,7 @@
 #include "video_core/sotc_generation.h" // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA granule generations
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_trace.h" // sotc: SOTC_TRACE (redirty instants)
-#include "../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG (fresh regions)
+#include "../../../sotc/region_predrain.h" // sotc: SOTC_REGION_PREDRAIN (fresh regions)
 
 namespace VideoCore {
 /// sotc: prints the current thread's return addresses as exe offsets (page_manager.cpp).
@@ -249,7 +249,7 @@ public:
         return std::min(bytes, size);
     }
 
-    /// sotc: SOTC_UNTRACK_AUTO: like UnmarkRegionAsGpuModified(.., false), after a download wrote
+    /// sotc: SOTC_CLASS_TRACK=1: like UnmarkRegionAsGpuModified(.., false), after a download wrote
     /// the GPU's bytes into guest memory: untracked pages get their CPU bit back (see retrack in
     /// RegionManager::ChangeRegionState).
     void UnmarkDownloadedAsGpuModified(VAddr cpu_addr, u64 size) noexcept {
@@ -456,7 +456,7 @@ public:
             if (guest_fault) {
                 manager->NoteGuestWriteFaultLocked(offset);
             }
-            // sotc: SOTC_UNTRACK_AUTO self-check. A protected, untracked page without a GPU bit
+            // sotc: SOTC_CLASS_TRACK=1 self-check. A protected, untracked page without a GPU bit
             // faulted: the untracking did not hold, so the list is dropped (SotcUntrack::Trip).
             if (guest_fault && SotcUntrack::AutoOn()) {
                 if (const u64 bad = manager->CountUntrackedFaultsLocked(offset, size)) {
@@ -652,7 +652,7 @@ private:
                                  HIGHER_PAGE_SIZE, base_cpu_addr);
         }
         live_managers.push_back(new_manager);
-        // sotc: SOTC_REGION_PREDRAIN / SOTC_BIG_BIND_LOG: the region is fresh (all CPU-dirty) and, with
+        // sotc: SOTC_REGION_PREDRAIN: the region is fresh (all CPU-dirty) and, with
         // predrain, queued for an idle upload (region_predrain.h).
         SotcRegionPredrain::NoteRegionCreated(page_index);
         return new_manager;
@@ -675,7 +675,7 @@ public:
         }
     }
 
-    /// sotc: SOTC_UNTRACK_AUTO. Gives every live region its untracked mask for `ranges` (the list
+    /// sotc: SOTC_CLASS_TRACK=1. Gives every live region its untracked mask for `ranges` (the list
     /// the flip thread published, SotcUntrack::AutoSnapshot). GPU command (draw) thread only, as
     /// ForEachSweepSpan. With readbacks disabled nothing is untracked (the self-check is blind there).
     void ApplyUntracked(const std::vector<SotcUntrack::Range>& ranges) {

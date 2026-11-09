@@ -42,7 +42,6 @@
 #include "pc_pool_place_glue.h" // sotc: SOTC_PC_PLACE / SOTC_PC_RECYCLE feed
 #include "mem_classes.h" // sotc: step 6 feed (CPU-only ranges) and the PC memory model owner feed
 #include "native/n1verify.h" // sotc: SOTC_VERIFY=n1 allocator class feed
-#include "native/native_draw.h" // sotc: SOTC_NATIVE_FREE_DISCARD
 #include "probes.h"
 #include "video_core/sotc_trace.h" // image bounds (SotcTrace::ImageBase/ImageSize)
 
@@ -516,7 +515,6 @@ HookAction FreePre(GuestRegs& regs, void*) {
     SotcPcRing::OnFreeBlock(e.base); // sotc: SOTC_PC_RING
     SotcRbClass::OnFreeBlock(e.base); // sotc: SOTC_RB_CLASS
     SotcN1Verify::OnFreeBlock(e.base); // sotc: SOTC_VERIFY=n1
-    SotcNative::DiscardFreed(e.base, e.size); // sotc: SOTC_NATIVE_FREE_DISCARD
     PoolRow& row = g_pools[e.pool];
     row.live_bytes -= static_cast<int64_t>(e.size);
     if (row.live_bytes < 0) {

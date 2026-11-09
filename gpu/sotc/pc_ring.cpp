@@ -668,27 +668,14 @@ void DeclareRange(Block* b, uint64_t addr, uint64_t size, uint32_t epoch) {
     const uint64_t end = std::min(addr + size, block_end);
     uint64_t run_lo = 0;
     uint64_t run_hi = 0;
-    // sotc: SOTC_PC_RING_SLOW=1 keeps the old declare (posted to the draw thread, which runs the
-    // invalidation there). Default: DeclareRingWrite, which settles the runs on the calling thread.
-    static const bool slow_declare = [] {
-        const char* v = std::getenv("SOTC_PC_RING_SLOW");
-        return v && v[0] == '1';
-    }();
+    // sotc: DeclareRingWrite settles the runs on the calling thread.
     auto flush = [&] {
         const uint64_t hi = std::min(run_hi, block_end);
         if (hi > run_lo) {
-            if (slow_declare) {
-                if (VideoCore::PageManager::MaybeWriteProtected(run_lo, hi - run_lo)) {
-                    VideoCore::PageManager::DeclareCpuWrite(run_lo, hi - run_lo);
-                    g_declares.fetch_add(1, std::memory_order_relaxed);
-                    g_declared_bytes.fetch_add(hi - run_lo, std::memory_order_relaxed);
-                }
-            } else {
-                // The lock-free "nothing protected" look is inside DeclareRingWrite (counted there).
-                VideoCore::PageManager::DeclareRingWrite(run_lo, hi - run_lo);
-                g_declares.fetch_add(1, std::memory_order_relaxed);
-                g_declared_bytes.fetch_add(hi - run_lo, std::memory_order_relaxed);
-            }
+            // The lock-free "nothing protected" look is inside DeclareRingWrite (counted there).
+            VideoCore::PageManager::DeclareRingWrite(run_lo, hi - run_lo);
+            g_declares.fetch_add(1, std::memory_order_relaxed);
+            g_declared_bytes.fetch_add(hi - run_lo, std::memory_order_relaxed);
         }
         run_lo = run_hi = 0;
     };
@@ -1787,49 +1774,6 @@ void NoteHostVerify(bool written, uint64_t bytes, bool changed) {
     }
 }
 
-// sotc: SOTC_PC_RING_HEAPSTAT=1 (off by default). Per memtype slot of the post phase of MEMTYPE_ALLOC
-// (probe_memtype.cpp): the allocations of the window, and how many of them lie inside a served range
-// (ArenaRelation 1: an imported arena block or heap run), straddle one (2) or lie outside all of them
-// (0). The share per slot is the measured answer to which heaps the GPU already reads in place. Only
-// mode 8 has served ranges, so the other modes count everything as outside. Printed in the host window.
-constexpr size_t kStatSlots = 64; // = the memtype probe's kSlots (probe_memtype.cpp)
-struct HeapStat {
-    std::atomic<uint64_t> calls{0};
-    std::atomic<uint64_t> bytes{0};
-    std::atomic<uint64_t> inside{0};
-    std::atomic<uint64_t> inside_bytes{0};
-    std::atomic<uint64_t> straddle{0};
-    std::atomic<uint64_t> outside{0};
-};
-std::array<HeapStat, kStatSlots> g_heap_stat{};
-
-bool HeapStatOn() {
-    static const bool on = [] {
-        const char* v = std::getenv("SOTC_PC_RING_HEAPSTAT");
-        return v && v[0] && std::strtol(v, nullptr, 10) != 0;
-    }();
-    return on;
-}
-
-// Post phase of MEMTYPE_ALLOC (any game thread, lock-free): one allocation of a memtype slot at addr.
-void NoteHeapAlloc(uint32_t slot, uint64_t addr, uint64_t size) {
-    if (slot >= kStatSlots || addr == 0 || size == 0 || !HeapStatOn()) {
-        return;
-    }
-    HeapStat& s = g_heap_stat[slot];
-    s.calls.fetch_add(1, std::memory_order_relaxed);
-    s.bytes.fetch_add(size, std::memory_order_relaxed);
-    const int relation = ArenaRelation(addr, size);
-    if (relation == 1) {
-        s.inside.fetch_add(1, std::memory_order_relaxed);
-        s.inside_bytes.fetch_add(size, std::memory_order_relaxed);
-    } else if (relation == 2) {
-        s.straddle.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        s.outside.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
 // Mode 8 report lines (Report prints nothing else in this mode). The read traffic is the unique
 // bytes per submit, summed over the submits of the window, per frame (the GPU reads host memory
 // per submit; overlapping binds of one submit are read once).
@@ -1939,29 +1883,6 @@ void ReportHost(std::string& out, double seconds) {
                       static_cast<unsigned long long>(wr), static_cast<double>(wrb) / mib,
                       static_cast<unsigned long long>(wrc));
         out += line;
-    }
-    if (HeapStatOn()) { // one line per memtype slot that allocated in the window
-        for (size_t slot = 0; slot < kStatSlots; ++slot) {
-            HeapStat& s = g_heap_stat[slot];
-            const uint64_t calls = s.calls.exchange(0, std::memory_order_relaxed);
-            const uint64_t heap_bytes = s.bytes.exchange(0, std::memory_order_relaxed);
-            const uint64_t inside = s.inside.exchange(0, std::memory_order_relaxed);
-            const uint64_t inside_bytes = s.inside_bytes.exchange(0, std::memory_order_relaxed);
-            const uint64_t straddle = s.straddle.exchange(0, std::memory_order_relaxed);
-            const uint64_t outside = s.outside.exchange(0, std::memory_order_relaxed);
-            if (calls == 0) {
-                continue;
-            }
-            std::snprintf(line, sizeof line,
-                          "SOTC PC RING host heap slot %zu: allocs %llu (%.2f MiB), inside a served "
-                          "range %llu (%.2f MiB), straddling %llu, outside %llu\n",
-                          slot, static_cast<unsigned long long>(calls),
-                          static_cast<double>(heap_bytes) / mib, static_cast<unsigned long long>(inside),
-                          static_cast<double>(inside_bytes) / mib,
-                          static_cast<unsigned long long>(straddle),
-                          static_cast<unsigned long long>(outside));
-            out += line;
-        }
     }
 }
 
@@ -2190,7 +2111,7 @@ void Report(std::string& out, double seconds) {
                       frames ? declared / 1048576.0 / static_cast<double>(frames) : 0.0,
                       faults / seconds, overflow ? " (block table full)" : "");
         out += line;
-        // sotc: DeclareRingWrite counters (SOTC_PC_RING_SLOW=1: no calls here).
+        // sotc: DeclareRingWrite counters.
         const auto rd = VideoCore::PageManager::GetRingDeclareStats(true);
         if (rd.calls) {
             char rl[400];

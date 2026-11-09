@@ -44,7 +44,7 @@ inline bool TracksGuestPages() {
     // stale-memory cause (a write no announce covers) and a behaviour cause of a mode-1 bug can be told apart.
     // =2 keeps the protection but still skips the readbacks: a stale CPU write (fixed by =2) and a missing readback
     // (fixed by =1 only) are told apart too.
-    // =3 keeps mode 1 as it is (announces, no readbacks) and only adds the protection of SOTC_NATIVE_TRACK_RANGE
+    // =3 keeps mode 1 as it is (announces, no readbacks) and only adds the write protection
     // (page_manager.cpp Protect): a write there that no announce covers is caught by its fault.
     return Mode() != 1 || TrackMode() == 1 || TrackMode() == 2;
 }

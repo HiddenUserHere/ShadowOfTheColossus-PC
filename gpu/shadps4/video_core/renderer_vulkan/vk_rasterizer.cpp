@@ -55,7 +55,7 @@
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
-#include "../../../sotc/nonblocking.h" // sotc: plan B switches (SOTC_BIND_DESC_REUSE, SOTC_SAMPLER_CACHE, SOTC_FLAT_ARENA)
+#include "../../../sotc/nonblocking.h" // sotc: plan B switches (SOTC_BIND_DESC_REUSE, SOTC_SAMPLER_CACHE)
 #include "video_core/sotc_noprepass.h" // sotc: SOTC_NO_PREPASS=2 (measurement only)
 #include "video_core/sotc_prepass_probe.h" // sotc: SOTC_PREPASS_PROBE (main depth address, observe only)
 #include "../../../sotc/native/verify.h" // sotc: SOTC_VERIFY (SotcVerify::VerifyAll)
@@ -76,13 +76,11 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "../../../sotc/load_warm.h" // sotc: SOTC_LOAD_WARM (texture records)
-#include "../../../sotc/region_predrain.h" // sotc: SOTC_BIG_BIND_LOG (bind context)
 #include "../../../sotc/probes.h"           // sotc: SOTC_BLOCK_EXTENT
 #include "../../../sotc/probe_vsize.h"      // sotc: SOTC_VSIZE_PROBE (unbounded read-only binds)
 #include "video_core/sotc_checkpoints.h"    // sotc: SOTC_GPU_CHECKPOINTS
 #include "../../../sotc/draw_gate.h"            // sotc: SOTC_DRAW_GATE
 #include "../../../sotc/gcn_census.h"           // sotc: SOTC_GCN_CENSUS
-#include "../../../sotc/guest_mem.h"            // sotc: SOTC_RB_CHANGED (backing view)
 
 // sotc: SOTC_PR_RESOLVE. Generation of the runtime memory table (src/runtime_memory.c); odd while
 // a change is in progress. Same declaration as sotc_bininfo.cpp.
@@ -185,20 +183,6 @@ void Rasterizer::GcnSubmitStart() {
         SotcGcn::OnSubmitStart(buffer_cache, texture_cache, scheduler);
     }
 }
-
-namespace {
-// sotc: SOTC_LOAD_WARM texture record: what rebuilds a texture bind's ImageDesc (the same
-// constructor BindTexturesFull uses), stored raw per area key (load_warm.cpp).
-struct SotcTexBlob {
-    AmdGpu::Image tsharp;
-    Shader::ImageResource resource;
-};
-static_assert(std::is_trivially_copyable_v<SotcTexBlob>);
-const bool kSotcTexBlobSizeSet = [] {
-    SotcLoadWarm::SetTextureBlobSize(sizeof(SotcTexBlob));
-    return true;
-}();
-} // namespace
 
 // sotc: SOTC_DEDUP_STATE=0 sends the vertex inputs on every draw again (vertex_input_cache in
 // DynamicState, vk_scheduler.h, is then never read or written).
@@ -3251,18 +3235,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
                                      is_indexed ? SotcCheckpoints::Kind::DrawIndexed : SotcCheckpoints::Kind::Draw,
                                      regs.num_indices, regs.num_instances.NumInstances(), instance_offset); // sotc
     CheckpointResources(cp_seq);
-    // sotc: SOTC_SKIP_DRAW_VS=<vertex program hash> (diagnostics): the draws of that vertex program are not recorded.
-    static const u64 skip_vs = [] {
-        const char* v = std::getenv("SOTC_SKIP_DRAW_VS");
-        return v ? std::strtoull(v, nullptr, 16) : 0ull;
-    }();
-    if (skip_vs != 0 && vs_info.pgm_hash == skip_vs) {
-        static std::atomic<u32> skipped{0};
-        if (skipped.fetch_add(1, std::memory_order_relaxed) < 4) {
-            std::fprintf(stderr, "SOTC SKIP DRAW VS: draw of vs %#llx not recorded\n",
-                         static_cast<unsigned long long>(skip_vs));
-        }
-    } else if (is_indexed) {
+    if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
     } else {
@@ -4680,51 +4653,10 @@ void BindDiffNote(u32 mask, bool hit) {
 
 // sotc: defined with the frame bind cache below (same unnamed namespace).
 namespace {
-// sotc: SOTC_BIND_CACHE_WIDE (gpu/sotc/nonblocking.h). OpComputeMode is the SOTC_OP_COMPUTE_BIND mode of the frame cache:
-// the variable's own value when it is set (2: the verify), else 1 under SOTC_BIND_CACHE_WIDE, else 0 (compute and written
-// binds refused as before).
+// sotc: OpComputeMode is the SOTC_OP_COMPUTE_BIND mode of the frame cache (2: the verify, 0: compute and written binds
+// refused).
 static int OpComputeMode() {
-    if (SotcStats::kOpComputeBind != 0) {
-        return SotcStats::kOpComputeBind;
-    }
-    static const bool wide = SotcNonBlocking::BindCacheWide();
-    return wide ? 1 : 0;
-}
-
-// sotc: SOTC_BIND_CACHE_WIDE counters, read by WideReport. Their own atomics: driver.cpp takes the SotcStats ones each 5 s.
-static std::atomic<u64> wide_compute_eligible{}, wide_graphics_hits{}, wide_compute_hits{}, wide_storage_hits{},
-    wide_write_replays{};
-static std::atomic<u64> wide_compute_refused[SotcStats::BgGates]{};
-
-// sotc: SOTC_BIND_CACHE_WIDE 5 s line (SOTC_FPS only). Hits by kind (graphics, compute); storage = hits that replayed written
-// bindings, with the number of bindings replayed. Compute binds refused, by the gate that refused them.
-static void WideReport() {
-    if (!SotcStats::kFpsLog || !SotcNonBlocking::BindCacheWide()) {
-        return;
-    }
-    static std::atomic<s64> due{};
-    const s64 now = static_cast<s64>(SotcStats::NowNs());
-    s64 d = due.load(std::memory_order_relaxed);
-    if (now < d || !due.compare_exchange_strong(d, now + 5'000'000'000LL)) {
-        return;
-    }
-    const auto take = [](std::atomic<u64>& c) {
-        return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed));
-    };
-    char refused[512]{};
-    size_t ri = 0;
-    for (uint32_t g = 1; g < SotcStats::BgGates; ++g) {
-        const auto n = take(wide_compute_refused[g]);
-        if (n != 0) {
-            ri += std::snprintf(refused + ri, sizeof(refused) - ri, "%s%s %llu", ri ? ", " : "",
-                                SotcStats::kBindGateNames[g], n);
-        }
-    }
-    std::fprintf(stderr,
-                 "SOTC BIND WIDE: mode %d, compute eligible %llu, hits compute %llu, graphics %llu, storage %llu "
-                 "(written bindings replayed %llu); compute refused [%s]\n",
-                 OpComputeMode(), take(wide_compute_eligible), take(wide_compute_hits), take(wide_graphics_hits),
-                 take(wide_storage_hits), take(wide_write_replays), ri ? refused : "none");
+    return SotcStats::kOpComputeBind;
 }
 
 u64 BindCacheFrameKey(const Pipeline* pipeline, u64 hash, u64 targets_key);
@@ -4773,7 +4705,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     desc_reuse = {}; // sotc: SOTC_BIND_DESC_REUSE: this op's record (BindPipelineResources)
     desc_reuse_entry = nullptr;
     PlanBReport(pipeline_cache.GetDescriptorHeap());
-    WideReport(); // sotc: SOTC_BIND_CACHE_WIDE 5 s line (SOTC_FPS only)
     // sotc: SOTC_PROTECT_ASYNC_UNPROTECT: the unprotects this bind makes are read next by the GPU (page_manager.h).
     const VideoCore::PageManager::GpuOnlyScope gpu_only_scope;
     // sotc: SOTC_DESCRIPTOR_HEAP: a heap draw replaces the descriptor state of the command buffer, so a classic draw
@@ -5017,9 +4948,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
                                                                      : SotcStats::BgPacketHeap)
                                  : BindCacheRefusal(pipeline, liverpool->DrawRegs());
             SotcStats::bind_gate_refused[gate].fetch_add(1, std::memory_order_relaxed);
-            if (pipeline->IsCompute() && SotcNonBlocking::BindCacheWide()) { // sotc: SOTC_BIND_CACHE_WIDE
-                wide_compute_refused[gate].fetch_add(1, std::memory_order_relaxed);
-            }
         }
     }
     if (SotcStats::kFpsLog && SotcStats::kBindCachePacket != 0 && packet_op) { // sotc: SOTC_BIND_CACHE_PACKET
@@ -5036,9 +4964,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     const bool compute_verify = compute_bind && OpComputeMode() == 2;
     if (compute_bind && SotcStats::kFpsLog) {
         SotcStats::op_compute_eligible.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (compute_bind && SotcNonBlocking::BindCacheWide()) { // sotc: SOTC_BIND_CACHE_WIDE, a dispatch admitted by it
-        wide_compute_eligible.fetch_add(1, std::memory_order_relaxed);
     }
     BindCacheEntry* verify_ref = nullptr;
     BindCacheEntry* pk_verify_ref = nullptr; // sotc: SOTC_BIND_CACHE_PACKET=2, the entry a packet hit would take
@@ -5992,8 +5917,8 @@ u32 Rasterizer::BindCacheRefusal(const Pipeline* pipeline, const AmdGpu::Regs& r
     // (no DMA pointer, no sharp table; the write checks below apply to it too).
     // Returns the first gate the bind fails (SotcStats::BindGate), BgNone when it is eligible.
     //
-    // Why each gate refuses (SOTC_BIND_CACHE_WIDE admits compute dispatches and written plain buffers, see OpComputeMode):
-    //  - compute: a dispatch enters the frame cache only in OpComputeMode (SOTC_OP_COMPUTE_BIND or _WIDE).
+    // Why each gate refuses:
+    //  - compute: a dispatch enters the frame cache only in OpComputeMode (SOTC_OP_COMPUTE_BIND).
     //  - clip plane: the user clip plane state is not replayed by a hit.
     //  - storage/fmask: has_storage_images does not tell a read-only storage image from a written one, and a
     //    written image needs the image bookkeeping of the full bind (BindCacheInvalidateImage, the layout and the
@@ -6913,7 +6838,6 @@ bool Rasterizer::BindCacheEntryFresh(BindCacheEntry& entry, u32& reason) {
 // (gpu/sotc/nonblocking.h). Called from Rasterizer::BindResources (the draw thread).
 static void PlanBReport(DescriptorHeap& heap) {
     static const bool any = SotcNonBlocking::BindDescReuse() || SotcNonBlocking::SamplerCache() ||
-                            SotcNonBlocking::HleFillSkip() || SotcNonBlocking::FlatArena() ||
                             SotcNonBlocking::ProtectAsyncUnprotect();
     if (!any) {
         return;
@@ -6935,14 +6859,10 @@ static void PlanBReport(DescriptorHeap& heap) {
     }
     std::fprintf(stderr,
                  "SOTC PLAN-B (5 s): desc sets reused %llu, rewritten (%s); sampler checks skipped %llu, run %llu; "
-                 "fills skipped %llu, run %llu (no signal %llu); flat arena reused %llu, uploaded %llu, retired %llu, "
-                 "to stream %llu; unprotects queued %llu, sync %llu\n",
+                 "unprotects queued %llu, sync %llu\n",
                  take(SotcStats::pb_desc_reused), rewrite, take(SotcStats::pb_sampler_skipped),
-                 take(SotcStats::pb_sampler_checked), take(SotcStats::pb_fill_skipped),
-                 take(SotcStats::pb_fill_executed), take(SotcStats::pb_fill_nosignal),
-                 take(SotcStats::pb_flat_reused), take(SotcStats::pb_flat_uploaded),
-                 take(SotcStats::pb_flat_retired), take(SotcStats::pb_flat_stream),
-                 take(SotcStats::pb_unprotect_queued), take(SotcStats::pb_unprotect_sync));
+                 take(SotcStats::pb_sampler_checked), take(SotcStats::pb_unprotect_queued),
+                 take(SotcStats::pb_unprotect_sync));
     // sotc: SOTC_BIND_DESC_REUSE: the persistent sets (alive = owned by entries) and the dynamic flat layouts.
     if (SotcNonBlocking::BindDescReuse()) {
         const auto st = heap.TakePersistentStats();
@@ -7334,36 +7254,11 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
             }
             const u32* flat = FlatForBind(*st);
             const u64 hash = XXH3_64bits(flat, slot.size);
-            // sotc: SOTC_FLAT_ARENA: the table's arena place (kept across ticks while the arena holds it); the ring
-            // below only when the arena has no room.
-            bool placed = false;
-            if (auto* arena = buffer_cache.GetFlatArena()) {
-                VideoCore::FlatArena::Ref ref{};
-                bool uploaded = false;
-                if (arena->Obtain(hash, flat, slot.size, alignment, scheduler.CurrentTick(), ref, uploaded)) {
-                    slot.offset = ref.offset;
-                    slot.buffer = ref.buffer;
-                    slot.base = ref.address;
-                    slot.arena = true;
-                    slot.hash = hash;
-                    slot.gen = buffer_cache.StreamGeneration();
-                    slot.tick = scheduler.CurrentTick();
-                    placed = true;
-                    if (stats) {
-                        (uploaded ? SotcStats::pb_flat_uploaded : SotcStats::pb_flat_reused)
-                            .fetch_add(1, std::memory_order_relaxed);
-                    }
-                } else if (stats) {
-                    SotcStats::pb_flat_stream.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
             // sotc: only a copy made in this tick may be reused: a later tick reusing it does not
             // extend the ring's watch over it, and a wrap would overwrite it while that tick's
             // draws still read it on the GPU (review of 2026-10-29).
-            if (placed) {
-                // placed in the arena above
-            } else if (!slot.arena && hash == slot.hash && slot.gen == buffer_cache.StreamGeneration() &&
-                       slot.tick == scheduler.CurrentTick()) {
+            if (hash == slot.hash && slot.gen == buffer_cache.StreamGeneration() &&
+                slot.tick == scheduler.CurrentTick()) {
                 if (stats) {
                     SotcStats::bf_flat_reused.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -7371,7 +7266,6 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
                 slot.offset = vk_buffer.Copy(flat, slot.size, alignment);
                 slot.buffer = vk_buffer.Handle();
                 slot.base = vk_buffer.BufferDeviceAddress();
-                slot.arena = false;
                 slot.hash = hash;
                 slot.gen = buffer_cache.StreamGeneration();
                 slot.tick = scheduler.CurrentTick();
@@ -7445,9 +7339,6 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
         // sotc: the flat copies made or reused above must still be in this lap and tick of the
         // stream ring (the synchronization may have wrapped it or submitted).
         for (const auto& slot : entry->flat_slots) {
-            if (slot.arena) { // sotc: SOTC_FLAT_ARENA: not a ring copy
-                continue;
-            }
             if (slot.gen != buffer_cache.StreamGeneration() ||
                 slot.tick != scheduler.CurrentTick()) {
                 return refuse(true, SotcStats::RfFlatTick);
@@ -7655,7 +7546,7 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
     push_data.yscale = bind_input_push.yscale;
     for (const auto& slot : entry->flat_slots) {
         buffer_infos[slot.info].offset = slot.offset;
-        if (slot.buffer) { // sotc: SOTC_FLAT_ARENA: the copy may live in the arena or the ring
+        if (slot.buffer) { // sotc: the buffer the copy lives in (the stream ring)
             buffer_infos[slot.info].buffer = slot.buffer;
         }
     }
@@ -7718,17 +7609,6 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
             if (pipeline->IsCompute()) {
                 SotcStats::wr_compute_hits.fetch_add(1, std::memory_order_relaxed);
             }
-        }
-    }
-    if (SotcNonBlocking::BindCacheWide()) { // sotc: SOTC_BIND_CACHE_WIDE counters (WideReport)
-        if (pipeline->IsCompute()) {
-            wide_compute_hits.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            wide_graphics_hits.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (!entry->own_writes.empty()) { // the written bindings a hit replayed (ReplayOwnWrites)
-            wide_storage_hits.fetch_add(1, std::memory_order_relaxed);
-            wide_write_replays.fetch_add(entry->own_writes.size(), std::memory_order_relaxed);
         }
     }
     // sotc: SOTC_PACKET. The hit's addressed ranges are this op's: CommitFastBind keeps them for the fast binds.
@@ -9021,36 +8901,10 @@ void Rasterizer::BindSkippableSpecial(const Shader::Info& stage, const Shader::B
              stage.pgm_hash == kTonemapHash)) {
             bind_cache_uncacheable = true;
         }
-        // sotc: SOTC_FLAT_ARENA: the table's arena place when the arena has it or has room (else the ring).
-        vk::Buffer flat_buffer = vk_buffer.Handle();
-        vk::DeviceAddress flat_base = vk_buffer.BufferDeviceAddress();
-        u64 offset = 0;
-        u64 flat_hash = 0;
-        bool hashed = false;
-        bool in_arena = false;
-        if (auto* arena = buffer_cache.GetFlatArena()) {
-            flat_hash = XXH3_64bits(flat, ubo_size);
-            hashed = true;
-            VideoCore::FlatArena::Ref ref{};
-            bool uploaded = false;
-            if (arena->Obtain(flat_hash, flat, ubo_size, alignment, scheduler.CurrentTick(), ref,
-                              uploaded)) {
-                offset = ref.offset;
-                flat_buffer = ref.buffer;
-                flat_base = ref.address;
-                in_arena = true;
-                if (SotcStats::kFpsLog) {
-                    (uploaded ? SotcStats::pb_flat_uploaded : SotcStats::pb_flat_reused)
-                        .fetch_add(1, std::memory_order_relaxed);
-                }
-            } else if (SotcStats::kFpsLog) {
-                SotcStats::pb_flat_stream.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-        if (!in_arena) {
-            offset = vk_buffer.Copy(flat, ubo_size, alignment);
-            bind_cache_stream_rec = true; // sotc: SOTC_BIND_CACHE_FRAME: a copy in the ring
-        }
+        const vk::Buffer flat_buffer = vk_buffer.Handle();
+        const vk::DeviceAddress flat_base = vk_buffer.BufferDeviceAddress();
+        const u64 offset = vk_buffer.Copy(flat, ubo_size, alignment);
+        bind_cache_stream_rec = true; // sotc: SOTC_BIND_CACHE_FRAME: a copy in the ring
         buffer_infos.emplace_back(flat_buffer, offset, ubo_size);
         // sotc: SOTC_PACKET: the flat buffer's device address for the packet (flat buffers are per stage:
         // the fragment one has its own word, the vertex and compute one shares flatbuf_address).
@@ -9063,9 +8917,9 @@ void Rasterizer::BindSkippableSpecial(const Shader::Info& stage, const Shader::B
         if (bind_cache_recording && SotcStats::kBindCacheFrame) {
             bind_cache_flat_rec.push_back({cur_bind_stage,
                                            static_cast<u32>(buffer_infos.size() - 1),
-                                           ubo_size, hashed ? flat_hash : XXH3_64bits(flat, ubo_size),
+                                           ubo_size, XXH3_64bits(flat, ubo_size),
                                            offset, buffer_cache.StreamGeneration(),
-                                           scheduler.CurrentTick(), flat_buffer, flat_base, in_arena});
+                                           scheduler.CurrentTick(), flat_buffer, flat_base});
         }
     } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
         // Permutations compiled without enabled planes never read the buffer, so the
@@ -9636,15 +9490,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         maint_epoch = SotcPcRing::SubmitEpoch();
                         maint_version = SotcPcRing::BlockVersion();
                     }
-                    // sotc: SOTC_BIG_BIND_LOG: the shader and descriptor the bind's log line names (no behaviour change).
-                    const bool big_bind_log = SotcRegionPredrain::BigBindLogEnabled();
-                    if (big_bind_log) {
-                        const auto dsharp = desc.GetSharp(stage);
-                        SotcRegionPredrain::SetBindContext(
-                            stage.pgm_hash, static_cast<u32>(stage.hw_stage),
-                            static_cast<u32>(stage.sw_stage), buf_index, vbase, vsize,
-                            dsharp.num_records, dsharp.stride);
-                    }
                     if (SotcVsizeProbe::On()) { // sotc: SOTC_VSIZE_PROBE: the dirty bytes of this bind's sync
                         SotcVsizeProbe::ResetDirty();
                     }
@@ -9652,9 +9497,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         const SotcStats::SplitTimer obtain_split{SotcStats::SplitBufObtain};
                         obtained = buffer_cache.ObtainBuffer(vbase, size, desc.is_written,
                                                              desc.is_formatted, mark_offset, mark_size);
-                    }
-                    if (big_bind_log) {
-                        SotcRegionPredrain::ClearBindContext();
                     }
                     if (memo) {
                         // The version after the call: it may have unbound or evicted other ranges.
@@ -11126,17 +10968,6 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
                     VideoCore::TsharpSlotCache::NoteTexVerify(same);
                 }
             }
-            // sotc: SOTC_LOAD_WARM: record the plain single-binding sampled textures for the next
-            // load of this area (load_warm.h); storage and mip-fallback binds are not replayed.
-            if (SotcLoadWarm::TexturesEnabled() && num_bindings == 1 &&
-                mip_fallback_mode == Shader::MipStorageFallbackMode::None &&
-                !image_desc.is_written) {
-                SotcTexBlob blob;
-                std::memset(&blob, 0, sizeof blob);
-                blob.tsharp = tsharp;
-                blob.resource = image_desc;
-                SotcLoadWarm::NoteTexture(&blob, sizeof blob);
-            }
             if (rec) { // sotc: SOTC_TEX_BLOCK: the lookup as TryTextureBlock replays it
                 const size_t index = image_bindings.size() - 1;
                 if (!texture_cache.IsPerfectFind(image_id, desc.info)) {
@@ -11946,12 +11777,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     if (!dst_gds) {
         NoteGuestWrite(dst, num_bytes); // sotc: SOTC_SHADER_ADDR ordering
     }
-    // sotc: SOTC_NATIVE_UNIFIED: a unified range is written by the GPU in guest memory, possibly by work not run yet:
-    // the copy stays on the GPU, in order.
-    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
-        !buffer_cache.IsNativeUnified(dst, num_bytes)) {
+    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
-            !buffer_cache.IsNativeUnified(src, num_bytes) && !texture_cache.FindImageFromRange(src, num_bytes)) {
+            !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             if (!SotcNative::TracksGuestPages()) { // sotc: SOTC_NATIVE=1, see FillBuffer
@@ -12052,98 +11880,10 @@ bool Rasterizer::InvalidateMemoryOnGuestFault(VAddr addr, u64 size) {
     return true;
 }
 
-namespace {
-// sotc: SOTC_RB_CHANGED=1, diagnostic: the readbacks that changed the guest bytes (a real GPU result reached the
-// CPU), per guest instruction of the read fault, every 5 s. A readback that copies the bytes the guest already holds
-// only came from page sharing. Compare two sessions to find the consumer one of them needs.
-struct RbChanged {
-    std::mutex mu;
-    std::unordered_map<u64, std::pair<u64, u64>> rows; // eboot offset -> (changed readbacks, readbacks)
-    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
-};
-
-bool RbChangedOn() {
-    static const bool on = [] {
-        const char* v = std::getenv("SOTC_RB_CHANGED");
-        return v && v[0] == '1';
-    }();
-    return on;
-}
-
-void NoteRbChanged(u64 rip, bool changed) {
-    static RbChanged t;
-    const u64 base = SotcTrace::ImageBase();
-    const u64 offset = (base && rip >= base && rip - base < SotcTrace::ImageSize()) ? rip - base : ~u64{0};
-    std::scoped_lock lock{t.mu};
-    auto& row = t.rows[offset];
-    row.first += changed ? 1 : 0;
-    row.second += 1;
-    const auto now = std::chrono::steady_clock::now();
-    if (now - t.last < std::chrono::seconds(5)) {
-        return;
-    }
-    t.last = now;
-    std::vector<std::pair<u64, std::pair<u64, u64>>> rows(t.rows.begin(), t.rows.end());
-    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
-    std::string text;
-    for (size_t i = 0; i < rows.size() && i < 20 && rows[i].second.first > 0; ++i) {
-        char item[64];
-        if (rows[i].first == ~u64{0}) {
-            std::snprintf(item, sizeof item, " ?:%llu/%llu", (unsigned long long)rows[i].second.first,
-                          (unsigned long long)rows[i].second.second);
-        } else {
-            std::snprintf(item, sizeof item, " 0x%llx:%llu/%llu", (unsigned long long)rows[i].first,
-                          (unsigned long long)rows[i].second.first, (unsigned long long)rows[i].second.second);
-        }
-        text += item;
-    }
-    std::fprintf(stderr, "SOTC RB CHANGED (5 s): changed/all readbacks by eboot offset:%s\n", text.c_str());
-    t.rows.clear();
-}
-} // namespace
-
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
-    }
-    if (RbChangedOn() && size <= (u64{16} << 20)) {
-        const u64 rip = VideoCore::SotcFaultRip::current;
-        const unsigned char* backing = SotcGuest::Backing(addr, size);
-        std::vector<unsigned char> before;
-        if (backing) {
-            before.assign(backing, backing + size);
-        }
-        buffer_cache.ReadMemory(addr, size, false, assume_locks);
-        if (backing) {
-            const bool changed = std::memcmp(before.data(), backing, size) != 0;
-            if (rip != 0) {
-                NoteRbChanged(rip, changed);
-            }
-            // sotc: each readback that changed guest bytes, first 80: who read (port thread or guest), where, what.
-            if (changed) {
-                static std::atomic<u32> shown{0};
-                if (shown.fetch_add(1, std::memory_order_relaxed) < 80) {
-                    u64 first = 0, diffs = 0;
-                    for (u64 i = 0; i < size; ++i) {
-                        if (before[i] != backing[i]) {
-                            if (diffs++ == 0) {
-                                first = i;
-                            }
-                        }
-                    }
-                    const u64 base = SotcTrace::ImageBase();
-                    std::fprintf(stderr, "SOTC RB CHANGED DETAIL addr %#llx+%#llx %s rip %#llx: %llu bytes differ, first "
-                                 "at +%#llx (%02x -> %02x)\n",
-                                 static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size),
-                                 IsGpuSideThread() ? "port-thread" : "guest-thread",
-                                 static_cast<unsigned long long>(rip && base && rip > base ? rip - base : rip),
-                                 static_cast<unsigned long long>(diffs), static_cast<unsigned long long>(first),
-                                 before[first], backing[first]);
-                }
-            }
-        }
-        return true;
     }
     buffer_cache.ReadMemory(addr, size, false, assume_locks);
     return true;
@@ -13115,50 +12855,6 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
     return liverpool->IsGpuSideThreadId(tid);
 }
 #endif
-
-// sotc: SOTC_LOAD_WARM: an early bind of a recorded texture on the draw thread (idle gaps,
-// Liverpool::BackLoop): FindImage and FindTexture with the ImageDesc the real bind builds, so the
-// image is created, tracked (page protection) and uploaded before the first frame needs it. A record
-// whose T# no longer points at mapped GPU memory, or has an invalid format, is skipped.
-void Rasterizer::WarmTexture(const void* data, size_t size) {
-    if (size != sizeof(SotcTexBlob)) {
-        return;
-    }
-    SotcTexBlob blob;
-    std::memcpy(&blob, data, sizeof blob);
-    const AmdGpu::Image& tsharp = blob.tsharp;
-    const auto dfmt = tsharp.GetDataFmt();
-    if (!tsharp || dfmt == AmdGpu::DataFormat::FormatInvalid || !magic_enum::enum_contains(dfmt) ||
-        !magic_enum::enum_contains(tsharp.GetNumberFmt()) ||
-        !memory->IsValidGpuMapping(tsharp.Address(), 0)) {
-        return;
-    }
-    const auto texture_lock = texture_cache.BatchLock();
-    VideoCore::TextureCache::ImageDesc desc(tsharp, blob.resource);
-    // One texture is one call: a large one would hold the draw thread past the idle budget.
-    if (desc.info.guest_size > 16_MB) {
-        return;
-    }
-    // A record is an old T#: its whole range must be mapped now (the image hashes and uploads read
-    // guest memory directly; a range running into unmapped memory crashed the first texture warm,
-    // read fault in XXH3 at 0x108e1dc000), and memory the GPU writes is left to the real bind
-    // (its pages can be read-protected, and the draw thread cannot take that fault).
-    const VAddr base = desc.info.guest_address;
-    const u64 bytes = desc.info.guest_size;
-    if (bytes == 0 || !memory->IsValidMapping(base, bytes) ||
-        buffer_cache.IsRegionGpuModified(base, bytes)) {
-        return;
-    }
-    auto image_id = texture_cache.FindImage(desc);
-    if (!image_id) {
-        return;
-    }
-    // As BindTexturesFull: a stencil image with an associated depth image is read through it.
-    if (const auto depth_image_id = texture_cache.GetAssociatedDepth(texture_cache.GetImage(image_id))) {
-        image_id = depth_image_id;
-    }
-    (void)texture_cache.FindTexture(image_id, desc);
-}
 
 // sotc: SOTC_GPU_CHECKPOINTS: the buffers and images command `seq` binds (bound_buffers, the vertex/index reads,
 // bound_images), for the device lost report (sotc_checkpoints.h). seq 0: the switch is off.

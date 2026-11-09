@@ -521,11 +521,6 @@ void InstallDetour(size_t index) {
     Core::DetourResult result;
     if (Core::InstallGuestDetour(request, &result) && result.installed) {
         rec.installed = true;
-        // sotc: SOTC_RB_CHANGED diagnostic: the stub's image offset, to name the hook of a trampoline return address.
-        if (std::getenv("SOTC_RB_CHANGED")) {
-            std::fprintf(stderr, "SOTC HOOK STUB %s at image offset %#llx\n", rec.name.c_str(),
-                         static_cast<unsigned long long>(result.stub - static_cast<uint64_t>(g_image)));
-        }
         return;
     }
     rec.off_reason = std::string("detour: ") + (result.reason && *result.reason ? result.reason : "refused");

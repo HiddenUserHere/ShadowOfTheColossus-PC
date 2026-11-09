@@ -15,8 +15,7 @@
 //   1  apply: when the game allocates in the arena, the 4 KiB pages of the new allocation not
 //      declared in this submit are unprotected and marked CPU-written before the game writes them
 //      (PageManager::DeclareRingWrite, the fault's write branch ahead of time, settled on the
-//      calling thread; SOTC_PC_RING_SLOW=1 uses PageManager::DeclareCpuWrite, which posts it to the
-//      draw thread). Two sites, one
+//      calling thread). Two sites, one
 //      hook each (scripts/hooks.d/pcring.py). PC_RING_HEAP (default, SOTC_PC_RING=1): a wrap of the
 //      RenderSingleFrameGPU heap's allocator slot, sub_1d750; every allocation of that heap passes
 //      there, whatever the caller. PC_RING_BUMP (SOTC_PC_RING_BUMP=1, comparison only): an entry

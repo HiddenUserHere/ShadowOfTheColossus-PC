@@ -2017,15 +2017,11 @@ void PipelineCache::PredictLibraries(const std::vector<SotcPipePredict::Slot>* s
     const u64 now_ns = static_cast<u64>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
     // sotc: SOTC_GPL_PREDICT eviction (every 10 s during play): a predicted library no material referenced and no draw
-    // used for SOTC_GPL_PREDICT_EVICT_S seconds (default 180; 0 keeps every library) leaves memory; its compiled code
-    // stays in the driver cache (a later material rebuilds it from there), never one of the manifest's, never a job in
-    // flight. The handles are destroyed once the GPU has finished the frames that linked them (DeferOperation).
-    static const u64 evict_age_ns = [] {
-        const char* v = std::getenv("SOTC_GPL_PREDICT_EVICT_S");
-        const long s = v && v[0] != '\0' ? std::strtol(v, nullptr, 10) : 180;
-        return s <= 0 ? u64{0} : static_cast<u64>(s) * 1'000'000'000ull;
-    }();
-    if (evict_age_ns != 0 && !manifest_holding && !pre_holding && now - st.last_evict > std::chrono::seconds{10}) {
+    // used for 180 seconds leaves memory; its compiled code stays in the driver cache (a later material rebuilds it
+    // from there), never one of the manifest's, never a job in flight. The handles are destroyed once the GPU has
+    // finished the frames that linked them (DeferOperation).
+    constexpr u64 evict_age_ns = 180ull * 1'000'000'000ull;
+    if (!manifest_holding && !pre_holding && now - st.last_evict > std::chrono::seconds{10}) {
         st.last_evict = now;
         GplLibraryCache::Evicted evicted;
         if (gpl_libs.EvictStale(now_ns, evict_age_ns, st.inflight, evicted) != 0) {

@@ -47,12 +47,6 @@ struct FrameBackend {
 };
 void SetFrameBackend(const FrameBackend& backend);
 
-/// sotc: SOTC_NATIVE_FREE_DISCARD=1. The buffer cache's handler for a block the game freed (pool_free_block): its
-/// GPU-written state is forgotten as at an unmap (SOTC_DROP_NATIVE), so the memory's next contents upload from guest
-/// memory. DiscardFreed calls it (any thread; no-op until registered or with the switch off).
-void SetFreeDiscard(void* ctx, void (*fn)(void* ctx, uint64_t addr, uint64_t size));
-void DiscardFreed(uint64_t addr, uint64_t size);
-
 /// sotc: SOTC_NATIVE_OWNER_DISCARD=1 (read once; needs SOTC_NATIVE mode != 0). A 4 KiB-aligned or unaligned range
 /// changes owner (a guest allocation or free, or a block the engine hands to new contents): the GPU-written state
 /// of the range is forgotten byte-exactly, as an unmap does (BufferCache::NativeDiscardOwner). Pages that still hold
