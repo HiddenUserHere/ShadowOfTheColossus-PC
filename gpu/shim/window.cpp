@@ -1,6 +1,7 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -133,7 +134,18 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     // sotc: SOTC_HEADLESS=2 (monitor): a small window in the bottom-right corner of the primary
     // display's usable area (the taskbar is left out). It is created hidden and shown below.
     const bool monitor = IsMonitor();
-    int x_pos = SDL_WINDOWPOS_CENTERED, y_pos = SDL_WINDOWPOS_CENTERED;
+    // sotc: SOTC_MONITOR_AT=x,y (the launcher's "Game monitor"): centred on the display holding
+    // that desktop point; the primary display without it. The SOTC_HEADLESS=2 corner placement
+    // below takes precedence.
+    SDL_DisplayID display = 0;
+    if (const char* at = std::getenv("SOTC_MONITOR_AT")) {
+        SDL_Point point{};
+        if (std::sscanf(at, "%d,%d", &point.x, &point.y) == 2) {
+            display = SDL_GetDisplayForPoint(&point);
+        }
+    }
+    const int position = display ? int(SDL_WINDOWPOS_CENTERED_DISPLAY(display)) : int(SDL_WINDOWPOS_CENTERED);
+    int x_pos = position, y_pos = position;
     if (monitor) {
         MonitorSize(width_, height_);
         SDL_Rect usable{};
@@ -187,6 +199,12 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
     if (const char* version = std::getenv("SOTC_GAME_VERSION"); version && *version) {
         title_suffix = std::string(" · v") + version;
+    }
+    // sotc: the port's version (SOTC_PORT_VERSION, from the launcher).
+    if (const char* port = std::getenv("SOTC_PORT_VERSION"); port && *port) {
+        title_suffix += std::string(" · Port v") + port;
+    }
+    if (!title_suffix.empty()) {
         UpdateTextTitle();
     }
 #ifdef _WIN32
@@ -268,7 +286,8 @@ int WindowSDL::PollTextInput(std::string& out) {
     return text_state;
 }
 
-// sotc: the window title shows the game version and the frame rate, refreshed once a second.
+// sotc: the window title shows the game and port versions, the frame rate and how long the game
+// has been open (h:mm:ss), refreshed once a second.
 void WindowSDL::UpdateTitleStats() {
     const u64 now = SDL_GetTicks();
     if (now - title_ticks < 1000) {
@@ -278,9 +297,15 @@ void WindowSDL::UpdateTitleStats() {
     if (title_ticks != 0) {
         const double fps = double(flips - title_flips) * 1000.0 / double(now - title_ticks);
         const char* version = std::getenv("SOTC_GAME_VERSION");
-        char suffix[64];
-        std::snprintf(suffix, sizeof(suffix), "%s%s · %.0f FPS",
-                      version && *version ? " · v" : "", version ? version : "", fps);
+        const char* port = std::getenv("SOTC_PORT_VERSION");
+        static const auto opened = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+        const long long s = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now() - opened).count();
+        char suffix[128];
+        std::snprintf(suffix, sizeof(suffix), "%s%s%s%s · %.0f FPS · %lld:%02lld:%02lld",
+                      version && *version ? " · v" : "", version ? version : "",
+                      port && *port ? " · Port v" : "", port ? port : "", fps, s / 3600,
+                      s / 60 % 60, s % 60);
         title_suffix = suffix;
         UpdateTextTitle();
     }

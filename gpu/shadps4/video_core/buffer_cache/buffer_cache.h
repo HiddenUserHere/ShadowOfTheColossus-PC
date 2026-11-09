@@ -402,6 +402,12 @@ public:
         return gpu_modified_ranges.Intersects(addr, size) || RbxOwedIntersects(addr, size);
     }
 
+    /// sotc: IsRangeGpuWritten for any thread (the guest's fault handler).
+    [[nodiscard]] bool IsRangeGpuWrittenLocked(VAddr addr, size_t size) {
+        std::shared_lock lock{gpu_modified_mutex};
+        return gpu_modified_ranges.Intersects(addr, size);
+    }
+
     // sotc: SOTC_RB_EXACT=1 API (see the big comment above BufferCache::TryServeExact). All are
     // no-ops returning neutral values when the switch is off. Draw thread unless noted.
     /// SOTC_RB_EXACT=1 or =publish (and SOTC_RB_OWNER=1 and asynchronous readbacks).
@@ -464,6 +470,8 @@ public:
 
     /// Releases the arena memory backing a range the guest unmapped. GPU thread only.
     void ReleaseMemory(VAddr device_addr, u64 size);
+    /// sotc: SOTC_RELEASE_DEFER=1: releases whose GPU work is done (TickFrame, each release).
+    void ProcessPendingReleases();
 
     /// sotc: gives back arena allocations whose blocks were not bound for a while and hold no
     /// GPU-written data, once resident arena memory passes SOTC_ARENA_EVICT_MB. Called between
@@ -632,6 +640,11 @@ private:
         bool pf_group{};
         u64 group_bytes{};
         u64 group_tick{};
+        bool data_ready{}; ///< sotc (SOTC_RB_AGE): its last GPU write had completed when asked
+        /// sotc (SOTC_RB_DIRTY_RETRY): a dirty readback hands the reread to its guest thread
+        /// instead of reading back on the draw thread; set when it did.
+        bool allow_retry{};
+        bool retried{};
         boost::container::small_vector<ReadbackItem, 16> pending;
         /// sotc: SOTC_WRITE_DIET (C1): hull [hull_lo, hull_hi) over every pending item's
         /// [addr, addr + size) and every gpu_ranges entry (RbHullCover). Widened wherever pending
@@ -953,6 +966,22 @@ private:
     /// sotc: gpu_modified_ranges is changed on the GPU side (the draw thread, see
     /// Liverpool::IsBackThreaded) and read by the command processor's SRT walkers (ReadClean).
     std::shared_mutex gpu_modified_mutex;
+    /// sotc (SOTC_RB_AGE): the tick of the last GPU write per 64 KiB page, under
+    /// gpu_modified_mutex.
+    struct WriteMark {
+        u64 tick, addr, size, program;
+    };
+    std::unordered_map<u64, WriteMark> write_ticks;
+
+public:
+    /// sotc (SOTC_RB_AGE): the last GPU write that marked this 64 KiB page.
+    WriteMark LastWriteMark(VAddr addr) {
+        std::shared_lock lock{gpu_modified_mutex};
+        const auto it = write_ticks.find(addr >> 16);
+        return it == write_ticks.end() ? WriteMark{} : it->second;
+    }
+
+private:
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<HostImport> host_import; ///< sotc: SOTC_HOST_IMPORT, null when off
@@ -1081,6 +1110,19 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// sotc: SOTC_RELEASE_DEFER: unmapped block ranges released once the GPU passed `tick`
+    /// (the work recorded before the unmap), or at once when a bind uses them again.
+    struct PendingRelease {
+        u64 first_block;
+        u64 end_block;
+        u64 tick;
+    };
+    std::vector<PendingRelease> pending_releases;
+    /// The release itself; finish: wait for all the GPU work first (the old way).
+    /// sotc: false when no block of the range was resident (nothing released, nothing to flush).
+    bool ReleaseBlocks(u64 first_block, u64 end_block, bool finish);
+    /// Releases now the pending ones that overlap [first_block, end_block).
+    void ForcePendingReleases(u64 first_block, u64 end_block);
     /// sotc: bumped at every resident_ranges.Add/Subtract. SynchronizeDmaBuffers rebuilds its
     /// merged runs only when this (or the arena count) changed since the last rebuild.
     u64 resident_version{};

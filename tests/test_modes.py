@@ -40,7 +40,7 @@ def spots_for(modes=(), families=(), render=False):
     for address, expected in families:
         spots[address] = expected
     if render:
-        for address, _, original in m.RENDER_SITES:
+        for address, _, original in [*m.RENDER_SITES, m.WIDE_ASPECT]:
             spots[address] = bytes.fromhex(original)
     return spots
 
@@ -133,7 +133,7 @@ class BuildTests(Clean):
         groups, cvars = m.build_patches(elf, ph, '', '3840x1600', log=log.append)
         self.assertEqual(len(groups), 2)
         render = groups[1]
-        self.assertEqual(len(render), len(m.RENDER_SITES))
+        self.assertEqual(len(render), len(m.RENDER_SITES) + 1)  # + WIDE_ASPECT: 3840x1600 is wider than 16:9
         for offset, expected, data in render:
             self.assertEqual(m.image_bytes(elf, ph, offset, len(expected)), expected)
             self.assertEqual(len(data), len(expected))

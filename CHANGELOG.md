@@ -179,6 +179,176 @@ quando não diz outra coisa):
 
 </details>
 
+## 0.72.2 — 2026-11-05
+- **Título da janela com a versão do port e o tempo de jogo:** `SHADOW OF THE COLOSSUS™ · v01.01 · Port v0.72.2 · 60 FPS · 0:12:34`.
+- **Atualizar o port limpa o cache de shaders uma vez** (o lançador guarda a versão que montou o cache em `user/cache/port_version.txt`): shaders montados pela versão anterior podiam conflitar com a nova. A primeira partida depois da atualização engasga um pouco enquanto o cache é refeito. O botão "Limpar cache de shaders" continua nas configurações.
+- **A queda forte de FPS na troca de área voltou na 0.72; corrigido.** As texturas mais finas que a 0.72
+  ligou (Alta no mip 1, Máxima no mip 0 com os bancos mantidos 3 s e sem a proteção do pool) faziam o jogo
+  copiar até 1,1 GB de texturas num quadro ao entrar numa área nova: pior quadro de 134–293 ms na entrada da
+  floresta, contra 58–75 ms na 0.70. Com o mip 1 sozinho o tranco continuava. Alta e Máxima voltam ao
+  comportamento da 0.71 (mip 2, sem os 3 s, com a proteção do pool): "muito mais suave, queda de 2–3 FPS por
+  2 s" no teste do usuário. Quem quiser as texturas mais finas pode usar `SOTC_LOD_LEVEL=1` ou `0` nas
+  variáveis extras.
+- **Troca de área: consulta da tabela de memória sem trava** para buffers que passam da área mapeada
+  (`SOTC_CLAMP_GAP=0` desliga) e **teto de 128 MB por quadro** para as texturas cujo adiamento venceu, que antes
+  subiam todas no mesmo quadro (`SOTC_UPLOAD_EXPIRED_MB`, 0 = sem teto).
+- **Diagnóstico (desligados):** `SOTC_DRAW_SPLIT=1` separa os binds (clamp, busca de buffer, decodificação,
+  busca de imagem e de view) e as leituras do jogo feitas na thread de desenho; `SOTC_RB_DIRTY_RETRY=1` devolve
+  à thread do jogo a releitura de uma leitura suja (experimental: uma queda em `0x94c71` numa das duas rodadas).
+- **Experimental (desligado): mapa de visibilidade direto na memória do jogo** (`SOTC_VIS_DIRECT=1` com `SOTC_PC_MEMORY=1`): os shaders que reescrevem o mapa que o jogo varre a cada quadro escrevem na memória do jogo, sem a leitura de volta da GPU. Com `SOTC_VIS_PROGRAMS=0x2e0f474b,0xf94d23d4,0x93aec24b,0x729c541e,0x4defcf7f` a entrada da floresta caiu de 31 para 14 quadros acima de 50 ms no teste do usuário. Diagnósticos `SOTC_SLOW_OPS=1` (shaders mais caros dos quadros lentos) e `tools/entry_report.py` (resumo do log por trecho).
+- **Experimental (desligado): texturas lidas pela GPU direto na memória do jogo** (`SOTC_TEX_DIRECT=1`, com `SOTC_PC_MEMORY=1` e `SOTC_PC_MEMORY_PREIMPORT=1`, que importa os 10 GB da memória do jogo no boot em ~2,6 s): sem a cópia pela CPU na primeira entrada de uma área. Entrada da floresta no teste do usuário: 14 → 9 quadros acima de 50 ms.
+- **Experimental (desligado): liberação de memória do unmap sem esperar a GPU inteira** (`SOTC_RELEASE_DEFER=1`): na troca de área cada liberação esperava todo o trabalho da GPU, 28–63 vezes por quadro (10–20 ms por quadro). **Corrigido também** o travamento ao carregar um save com `SOTC_VIS_DIRECT=1` (rótulos de fim de pipe escritos fora de ordem).
+- **Final do jogo sem texturas esticadas e sem fechar na passagem para a intro (ligado por padrão)** (`SOTC_POOL_FREEZE=1`, T51): no fim do jogo o jogo devolve a memória de texturas que ainda desenha; quando outra textura pega essa memória o port recarregava o conteúdo novo na textura ainda em uso (texturas esticadas, piscadas e a queda na passagem do final para a intro). Agora essas texturas ficam como estavam por 400 quadros.
+- **Menos memória de vídeo presa depois das trocas de área (ligado por padrão):** texturas de 2048×2048 ou mais têm memória própria e voltam ao driver quando saem; antes até 1,8 GB ficava reservado e vazio, passando do limite em placas de 8 GB (`SOTC_IMAGE_DEDICATED=0` desliga).
+- **Liberação de memória sem espera na troca de área e texturas lidas direto pela placa (ligados por padrão; as texturas diretas só com 24 GB de RAM ou mais).**
+
+## 0.72.1 — 2026-11-03
+- **Placas com menos de 8 GB de memória de vídeo: perfil leve automático.** As melhorias de textura da 0.72
+  (Máxima no mip 0 com os bancos mantidos 3 s e sem a proteção de emergência do pool, Alta no mip 1) usavam
+  5–7 GB numa placa de 8 GB e estouravam as de 6 GB. Agora, com menos de 8 GB, a Máxima fica no mip 1 (sem os
+  3 s, com a proteção), a Alta volta ao mip 2 (como na 0.71), "Uso de memória de vídeo" Alto/Máximo (o do modo
+  Extremo) vira Padrão e não há reserva da área temporária na memória de vídeo. Placas de 8 GB ou mais
+  continuam com tudo.
+- **Lançador: "Memória da placa" nos Ajustes rápidos** (aba Jogar): Automático (pela placa, padrão), Leve ou
+  Completo, com uma linha dizendo o que vale para a placa encontrada. O registro da sessão mostra o perfil.
+
+## 0.72 — 2026-11-03
+- **Melhorias que a correção do T38 liberou, agora ligadas por padrão** (testadas em todos os colossos do
+  Time Attack, na Máxima com o modo PS4 Pro, sem queda e sem mosaico). Elas ficavam desligadas porque
+  derrubavam o jogo ou punham mosaico, e a causa era a mesma liberação dupla de páginas:
+  - **Leituras rápidas da GPU** (`rb_hot`): cerca de 25% mais FPS no Santuário (a atualização liga
+    também em instalações antigas).
+  - **Texturas mais nítidas:** os mips medidos na tela (`SOTC_LOD_FEEDBACK`) e mips mais finos,
+    mip 1 na Alta e mip 0 na Máxima (antes, 2 nas duas).
+  - **Máxima:** os bancos de textura ficam 3 s amostrados antes de sair (`SOTC_LOD_LINGER=180`).
+  - **Atalhos do guarda do heap** de volta (`SOTC_GUARD_STALE`, `SOTC_GUARD_USER_POINTER`).
+- **Upscaler novo: AMD FSR 4.1 (experimental).** Pelo SDK oficial da AMD (FSR SDK 2.4.0, Vulkan), com as
+  DLLs assinadas da AMD junto do `bb-probe.exe` (`amd_fidelityfx_loader_vk.dll`,
+  `amd_fidelityfx_upscaler_vk.dll`; licença em `bin/licenses-amd`). O SDK escolhe a versão que a placa
+  roda: **FSR 4.1** (inteligência artificial) nas Radeon RX 6000, 7000 e 9000 e nos Ryzen AI recentes;
+  **FSR 3.1.6** nas outras placas (NVIDIA, Intel, Radeon antigas). Usa as mesmas entradas do DLSS (cena
+  antes do HUD, profundidade, vetores de movimento, câmera), os mesmos modos de resolução e a mesma
+  nitidez. Lançador: Upscaler > "AMD FSR 4.1". Testado na RTX 2060 Super (FSR 3.1.6, 1280×720 → 1080p,
+  ~57 FPS no Santuário, sem erros); falta testar numa Radeon RX 6000 ou mais nova. `SOTC_FSR_VERSION=3`
+  força o FSR 3.1 numa Radeon (comparação); `SOTC_FSR_JITTER` e `SOTC_FSR_DEBUG=1` para testes.
+- **Troca de área: menos um travamento.** A área temporária de envio para a GPU agora guarda uma reserva
+  (128 MB na memória do sistema, 64 MB na de vídeo), criada aos poucos no início do jogo. Antes ela era
+  liberada depois de alguns segundos sem uso e recriada no meio da troca de área: com a memória de vídeo
+  perto do limite, isso custou 95 ms num quadro. `SOTC_STAGING_KEEP_MB` / `SOTC_STAGING_KEEP_VRAM_MB` (0 =
+  como antes).
+- **Troca de área: cópias de textura com menos faltas de página.** Antes de copiar um bloco grande de textura,
+  o port pede ao Windows as páginas de uma vez (`PrefetchVirtualMemory`) em vez de uma falta por página de
+  4 KiB. Na entrada da floresta, 311 MB passaram com 6,5 mil faltas (antes 175 MB com 59 mil). Melhora
+  pequena. `SOTC_COPY_PREFETCH=0` desliga.
+- **Modos de jogo deixam a grama como no PS4.** Pro e Extremo não mudam mais a grama, o mato e as
+  sombras da grama (agora isso fica só para o Personalizado). A atualização volta a grama de quem já tinha
+  a configuração gravada para "Como no PS4".
+- **GPU integrada (AMD/Intel): orçamento de memória de vídeo certo.** Antes ficava em 2 GB (a fórmula das
+  placas dedicadas); agora é pelo menos a memória local que o driver anuncia (`SOTC_IGPU_BUDGET_MB` define à
+  mão). Num Ryzen 7 5700U: 3,9 GB em vez de 2 GB, sem as limpezas de texturas a cada carga.
+- **Lançador:** os botões da aba Avançado ficam em duas linhas ("Limpar cache de shaders" sumia numa janela
+  estreita); variável extra escrita com `=` na frente ainda vale; "Limpar cache" avisa se o jogo está aberto.
+- **Diagnóstico (desligados por padrão):** `SOTC_FORMAT_LOG=1` (formatos não suportados pela placa),
+  `SOTC_FORMAT_FALLBACK=1`, `SOTC_NAN_GUARD=1`, `SOTC_AMD_AS_NV=1` e suas partes (cada chave de teste de
+  shader ganha uma pasta de cache própria, sem precisar limpar o cache), `SOTC_RB_AGE=1` (quais instruções do
+  jogo esperam leituras da GPU e quem escreveu a página), `SOTC_CLEAN_GUEST_READS=1` (leituras simples do jogo
+  em bytes que a GPU não escreveu saem direto da memória, sem esperar a GPU; experimental).
+
+## 0.71 — 2026-11-02
+- **Texturas em mosaico colorido e quedas depois das cargas (T38, corrigido):** o problema existia em todas
+  as versões e era muito pior no **Time Attack**, onde o jogo sempre fechava por volta do 5º colosso. Causa:
+  o reservatório de páginas de 64 KiB do jogo liberava algumas páginas duas vezes. Ao encolher uma textura
+  (descartar mips), o jogo devolve as páginas sem tirá-las do endereço dela; outra textura (ou o heap) as
+  pega; quando a primeira textura é descartada inteira, o jogo pergunta ao sistema (`sceKernelVirtualQuery`)
+  que página está em cada endereço e libera de novo as que já são da outra. Cada página dessas ficava com
+  dois donos: pedaços de outras texturas na tela, heap estourado (quedas `0x490a0`, `0x490e0`, `0x1d8bf`,
+  `0x5fc064`), descritores de textura lixo (`data_fmt` 36/54) e a contagem de páginas livres subindo a cada
+  carga. Agora o port lembra o último endereço em que cada página física foi mapeada, e a liberação pula as
+  páginas que já foram para outro bloco. Teste: todos os colossos do Time Attack na Máxima, sem mosaico e
+  sem queda. `SOTC_POOL_OWNER=0` desliga. Ferramentas novas de diagnóstico (desligadas):
+  `SOTC_POOL_FREE_TRACE=1`, `SOTC_WRITE_TRACE=1`, `SOTC_ALIAS_LOG=1`, `SOTC_VIEW_CHECK=1`.
+- **Lançador: atualizar liga as melhorias também em instalações antigas.** Antes, uma opção que
+  passou a vir ligada (como "Geração de quadros sem a interface", que tira o tremido do HUD e das
+  letras) continuava desligada para quem já tinha a configuração gravada. Agora cada versão liga uma
+  vez as melhorias dela: nesta, HUD sem tremer na geração de quadros, motion blur desligado (sem rastro
+  da sombra em áreas escuras) e logotipos de abertura pulados.
+- **Lançador: "Modo de jogo" na aba Jogar.** Quatro modos: **Normal** (como no PS4: 30 FPS, texturas
+  altas, grama e sombras do console, sem o modo Pro), **Pro** (modo PS4 Pro a 30 FPS, texturas altas,
+  filtro 16x, grama mais cheia), **Extremo** (modo Pro a 60 FPS, texturas máximas, sombras e grama até
+  mais longe, memória de vídeo no máximo, DLSS na RTX e FSR 1 nas outras placas; pede uma placa forte)
+  e **Personalizado** (tudo como você deixar). Mudar à mão um ajuste do modo passa para Personalizado.
+- **Lançador com visual novo**, no estilo do lançador do bloodborne_pc e com a cara de Shadow of the
+  Colossus: pedra escura, títulos dourados em Cinzel, o azul da luz da espada no que está ativo, chaves
+  no lugar das caixas de marcar, campos arredondados, ícones no menu e o banner do jogo com degradê suave.
+- **Lançador: aba Saves.** Lista os saves com o progresso (área, colossos derrotados, tempo de jogo) e a
+  data; exporta os escolhidos ou todos para um .zip (para guardar ou levar a outro PC); importa de .zip,
+  de uma pasta (um save, a pasta savedata de outra instalação) ou do shadPS4; faz backup com um clique em
+  `user/backups` (ficam os 10 mais novos), e sempre antes de substituir um save na importação. A antiga
+  aba "Jogo e saves" virou "Jogo".
+- **Lançador: backup automático dos saves quando o jogo fecha**, também depois de uma queda (aba Saves,
+  ligado por padrão; os 10 mais novos ficam em `user/backups`).
+- **Lançador: botão "Relatório"** na barra de baixo: um .zip com os registros das últimas sessões, as últimas
+  quedas (com o dump), as configurações (sem o nome do jogador) e um resumo do PC, para anexar numa issue.
+- **Lançador: janela "Novidades"** na primeira abertura de cada versão nova, com o que mudou.
+- **Lançador: busca (Ctrl+F)** no topo do menu lateral: acha qualquer opção pelo nome, pela explicação ou
+  por palavras do dia a dia ("hud tremendo", "sem som", "vsync"), abre a página, rola até ela e a destaca.
+- **Lançador: barra de título própria** no tema, com os botões de minimizar, maximizar e fechar (o Windows
+  continua movendo, encaixando e redimensionando a janela).
+- **Lançador: "Visão avançada"** no menu lateral: desligada, as abas Avançado e Debug ficam escondidas (a
+  busca continua achando as opções delas).
+- **Lançador: aba Ajuda** com os problemas mais comuns e o que fazer, em cartões: pedir ajuda (relatório
+  e issues), jogo que não abre, tela preta, sem som, travadas, FPS baixo, HUD tremendo, texturas coloridas
+  ou borradas, controle, saves e atualização. Cada tópico tem botões que levam direto à opção certa, e a
+  busca (Ctrl+F) acha os tópicos.
+- **Lançador: configuração inicial em cinco etapas** (I O Despertar, II O Santuário, III A Espada Antiga,
+  IV Agro, V A Terra Proibida), no estilo do assistente do bloodborne_pc: idioma e o que é preciso, o jogo
+  (achado sozinho, com atualização, DLC, saves e som), **a verificação do PC** (processador, memória, placa
+  de vídeo e se o jogo está num NVMe, SSD ou HD) que **escolhe o Modo de jogo** que o PC aguenta, controles
+  e o resumo. "Configurar de novo" no menu lateral abre o assistente.
+- **Lançador: teste do controle** na aba Controles: o desenho do controle (PlayStation, Xbox ou Switch) com
+  os botões acendendo, os gatilhos enchendo e os analógicos mexendo, lido pelo mesmo SDL do jogo.
+- **Monitor do jogo** (Imagem e FPS > Tela, com dois monitores ou mais): a janela e a tela cheia abrem no
+  monitor escolhido (`SOTC_MONITOR_AT`), e o ritmo de quadros segue a taxa dele.
+- **Lançador: minimizar para a bandeja do Windows** (Avançado): um ícone perto do relógio, com Abrir e Sair.
+- **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
+  da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
+- **Lançador: logotipos de abertura pulados por padrão** (instalações novas).
+- **Lançador: motion blur agora vem desligado por padrão** (Efeitos > "Motion blur", dá para religar). Era a
+  causa da sombra do personagem deixando rastro ao mover em áreas escuras; a correção só existia na
+  configuração local e não ia no pacote. Equivale a `r_motionBlurEnable=0`.
+- **Lançador: geração de quadros sem a interface agora vem ligada por padrão** (`fg_hudless`), para letras e
+  ícones não tremerem com o FSR 3 (F8). Antes só valia para quem marcava a opção, então o pacote novo
+  não levava a correção. Opção "HDR (experimental)" na seção Tela.
+- **Menos travadas ao trocar de área (do fork Oussama268, opt12):** o pacote de cache de shaders do v0.70
+  não vence mais os arquivos novos (milhares de shaders eram traduzidos de novo a cada sessão, ~900 ms de
+  travada), texturas pequenas escritas pela CPU passam a ser verificadas inteiras (texturas velhas/coloridas),
+  mutexes do jogo giram 20 µs antes de dormir (`SOTC_MUTEX_SPIN_US=0` desliga) e buffers de staging grandes
+  ficam guardados entre quadros (`SOTC_STAGING_LARGE_POW2=0` desliga). O cache de shaders é refeito na
+  primeira abertura.
+- **DLSS: viés de cor atual na cena toda (`SOTC_DLSS_BIAS`, padrão 0,4; 0 desliga).** A sombra do
+  personagem não tem vetor de movimento, então o DLSS a mantinha no histórico e deixava rastro em
+  áreas escuras, mesmo com o preset E. O DLSS agora favorece mais o quadro atual. Se ainda houver
+  rastro, teste `SOTC_DLSS_BIAS=0.7`; se a imagem ficar granulada, use um valor menor.
+- **DLSS: preset E por padrão (`SOTC_DLSS_PRESET`)**. Letras E a O forçam um preset do modelo do DLSS
+  em todos os modos; `default` volta ao preset padrão da NVIDIA por modo. Sem a chave, o jogo usa o
+  preset E.
+- **Sombra/personagem com rastro em áreas escuras (corrigido):** há duas causas. (1) O **motion blur do
+  próprio jogo**, visível em cenas escuras e com 60 FPS: desligado por padrão (`fx_motionblur`).
+  (2) O **modelo padrão do DLSS** deixava ghosting em cenas escuras, também em Qualidade; com o preset E
+  (modelo CNN) o rastro some e o DLSS segue ativo. Os presets K e J (transformer) não resolveram.
+  O modo DLSS padrão do lançador passou de Ultra Desempenho para Qualidade.
+
+- **HDR10 para o jogo SDR (#347), experimental:** `SOTC_HDR=1` mostra o jogo numa tela HDR10 (PQ,
+  Rec.2020), expandindo o SDR no passe final: o branco SDR fica em `SOTC_HDR_PAPER` nits (padrão 200)
+  e os realces ganham até `SOTC_HDR_GAIN` vezes (padrão 1,5; 1 = sem ganho). `SOTC_HDR_WHITE` é
+  aceito como outro nome de `SOTC_HDR_PAPER` (igual ao fork do Oussama). Precisa do HDR ligado
+  no Windows e de um monitor HDR; sem isso o jogo avisa no log e segue em SDR. **Ainda não testado em
+  tela HDR** (o monitor de desenvolvimento não tem HDR). No lançador: Vídeo > Tela > "HDR (experimental)".
+  O cache de shaders é refeito na primeira abertura.
+- **Docs: remapear teclas e botões do mouse (#333):** `key.<entrada>=` e `mouse.<entrada>=` no
+  `sotc.ini` já funcionavam (inclusive L1/R1); agora estão documentados com exemplos. Um menu de
+  remapeamento dentro do jogo não existe (o menu é do próprio jogo).
+
 ## 0.70.1 — 2026-10-29
 Correções e melhorias por cima da 0.70, que vem inteira (trocas de área, queda `0x49800`, DLSS no
 modo Pro, HUD com geração de quadros).

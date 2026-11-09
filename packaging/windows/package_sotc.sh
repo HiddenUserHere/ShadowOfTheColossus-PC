@@ -4,6 +4,8 @@
 # scripts, sotc.py and SotC.bat. Players need their own game dump; sound needs their own console's
 # libSceNgs2/libSceUlt (never packaged here). Run after `bash build.sh`.
 # Freezing uses a Windows Python with PyInstaller and Pillow (WINPYTHON, default C:\PyBuild312).
+# Install certifi there too: the updater adds its CA bundle to the Windows roots (issue #359);
+# PyInstaller bundles it (and its cacert.pem) by itself when it is installed.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 export MSYS2_ROOT=${MSYS2_ROOT:-/i/msys64}
@@ -26,6 +28,8 @@ rm -rf -- out/stage
 mkdir -p "$dest/bin" "$dest/scripts" "$dest/launcher"
 cp -r out/pyi-dist/SotC/. "$dest/"
 cp launcher/sotc.ico launcher/sotc.png launcher/window_icon.png "$dest/launcher/"
+# The launcher theme's fonts (Cinzel, Inter: SIL Open Font License, licences next to them).
+cp -r launcher/assets "$dest/launcher/"
 # Xbox-style button icons drawn for the port (tools/make_button_icons.py).
 cp -r glyphs "$dest/"
 # Without debug information (out/ keeps the symbols for crash reports).
@@ -49,6 +53,20 @@ if [[ -f "$streamline/sl.interposer.dll" ]]; then
     echo "DLSS-G: NVIDIA Streamline runtime included"
 else
     echo "DLSS-G: no Streamline runtime in $streamline (FSR 3 only)" >&2
+fi
+# AMD FSR 4.1 / 3.1 upscaling (vk_fsr4.cpp): the official signed AMD FSR SDK 2.4.0 DLLs next to
+# bb-probe.exe (redistributable in binary form under AMD's license, kept with them). Not in git:
+# AMD_FSR_DIR (default ../SotC-deps/amd-fsr-sdk-2.4.0) holds Kits/FidelityFX/signedbin's
+# amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll from
+# github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK tag v2.4.0. Without it, FSR 1 instead.
+amd_fsr=${AMD_FSR_DIR:-../SotC-deps/amd-fsr-sdk-2.4.0}
+if [[ -f "$amd_fsr/amd_fidelityfx_loader_vk.dll" ]]; then
+    cp "$amd_fsr"/amd_fidelityfx_loader_vk.dll "$amd_fsr"/amd_fidelityfx_upscaler_vk.dll "$dest/bin/"
+    mkdir -p "$dest/bin/licenses-amd"
+    cp "$amd_fsr"/licenses-amd/* "$dest/bin/licenses-amd/"
+    echo "AMD FSR: FSR SDK 2.4.0 upscaler included"
+else
+    echo "AMD FSR: no FSR SDK in $amd_fsr (FSR 1 instead of FSR 4)" >&2
 fi
 cp scripts/prepare.py scripts/link_libc.py scripts/link_modules.py scripts/content_profile.py \
    scripts/sotc_cpu.py scripts/sotc_modes.py scripts/sotc_hooks.py scripts/tuning_export.py "$dest/scripts/"

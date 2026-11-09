@@ -3712,8 +3712,10 @@ constexpr u64 kTonemapHash = 0x291dbcd0;
 constexpr u32 kVignetteDword = 51;
 
 bool Rasterizer::TaaOff() {
-    // TAA comes back if super resolution is switched or turns itself off
-    return Dlssg::SuperResolution();
+    // TAA comes back if super resolution is switched or turns itself off, and while DLSS takes
+    // no frames (PS4 Pro Cinematic mode at 1080p: neither TAA nor DLSS left the raw jittered
+    // frames, 2 Nov). sotc: the SOTC_TAA_OFF override stays deleted (N4).
+    return Dlssg::SuperResolutionUpscaling();
 }
 
 namespace {
@@ -3984,6 +3986,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved,
     }
     Vulkan::FrameGraph::AsyncAfter(async.fp, async_value != 0, async_value);
     DebugState.IncDispatch();
+    AfterVisDirect(); // sotc: SOTC_VIS_DIRECT
     MaybeDumpImages(cs.pgm_hash);
 
     {
@@ -4106,6 +4109,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     }
     Vulkan::FrameGraph::AsyncAfter(async.fp, async_value != 0, async_value);
     DebugState.IncDispatch();
+    AfterVisDirect(); // sotc: SOTC_VIS_DIRECT
     runtime.AccessBuffer(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
                          vk::AccessFlagBits2::eIndirectCommandRead);
     MaybeDumpImages(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
@@ -8945,8 +8949,9 @@ const u32* Rasterizer::FlatForBind(const Shader::Info& stage) {
             const char* v = std::getenv("SOTC_DLSS_VIGNETTE");
             return !v || v[0] != '0';
         }();
+        // sotc: the vignette follows SuperResolutionUpscaling, as TaaOff (upstream 715c217).
         if (stage.pgm_hash == kTonemapHash && stage.FlatBuf().size() > kVignetteDword + 3 &&
-            vignette_after && Dlssg::SuperResolution()) {
+            vignette_after && Dlssg::SuperResolutionUpscaling()) {
             tonemap_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
             float params[4];
             std::memcpy(params, &tonemap_flat[kVignetteDword], sizeof(params));
@@ -9346,6 +9351,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 size = pb->size; // sotc: SOTC_PR_RESOLVE: clamped and limited by the prep thread
             } else if (clamp1) {
                 if (vbase != 0 && vsize != 0) {
+                    const SotcStats::SplitTimer clamp_split{SotcStats::SplitBufClamp};
                     size = memory->ClampRangeSize(vbase, vsize);
                 }
             } else if (vbase != 0 && vsize != 0 && memory->IsValidMapping(vbase) &&
@@ -9529,6 +9535,26 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         mark_size = static_cast<u32>(window_len);
                     }
                 }
+                // sotc: SOTC_VIS_DIRECT: a visibility bitmap written in the game's memory (upstream f167256). Not for
+                // a SOTC_BDA table slot (the shader reads that address from the table, which this bind does not
+                // fill); never recorded by the bind cache.
+                if (desc.is_written && !bda_slot && stage.sw_stage == Shader::SwStage::Compute &&
+                    SotcStats::kVisDirect && SotcStats::VisDirectProgram(stage.pgm_hash) &&
+                    BindVisDirect(vbase, size, alignment, binding, push_data)) {
+                    if (bind_cache_recording) {
+                        bind_cache_uncacheable = true;
+                    }
+                    set_write_sets[set_write_index] = set;
+                    auto& set_write = set_writes[set_write_index++];
+                    set_write.dstSet = VK_NULL_HANDLE;
+                    set_write.dstBinding = binding.unified++;
+                    set_write.dstArrayElement = 0;
+                    set_write.descriptorCount = 1;
+                    set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
+                    set_write.pBufferInfo = &buffer_infos.back();
+                    ++binding.buffer;
+                    continue;
+                }
                 // sotc: SOTC_BIND_CACHE_FRAME. A read-only V# of a read-only graphics bind: the
                 // arena and offset ObtainBuffer returned last time are still the answer while
                 // BufferCache::BindVersion and the mapping under it are as they were (the checks
@@ -9622,8 +9648,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     if (SotcVsizeProbe::On()) { // sotc: SOTC_VSIZE_PROBE: the dirty bytes of this bind's sync
                         SotcVsizeProbe::ResetDirty();
                     }
-                    obtained = buffer_cache.ObtainBuffer(vbase, size, desc.is_written,
-                                                         desc.is_formatted, mark_offset, mark_size);
+                    {
+                        const SotcStats::SplitTimer obtain_split{SotcStats::SplitBufObtain};
+                        obtained = buffer_cache.ObtainBuffer(vbase, size, desc.is_written,
+                                                             desc.is_formatted, mark_offset, mark_size);
+                    }
                     if (big_bind_log) {
                         SotcRegionPredrain::ClearBindContext();
                     }
@@ -10045,6 +10074,73 @@ void Rasterizer::BindBuffersSkipVerify(const Shader::Info& stage, Shader::Backen
         mask |= SotcGcn::Commit::SkipMmBindings;
     }
     SotcGcn::Commit::NoteSkipVerify(mask, stage.pgm_hash, stage_index);
+}
+
+// sotc: SOTC_VIS_DIRECT (upstream f167256): BindBuffers binds a visibility bitmap in the game's memory; the dispatch
+// copies it into the arena after (AfterVisDirect).
+bool Rasterizer::BindVisDirect(VAddr address, u64 size, u64 alignment,
+                               Shader::Backend::Bindings& binding, Shader::PushData& push_data) {
+    if (!SotcGuestMemory::Enabled()) {
+        return false;
+    }
+    VAddr run_start = 0;
+    u64 run_size = 0;
+    const u8* run = memory->GetBackingRun(address, &run_start, &run_size);
+    if (!run || address + size > run_start + run_size) {
+        SotcStats::vis_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const u8* host = run + (address - run_start);
+    const SotcGuestMemory::Span span = SotcGuestMemory::Get(host, size);
+    if (!span.buffer) {
+        SotcStats::vis_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    // Bytes the GPU wrote in the arena before (or another shader since) come back to the game's
+    // memory first: from now on the game's memory holds the bitmap and the arena follows it.
+    if (buffer_cache.IsRegionGpuModified(address, size)) {
+        buffer_cache.ReadMemory(address, size, false, true);
+    }
+    const u64 offset_aligned = Common::AlignDown(span.offset, alignment);
+    const u64 adjust = span.offset - offset_aligned;
+    push_data.AddOffset(binding.buffer, adjust);
+    buffer_infos.emplace_back(span.buffer, offset_aligned, size + adjust);
+    vis_copies.push_back({address, size, span.buffer, span.offset});
+    texture_cache.InvalidateMemoryFromGPU(address, size);
+    SotcStats::vis_direct_binds.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void Rasterizer::AfterVisDirect() {
+    if (vis_copies.empty()) {
+        return;
+    }
+    // The arena's copy of each bitmap follows the game's memory (GPU readers bind the arena).
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::MemoryBarrier2 written{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite |
+                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &written});
+    for (const VisCopy& copy : vis_copies) {
+        const auto [arena, arena_offset] = buffer_cache.ObtainBuffer(copy.address, copy.size, false);
+        cmdbuf.copyBuffer(copy.buffer, arena->Handle(),
+                          vk::BufferCopy{.srcOffset = copy.offset, .dstOffset = arena_offset,
+                                         .size = copy.size});
+    }
+    const vk::MemoryBarrier2 copied{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+                         vk::AccessFlagBits2::eIndirectCommandRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
+    vis_copies.clear();
+    SotcStats::vis_label_pending = true;
 }
 
 // sotc: the final composite samples the UI layer and the scene: UI first in the base game's
@@ -11000,7 +11096,10 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
                 lazy_binds.push_back(LazyBind{static_cast<u32>(image_bindings.size() - 1), tsharp,
                                               &image_desc, skip.view_info});
             } else {
-                desc = VideoCore::TextureCache::ImageDesc(tsharp, image_desc);
+                {
+                    const SotcStats::SplitTimer desc_split{SotcStats::SplitTexDesc}; // sotc: SOTC_DRAW_SPLIT
+                    desc = VideoCore::TextureCache::ImageDesc(tsharp, image_desc);
+                }
                 if (tslot_mode == 2 && plain) { // sotc: SOTC_TSLOT=2: the tail predicate, and no tail hit
                     VideoCore::TsharpSlotCache::NoteTexTail(
                         tail_candidate == (desc.rebase_mip != 0) && !(tail_candidate && skipped));
@@ -11013,9 +11112,12 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
                     desc.view_info.range.base.level += i;
                     desc.view_info.range.extent.levels = 1;
                 }
-                image_id = desc.type == VideoCore::TextureCache::BindingType::Texture
-                               ? texture_cache.FindTextureIdentity(tkey, desc).image_id
-                               : texture_cache.FindImage(desc);
+                {
+                    const SotcStats::SplitTimer find_split{SotcStats::SplitTexFind}; // sotc: SOTC_DRAW_SPLIT
+                    image_id = desc.type == VideoCore::TextureCache::BindingType::Texture
+                                   ? texture_cache.FindTextureIdentity(tkey, desc).image_id
+                                   : texture_cache.FindImage(desc);
+                }
                 if (skipped) { // sotc: SOTC_TSLOT=2: the skip's answer is compared with this one
                     const bool same =
                         image_id == skip.image_id && desc.view_info == skip.view_info &&
@@ -11112,7 +11214,10 @@ void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bi
             // sotc: SOTC_TSLOT: a texture's second pass may skip UpdateImage where it is a no-op.
             const bool second_update = !(tslot_mode != 0 &&
                                          desc.type == VideoCore::TextureCache::BindingType::Texture);
-            auto& image_view = texture_cache.FindTexture(image_id, desc, second_update);
+            auto& image_view = [&]() -> auto& {
+                const SotcStats::SplitTimer view_split{SotcStats::SplitTexView}; // sotc: SOTC_DRAW_SPLIT
+                return texture_cache.FindTexture(image_id, desc, second_update);
+            }();
             const auto binding = image.binding;
 
             // The image is either bound as storage in a separate descriptor or bound as render
@@ -12120,7 +12225,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         // guest-thread command would run ahead of the draws already queued, which may still use
         // the range (review of #99).
         liverpool->SendOrderedCommand(
-            [this, addr, size] { buffer_cache.ReleaseMemory(addr, size); });
+            [this, addr, size] { buffer_cache.ReleaseMemory(addr, size); }, 5);
     }
     // sotc: SOTC_TC_SINGLE_WRITER: the texture part runs on the draw thread, at the command
     // processor's point of the stream (as the arena release above); the guest thread takes no lock.

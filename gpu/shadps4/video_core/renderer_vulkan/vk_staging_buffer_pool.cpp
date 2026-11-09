@@ -55,6 +55,36 @@ u64 RoundAllocationSize(u64 size) {
     return Common::AlignUp(size, step);
 }
 
+// sotc: the memory type of a ring block: upload blocks move to the large BAR heap under
+// SOTC_REBAR_UPLOAD, per block.
+MemoryType RingBlockType(const Instance& instance, MemoryType type) {
+    return type == MemoryType::HostUncached
+               ? VideoCore::ResolveRebarType(instance, RING_BLOCK_SIZE, type)
+               : type;
+}
+
+// sotc: the ring blocks TrimRing keeps (upstream 0.72): the first SOTC_STAGING_KEEP_MB (default
+// 128) of each host-memory ring and the first SOTC_STAGING_KEEP_VRAM_MB (default 64; 0 on GPUs
+// with a video memory budget under 4 GB) of the device-local one stay allocated. Trimmed after
+// 300 idle frames, they were allocated again by the next area change inside the frames that
+// needed them: 11 blocks in 95 ms in one 5 s window (3 Nov, Pro + Maximum, video memory near its
+// budget). TickFrame also makes the reserve ahead, one block per frame, so the first area change
+// finds it too.
+size_t RingKeepBlocks(const Instance& instance, size_t type) {
+    static const size_t keep_host_blocks = [] {
+        const char* v = std::getenv("SOTC_STAGING_KEEP_MB");
+        return static_cast<size_t>((v ? std::strtoull(v, nullptr, 10) : 128ull) /
+                                   (RING_BLOCK_SIZE >> 20));
+    }();
+    static const size_t keep_device_blocks = [&instance] {
+        const char* v = std::getenv("SOTC_STAGING_KEEP_VRAM_MB");
+        const u64 fallback = instance.GetTotalMemoryBudget() >= (4ull << 30) ? 64ull : 0ull;
+        return static_cast<size_t>((v ? std::strtoull(v, nullptr, 10) : fallback) /
+                                   (RING_BLOCK_SIZE >> 20));
+    }();
+    return type == u32(MemoryType::DeviceLocal) ? keep_device_blocks : keep_host_blocks;
+}
+
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
@@ -157,12 +187,11 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
             best_offset = 0;
         } else {
             const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
-            const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingBlock, RING_BLOCK_SIZE};
-            // sotc: upload blocks move to the large BAR heap under SOTC_REBAR_UPLOAD, per block.
-            const MemoryType block_type =
-                type == MemoryType::HostUncached
-                    ? VideoCore::ResolveRebarType(instance, RING_BLOCK_SIZE, type)
-                    : type;
+            const SotcStats::AllocTrace alloc_trace{type == MemoryType::DeviceLocal
+                                                        ? SotcStats::AllocStagingBlockDevice
+                                                        : SotcStats::AllocStagingBlock,
+                                                    RING_BLOCK_SIZE};
+            const MemoryType block_type = RingBlockType(instance, type);
             best = &ring.blocks.emplace_back(Block{
                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, block_type,
                                                                     RING_BLOCK_SIZE),
@@ -261,12 +290,22 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     ++frame;
-    // sotc: every ring is trimmed. Trimmed after 300 idle frames, a block is allocated again (~2 ms
-    // each) by the next streaming burst, inside the frame that needed it: 115 allocations in a
-    // 6-minute attract run. The device-local ring is trimmed too (video memory is short on 6 GB
-    // cards).
+    // sotc: every ring is trimmed down to its kept reserve (RingKeepBlocks), and the reserve is
+    // made ahead, one block per frame.
     for (size_t type = 0; type < rings.size(); ++type) {
-        TrimRing(rings[type]);
+        Ring& ring = rings[type];
+        TrimRing(ring);
+        const size_t keep = RingKeepBlocks(instance, type);
+        if (ring.blocks.size() < keep && frame > 60) {
+            const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingKept, RING_BLOCK_SIZE};
+            ring.blocks.emplace_back(Block{
+                .buffer = std::make_unique<VideoCore::StreamBuffer>(
+                    instance, scheduler, RingBlockType(instance, MemoryType(type)),
+                    RING_BLOCK_SIZE),
+                .last_used_frame = frame,
+            });
+            held_bytes[type].fetch_add(RING_BLOCK_SIZE, std::memory_order_relaxed); // sotc: RAM report
+        }
     }
     for (auto& cache : large_caches) {
         TrimLarge(cache);
@@ -276,7 +315,9 @@ void StagingBufferPool::TickFrame() {
 
 void StagingBufferPool::TrimRing(Ring& ring) {
     auto& blocks = ring.blocks;
-    for (size_t i = blocks.size(); i-- > 0;) {
+    // sotc: the first RingKeepBlocks blocks stay allocated (upstream 0.72).
+    const size_t keep_blocks = RingKeepBlocks(instance, static_cast<size_t>(&ring - rings.data()));
+    for (size_t i = blocks.size(); i-- > keep_blocks;) {
         const Block& block = blocks[i];
         if (frame - block.last_used_frame < RING_IDLE_FRAMES ||
             !scheduler.IsFree(block.buffer->LastTick())) {

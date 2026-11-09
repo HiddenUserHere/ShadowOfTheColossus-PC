@@ -107,6 +107,14 @@ struct Buffer {
     explicit Buffer(VAddr cpu_addr_, u64 size_bytes_, vk::Buffer borrowed_buffer,
                     vk::DeviceAddress borrowed_address);
 
+    /// sotc: wraps a buffer owned elsewhere (an imported chunk of the game's memory,
+    /// SotcGuestMemory). Never destroyed: the owner keeps the handle.
+    Buffer(vk::Device device, vk::Buffer external, u64 size_bytes_)
+        : size_bytes{size_bytes_}, is_coherent{true}, mem_type{MemoryType::HostUncached},
+          buffer{device, nullptr} {
+        buffer.buffer = external;
+    }
+
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
 
