@@ -4,6 +4,8 @@
 #pragma once
 
 #include <atomic>
+#include <functional> // sotc: SOTC_COMPUTE_FAST (QueueOptimizedHook)
+#include <mutex>
 
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
@@ -36,6 +38,29 @@ struct ComputePipelineKey {
     void Serialize(Serialization::Archive& ar) const;
     bool Deserialize(Serialization::Archive& ar);
 };
+
+/// sotc: SOTC_COMPUTE_SPECFREE counters (totals; ReportComputeSpecFree in vk_compute_pipeline.cpp prints them every
+/// 5 s). dispatches/hits: dispatches, and those whose pipeline was not compiled by a dispatch lookup (prebuilt at
+/// shader file load, warmed up, or in the pack cache). fallback_*: new compute permutations of a program that had a
+/// prebuilt one, by the first key part that differs from it (image dimension, image integer type, a written formatted
+/// buffer, an atomic image, anything else); not_prebuilt: compute programs first translated by a dispatch.
+/// programs/variants: prebuilds installed (programs, and their permutations with the int/float variants);
+/// compile_ns: worker time of their translations and pipeline builds.
+/// sotc: perms_hist: prebuilt programs by the permutations queued for them (1, 2, 4, 8, over the cap: the two
+/// all-int/all-float ones of a program with more than kSpecFreeMaxAmbiguous ambiguous images); perms_queued: all
+/// those permutations (the expected prebuild count); fallback_int_capped: the int fallbacks of over-cap programs.
+struct ComputeSpecFreeStats {
+    std::atomic<u64> dispatches{0}, hits{0};
+    std::atomic<u64> fallback_dim{0}, fallback_int{0}, fallback_written_fmt{0}, fallback_atomic{0},
+        fallback_other{0};
+    std::atomic<u64> fallback_int_capped{0};
+    std::atomic<u64> perms_hist[5]{};
+    std::atomic<u64> perms_queued{0};
+    std::atomic<u64> not_prebuilt{0};
+    std::atomic<u64> programs{0}, variants{0}, compile_ns{0};
+    std::atomic<u32> logged{0};
+};
+extern ComputeSpecFreeStats g_specfree;
 
 class ComputePipeline : public Pipeline {
 public:
@@ -73,6 +98,26 @@ public:
 
     void BindWhenReady() const;
 
+    /// sotc: SOTC_COMPUTE_FAST (SotcNonBlocking::ComputeFast). Claims a deferred construction and makes its first
+    /// pipeline: the optimized one when the driver cache has it (probe, with the device's cache control), otherwise a
+    /// build with DISABLE_OPTIMIZATION. True when the optimized build must still follow (BuildOptimized, queued by the
+    /// caller on a background lane); false when it was claimed already or the optimized pipeline is in place.
+    bool BuildFast();
+
+    /// sotc: SOTC_COMPUTE_FAST: the optimized build after BuildFast; it replaces the fast handle for later binds and
+    /// retires the fast one by tick (Install).
+    void BuildOptimized();
+
+    /// sotc: SOTC_COMPUTE_FAST: the bound handle is the fast (unoptimized) build still. Such a pipeline is not moved to
+    /// the async compute queue (its retirement waits for graphics ticks only).
+    [[nodiscard]] bool OnFastBuild() const noexcept {
+        return sotc_fast_live.load(std::memory_order_acquire);
+    }
+
+    /// sotc: SOTC_COMPUTE_FAST: queues BuildOptimized for a pipeline on a background lane (set by the PipelineCache that
+    /// owns the workers; used when the recorder made the fast build itself).
+    static inline std::function<void(ComputePipeline*)> QueueOptimizedHook;
+
     /// sotc: waits until a deferred construction has made its pipeline (building it here if no
     /// worker started it yet). Handle() is then the result, null if the driver refused it.
     void WaitBuilt();
@@ -92,12 +137,25 @@ public:
     /// sotc: SOTC_COMPUTE_PACK: the pack list names this pipeline (a driver-cache hit): no worker job is queued, the
     /// recorder builds it inline at its first bind (counted as an inline build, not a wait).
     bool sotc_inline{};
+    /// sotc: SOTC_COMPUTE_SPECFREE: compiled by a dispatch's lookup (not a prebuild, not from the pack cache).
+    bool sotc_dispatch_built{};
     u64 KeyValue() const {
         return compute_key.value;
     }
 
 private:
+    /// sotc: SOTC_COMPUTE_FAST: Normal is the build as before; Fast adds DISABLE_OPTIMIZATION; Probe asks the driver
+    /// cache for the optimized pipeline (FAIL_ON_PIPELINE_COMPILE_REQUIRED, no compile).
+    enum class BuildMode { Normal, Fast, Probe };
     void CreatePipeline();
+    /// sotc: one create call; the result and the pipeline (null on failure). Asserts only in Normal mode.
+    std::pair<vk::Result, vk::UniquePipeline> MakePipeline(BuildMode mode);
+    /// sotc: SOTC_COMPUTE_FAST: installs a built pipeline (sotc_swap_mutex). The first one becomes the handle; an
+    /// optimized one replaces a fast one (whose destruction is deferred until the GPU reached the current tick); any
+    /// other is destroyed at once (never bound).
+    bool Install(vk::UniquePipeline built, bool optimized);
+    /// sotc: SOTC_COMPUTE_FAST: the recorder's fast build while a worker builds the optimized one (no claim).
+    void BuildFastBeside();
 
     ComputePipelineKey compute_key;
     vk::PipelineCache cache;
@@ -107,6 +165,13 @@ private:
     std::atomic<bool> claimed{false};
     /// sotc: SOTC_PIPE_COMPILE_CHECK: set once this pipeline was logged (waited for or built off a worker).
     mutable std::atomic<bool> sotc_logged{false};
+    /// sotc: SOTC_COMPUTE_FAST state: the swap lock, the fast handle is bound, a fast build is running, the claimed build
+    /// is the normal (optimized) one, and the fast build's time (ns, for the evidence line).
+    std::mutex sotc_swap_mutex;
+    std::atomic<bool> sotc_fast_live{false};
+    std::atomic<bool> sotc_fast_running{false};
+    std::atomic<bool> sotc_normal_claim{false};
+    std::atomic<u64> sotc_fast_ns{0};
 };
 
 } // namespace Vulkan

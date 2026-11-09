@@ -1124,8 +1124,10 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     // building pipelines that misrender (sotc_arch/heap.cpp).
     SotcArch::Heap::CheckRequirements(bindless_images, bindless_samplers);
     // sotc: SOTC_PIPE_COMPILE_CHECK: the cache-control feature, when the device has it and the switch is on.
+    // sotc: SOTC_COMPUTE_FAST also wants it (its driver-cache probe of the optimized compute build).
     const bool sotc_compile_control =
-        vk13_features.pipelineCreationCacheControl && SotcPipeFeedback::CompileCheckOn();
+        vk13_features.pipelineCreationCacheControl &&
+        (SotcPipeFeedback::CompileCheckOn() || SotcNonBlocking::ComputeFast());
     SotcPipeFeedback::g_compile_control.store(sotc_compile_control, std::memory_order_relaxed);
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{

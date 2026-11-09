@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <bit> // sotc: SOTC_PR_PRED (std::popcount)
 #include <chrono>
 #include <cstdio>
 #include <map>
@@ -3946,6 +3947,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved,
     // the recording waits for the moved dispatches it conflicts with.
     const u64 async_value =
         async.candidate && scheduler.HasAsyncQueue() && pipeline->IsReady() &&
+                !pipeline->OnFastBuild() && // sotc: SOTC_COMPUTE_FAST (a fast handle retires by graphics tick)
                 cs.images.empty()
             ? scheduler.AsyncBegin()
             : 0;
@@ -3965,6 +3967,12 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved,
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
+    if (Shader::ComputeSpecFree()) { // sotc: SOTC_COMPUTE_SPECFREE: dispatches, and those on a prebuilt pipeline
+        g_specfree.dispatches.fetch_add(1, std::memory_order_relaxed);
+        if (!pipeline->sotc_dispatch_built) {
+            g_specfree.hits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     CheckpointResources(GpuCheckpoint(cmdbuf, pipeline, SotcCheckpoints::Kind::Dispatch, cs_program.dim_x, cs_program.dim_y,
                   cs_program.dim_z)); // sotc
     GcnBeforeOp(scheduler); // sotc: SOTC_GCN_BARRIER (outside a pass: the pending global barrier goes first)
@@ -4063,6 +4071,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     // sotc: N5 async move, see DispatchDirect.
     const u64 async_value =
         async.candidate && scheduler.HasAsyncQueue() && pipeline->IsReady() &&
+                !pipeline->OnFastBuild() && // sotc: SOTC_COMPUTE_FAST (a fast handle retires by graphics tick)
                 pipeline->GetStage(Shader::SwStage::Compute).images.empty()
             ? scheduler.AsyncBegin()
             : 0;
@@ -4081,6 +4090,12 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
+    if (Shader::ComputeSpecFree()) { // sotc: SOTC_COMPUTE_SPECFREE: dispatches, and those on a prebuilt pipeline
+        g_specfree.dispatches.fetch_add(1, std::memory_order_relaxed);
+        if (!pipeline->sotc_dispatch_built) {
+            g_specfree.hits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     CheckpointResources(GpuCheckpoint(cmdbuf, pipeline, SotcCheckpoints::Kind::DispatchIndirect, address, offset, 0)); // sotc
     GcnBeforeOp(scheduler); // sotc: SOTC_GCN_BARRIER
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
@@ -4393,15 +4408,8 @@ static bool SotcPrKeysOn() {
     return on;
 }
 
-// sotc: SOTC_PR_PRED (default 0; 1 BindBuffers takes the shader-addressed predicate from the prepared buffers
-// (PrBuffer::shader_addressed) for prepared stages). Acts only with SOTC_PR_RESOLVE, which holds those buffers.
-static bool SotcPrPredOn() {
-    static const bool on = [] {
-        const char* v = std::getenv("SOTC_PR_PRED");
-        return v && v[0] == '1';
-    }();
-    return on;
-}
+// sotc: SOTC_PR_PRED (E1) is SotcNonBlocking::PrPred() (gpu/sotc/nonblocking.h): the predicates are in
+// PreparedDraw::pred_* for every stage (Rasterizer::PreparePredicates), with or without SOTC_PR_RESOLVE.
 
 // sotc: SOTC_PR_KEYS. The heap stages of a pipeline, as BindResources finds them: out[0] the fragment-kind heap
 // stage, out[1] the vertex-kind one (SOTC_HEAP_VS). False when a kind has two stages (the draw is dropped there):
@@ -4428,8 +4436,9 @@ static bool PrHeapStages(const Pipeline& pipeline, const Shader::Info* (&out)[2]
 static PrBuffer PrResolveBuffer(const Shader::Info& stage, const Shader::BufferResource& desc,
                                 Core::MemoryManager* mem, const Shader::Profile& profile) {
     PrBuffer out{};
-    // sotc: SOTC_PR_PRED: BindBuffers' shader_addressed lambda (ShaderAddrBufferAt, null profile when
-    // shader_addr is 0). Taken before the special check, so a special buffer's bit is the lambda's too.
+    // sotc: BindBuffers' shader_addressed lambda (ShaderAddrBufferAt, null profile when shader_addr is 0), for the
+    // users of the resolved buffers. Taken before the special check, so a special buffer's bit is the lambda's too.
+    // (SOTC_PR_PRED reads PreparedDraw::pred_addr instead, filled for every stage.)
     if (profile.shader_addr != 0) {
         out.shader_addressed = Shader::ShaderAddrBufferAt(
             profile, stage, static_cast<u32>(&desc - stage.buffers.data()));
@@ -4667,6 +4676,53 @@ void BindDiffNote(u32 mask, bool hit) {
 
 // sotc: defined with the frame bind cache below (same unnamed namespace).
 namespace {
+// sotc: SOTC_BIND_CACHE_WIDE (gpu/sotc/nonblocking.h). OpComputeMode is the SOTC_OP_COMPUTE_BIND mode of the frame cache:
+// the variable's own value when it is set (2: the verify), else 1 under SOTC_BIND_CACHE_WIDE, else 0 (compute and written
+// binds refused as before).
+static int OpComputeMode() {
+    if (SotcStats::kOpComputeBind != 0) {
+        return SotcStats::kOpComputeBind;
+    }
+    static const bool wide = SotcNonBlocking::BindCacheWide();
+    return wide ? 1 : 0;
+}
+
+// sotc: SOTC_BIND_CACHE_WIDE counters, read by WideReport. Their own atomics: driver.cpp takes the SotcStats ones each 5 s.
+static std::atomic<u64> wide_compute_eligible{}, wide_graphics_hits{}, wide_compute_hits{}, wide_storage_hits{},
+    wide_write_replays{};
+static std::atomic<u64> wide_compute_refused[SotcStats::BgGates]{};
+
+// sotc: SOTC_BIND_CACHE_WIDE 5 s line (SOTC_FPS only). Hits by kind (graphics, compute); storage = hits that replayed written
+// bindings, with the number of bindings replayed. Compute binds refused, by the gate that refused them.
+static void WideReport() {
+    if (!SotcStats::kFpsLog || !SotcNonBlocking::BindCacheWide()) {
+        return;
+    }
+    static std::atomic<s64> due{};
+    const s64 now = static_cast<s64>(SotcStats::NowNs());
+    s64 d = due.load(std::memory_order_relaxed);
+    if (now < d || !due.compare_exchange_strong(d, now + 5'000'000'000LL)) {
+        return;
+    }
+    const auto take = [](std::atomic<u64>& c) {
+        return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed));
+    };
+    char refused[512]{};
+    size_t ri = 0;
+    for (uint32_t g = 1; g < SotcStats::BgGates; ++g) {
+        const auto n = take(wide_compute_refused[g]);
+        if (n != 0) {
+            ri += std::snprintf(refused + ri, sizeof(refused) - ri, "%s%s %llu", ri ? ", " : "",
+                                SotcStats::kBindGateNames[g], n);
+        }
+    }
+    std::fprintf(stderr,
+                 "SOTC BIND WIDE: mode %d, compute eligible %llu, hits compute %llu, graphics %llu, storage %llu "
+                 "(written bindings replayed %llu); compute refused [%s]\n",
+                 OpComputeMode(), take(wide_compute_eligible), take(wide_compute_hits), take(wide_graphics_hits),
+                 take(wide_storage_hits), take(wide_write_replays), ri ? refused : "none");
+}
+
 u64 BindCacheFrameKey(const Pipeline* pipeline, u64 hash, u64 targets_key);
 }
 
@@ -4699,6 +4755,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     desc_reuse = {}; // sotc: SOTC_BIND_DESC_REUSE: this op's record (BindPipelineResources)
     desc_reuse_entry = nullptr;
     PlanBReport(pipeline_cache.GetDescriptorHeap());
+    WideReport(); // sotc: SOTC_BIND_CACHE_WIDE 5 s line (SOTC_FPS only)
     // sotc: SOTC_PROTECT_ASYNC_UNPROTECT: the unprotects this bind makes are read next by the GPU (page_manager.h).
     const VideoCore::PageManager::GpuOnlyScope gpu_only_scope;
     // sotc: SOTC_DESCRIPTOR_HEAP: a heap draw replaces the descriptor state of the command buffer, so a classic draw
@@ -4928,6 +4985,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
                                                                      : SotcStats::BgPacketHeap)
                                  : BindCacheRefusal(pipeline, liverpool->DrawRegs());
             SotcStats::bind_gate_refused[gate].fetch_add(1, std::memory_order_relaxed);
+            if (pipeline->IsCompute() && SotcNonBlocking::BindCacheWide()) { // sotc: SOTC_BIND_CACHE_WIDE
+                wide_compute_refused[gate].fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
     if (SotcStats::kFpsLog && SotcStats::kBindCachePacket != 0 && packet_op) { // sotc: SOTC_BIND_CACHE_PACKET
@@ -4941,9 +5001,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
     // sotc: SOTC_OP_COMPUTE_BIND. A dispatch eligible for the frame cache; mode 2 never takes a hit
     // and compares the would-be hit (verify_ref, found before the full bind) with the full bind.
     const bool compute_bind = cache_eligible && pipeline->IsCompute();
-    const bool compute_verify = compute_bind && SotcStats::kOpComputeBind == 2;
+    const bool compute_verify = compute_bind && OpComputeMode() == 2;
     if (compute_bind && SotcStats::kFpsLog) {
         SotcStats::op_compute_eligible.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (compute_bind && SotcNonBlocking::BindCacheWide()) { // sotc: SOTC_BIND_CACHE_WIDE, a dispatch admitted by it
+        wide_compute_eligible.fetch_add(1, std::memory_order_relaxed);
     }
     BindCacheEntry* verify_ref = nullptr;
     BindCacheEntry* pk_verify_ref = nullptr; // sotc: SOTC_BIND_CACHE_PACKET=2, the entry a packet hit would take
@@ -5231,7 +5294,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         if (bool hit_dma = false; !compute_verify && pk_take_hit &&
                                   (SotcStats::kBindCacheFrame
                                        ? TryBindCacheFrame(pipeline, cache_hash, hit_dma,
-                                                           heap_defer ? heap_mask_op : 0u)
+                                                           heap_defer ? heap_mask_op : 0u,
+                                                           reg_prepared) // sotc: SOTC_PR_BCPROBE
                                        : TryBindCache(pipeline, cache_hash, hit_dma))) {
             if (compute_bind && SotcStats::kFpsLog) {
                 SotcStats::op_compute_hits.fetch_add(1, std::memory_order_relaxed);
@@ -5407,6 +5471,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             PrGenNote(pr_gen, true, false, false, !same);
         }
     }
+    bind_pred_slot = reg_prepared; // sotc: SOTC_PR_PRED (E1): BindBuffers reads this op's predicates
     for (const auto* stage : pipeline->GetStages()) {
         ++stage_counter;
         if (!stage) {
@@ -5852,7 +5917,7 @@ bool Rasterizer::BindCacheEligible(const Pipeline* pipeline, const AmdGpu::Regs&
 // ranges and write notes in the shader-address path, which is not recorded). Everything else stays refused.
 static bool WrittenBindAdmitted(const Pipeline& pipeline, const Shader::Info& stage,
                                 const Shader::BufferResource& desc) {
-    if (SotcStats::kOpComputeBind == 0 || desc.IsSpecial() || desc.is_formatted) {
+    if (OpComputeMode() == 0 || desc.IsSpecial() || desc.is_formatted) {
         return false;
     }
     const auto& profile = pipeline.GetProfile();
@@ -5871,8 +5936,20 @@ u32 Rasterizer::BindCacheRefusal(const Pipeline* pipeline, const AmdGpu::Regs& r
     // sotc: SOTC_OP_COMPUTE_BIND: a dispatch is eligible under the same rules when it reads only
     // (no DMA pointer, no sharp table; the write checks below apply to it too).
     // Returns the first gate the bind fails (SotcStats::BindGate), BgNone when it is eligible.
+    //
+    // Why each gate refuses (SOTC_BIND_CACHE_WIDE admits compute dispatches and written plain buffers, see OpComputeMode):
+    //  - compute: a dispatch enters the frame cache only in OpComputeMode (SOTC_OP_COMPUTE_BIND or _WIDE).
+    //  - clip plane: the user clip plane state is not replayed by a hit.
+    //  - storage/fmask: has_storage_images does not tell a read-only storage image from a written one, and a
+    //    written image needs the image bookkeeping of the full bind (BindCacheInvalidateImage, the layout and the
+    //    write barriers of the op), which a hit does not replay. fmask bindings are not recorded by any entry.
+    //  - dispatch dma / sharp tables: the dispatch reads V# words from guest memory (a pointer or a table) that the
+    //    entry does not hold, so a hit could not see a change to them.
+    //  - shared memory: no guest binding to replay.
+    //  - written buffers: WrittenBindAdmitted (texel, GDS and shader-addressed buffers keep their own path).
+    //  - written images: as storage images, the image bookkeeping is not replayed.
     const bool compute = pipeline->IsCompute();
-    if (compute && SotcStats::kOpComputeBind == 0) {
+    if (compute && OpComputeMode() == 0) {
         return SotcStats::BgCompute;
     }
     if (regs.clipper_control.user_clip_plane_enable != 0) {
@@ -6588,6 +6665,7 @@ void Rasterizer::BindCacheSyncFrame(const Pipeline* pipeline, bool eligible) {
     if (frame_cache.empty()) {
         frame_cache.resize(BindCacheFrameEntries);
         frame_keys.assign(BindCacheFrameEntries, 0);
+        frame_ready.store(true, std::memory_order_release); // sotc: SOTC_PR_BCPROBE: the probe may read them now
     }
     BindCacheState now{
         .tick = scheduler.CurrentTick(),
@@ -6615,6 +6693,7 @@ void Rasterizer::BindCacheSyncFrame(const Pipeline* pipeline, bool eligible) {
             identity[AmdGpu::NUM_COLOR_BUFFERS] = texture_cache.GetImage(db_desc.first).image_uid;
         }
         now.targets_key = XXH3_64bits(identity.data(), identity.size() * sizeof(u64));
+        targets_pub.store(now.targets_key, std::memory_order_relaxed); // sotc: SOTC_PR_BCPROBE (the probe's guess)
     } else {
         // A dispatch renders into no target.
         now.targets = bind_cache_state.targets;
@@ -6863,7 +6942,8 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
 void Rasterizer::BindCacheDropFrame(BindCacheEntry& entry, u32 reason) {
     const size_t index = static_cast<size_t>(&entry - frame_cache.data());
     if (index < frame_keys.size() && frame_keys[index] != 0) {
-        frame_keys[index] = 0;
+        __atomic_store_n(&frame_keys[index], u64{0}, __ATOMIC_RELAXED); // sotc: SOTC_PR_BCPROBE reads it
+        __atomic_store_n(&entry.probe_seq, entry.probe_seq + 1, __ATOMIC_RELEASE); // sotc: SOTC_PR_BCPROBE
         --bind_cache_live;
         if (SotcStats::kFpsLog) {
             SotcStats::bf_live.store(bind_cache_live, std::memory_order_relaxed);
@@ -7037,7 +7117,8 @@ void Rasterizer::WriteVerify(const BindCacheEntry& ref) {
     }
 }
 
-bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& uses_dma, u32 heap_mask) {
+bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& uses_dma, u32 heap_mask,
+                                   const PreparedDraw* prepared) {
     // sotc: SOTC_BIND_CACHE_FRAME, see the comment above BindCacheSyncFrame. The rest follows
     // TryBindCache (SOTC_BIND_CACHE_XTICK): what a full bind does that a hit would skip is
     // replayed the same way.
@@ -7062,7 +7143,50 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
         }
     }
     const u64 targets_key = bind_cache_state.targets_key;
-    const u64 lookup_key = BindCacheFrameKey(pipeline, hash, targets_key);
+    // sotc: SOTC_PR_BCPROBE (E2). The GpuPrep thread's probe of this op (BindCacheProbeFrame), used when its inputs are
+    // this lookup's (pipeline, hash, targets key) and the table has not moved under it: the slot it found holds the same
+    // sequence number and key and the entry the same pipeline, hash and targets key (what BindCacheFindFrame compares),
+    // or, for a miss, no key was stored since (frame_commit_seq). Otherwise the lookup runs as before. Mode 2 runs the
+    // lookup in every case, uses it, and counts the accepted probes that answered differently.
+    const int bc_mode = SotcNonBlocking::PrBcProbe();
+    bool probe_used = false;
+    BindCacheEntry* probe_entry = nullptr;
+    if (bc_mode != 0 && prepared && prepared->bc_probed) {
+        PrepCounters& pc = g_prep_counters;
+        bool ok = prepared->bc_pipeline == pipeline && prepared->bc_hash == hash &&
+                  prepared->bc_targets_key == targets_key;
+        if (ok) {
+            const u32 index = prepared->bc_index;
+            if (index == ~0u) {
+                ok = frame_commit_seq.load(std::memory_order_relaxed) == prepared->bc_seq;
+            } else if (index < frame_cache.size() && frame_cache[index].probe_seq == prepared->bc_seq &&
+                       frame_keys[index] == prepared->bc_key && frame_cache[index].pipeline == pipeline &&
+                       frame_cache[index].hash == hash && frame_cache[index].targets_key == targets_key) {
+                probe_entry = &frame_cache[index];
+            } else {
+                ok = false;
+            }
+        }
+        if (ok) {
+            ++pc.bc_used;
+            probe_used = bc_mode == 1;
+        } else {
+            ++pc.bc_stale;
+        }
+        if (ok && bc_mode == 2) {
+            BindCacheEntry* found =
+                BindCacheFindFrame(BindCacheFrameKey(pipeline, hash, targets_key), pipeline, hash, targets_key);
+            if (found != probe_entry) {
+                ++pc.bc_mismatch;
+                static std::atomic<u32> shown_bc{0};
+                if (shown_bc.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    std::fprintf(stderr, "SOTC PR BCPROBE verify mismatch: probe %s, lookup %s\n",
+                                 probe_entry ? "entry" : "miss", found ? "entry" : "miss");
+                }
+            }
+        }
+    }
+    const u64 lookup_key = probe_used ? prepared->bc_key : BindCacheFrameKey(pipeline, hash, targets_key);
     if (stats) {
         // distinct keys looked up per game frame (does the table hold a frame's worth?)
         const u64 frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
@@ -7079,7 +7203,8 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
     bind_cache_kept_write = false; // sotc: SOTC_BIND_CACHE_CONTENT, per lookup
     bind_cache_hold = false;
     bind_cache_verify_pending = false;
-    BindCacheEntry* entry = BindCacheFindFrame(lookup_key, pipeline, hash, targets_key);
+    BindCacheEntry* entry =
+        probe_used ? probe_entry : BindCacheFindFrame(lookup_key, pipeline, hash, targets_key);
     const auto miss = [&](u32 reason) {
         if (stats) {
             SotcStats::bf_miss[reason].fetch_add(1, std::memory_order_relaxed);
@@ -7540,6 +7665,17 @@ bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& use
             }
         }
     }
+    if (SotcNonBlocking::BindCacheWide()) { // sotc: SOTC_BIND_CACHE_WIDE counters (WideReport)
+        if (pipeline->IsCompute()) {
+            wide_compute_hits.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            wide_graphics_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!entry->own_writes.empty()) { // the written bindings a hit replayed (ReplayOwnWrites)
+            wide_storage_hits.fetch_add(1, std::memory_order_relaxed);
+            wide_write_replays.fetch_add(entry->own_writes.size(), std::memory_order_relaxed);
+        }
+    }
     // sotc: SOTC_PACKET. The hit's addressed ranges are this op's: CommitFastBind keeps them for the fast binds.
     packet_addr_rec.assign(entry->addr.begin(), entry->addr.end());
     return true;
@@ -7679,7 +7815,9 @@ Rasterizer::BindCacheEntry* Rasterizer::CommitBindCacheFrame(const Pipeline* pip
     } else {
         ++bind_cache_live;
     }
-    frame_keys[chosen] = 0; // not findable while it is rewritten
+    __atomic_store_n(&frame_keys[chosen], u64{0}, __ATOMIC_RELAXED); // not findable while it is rewritten
+    // sotc: SOTC_PR_BCPROBE: a probe of this slot made before is stale from here on.
+    __atomic_store_n(&entry->probe_seq, entry->probe_seq + 1, __ATOMIC_RELEASE);
     entry->pipeline = pipeline;
     entry->hash = hash;
     entry->last_use = ++bind_cache_clock;
@@ -7764,7 +7902,9 @@ Rasterizer::BindCacheEntry* Rasterizer::CommitBindCacheFrame(const Pipeline* pip
     entry->checked_flag_seq = checked_flag; // sotc: SOTC_BIND_CACHE_CONTENT
     entry->made_frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
     entry->valid = true;
-    frame_keys[chosen] = key;
+    __atomic_store_n(&frame_keys[chosen], key, __ATOMIC_RELEASE);
+    // sotc: SOTC_PR_BCPROBE: a key appeared; a probe miss made before this is stale (after the key store).
+    frame_commit_seq.store(frame_commit_seq.load(std::memory_order_relaxed) + 1, std::memory_order_release);
     if (SotcStats::kFpsLog) {
         SotcStats::bf_stored.fetch_add(1, std::memory_order_relaxed);
         SotcStats::bf_live.store(bind_cache_live, std::memory_order_relaxed);
@@ -8924,12 +9064,49 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     if (shader_addr_profile && shader_addr_profile->shader_addr == 0) {
         shader_addr_profile = nullptr;
     }
+    // sotc: SOTC_PR_PRED (E1). The stage's predicate bits as the GpuPrep thread computed them (PreparePredicates, the
+    // same ShaderAddrBufferAt on the pipeline's profile). Mode 1 reads the shader-addressed bit from the slot; mode 2
+    // computes every bit here, counts the differences and uses its own.
+    const int pred_mode = SotcNonBlocking::PrPred();
+    const PreparedDraw* pred_slot = bind_pred_slot;
+    const bool pred_stage = pred_mode != 0 && pred_slot && pred_slot->pred_ready &&
+                            cur_bind_stage < Shader::MaxStageTypes &&
+                            ((pred_slot->pred_stage_ok >> cur_bind_stage) & 1) != 0;
+    const u64 pred_addr = pred_stage ? pred_slot->pred_addr[cur_bind_stage] : 0;
+    const bool use_pred = pred_stage && pred_mode == 1;
+    if (pred_stage) {
+        PrepCounters& pc = g_prep_counters;
+        ++pc.pred_used;
+        if (pred_mode == 2) {
+            u64 addr = 0, special = 0, written = 0;
+            for (u32 i = 0; i < stage.buffers.size(); ++i) {
+                const auto& desc = stage.buffers[i];
+                addr |= u64{shader_addr_profile && Shader::ShaderAddrBufferAt(*shader_addr_profile, stage, i)} << i;
+                special |= u64{desc.IsSpecial()} << i;
+                written |= u64{desc.is_written} << i;
+            }
+            const u32 diff = static_cast<u32>(std::popcount(addr ^ pred_addr) +
+                                              std::popcount(special ^ pred_slot->pred_special[cur_bind_stage]) +
+                                              std::popcount(written ^ pred_slot->pred_written[cur_bind_stage]));
+            pc.pred_diff += diff;
+            static std::atomic<u32> shown_pred{0};
+            if (diff != 0 && shown_pred.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr,
+                             "SOTC PR PRED verify mismatch: shader %#llx stage %u addr %#llx/%#llx special "
+                             "%#llx/%#llx written %#llx/%#llx (inline/prepared)\n",
+                             static_cast<unsigned long long>(stage.pgm_hash), cur_bind_stage,
+                             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(pred_addr),
+                             static_cast<unsigned long long>(special),
+                             static_cast<unsigned long long>(pred_slot->pred_special[cur_bind_stage]),
+                             static_cast<unsigned long long>(written),
+                             static_cast<unsigned long long>(pred_slot->pred_written[cur_bind_stage]));
+            }
+        }
+    }
     const auto shader_addressed = [&](const Shader::BufferResource& desc) {
         const u32 index = static_cast<u32>(&desc - stage.buffers.data());
-        // sotc: SOTC_PR_PRED=1: the bit the prep thread computed for this buffer (PrepareResources, same
-        // ShaderAddrBufferAt on the pipeline's profile). Only for a prepared stage; the rest computes it here.
-        if (pr && pr_stage && SotcPrPredOn()) {
-            return pr->buffers[pr_stage->buf_first + index].shader_addressed;
+        if (use_pred) { // sotc: SOTC_PR_PRED=1: the prepared bit (index < 64: pred_stage_ok)
+            return ((pred_addr >> index) & 1) != 0;
         }
         return shader_addr_profile &&
                Shader::ShaderAddrBufferAt(*shader_addr_profile, stage, index);
@@ -11701,6 +11878,8 @@ void Rasterizer::PrepareDraw(const AmdGpu::Regs& regs, const Pipeline* resolved,
     out.valid = false;
     out.is_dispatch = false; // sotc: SOTC_GCN_COMMIT (a dispatch's slot is made by PrepareDispatch)
     out.has_offsets = false;
+    out.pred_ready = false; // sotc: SOTC_PR_PRED / SOTC_PR_BCPROBE: nothing from an earlier op in this slot
+    out.bc_probed = false;
     // sotc: SOTC_PR_KEYS: no table key from an earlier op in this slot (BindResources checks valid).
     for (auto& table_key : out.table_keys) {
         table_key.valid = false;
@@ -11730,6 +11909,12 @@ void Rasterizer::PrepareDraw(const AmdGpu::Regs& regs, const Pipeline* resolved,
     out.fast_hash = FastBindHash(pipeline, out.push_data, regs);
     out.res_ok = SotcStats::kBindCacheFrame && out.cache_eligible &&
                  BindResourceHash(pipeline, out.res_hash);
+    if (out.res_ok && SotcNonBlocking::PrBcProbe() != 0) {
+        // sotc: SOTC_PR_BCPROBE (E2): the cache hash BindResources makes for a level-2 key (the border color base and
+        // the resource hash), then the read-only probe of the frame table.
+        const u64 bc_base = regs.ta_bc_base.Address();
+        BindCacheProbeFrame(pipeline, XXH3_64bits_withSeed(&bc_base, sizeof(bc_base), out.res_hash), out);
+    }
     if (direct) {
         const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
         const auto& fetch_shader = pipeline->GetFetchShader();
@@ -11746,6 +11931,9 @@ void Rasterizer::PrepareDraw(const AmdGpu::Regs& regs, const Pipeline* resolved,
         }
     }
     out.valid = true;
+    if (SotcNonBlocking::PrPred() != 0) {
+        PreparePredicates(pipeline, out); // sotc: SOTC_PR_PRED (E1)
+    }
     if (SotcPrKeysOn() && SotcArch::TableMemo::On() && pipeline->HasPacketRange()) {
         // sotc: SOTC_PR_KEYS: the heap stages' memo keys (TableMemo::Resolve, BindResources), from this
         // thread's flat copy (setup_stages, PrepLoop) and this op's border color base. Only the
@@ -11780,6 +11968,8 @@ void Rasterizer::PrepareDispatch(const AmdGpu::Regs& regs, const AmdGpu::Compute
     out.is_dispatch = true;
     out.valid = false;
     out.has_offsets = false; // compute: no vertex offsets
+    out.pred_ready = false;  // sotc: SOTC_PR_PRED
+    out.bc_probed = false;   // sotc: SOTC_PR_BCPROBE: graphics draws only
     for (auto& table_key : out.table_keys) {
         table_key.valid = false;
     }
@@ -11792,6 +11982,9 @@ void Rasterizer::PrepareDispatch(const AmdGpu::Regs& regs, const AmdGpu::Compute
     out.cache_eligible = BindCacheEligible(resolved, regs);
     out.fast_hash = FastBindHash(resolved, out.push_data, regs);
     out.res_ok = SotcStats::kBindCacheFrame && out.cache_eligible && BindResourceHash(resolved, out.res_hash);
+    if (SotcNonBlocking::PrPred() != 0) {
+        PreparePredicates(resolved, out); // sotc: SOTC_PR_PRED (E1)
+    }
     if (SotcPrKeysOn() && SotcArch::TableMemo::On() && resolved->HasPacketRange()) {
         // sotc: SOTC_PR_KEYS: the compute heap stage's memo key (BindResources' resolve_heap_tables, kind 0), with this
         // op's border color base.
@@ -11846,6 +12039,66 @@ void Rasterizer::PrepareResources(const Pipeline* pipeline, PreparedResources& o
             out.images[out.num_images++] = PrResolveImage(*stage, image, memory);
         }
     }
+}
+
+void Rasterizer::PreparePredicates(const Pipeline* pipeline, PreparedDraw& out) const {
+    // sotc: SOTC_PR_PRED (E1), on a GpuPrep thread. BindBuffers' predicates per buffer: ShaderAddrBufferAt on the
+    // pipeline's profile (BindBuffers uses the profile BindResources sets, the same one; null when shader_addr is 0,
+    // where ShaderAddrBufferAt is false too), IsSpecial and is_written. A stage with more than 64 buffers has none.
+    const Shader::Profile& profile = pipeline->GetProfile();
+    out.pred_stage_ok = 0;
+    u32 stage_index = 0;
+    for (const auto* stage : pipeline->GetStages()) {
+        const u32 s = stage_index++;
+        if (!stage || s >= Shader::MaxStageTypes || stage->buffers.size() > 64) {
+            continue;
+        }
+        u64 addr = 0, special = 0, written = 0;
+        for (u32 i = 0; i < stage->buffers.size(); ++i) {
+            const auto& desc = stage->buffers[i];
+            addr |= u64{profile.shader_addr != 0 && Shader::ShaderAddrBufferAt(profile, *stage, i)} << i;
+            special |= u64{desc.IsSpecial()} << i;
+            written |= u64{desc.is_written} << i;
+        }
+        out.pred_addr[s] = addr;
+        out.pred_special[s] = special;
+        out.pred_written[s] = written;
+        out.pred_stage_ok |= static_cast<u8>(1u << s);
+    }
+    out.pred_ready = true;
+}
+
+void Rasterizer::BindCacheProbeFrame(const Pipeline* pipeline, u64 hash, PreparedDraw& out) const {
+    // sotc: SOTC_PR_BCPROBE (E2), on a GpuPrep thread. Read-only: frame_keys and the slots' probe_seq with atomic loads;
+    // nothing else of the table (the draw thread checks the entry itself). The commit sequence is read before the scan,
+    // so a key stored after it makes the draw thread see another sequence. The render-target key is the last one the
+    // draw thread published; a pass change ahead makes the probe stale (the draw thread compares it).
+    out.bc_probed = false;
+    if (!frame_ready.load(std::memory_order_acquire)) {
+        return;
+    }
+    const u32 commit_seq = frame_commit_seq.load(std::memory_order_acquire);
+    const u64 targets_key = targets_pub.load(std::memory_order_relaxed);
+    const u64 key = BindCacheFrameKey(pipeline, hash, targets_key);
+    u64* const keys = const_cast<u64*>(frame_keys.data());
+    out.bc_index = ~0u;
+    out.bc_seq = commit_seq;
+    const size_t base = static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> 52); // as BindCacheFindFrame
+    for (u32 probe = 0; probe < BindCacheFrameProbe; ++probe) {
+        const size_t index = (base + probe) & (BindCacheFrameEntries - 1);
+        if (__atomic_load_n(&keys[index], __ATOMIC_ACQUIRE) != key) {
+            continue;
+        }
+        u32* const seq = const_cast<u32*>(&frame_cache[index].probe_seq);
+        out.bc_index = static_cast<u32>(index);
+        out.bc_seq = __atomic_load_n(seq, __ATOMIC_ACQUIRE);
+        break;
+    }
+    out.bc_pipeline = pipeline;
+    out.bc_hash = hash;
+    out.bc_targets_key = targets_key;
+    out.bc_key = key;
+    out.bc_probed = true;
 }
 
 void Rasterizer::PrefetchImagesShared(const Pipeline* pipeline) {

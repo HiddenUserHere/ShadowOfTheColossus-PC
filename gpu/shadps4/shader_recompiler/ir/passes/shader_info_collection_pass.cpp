@@ -187,6 +187,12 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
             Visit(info, inst);
         }
     }
+    // sotc: SOTC_COMPUTE_SPECFREE: whether a resource's fields are read at run time depends on the T# of the translation
+    // (SpecFreeImageRuntime); the flat buffer is bound either way, so a fallback permutation keeps the program's
+    // binding layout.
+    if (SpecFreeStage(info) && (!info.buffers.empty() || !info.images.empty() || !info.samplers.empty())) {
+        AddFlatbuf(info);
+    }
 
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
         info.uses_dma = false;

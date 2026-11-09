@@ -108,7 +108,10 @@ static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 44u : 141
                                        (Shader::SpvProgramIds() ? 256u : 0u) +
                                        // sotc: SOTC_VS_DRAW_KIND=1 (info.h): instanced vertex modules shared by both
                                        // draw kinds (user data + BaseInstance), apart.
-                                       (Shader::VsDrawKindOn() ? 128u : 0u);
+                                       (Shader::VsDrawKindOn() ? 128u : 0u) +
+                                       // sotc: SOTC_COMPUTE_SPECFREE=1 (info.h): compute modules read the descriptor
+                                       // fields from the sharps at run time and their keys hold markers, apart.
+                                       (Shader::ComputeSpecFree() ? 0x20000000u : 0u);
 // sotc: 22 (from 21): the record ends with the stage variant (SOTC_HEAP). Without it a cached Plain or Heap
 // program came back as Default, so its layout disagreed with its binary (slot-word assert, device lost).
 // 23: a variant's pgm_hash is the game's hash again (Info::CacheHash keys the caches), so 22's variant records differ.
@@ -133,7 +136,9 @@ static bool MetaVersionAccepted(u32 version) {
 // their layouts) of another setting are not the same.
 static const u32 PipelineKeyVersion =
     3u + (Shader::StageBindingsEnabled() ? 1000u : 0u) + (BindlessSamplersRequested() ? 2000u : 0u) +
-    (Shader::Backend::VsBindingBaseOn() ? 4000u : 0u);
+    (Shader::Backend::VsBindingBaseOn() ? 4000u : 0u) +
+    // sotc: SOTC_COMPUTE_SPECFREE=1: compute pipelines of spec-free modules, apart.
+    (Shader::ComputeSpecFree() ? 8000u : 0u);
 } // namespace Serialization
 
 namespace Vulkan {

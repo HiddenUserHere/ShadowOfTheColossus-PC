@@ -91,12 +91,18 @@ inline void FillVsAttrib(VsAttribSpecialization& spec, const Gcn::VertexAttribut
 }
 
 inline void FillBuffer(BufferSpecialization& spec, const BufferResource& desc,
-                       AmdGpu::Buffer sharp) {
+                       AmdGpu::Buffer sharp, bool specfree = false) {
     // sotc: SOTC_GENERIC_BUFFERS: unswizzled buffers read their stride at run time (resource_patching_pass.cpp).
     spec.stride = GenericBufferStride() && !sharp.swizzle_enable ? 0 : sharp.GetStride();
     spec.is_formatted = desc.is_formatted;
     spec.swizzle_enable = sharp.swizzle_enable;
-    if (spec.is_formatted && GenericFormatBuffer(desc, sharp)) {
+    // sotc: SOTC_COMPUTE_SPECFREE: stride, swizzle, index stride and element size are read from the V# at run time.
+    const bool runtime_address = specfree && SpecFreeBufferAddress(desc);
+    if (runtime_address) {
+        spec.stride = 0;
+        spec.swizzle_enable = 0;
+    }
+    if (spec.is_formatted && GenericFormatBuffer(desc, sharp, specfree)) {
         // sotc: SOTC_GENERIC_BUFFERS=2: the loads decode the V# format at run time (lower_buffer_format_to_raw.cpp).
         spec.data_format = kGenericBufferFormatKey;
         spec.num_format = 0;
@@ -140,7 +146,7 @@ inline bool KeepSrgb(const Info& info) {
 }
 
 inline void FillImage(ImageSpecialization& spec, const ImageResource& desc, AmdGpu::Image sharp,
-                      const Info& info, bool keep_srgb = true) {
+                      const Info& info, bool keep_srgb = true, bool specfree = false) {
     spec.type = sharp.GetViewType(desc.is_array);
     spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
     spec.is_storage = desc.is_written;
@@ -151,6 +157,15 @@ inline void FillImage(ImageSpecialization& spec, const ImageResource& desc, AmdG
     }
     spec.num_conversion = sharp.GetNumberConversion();
     spec.num_bindings = desc.NumBindings(info);
+    if (specfree) {
+        // sotc: SOTC_COMPUTE_SPECFREE: the sRGB flag only keys the sampler's force_degamma, which is read from the
+        // S# and the T# at run time; dst_select and the number conversion too when the run-time code covers this T#.
+        spec.is_srgb = false;
+        if (SpecFreeImageRuntime(desc, sharp)) {
+            spec.dst_select = AmdGpu::IdentityMapping;
+            spec.num_conversion = static_cast<AmdGpu::NumberConversion>(kSpecFreeConversionKey);
+        }
+    }
 }
 
 inline void FillFMask(FMaskSpecialization& spec, AmdGpu::Image sharp) {
@@ -158,9 +173,13 @@ inline void FillFMask(FMaskSpecialization& spec, AmdGpu::Image sharp) {
     spec.height = sharp.height;
 }
 
-inline void FillSampler(SamplerSpecialization& spec, AmdGpu::Sampler sharp) {
+inline void FillSampler(SamplerSpecialization& spec, AmdGpu::Sampler sharp, bool specfree = false) {
     spec.force_unnormalized = sharp.force_unnormalized;
     spec.force_degamma = sharp.force_degamma;
+    if (specfree) { // sotc: SOTC_COMPUTE_SPECFREE: both bits are read from the S# at run time
+        spec.force_unnormalized = 0;
+        spec.force_degamma = 0;
+    }
 }
 
 // sotc: SOTC_SPEC_MEMO. Key words: every field of an element, in a fixed order and width. The
@@ -243,22 +262,23 @@ struct StageSpecialization {
                          });
         }
         u32 binding{};
+        const bool specfree = SpecFreeStage(*info); // sotc: SOTC_COMPUTE_SPECFREE
         ForEachSharp(binding, buffers, info->buffers,
-                     [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
-                         FillBuffer(spec, desc, sharp);
+                     [specfree](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+                         FillBuffer(spec, desc, sharp, specfree);
                      });
         const bool keep_srgb = info->images.empty() || KeepSrgb(*info); // sotc: SOTC_IMAGE_SRGB_NORMALIZE
         ForEachSharp(binding, images, info->images,
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                         FillImage(spec, desc, sharp, *info, keep_srgb);
+                         FillImage(spec, desc, sharp, *info, keep_srgb, specfree);
                      });
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          FillFMask(spec, sharp);
                      });
         ForEachSharp(samplers, info->samplers,
-                     [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {
-                         FillSampler(spec, sharp);
+                     [specfree](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {
+                         FillSampler(spec, sharp, specfree);
                      });
 
         // Initialize runtime_info fields that rely on analysis in tessellation passes
@@ -419,13 +439,14 @@ inline void BuildSpecKey(std::vector<u32>& out, const Info& info,
         out.push_back(0);
     }
 
+    const bool specfree = SpecFreeStage(info); // sotc: SOTC_COMPUTE_SPECFREE
     out.push_back(static_cast<u32>(info.buffers.size()));
     for (const auto& desc : info.buffers) {
         BufferSpecialization spec{};
         const auto sharp = desc.GetSharp(info);
         out.push_back(sharp ? 1u : 0u);
         if (sharp) {
-            FillBuffer(spec, desc, sharp);
+            FillBuffer(spec, desc, sharp, specfree);
         }
         PackBuffer(out, spec);
     }
@@ -437,7 +458,7 @@ inline void BuildSpecKey(std::vector<u32>& out, const Info& info,
         const auto sharp = desc.GetSharp(info);
         out.push_back(sharp ? 1u : 0u);
         if (sharp) {
-            FillImage(spec, desc, sharp, info, keep_srgb);
+            FillImage(spec, desc, sharp, info, keep_srgb, specfree);
         }
         PackImage(out, spec);
     }
@@ -458,7 +479,7 @@ inline void BuildSpecKey(std::vector<u32>& out, const Info& info,
         SamplerSpecialization spec{};
         const auto sharp = desc.GetSharp(info);
         if (sharp) {
-            FillSampler(spec, sharp);
+            FillSampler(spec, sharp, specfree);
         }
         PackSampler(out, spec);
     }

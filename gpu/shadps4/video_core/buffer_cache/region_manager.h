@@ -25,6 +25,7 @@
 #include "../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK=1 owns the untrack list (plan step 6)
 #include "../../../sotc/pc_ring.h"     // sotc: SotcPcRing::FullRingMode (stall guard in LockTimed)
 #include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
+#include "../../../sotc/nonblocking.h" // sotc: SOTC_WATCH_SKIP (cpu_chunks summary, walk counters)
 #include "../sotc_generation.h"      // sotc: SOTC_GEN_BIND / SOTC_GEN_DMA granule generations
 #include "sync_events.h" // sotc: SOTC_SYNC_EVENTS (dirty journal hint on CPU rises)
 #include "video_core/sotc_arch/addr_table_hooks.h" // sotc: SOTC_ADDR_TABLE clean state (Dirty hooks)
@@ -796,15 +797,22 @@ public:
         if constexpr (type == Type::CPU &&
                       (cpu_op == StateOp::Clear || cpu_op == StateOp::None) &&
                       (gpu_op == StateOp::None || gpu_op == StateOp::Set)) {
+            // sotc: SOTC_WATCH_SKIP. A clean chunk summary answers any_cpu without the word loop.
+            const bool summary_clean = SotcNonBlocking::WatchSkip() && CpuChunksClean(offset, size);
             bool any_cpu = false;
             bool all_gpu = true;
             IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
-                any_cpu |= (__atomic_load_n(&cpu[index], __ATOMIC_ACQUIRE) & mask) != 0;
+                if (!summary_clean) {
+                    any_cpu |= (__atomic_load_n(&cpu[index], __ATOMIC_ACQUIRE) & mask) != 0;
+                }
                 if constexpr (gpu_op == StateOp::Set) {
                     all_gpu &= (__atomic_load_n(&gpu[index], __ATOMIC_ACQUIRE) & mask) == mask;
                 }
             });
             if (!any_cpu && (gpu_op == StateOp::None || all_gpu)) {
+                if (summary_clean) {
+                    SotcNonBlocking::WatchSkipStats::clean_skips.fetch_add(1, std::memory_order_relaxed);
+                }
                 return true;
             }
         }
@@ -816,6 +824,14 @@ public:
         Bounds watcher_bounds;
         if constexpr (locked) {
             mutex.lock();
+        }
+        // sotc: SOTC_WATCH_SKIP counters: a locked CPU walk and the pages it covers.
+        if constexpr (type == Type::CPU) {
+            if (SotcNonBlocking::WatchSkip()) {
+                SotcNonBlocking::WatchSkipStats::walks.fetch_add(1, std::memory_order_relaxed);
+                SotcNonBlocking::WatchSkipStats::pages_walked.fetch_add(
+                    static_cast<uint64_t>(size) / BYTES_PER_PAGE, std::memory_order_relaxed);
+            }
         }
         // sotc: uploads (<CPU, Clear, None>) keep the CPU bit of hot pages (FaultGrace). Never for
         // written bindings (<CPU, Clear, Set>): keeping the bit there would upload CPU data over
@@ -882,6 +898,12 @@ public:
         if (end_page) {
             func(cpu_addr + start_page * BYTES_PER_PAGE, (end_page - start_page) * BYTES_PER_PAGE);
         }
+        // sotc: SOTC_WATCH_SKIP. A chunk this walk left without CPU bits drops its summary bit (region mutex held).
+        if constexpr (type == Type::CPU && cpu_op == StateOp::Clear) {
+            if (SotcNonBlocking::WatchSkip()) {
+                ClearEmptyChunksLocked(offset, static_cast<u64>(size));
+            }
+        }
         if constexpr (grace_op) {
             // Hot pages keep their CPU bit without a new fault: the next sweep uploads them again.
             if (kept_words) {
@@ -918,8 +940,54 @@ public:
         return false;
     }
 
+    /// sotc: SOTC_WATCH_SKIP. Chunks (2 MiB) and their words: 8 words of 256 KiB, 8 chunks per region.
+    static constexpr u64 kChunkBytes = u64{2} << 20;
+    static constexpr u64 kWordsPerChunk = kChunkBytes / BYTES_PER_WORD;
+    static constexpr u64 kChunksPerRegion = HIGHER_PAGE_SIZE / kChunkBytes;
+    static_assert(kWordsPerChunk * kChunksPerRegion == NUM_REGION_WORDS);
+
+    /// sotc: SOTC_WATCH_SKIP. The cpu_chunks bits of the chunks [offset, offset + size) cover. Pure.
+    static constexpr u8 ChunkMask(u64 offset, u64 size) noexcept {
+        if (size == 0) {
+            return 0;
+        }
+        const u64 first = offset / kChunkBytes;
+        const u64 last = (offset + size - 1) / kChunkBytes;
+        const u64 bits = ((u64{1} << (last + 1)) - 1) & ~((u64{1} << first) - 1);
+        return static_cast<u8>(bits);
+    }
+
+    /// sotc: SOTC_WATCH_SKIP. True when no CPU bit can be set in [offset, offset + size) (lock-free, one load).
+    bool CpuChunksClean(u64 offset, u64 size) const noexcept {
+        return (cpu_chunks.load(std::memory_order_acquire) & ChunkMask(offset, size)) == 0;
+    }
+
+    /// sotc: SOTC_WATCH_SKIP. Region mutex held. Drops the summary bit of each chunk of [offset, offset + size)
+    /// that holds no CPU bit any more (a bit cleared by a walk; the other chunks keep theirs).
+    void ClearEmptyChunksLocked(u64 offset, u64 size) noexcept {
+        const u8 chunks = ChunkMask(offset, size);
+        for (u64 chunk = 0; chunk < kChunksPerRegion; ++chunk) {
+            if (!(chunks & (1u << chunk))) {
+                continue;
+            }
+            u64 any = 0;
+            for (u64 w = chunk * kWordsPerChunk; w < (chunk + 1) * kWordsPerChunk; ++w) {
+                any |= cpu[w];
+            }
+            if (!any) {
+                cpu_chunks.fetch_and(static_cast<u8>(~(1u << chunk)), std::memory_order_release);
+            }
+        }
+    }
+
     template <Type type>
     bool IsRegionModified(u64 offset, u64 size) noexcept {
+        if constexpr (type == Type::CPU) {
+            if (SotcNonBlocking::WatchSkip() && CpuChunksClean(offset, size)) {
+                SotcNonBlocking::WatchSkipStats::clean_skips.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
         auto& state = GetRegionBits<type>();
         const auto [start_word, start_page, end_word, end_page] = GetBounds(offset, size);
         const auto [start_mask, end_mask] = GetMasks(start_page, end_page);
@@ -1339,6 +1407,13 @@ private:
             gpu[index] |= mask;
         }
         const u64 cpu_changed = (cpu[index] ^ prev_cpu) & mask;
+        // sotc: SOTC_WATCH_SKIP summary (see cpu_chunks). Set after the bit store, under the region mutex.
+        if constexpr (cpu_op == StateOp::Set) {
+            if (cpu_changed && SotcNonBlocking::WatchSkip()) {
+                cpu_chunks.fetch_or(static_cast<u8>(1u << (index / kWordsPerChunk)),
+                                    std::memory_order_release);
+            }
+        }
         // sotc: SOTC_SYNC_EVENTS. The CPU bits that rose in this word: the journal's hint for the
         // draw-side drain (sync_events.h). Recorded after the bit store, under the region mutex.
         if constexpr (cpu_op == StateOp::Set) {
@@ -1503,6 +1578,13 @@ private:
     bool sticky_any{false};
     RegionBits untracked{}; // sotc: SOTC_UNTRACK_RANGES (ComputeUntracked), zero when unset
     RegionBits ring{};      // sotc: SOTC_PC_RING mask (SetRingMask), zero while the ring is off
+    // sotc: SOTC_WATCH_SKIP summary. Bit c is set when a CPU bit may be set in chunk c (2 MiB, 8 words). Invariant:
+    // a CPU bit set => its chunk bit set. The only CPU-bit rise is UpdateStateAndProtection<Set> (under the region
+    // mutex, after the bit store); every caller reaches it: MarkRegionAsCpuModified and the InvalidateRegion guest
+    // fault, MarkAhead*, MarkCpuModifiedUnlessGpu, RetrackDownloadedLocked, SetUntrackedMask, the ring paths. The
+    // constructor sets every CPU bit (cpu.Fill(~0)), so the summary starts all set. Only the locked CPU walk of
+    // ForEachModifiedRange<CPU, Clear> clears a bit, and only when its chunk holds no CPU bit any more.
+    std::atomic<u8> cpu_chunks{0xFF};
     LockType mutex;
 };
 

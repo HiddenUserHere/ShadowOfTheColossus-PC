@@ -32,8 +32,8 @@ inline std::optional<IR::U32> SotcSharpDword(IR::IREmitter& ir, const BufferReso
 
 /// True when the buffer's formatted loads decode the V# format at run time (SOTC_GENERIC_BUFFERS=2). The fetch must
 /// be a load, so the shader can read dword 3.
-inline bool SotcGenericFormatLoads(const BufferResource& desc, const AmdGpu::Buffer& sharp) {
-    return GenericFormatBuffer(desc, sharp) &&
+inline bool SotcGenericFormatLoads(const BufferResource& desc, const AmdGpu::Buffer& sharp, bool specfree = false) {
+    return GenericFormatBuffer(desc, sharp, specfree) &&
            (desc.sharp_fetch.summary == SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad ||
             desc.sharp_fetch.summary == SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad);
 }

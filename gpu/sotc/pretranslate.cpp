@@ -87,7 +87,8 @@ bool ComputeOn() noexcept {
             return v[0] == '1';
         }
         // sotc: SOTC_COMPUTE_PACK (default on) prebuilds the compute programs through this path when the switch is unset.
-        return SotcNonBlocking::ComputePackRequested();
+        // sotc: SOTC_COMPUTE_SPECFREE=1 too: its compute programs are made to be compiled at shader file load.
+        return SotcNonBlocking::ComputePackRequested() || Shader::ComputeSpecFree();
     }();
     return on;
 }

@@ -643,8 +643,9 @@ def main():
     # own files and sessions, never shipped).
     def on(name):
         return env.get(name, '0') not in ('', '0')
+    # SOTC_COMPUTE_SPECFREE: compute programs prebuilt at shader file load (spec-free compute, info.h).
     if any(on(n) for n in ('SOTC_CSDR_PROBE', 'SOTC_PREDICT_PROBE', 'SOTC_PRETRANSLATE', 'SOTC_PRETRANSLATE_COMPUTE', 'SOTC_RES_DUMP',
-                           'SOTC_PRECOMPILE')):
+                           'SOTC_PRECOMPILE', 'SOTC_COMPUTE_SPECFREE')):
         env.setdefault('SOTC_RES_LOADED', '1')
     # The pipeline manifest (default on): the loader hook hands the game's own shader code to it; the shipped manifest
     # is found next to this script (data/pipeline_manifest, copied there by the package too).

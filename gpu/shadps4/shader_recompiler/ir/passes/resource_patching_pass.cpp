@@ -860,6 +860,46 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
     return buffer_offset;
 }
 
+// sotc: SOTC_COMPUTE_SPECFREE. The address of a buffer access with every address field of the V# read at run time
+// (SpecFreeBufferAddress): stride (dword 1 bits 16..29), swizzle_enable (dword 1 bit 31), element_size (dword 3 bits
+// 19..20, 2 << n bytes), index_stride (dword 3 bits 21..22, 8 << n) and add_tid_enable (dword 3 bit 23). Both the
+// linear and the swizzled address are computed and selected; the sizes are powers of two, so the divisions of
+// CalculateBufferAddress are shifts and masks here.
+IR::U32 SpecFreeBufferAddressOf(IR::IREmitter& ir, const IR::Inst& inst, const BufferResource& desc,
+                                AmdGpu::DataFormat data_format, bool byte_address) {
+    const auto inst_info = inst.Flags<IR::BufferInstInfo>();
+    const IR::U32 dword1 = *Optimization::SotcSharpDword(ir, desc, 1);
+    const IR::U32 dword3 = *Optimization::SotcSharpDword(ir, desc, 3);
+    const IR::U32 stride = ir.BitFieldExtract(dword1, ir.Imm32(16), ir.Imm32(14));
+    const IR::U1 swizzle = ir.INotEqual(ir.BitFieldExtract(dword1, ir.Imm32(31), ir.Imm32(1)), ir.Imm32(0));
+    const IR::U32 element_log2 = ir.IAdd(ir.BitFieldExtract(dword3, ir.Imm32(19), ir.Imm32(2)), ir.Imm32(1));
+    const IR::U32 index_stride_log2 = ir.IAdd(ir.BitFieldExtract(dword3, ir.Imm32(21), ir.Imm32(2)), ir.Imm32(3));
+    const IR::U1 add_tid = ir.INotEqual(ir.BitFieldExtract(dword3, ir.Imm32(23), ir.Imm32(1)), ir.Imm32(0));
+
+    IR::U32 index = inst_info.index_enable ? IR::GetBufferIndexArg(&inst) : ir.Imm32(0U);
+    index = ir.IAdd(index, IR::U32{ir.Select(add_tid, ir.LaneId(), ir.Imm32(0U))});
+    IR::U32 offset = ir.IAdd(ir.Imm32(static_cast<u32>(inst_info.inst_offset.Value())), IR::GetBufferSOffsetArg(&inst));
+    if (inst_info.voffset_enable) {
+        offset = ir.IAdd(offset, IR::GetBufferVOffsetArg(&inst));
+    }
+    const IR::U32 linear = ir.IAdd(ir.IMul(index, stride), offset);
+    const IR::U32 one = ir.Imm32(1U);
+    const IR::U32 index_msb = ir.ShiftRightLogical(index, index_stride_log2);
+    const IR::U32 index_lsb =
+        ir.BitwiseAnd(index, ir.ISub(ir.ShiftLeftLogical(one, index_stride_log2), one));
+    const IR::U32 offset_msb = ir.ShiftRightLogical(offset, element_log2);
+    const IR::U32 offset_lsb = ir.BitwiseAnd(offset, ir.ISub(ir.ShiftLeftLogical(one, element_log2), one));
+    const IR::U32 swizzled_msb = ir.ShiftLeftLogical(
+        ir.IAdd(ir.IMul(index_msb, stride), ir.ShiftLeftLogical(offset_msb, element_log2)), index_stride_log2);
+    const IR::U32 swizzled = ir.IAdd(swizzled_msb, ir.IAdd(ir.ShiftLeftLogical(index_lsb, element_log2), offset_lsb));
+    IR::U32 address{ir.Select(swizzle, swizzled, linear)};
+    const u32 shift = byte_address ? 0u : BufferAddressShift(inst, data_format);
+    if (shift != 0) {
+        address = ir.ShiftRightLogical(address, ir.Imm32(shift));
+    }
+    return address;
+}
+
 void PatchBufferArgs(IR::Inst& inst, Info& info) {
     const auto handle = inst.Arg(0);
     const auto buffer_res = info.buffers[handle.U32()];
@@ -871,6 +911,17 @@ void PatchBufferArgs(IR::Inst& inst, Info& info) {
     }
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
+    // sotc: SOTC_COMPUTE_SPECFREE: no V# address field is taken from the translation's V# (FillBuffer keys none).
+    if (SpecFreeStage(info) && SpecFreeBufferAddress(buffer_res)) {
+        const auto flags = inst.Flags<IR::BufferInstInfo>();
+        const bool typed = flags.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid;
+        const bool generic = inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32 && !typed &&
+                             Optimization::SotcGenericFormatLoads(buffer_res, buffer, true);
+        const auto data_format =
+            typed ? AmdGpu::RemapDataFormat(flags.inst_data_fmt.Value()) : buffer.GetDataFmt();
+        inst.SetArg(IR::LoadBufferArgs::Address, SpecFreeBufferAddressOf(ir, inst, buffer_res, data_format, generic));
+        return;
+    }
     // sotc: SOTC_GENERIC_BUFFERS. An indexed access to an unswizzled guest buffer takes its stride from the V#
     // at run time: dword 1 bits 16..29 (AmdGpu::Buffer::stride), where SharpFetch reads it (a flattened user data
     // dword, or the immediate the code built the V# with).
@@ -884,10 +935,84 @@ void PatchBufferArgs(IR::Inst& inst, Info& info) {
     }
     const bool generic_format = inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32 &&
                                 inst_info.inst_data_fmt == AmdGpu::DataFormat::FormatInvalid &&
-                                Optimization::SotcGenericFormatLoads(buffer_res, buffer);
+                                Optimization::SotcGenericFormatLoads(buffer_res, buffer, SpecFreeStage(info));
     inst.SetArg(IR::LoadBufferArgs::Address,
                 CalculateBufferAddress(ir, inst, info, buffer, buffer.stride, dynamic_stride,
                                        generic_format));
+}
+
+// sotc: SOTC_COMPUTE_SPECFREE. Dword `index` of a sharp as the shader sees it at run time: a flattened user data dword
+// where the fetch loads it, the immediate the code built it with otherwise. The caller checked the fetch is readable.
+template <typename T>
+IR::U32 SpecFreeSharpDword(IR::IREmitter& ir, const SharpFetch<T>& fetch, u32 index) {
+    if (fetch.summary == SharpFetch<T>::Summary::SingleLoad) {
+        return ir.LoadFlatbufDword(u32{fetch.offsets[0]} + index);
+    }
+    return (fetch.load_mask >> index) & 1 ? ir.LoadFlatbufDword(u32{fetch.offsets[index]})
+                                          : ir.Imm32(fetch.immediates[index]);
+}
+
+// sotc: SOTC_COMPUTE_SPECFREE. The T# dst_select applied at run time (dword 3 bits 0..11), with the single-channel
+// alpha-to-red remap of RemapSwizzle (data formats 8, 16 and 32, dword 1 bits 20..25); the formats with another remap
+// never take this path (SpecFreeSwizzleFormat). Forward: each output takes 0, 1 or a component, as ApplySwizzle.
+// Inverse (writes): memory channel i takes the first component whose selector names it, as CompMapping::Inverse.
+IR::Value SpecFreeSwizzle(IR::IREmitter& ir, const IR::Value& value, const IR::U32& dword1, const IR::U32& dword3,
+                          bool inverse) {
+    const IR::U32 data_format = ir.BitFieldExtract(dword1, ir.Imm32(20), ir.Imm32(6));
+    const IR::U1 single = ir.LogicalOr(ir.LogicalOr(ir.IEqual(data_format, ir.Imm32(1U)),
+                                                    ir.IEqual(data_format, ir.Imm32(2U))),
+                                       ir.IEqual(data_format, ir.Imm32(4U)));
+    std::array<IR::U32, 4> sel;
+    std::array<IR::F32, 4> comp;
+    for (u32 i = 0; i < 4; ++i) {
+        const IR::U32 raw = ir.BitFieldExtract(dword3, ir.Imm32(3 * i), ir.Imm32(3));
+        sel[i] = IR::U32{ir.Select(ir.LogicalAnd(single, ir.IEqual(raw, ir.Imm32(7U))), ir.Imm32(4U), raw)};
+        comp[i] = IR::F32{ir.CompositeExtract(value, i)};
+    }
+    std::array<IR::F32, 4> out;
+    for (u32 i = 0; i < 4; ++i) {
+        IR::F32 v = ir.Imm32(0.f);
+        if (inverse) {
+            for (int j = 3; j >= 0; --j) {
+                v = IR::F32{ir.Select(ir.IEqual(sel[j], ir.Imm32(4U + i)), comp[j], v)};
+            }
+        } else {
+            for (u32 c = 4; c-- > 0;) {
+                v = IR::F32{ir.Select(ir.IEqual(sel[i], ir.Imm32(4U + c)), comp[c], v)};
+            }
+            v = IR::F32{ir.Select(ir.IEqual(sel[i], ir.Imm32(1U)), ir.Imm32(1.f), v)};
+        }
+        out[i] = v;
+    }
+    return ir.CompositeConstruct(out[0], out[1], out[2], out[3]);
+}
+
+// sotc: SOTC_COMPUTE_SPECFREE. The number conversion of an integer-typed T# at run time (SpecFreeConversion: None,
+// Uint32ToUnorm, UintToUscaled, SintToSscaled, decided from dword 1's number and data formats as MapNumberConversion).
+// A float-typed T# (the key's is_integer false) can only have None among those, so it needs no code.
+IR::Value SpecFreeConvert(IR::IREmitter& ir, const IR::Value& value, const IR::U32& dword1, bool write) {
+    const IR::U32 data_format = ir.BitFieldExtract(dword1, ir.Imm32(20), ir.Imm32(6));
+    const IR::U32 num_format = ir.BitFieldExtract(dword1, ir.Imm32(26), ir.Imm32(4));
+    const IR::U1 is32 = ir.LogicalOr(ir.LogicalOr(ir.IEqual(data_format, ir.Imm32(4U)),
+                                                  ir.IEqual(data_format, ir.Imm32(11U))),
+                                     ir.LogicalOr(ir.IEqual(data_format, ir.Imm32(13U)),
+                                                  ir.IEqual(data_format, ir.Imm32(14U))));
+    const IR::U1 u32_unorm = ir.LogicalAnd(ir.IEqual(num_format, ir.Imm32(0U)), is32);
+    const IR::U1 uscaled = ir.IEqual(num_format, ir.Imm32(2U));
+    const IR::U1 sscaled = ir.IEqual(num_format, ir.Imm32(3U));
+    std::array<IR::F32, 4> out;
+    for (u32 i = 0; i < 4; ++i) {
+        const IR::F32 c{ir.CompositeExtract(value, i)};
+        const auto conv = [&](AmdGpu::NumberConversion k) {
+            return write ? ApplyWriteNumberConversion(ir, c, k) : ApplyReadNumberConversion(ir, c, k);
+        };
+        IR::F32 v = c;
+        v = IR::F32{ir.Select(u32_unorm, conv(AmdGpu::NumberConversion::Uint32ToUnorm), v)};
+        v = IR::F32{ir.Select(uscaled, conv(AmdGpu::NumberConversion::UintToUscaled), v)};
+        v = IR::F32{ir.Select(sscaled, conv(AmdGpu::NumberConversion::SintToSscaled), v)};
+        out[i] = v;
+    }
+    return ir.CompositeConstruct(out[0], out[1], out[2], out[3]);
 }
 
 void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image_res,
@@ -996,13 +1121,32 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
 
     const bool is_msaa = view_type == AmdGpu::ImageType::Color2DMsaa ||
                          view_type == AmdGpu::ImageType::Color2DMsaaArray;
-    const bool unnormalized = sampler.force_unnormalized || inst_info.is_unnormalized;
-    const bool needs_dimentions = (!is_msaa && unnormalized) || (is_msaa && !unnormalized);
+    // sotc: SOTC_COMPUTE_SPECFREE: the sampler's force_unnormalized (dword 0 bit 15) and force_degamma (bit 20) are
+    // read from the S# at run time (FillSampler keys neither); an unreadable S# is the zero sampler.
+    const bool specfree = SpecFreeStage(info);
+    const bool sampler_runtime = specfree && SpecFreeFetchReadable(sampler_res.sharp_fetch);
+    const std::optional<IR::U32> sampler_dword0 =
+        sampler_runtime ? std::optional<IR::U32>{SpecFreeSharpDword(ir, sampler_res.sharp_fetch, 0)} : std::nullopt;
+    const bool runtime_unnormalized = sampler_dword0 && !inst_info.is_unnormalized;
+    const bool unnormalized = (!specfree && sampler.force_unnormalized) || inst_info.is_unnormalized;
+    const bool needs_dimentions =
+        runtime_unnormalized || (!is_msaa && unnormalized) || (is_msaa && !unnormalized);
     const auto dimensions =
         needs_dimentions ? ir.ImageQueryDimension(handle, ir.Imm32(0u), ir.Imm1(false), inst_info)
                          : IR::Value{};
+    const IR::U1 unnorm_bit =
+        runtime_unnormalized
+            ? ir.INotEqual(ir.BitFieldExtract(*sampler_dword0, ir.Imm32(15), ir.Imm32(1)), ir.Imm32(0U))
+            : ir.Imm1(false);
     const auto get_coord = [&](u32 coord_idx, u32 dim_idx) -> IR::Value {
         const auto coord = get_addr_reg(coord_idx);
+        if (runtime_unnormalized) {
+            const auto dim = ir.ConvertUToF(32, 32, IR::U32{ir.CompositeExtract(dimensions, dim_idx)});
+            if (is_msaa) {
+                return ir.Select(unnorm_bit, ir.ConvertFToU(32, coord), ir.ConvertFToU(32, ir.FPMul(coord, dim)));
+            }
+            return ir.Select(unnorm_bit, ir.FPDiv(coord, dim), coord);
+        }
         if (is_msaa) {
             // For MSAA images preserve the unnormalized coord or manually unnormalize it
             if (unnormalized) {
@@ -1087,8 +1231,40 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         return ir.ImageSampleImplicitLod(handle, coords, bias, offset, inst_info);
     }();
 
-    auto converted = ApplyReadNumberConversionVec4(ir, texel, image.GetNumberConversion());
-    if (sampler.force_degamma && image.GetNumberFmt() != AmdGpu::NumberFormat::Srgb) {
+    // sotc: SOTC_COMPUTE_SPECFREE: the conversion of an integer T# at run time (SpecFreeConvert), and the degamma when
+    // the S# asks for it and the T# number format is not sRGB (dword 1: 9, other than BC4/5/6, as RemapNumberFormat).
+    const bool image_runtime = specfree && SpecFreeImageRuntime(image_res, image);
+    std::optional<IR::U32> image_dword1;
+    if ((image_runtime || sampler_dword0) && SpecFreeFetchReadable(image_res.sharp_fetch)) {
+        image_dword1 = SpecFreeSharpDword(ir, image_res.sharp_fetch, 1);
+    }
+    IR::Value converted;
+    if (image_runtime) {
+        converted = AmdGpu::IsInteger(image.GetNumberFmt()) ? SpecFreeConvert(ir, texel, *image_dword1, false)
+                                                            : texel;
+    } else {
+        converted = ApplyReadNumberConversionVec4(ir, texel, image.GetNumberConversion());
+    }
+    if (sampler_dword0) {
+        // An unreadable T# is the null image (unorm or float), never sRGB.
+        IR::U1 srgb = ir.Imm1(false);
+        if (image_dword1) {
+            const IR::U32 data_format = ir.BitFieldExtract(*image_dword1, ir.Imm32(20), ir.Imm32(6));
+            const IR::U32 num_format = ir.BitFieldExtract(*image_dword1, ir.Imm32(26), ir.Imm32(4));
+            const IR::U1 bc456 = ir.LogicalAnd(ir.IGreaterThanEqual(data_format, ir.Imm32(38U), false),
+                                               ir.ILessThanEqual(data_format, ir.Imm32(40U), false));
+            srgb = ir.LogicalAnd(ir.IEqual(num_format, ir.Imm32(9U)), ir.LogicalNot(bc456));
+        }
+        const IR::U1 degamma = ir.LogicalAnd(
+            ir.INotEqual(ir.BitFieldExtract(*sampler_dword0, ir.Imm32(20), ir.Imm32(1)), ir.Imm32(0U)),
+            ir.LogicalNot(srgb));
+        const IR::Value linear = ApplyForceDegamma(ir, texel);
+        std::array<IR::F32, 4> out;
+        for (u32 i = 0; i < 4; ++i) {
+            out[i] = IR::F32{ir.Select(degamma, ir.CompositeExtract(linear, i), ir.CompositeExtract(converted, i))};
+        }
+        converted = ir.CompositeConstruct(out[0], out[1], out[2], out[3]);
+    } else if (!specfree && sampler.force_degamma && image.GetNumberFmt() != AmdGpu::NumberFormat::Srgb) {
         converted = ApplyForceDegamma(ir, texel);
     }
     inst.ReplaceUsesWith(converted);
@@ -1164,14 +1340,28 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
     const auto ms = has_ms ? IR::U32{arg} : IR::U32{};
 
     const auto is_storage = image_res.is_written;
+    // sotc: SOTC_COMPUTE_SPECFREE: dst_select and the number conversion from the T# at run time (FillImage keys
+    // neither when SpecFreeImageRuntime holds).
+    const bool image_runtime = SpecFreeStage(info) && SpecFreeImageRuntime(image_res, image);
+    const bool runtime_convert = image_runtime && AmdGpu::IsInteger(image.GetNumberFmt());
+    std::optional<IR::U32> dword1, dword3;
+    if (image_runtime &&
+        (inst.GetOpcode() == IR::Opcode::ImageRead || inst.GetOpcode() == IR::Opcode::ImageWrite)) {
+        dword1 = SpecFreeSharpDword(ir, image_res.sharp_fetch, 1);
+        if (is_storage) {
+            dword3 = SpecFreeSharpDword(ir, image_res.sharp_fetch, 3);
+        }
+    }
     if (inst.GetOpcode() == IR::Opcode::ImageRead) {
         auto texel = ir.ImageRead(image_handle, coords, lod, ms, inst_info);
         if (is_storage) {
             // Storage image requires shader swizzle.
-            texel = ApplySwizzle(ir, texel, image.DstSelect());
+            texel = image_runtime ? SpecFreeSwizzle(ir, texel, *dword1, *dword3, false)
+                                  : ApplySwizzle(ir, texel, image.DstSelect());
         }
         const auto converted =
-            ApplyReadNumberConversionVec4(ir, texel, image.GetNumberConversion());
+            image_runtime ? (runtime_convert ? SpecFreeConvert(ir, texel, *dword1, false) : texel)
+                          : ApplyReadNumberConversionVec4(ir, texel, image.GetNumberConversion());
         inst.ReplaceUsesWith(converted);
     } else {
         inst.SetArg(1, coords);
@@ -1182,10 +1372,12 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
             auto texel = inst.Arg(4);
             if (is_storage) {
                 // Storage image requires shader swizzle.
-                texel = ApplySwizzle(ir, texel, image.DstSelect().Inverse());
+                texel = image_runtime ? SpecFreeSwizzle(ir, texel, *dword1, *dword3, true)
+                                      : ApplySwizzle(ir, texel, image.DstSelect().Inverse());
             }
             const auto converted =
-                ApplyWriteNumberConversionVec4(ir, texel, image.GetNumberConversion());
+                image_runtime ? (runtime_convert ? SpecFreeConvert(ir, texel, *dword1, true) : texel)
+                              : ApplyWriteNumberConversionVec4(ir, texel, image.GetNumberConversion());
             inst.SetArg(4, converted);
         }
     }
@@ -1396,6 +1588,9 @@ static void SotcFillSyntheticSharps(Shader::Info& info, const ResourceDiscoveryL
     }
     // An image only read or written (never sampled), whose texel type the code may not show: variant 1 takes the
     // other verdict.
+    // sotc: SOTC_COMPUTE_SPECFREE: a nonzero sotc_synthetic_mask flips only the ambiguous images whose bit is set, so
+    // the variants of a compute program cover every int/float combination of its ambiguous images.
+    u32 ambiguous = 0;
     for (auto& use : images) {
         bool read_only_unsampled = true;
         for (const auto& usage : resources) {
@@ -1406,11 +1601,15 @@ static void SotcFillSyntheticSharps(Shader::Info& info, const ResourceDiscoveryL
         }
         if (read_only_unsampled) {
             info.sotc_synthetic_reads = true;
-            if (info.sotc_synthetic_variant == 1) {
+            const bool flip = info.sotc_synthetic_mask == 0 ||
+                              (ambiguous < 8 && ((info.sotc_synthetic_mask >> ambiguous) & 1) != 0);
+            if (info.sotc_synthetic_variant == 1 && flip) {
                 use.integer = !use.integer;
             }
+            ++ambiguous;
         }
     }
+    info.sotc_synthetic_ambiguous = static_cast<u8>(std::min<u32>(ambiguous, 255u));
     for (const auto& usage : resources) {
         const IR::Inst& inst = *usage.user;
         if (IsBufferInstruction(inst)) {

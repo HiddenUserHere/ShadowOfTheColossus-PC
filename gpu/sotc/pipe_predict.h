@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_set>
 #include <vector>
 
 namespace SotcPipePredict {
@@ -19,8 +20,8 @@ namespace SotcPipePredict {
 bool On() noexcept;
 
 /// The material factory hook is wanted: SOTC_PIPE_PREDICT=1, or the library prediction of SOTC_GPL_NODROP
-/// (SotcNonBlocking::GplPredictRequested, on by default). hooks.cpp turns PIPE_PREDICT_MATERIAL on for the latter,
-/// whose own switch (SOTC_PIPE_PREDICT) stays 0. Read once.
+/// (SotcNonBlocking::GplPredictRequested, on by default), or SOTC_PACK_REFERENCED (the pack's program list).
+/// hooks.cpp turns PIPE_PREDICT_MATERIAL on for these, whose own switch (SOTC_PIPE_PREDICT) stays 0. Read once.
 bool MaterialsWanted() noexcept;
 
 /// One VS+PS pass slot of a material.
@@ -36,6 +37,10 @@ struct Slot {
 size_t TakeSlots(std::vector<Slot>& out, size_t max_materials);
 /// Any thread: materials are queued (no lock; TakeSlots may still find none).
 bool HasQueued() noexcept;
+
+/// Command processor or the pack hold (not a worker): adds the VS and PS program hashes that the materials taken so far
+/// name, and those of the materials still queued (read, not taken). Returns the number of hashes added to out.
+size_t ReferencedPrograms(std::unordered_set<uint64_t>& out);
 
 /// Counters of the material side, for the report line.
 struct MaterialStats {

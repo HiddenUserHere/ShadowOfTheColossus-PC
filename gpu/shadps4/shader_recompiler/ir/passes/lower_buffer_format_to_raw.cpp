@@ -353,7 +353,7 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
 
     const auto is_inst_typed = flags.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid;
     // sotc: SOTC_GENERIC_BUFFERS=2, the same decision as PatchBufferArgs (which made the address a byte address).
-    if (IsBufferFormatLoad(inst) && !is_inst_typed && SotcGenericFormatLoads(desc, buffer)) {
+    if (IsBufferFormatLoad(inst) && !is_inst_typed && SotcGenericFormatLoads(desc, buffer, SpecFreeStage(info))) {
         inst.ReplaceUsesWithAndRemove(
             LoadBufferFormatGeneric(ir, inst.Arg(0), IR::U32{inst.Arg(1)}, flags, desc, info));
         return;

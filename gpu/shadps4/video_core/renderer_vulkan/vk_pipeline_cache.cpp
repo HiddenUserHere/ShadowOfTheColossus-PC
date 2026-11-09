@@ -916,6 +916,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                 [this, urgent_only](std::stop_token token) { AsyncPipelineWorker(token, urgent_only); });
         }
     }
+    // sotc: SOTC_COMPUTE_FAST: the recorder's fast builds queue their optimized build on the workers.
+    if (SotcNonBlocking::ComputeFast() && !async_workers.empty()) {
+        ComputePipeline::QueueOptimizedHook = [this](ComputePipeline* pipeline) { QueueComputeOptimized(pipeline); };
+        std::fprintf(stderr, "SOTC COMPUTE FAST: on (driver-cache probe of the optimized build %s)\n",
+                     SotcPipeFeedback::g_compile_control.load(std::memory_order_relaxed) ? "on" : "off");
+    }
     // sotc: SOTC_ASYNC_COMPUTE_XLATE=1 (off by default), see ComputePrefetchEnabled.
     const uint64_t private_after_cache_load = SotcPipeManifest::ProcessPrivateBytes();
     compute_prefetch = !async_workers.empty() && [] {
@@ -934,6 +940,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 }
 
 PipelineCache::~PipelineCache() {
+    ComputePipeline::QueueOptimizedHook = nullptr; // sotc: SOTC_COMPUTE_FAST (the workers stop with this object)
     SaveUseCounts(); // sotc: N5 (no-op without SOTC_N5_PSO)
     if (driver_cache_saver.joinable()) {
         driver_cache_saver.request_stop();
@@ -1768,6 +1775,9 @@ void PipelineCache::PredictLibraries(const std::vector<SotcPipePredict::Slot>* s
     }
     auto& st = *lib_predict;
     ++st.calls;
+    if (pack_ref.pack_done && pack_ref.done_count.load(std::memory_order_acquire) != 0) {
+        DrainPackRef(); // sotc: SOTC_PACK_REFERENCED: the late libraries finished meanwhile
+    }
     const auto now = std::chrono::steady_clock::now();
     const u64 now_ns = static_cast<u64>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
@@ -1898,7 +1908,10 @@ void PipelineCache::PredictLibraries(const std::vector<SotcPipePredict::Slot>* s
         // One job per permutation and part: the vertex permutations with the slot's first pixel permutation (their
         // pre-rasterization library), the pixel permutations with the first vertex one (their fragment library). A
         // library is keyed by its stage hash, so a draw of another permutation (another specialization) never finds it.
-        const auto queue = [&](const GraphicsPipelineKey& rest, size_t vs_perm, size_t ps_perm, u32 parts, u64 id) {
+        // sotc: SOTC_PACK_REFERENCED: after the first-loading pack, a material's libraries are late (listed once built).
+        const bool late_refs = pack_ref.pack_done && shader_keys && SotcNonBlocking::GplPackReferenced();
+        const auto queue = [&](const GraphicsPipelineKey& rest, size_t vs_perm, size_t ps_perm, u32 parts, u64 id,
+                               u64 stage_program) {
             if (shader_keys) {
                 gpl_libs.Touch(id, now_ns); // sotc: this material references the library (eviction by age)
             }
@@ -1911,6 +1924,14 @@ void PipelineCache::PredictLibraries(const std::vector<SotcPipePredict::Slot>* s
                 return;
             }
             job->pack_id = id; // sotc: the library's id (GplLibraryCache::SetLibraryId in RunLibraryJob)
+            if (late_refs) { // sotc: SOTC_PACK_REFERENCED: noted when built, listed for the next launch
+                job->late_pack = true;
+                job->pack_program = stage_program;
+                if (pack_ref.watch.try_emplace(stage_program, false).second) {
+                    ++pack_ref.undrawn;
+                }
+                ++pack_ref.queued;
+            }
             st.inflight.insert(id);
             lib_jobs_pending.fetch_add(1, std::memory_order_relaxed);
             g_nodrop.pred_jobs.fetch_add(1, std::memory_order_relaxed);
@@ -1928,7 +1949,8 @@ void PipelineCache::PredictLibraries(const std::vector<SotcPipePredict::Slot>* s
                 queue(pre_rest, i, ps0,
                       shader_keys ? (1u << L::PreRaster) : (1u << L::PreRaster) | (1u << L::VertexInput),
                       shader_keys ? PackLibraryId(vs.info.CacheHash(), i, L::PreRaster)
-                                  : HashCombine(HashCombine(s.vs, u64{i}), LibPreState(pre_rest)));
+                                  : HashCombine(HashCombine(s.vs, u64{i}), LibPreState(pre_rest)),
+                  s.vs);
             }
         }
         // The pixel permutations translated for the pass's render-target layout when its pass is known (all when none
@@ -1952,7 +1974,8 @@ void PipelineCache::PredictLibraries(const std::vector<SotcPipePredict::Slot>* s
             queue(fs_rest, vs0, j,
                   shader_keys ? (1u << L::Fragment) : (1u << L::Fragment) | (1u << L::FragmentOutput),
                   shader_keys ? PackLibraryId(ps.info.CacheHash(), j, L::Fragment)
-                              : HashCombine(HashCombine(s.ps, u64{j}), LibFsState(fs_rest)));
+                              : HashCombine(HashCombine(s.ps, u64{j}), LibFsState(fs_rest)),
+              s.ps);
         }
     }
     g_nodrop.pred_waiting.store(st.waiting.size(), std::memory_order_relaxed);
@@ -2011,6 +2034,13 @@ void PipelineCache::RunLibraryJob(AsyncPipelineJob& job) {
         } else {
             pack_failed.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+    if (job.late_pack) { // sotc: SOTC_PACK_REFERENCED: counted and listed by the command processor (DrainPackRef)
+        const bool ok = GplLibraryCache::ThreadFailed() == failed0 &&
+                        (GplLibraryCache::ThreadBuilt() != built0 || GplLibraryCache::ThreadFound() != found0);
+        std::scoped_lock lock{pack_mutex};
+        pack_ref.done.push_back({job.pack_id, job.pack_program, ok});
+        pack_ref.done_count.fetch_add(1, std::memory_order_release);
     }
     lib_jobs_pending.fetch_sub(1, std::memory_order_relaxed);
     if (job.lib_wait) {
@@ -2582,7 +2612,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only,
                     while (!q.empty()) {
                         job = std::move(q.front());
                         q.pop_front();
-                        if (job->compute) {
+                        if (job->compute && !job->compute_opt) { // sotc: an optimized build has a fast one bound
                             job->compute->Build();
                         }
                     }
@@ -2684,6 +2714,15 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only,
             translate_done_cv.notify_all();
             continue;
         }
+        if (job->compute && (job->compute_fast || job->compute_opt)) { // sotc: SOTC_COMPUTE_FAST
+            if (job->compute_opt) {
+                job->compute->BuildOptimized();
+            } else if (job->compute->BuildFast()) {
+                QueueComputeOptimized(job->compute);
+            }
+            note_job();
+            continue;
+        }
         if (job->compute) {
             const auto start = std::chrono::steady_clock::now();
             job->compute->Build();
@@ -2694,6 +2733,13 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only,
             if (job->pre_compute) { // sotc: SOTC_PRETRANSLATE_COMPUTE: done when the pipeline is built (or refused)
                 job->compute->WaitBuilt();
                 SotcPretranslate::NoteBuilt(2, job->compute->Handle() != vk::Pipeline{});
+                if (Shader::ComputeSpecFree()) { // sotc: SOTC_COMPUTE_SPECFREE ("compile at load")
+                    g_specfree.compile_ns.fetch_add(
+                        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - start)
+                                             .count()),
+                        std::memory_order_relaxed);
+                }
                 if (job->pack_compute) { // sotc: SOTC_COMPUTE_PACK: the last pack build's time and the worker time
                     const auto now = std::chrono::steady_clock::now();
                     pack_compute_last_ns.store(
@@ -3189,6 +3235,14 @@ void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
                                                              start_time)
             .count(),
         std::memory_order_relaxed);
+    if (Shader::ComputeSpecFree() && t.pretranslate && !t.program && t.sw_stage == SwStage::Compute) {
+        // sotc: SOTC_COMPUTE_SPECFREE: the worker time of a compute prebuild's translation ("compile at load")
+        g_specfree.compile_ns.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - start_time)
+                                 .count()),
+            std::memory_order_relaxed);
+    }
 }
 
 void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
@@ -3222,6 +3276,7 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
         t.new_program = std::make_unique<Program>(t.hw_stage, t.sw_stage, params);
         t.new_program->info.sotc_synthetic = t.pretranslate; // sotc: SOTC_PRETRANSLATE
         t.new_program->info.sotc_synthetic_variant = t.synthetic_variant;
+        t.new_program->info.sotc_synthetic_mask = t.synthetic_mask; // sotc: SOTC_COMPUTE_SPECFREE
         t.module = CompileModule(t.new_program->info, runtime_info, params.code, 0, binding,
                                  &worker_pools, &t.spv);
         t.spec.emplace(t.new_program->info, runtime_info, profile, t.start);
@@ -3741,6 +3796,19 @@ bool PipelineCache::AddrTableComputeReady() {
     return false;
 }
 
+// sotc: SOTC_COMPUTE_FAST: the optimized build of a pipeline already bound with its fast build. Nothing waits for it, so
+// it goes to the Background lane (capped, below normal priority under SOTC_NB_SCHED).
+void PipelineCache::QueueComputeOptimized(ComputePipeline* pipeline) {
+    auto job = std::make_unique<AsyncPipelineJob>();
+    job->compute = pipeline;
+    job->compute_opt = true;
+    {
+        std::scoped_lock lock{async_mutex};
+        PushJobLocked(JobLane::Background, std::move(job));
+    }
+    async_cv.notify_one();
+}
+
 // sotc: N5. Counts the draws that bind each pipeline (its use count, saved at teardown).
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     const GraphicsPipeline* pipeline = GetGraphicsPipelineLookup(params);
@@ -3878,6 +3946,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         return last_graphics_pipeline;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    if (pack_ref.undrawn != 0) { // sotc: SOTC_PACK_REFERENCED: a late library's program drawn for the first time
+        NotePackRefDraw();
+    }
     if (pipe_predict) { // sotc: SOTC_PIPE_PREDICT: templates and hits
         NotePredictDraw(is_new, !is_new && it->second != nullptr);
     }
@@ -4353,16 +4424,21 @@ const ComputePipeline* PipelineCache::GetComputePipelineLookupSlow() {
                                                            compute_key, *infos[0],
                                                            modules[0], sdata, false, deferred);
         }
+        // sotc: SOTC_COMPUTE_SPECFREE: a pipeline compiled by this lookup is not a prebuilt hit (the pack cache's is).
+        it.value()->sotc_dispatch_built = !pack_listed;
         if (deferred && pack_listed) {
             it.value()->sotc_inline = true;
         } else if (deferred) {
             auto job = std::make_unique<AsyncPipelineJob>();
             job->compute = it.value().get();
+            // sotc: SOTC_COMPUTE_FAST: the dispatch's recorder will wait for it, so its first build is the fast one,
+            // on the Urgent lane (the reserved workers and every general one take it first).
+            job->compute_fast = SotcNonBlocking::ComputeFast();
             {
                 std::scoped_lock lock{async_mutex};
                 // Ahead of the graphics jobs, after the older compute ones: the recording
                 // thread binds them in this order.
-                PushJobLocked(JobLane::Compute, std::move(job));
+                PushJobLocked(job->compute_fast ? JobLane::Urgent : JobLane::Compute, std::move(job));
             }
             async_cv.notify_one();
         } else {
@@ -6128,29 +6204,69 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
             cache.FeedPretranslate();
         }
     } feed_next{*this};
-    const ComputePipelineKey key{HashCombine(t.hash, size_t{0})};
+    // sotc: SOTC_COMPUTE_SPECFREE: the permutation the prebuild serves (0, or an int/float variant's index).
+    size_t perm_idx = 0;
     const auto fail = [&] {
         SotcPretranslate::NoteBuilt(2, false);
-        pre_compute_pred.erase(t.hash);
+        if (t.synthetic_variant == 0) {
+            pre_compute_pred.erase(t.hash);
+        }
         if (t.module) {
             instance.GetDevice().destroyShaderModule(t.module);
             t.module = vk::ShaderModule{};
         }
     };
-    if (t.failed || !t.new_program || !t.spec || compute_pipelines.contains(key)) {
+    if (t.failed || !t.new_program || !t.spec ||
+        (t.synthetic_variant == 0 && compute_pipelines.contains(ComputePipelineKey{HashCombine(t.hash, size_t{0})}))) {
         fail();
         return;
     }
+    // sotc: SOTC_COMPUTE_SPECFREE: a program whose images the code alone does not type (sotc_synthetic_reads) gets the
+    // other int/float verdicts as more prebuilds (variant 1), compiled at load like the first: every combination of its
+    // k ambiguous images (masks 1..2^k-1) when k <= kSpecFreeMaxAmbiguous, else the all-flipped one only.
+    const bool queue_variant = Shader::ComputeSpecFree() && t.synthetic_variant == 0 &&
+                               t.new_program->info.sotc_synthetic_reads;
+    const u32 ambiguous = t.new_program->info.sotc_synthetic_ambiguous;
     Program* program = nullptr;
     if (const auto found = program_cache.find(t.hash); found != program_cache.end()) {
         // A draw translated the program meanwhile: its module serves the pipeline when the specialization is the same.
         program = found.value().get();
-        if (program->modules.empty() || !(program->modules[0].spec == *t.spec)) {
+        const auto same = std::ranges::find(program->modules, *t.spec, &Program::Module::spec);
+        if (same != program->modules.end() && (t.synthetic_variant == 0 ? same == program->modules.begin() : true)) {
+            perm_idx = static_cast<size_t>(std::distance(program->modules.begin(), same));
+            instance.GetDevice().destroyShaderModule(t.module);
+            t.module = vk::ShaderModule{};
+        } else if (t.synthetic_variant == 1 && !program->modules.empty() &&
+                   SameBindingLayout(program->info, t.new_program->info) &&
+                   std::ranges::find(program->pending_specs, *t.spec) == program->pending_specs.end()) {
+            // sotc: SOTC_COMPUTE_SPECFREE: the variant is one more permutation of the program.
+            perm_idx = program->modules.size();
+            Shader::CombineBindlessCache(program->info.bindless, t.new_program->info.bindless);
+            if (!((pre_holding || SotcPretranslate::Precompile()) &&
+                  PrePackAdd(t.hash, static_cast<u32>(perm_idx),
+                             SerializeShaderMeta(program->info, *t.spec, HashCombine(t.hash, perm_idx), perm_idx),
+                             t.spv))) {
+                RegisterShaderBinary(std::move(t.spv), t.hash, perm_idx);
+                SotcPredict::SetPretranslating(true);
+                RegisterShaderMeta(program->info, t.spec->fetch_shader_data, *t.spec, HashCombine(t.hash, perm_idx),
+                                   perm_idx);
+                SotcPredict::SetPretranslating(false);
+            }
+            program->AddPermut(t.module, std::move(*t.spec));
+            g_specfree.variants.fetch_add(1, std::memory_order_relaxed);
+        } else {
             fail();
             return;
         }
-        instance.GetDevice().destroyShaderModule(t.module);
-        t.module = vk::ShaderModule{};
+        // A module the compute pack destroyed (a program evicted to the index) cannot make a pipeline.
+        if (compute_pipelines.contains(ComputePipelineKey{HashCombine(t.hash, perm_idx)}) ||
+            !program->modules[perm_idx].module) {
+            SotcPretranslate::NoteBuilt(2, false);
+            return;
+        }
+    } else if (t.synthetic_variant != 0) {
+        fail(); // sotc: SOTC_COMPUTE_SPECFREE: the first prebuild of the program did not install
+        return;
     } else {
         auto [it, is_new] = program_cache.try_emplace(t.hash);
         it.value() = std::move(t.new_program);
@@ -6166,7 +6282,54 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
         }
         program->AddPermut(t.module, std::move(*t.spec));
         program->info.UserData() = {};
+        if (Shader::ComputeSpecFree()) {
+            g_specfree.programs.fetch_add(1, std::memory_order_relaxed);
+            g_specfree.variants.fetch_add(1, std::memory_order_relaxed);
+        }
     }
+    // sotc: SOTC_COMPUTE_SPECFREE: the variant masks of the program (0: the all-flipped variant 1 of an over-cap one).
+    boost::container::small_vector<u8, 8> variant_masks;
+    if (queue_variant) {
+        if (ambiguous != 0 && ambiguous <= Shader::kSpecFreeMaxAmbiguous) {
+            for (u32 mask = 1; mask < (1u << ambiguous); ++mask) {
+                variant_masks.push_back(static_cast<u8>(mask));
+            }
+        } else {
+            variant_masks.push_back(0);
+        }
+    }
+    if (Shader::ComputeSpecFree() && t.synthetic_variant == 0) {
+        const bool over_cap = queue_variant && ambiguous > Shader::kSpecFreeMaxAmbiguous;
+        const size_t perms = 1 + variant_masks.size();
+        const size_t bucket = over_cap ? 4 : perms >= 8 ? 3 : perms >= 4 ? 2 : perms >= 2 ? 1 : 0;
+        g_specfree.perms_hist[bucket].fetch_add(1, std::memory_order_relaxed);
+        g_specfree.perms_queued.fetch_add(perms, std::memory_order_relaxed);
+        program->sotc_ambiguous = static_cast<u8>(std::min<u32>(ambiguous, 255u));
+        static std::atomic<u32> over_cap_logged{0};
+        if (over_cap && over_cap_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::fprintf(stderr,
+                         "SOTC COMPUTE SPECFREE over cap %#llx: %u ambiguous images (2 variants prebuilt, not %llu)\n",
+                         static_cast<unsigned long long>(t.hash), ambiguous, 1ull << std::min<u32>(ambiguous, 63u));
+        }
+    }
+    for (const u8 mask : variant_masks) {
+        auto job = std::make_unique<AsyncPipelineJob>();
+        auto& v = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
+        v.hw_stage = t.hw_stage;
+        v.sw_stage = t.sw_stage;
+        v.hash = t.hash;
+        v.owned_code = t.owned_code;
+        v.code = v.owned_code;
+        v.runtime_info = t.runtime_info;
+        v.start = t.start;
+        v.pretranslate = true;
+        v.synthetic_variant = 1;
+        v.synthetic_mask = mask;
+        ++pack_compute_queued;
+        SotcPretranslate::NoteQueued(2);
+        pre_backlog.push_back(std::move(job));
+    }
+    const ComputePipelineKey key{HashCombine(t.hash, perm_idx)};
     // The ComputePipeline is made on the command processor (its layouts and the heap state are CP-only); a worker
     // builds it (Build). Ordinary pipeline: SerializationSupport, RegisterPipelineData, the same as a draw's.
     // sotc: SOTC_COMPUTE_PACK: a prebuild of the hold (or of the preparation run) is compiled into the pack cache and
@@ -6178,7 +6341,8 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
     auto pipe = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache,
                                                   StageProfile(program->info.variant),
                                                   pack_candidate ? PackPipelineCache() : *pipeline_cache, key,
-                                                  program->info, program->modules[0].module, sdata, false, true);
+                                                  program->info, program->modules[perm_idx].module, sdata, false,
+                                                  true);
     ComputePipeline* raw = pipe.get();
     auto [cit, cnew] = compute_pipelines.try_emplace(key);
     cit.value() = std::move(pipe);
@@ -6401,6 +6565,25 @@ bool PipelineCache::BuildPackLibraries() {
     };
     std::unordered_map<u32, std::array<Partner, 2>> partners; // variant -> {vertex, pixel}
     std::unordered_set<const Program*> partner_programs; // sotc: SOTC_GPL_PACK_LEAN: their modules stay (every job)
+    // sotc: SOTC_PACK_REFERENCED: the programs a material the game has created so far names (its VS and PS footer
+    // hashes; queued materials are read without taking them) and the manifest's stages. A program matches by its
+    // program key, its program hash or its cache hash (a variant's program is named by its hash only).
+    const bool restrict_refs = SotcNonBlocking::GplPackReferenced();
+    std::unordered_set<u64> referenced;
+    if (restrict_refs) {
+        SotcPipePredict::ReferencedPrograms(referenced);
+        if (manifest) {
+            for (const auto& st : manifest->stages) {
+                referenced.insert(st.rec.hash);
+                referenced.insert(st.cache_hash);
+            }
+        }
+    }
+    const auto is_referenced = [&](u64 key, const Program& p) {
+        return !restrict_refs || referenced.contains(key) || referenced.contains(p.info.pgm_hash) ||
+               referenced.contains(p.info.CacheHash());
+    };
+    u64 programs_all = 0, programs_ref = 0, unreferenced = 0;
     const auto usable = [](const Program& p, size_t& perm) {
         // Hardware VS and PS only: an export/local vertex stage is linked with geometry or tessellation stages, which a
         // pack job does not have (its library would never match a draw's).
@@ -6423,6 +6606,8 @@ bool PipelineCache::BuildPackLibraries() {
         if (!usable(p, perm)) {
             continue;
         }
+        ++programs_all;
+        programs_ref += is_referenced(it.key(), p) ? 1 : 0;
         auto& slot = partners[u32{p.info.variant}][p.info.sw_stage == Shader::SwStage::Vertex ? 0 : 1];
         if (!slot.program) {
             slot = Partner{&p, perm};
@@ -6447,6 +6632,10 @@ bool PipelineCache::BuildPackLibraries() {
         Program& p = *it.value();
         size_t first = 0;
         if (!usable(p, first)) {
+            continue;
+        }
+        if (!is_referenced(it.key(), p)) {
+            ++unreferenced; // sotc: SOTC_PACK_REFERENCED: no material the game created names this program
             continue;
         }
         const bool vertex = p.info.sw_stage == Shader::SwStage::Vertex;
@@ -6664,6 +6853,21 @@ bool PipelineCache::BuildPackLibraries() {
                  static_cast<double>(private_end) / 1048576.0,
                  (static_cast<double>(private_end) - static_cast<double>(private_start)) / 1048576.0,
                  std::chrono::duration<double>(Clock::now() - start).count());
+    if (restrict_refs) {
+        pack_ref.pack_done = true;
+        pack_ref.materials = SotcPipePredict::Stats().queued;
+        pack_ref.programs = programs_ref;
+        pack_ref.programs_all = programs_all;
+        pack_ref.libs_at_load = compiled.size();
+        pack_ref.load_seconds = std::chrono::duration<double>(compiled_end - start).count();
+        std::fprintf(stderr,
+                     "SOTC PACK REFERENCED: %llu programs of %llu loaded are named by a material or the manifest; "
+                     "the other %llu are not compiled at load (a material naming one queues its libraries when it is "
+                     "created)\n",
+                     static_cast<unsigned long long>(programs_ref), static_cast<unsigned long long>(programs_all),
+                     static_cast<unsigned long long>(unreferenced));
+        PackReferencedLog();
+    }
     return pack_failed.load(std::memory_order_relaxed) == 0 && no_partner == 0 && unlinkable == 0 &&
            (compiled.empty() || list_written || publish_background);
 }
@@ -6685,6 +6889,14 @@ void PipelineCache::PackComputePipelines(const std::unordered_set<u64>& listed, 
     }
     u64 programs = 0, built = 0, hinted = 0, synthetic = 0, failed = 0, already = 0, resident = 0, destroyed = 0;
     std::vector<ComputePipelineKey> gone;
+    // sotc: SOTC_COMPUTE_SPECFREE: a program can have several pack pipelines (the int/float variants). Its modules stay
+    // while either one is still on a worker (the build reads the module).
+    std::unordered_set<u64> busy_programs;
+    for (auto it = compute_pipelines.begin(); it != compute_pipelines.end(); ++it) {
+        if (it.value()->sotc_pack && !it.value()->IsReady()) {
+            busy_programs.insert(it.value()->sotc_pack_program);
+        }
+    }
     for (auto it = compute_pipelines.begin(); it != compute_pipelines.end(); ++it) {
         ComputePipeline& pipe = *it.value();
         if (!pipe.sotc_pack) {
@@ -6713,7 +6925,7 @@ void PipelineCache::PackComputePipelines(const std::unordered_set<u64>& listed, 
         const auto found = program_cache.find(pipe.sotc_pack_program);
         Program* program = found == program_cache.end() ? nullptr : found.value().get();
         if (!program || !program->sotc_pre || program->sotc_pre_checked || !program->pending_specs.empty() ||
-            program->modules.empty()) {
+            program->modules.empty() || busy_programs.contains(pipe.sotc_pack_program)) {
             ++resident; // bound by a dispatch (or a translation in flight): the pipeline stays, as before
             continue;
         }
@@ -6813,10 +7025,74 @@ void PipelineCache::RunPackPublish() {
     pack_publish_cv.notify_all();
 }
 
+// sotc: SOTC_PACK_REFERENCED. Command processor: the late libraries the workers finished are counted (built before or
+// after the first draw of their program) and listed; their ids join the list that the exit publication writes (the
+// pack cache holds their code, FinalPackPublish).
+void PipelineCache::DrainPackRef() {
+    std::vector<PackRef::Done> done;
+    {
+        std::scoped_lock lock{pack_mutex};
+        done.swap(pack_ref.done);
+        pack_ref.done_count.store(0, std::memory_order_release);
+    }
+    std::vector<u64> append;
+    for (const auto& d : done) {
+        if (!d.ok) {
+            continue;
+        }
+        ++pack_ref.built;
+        const auto f = pack_ref.watch.find(d.program);
+        if (f == pack_ref.watch.end() || !f->second) {
+            ++pack_ref.before;
+        } else {
+            ++pack_ref.after;
+        }
+        if (pack_listed_set.contains(d.id) || !pack_ref.listed_late.insert(d.id).second) {
+            continue;
+        }
+        pack_listed_set.insert(d.id);
+        append.push_back(d.id);
+    }
+    if (!append.empty()) {
+        std::scoped_lock lk{driver_cache_cv_mutex};
+        pack_listed_ids.insert(pack_listed_ids.end(), append.begin(), append.end());
+    }
+}
+
+void PipelineCache::NotePackRefDraw() {
+    for (const u32 stage : {u32(Shader::SwStage::Vertex), u32(Shader::SwStage::Fragment)}) {
+        const auto* info = infos[stage];
+        if (!info) {
+            continue;
+        }
+        const auto f = pack_ref.watch.find(info->pgm_hash);
+        if (f != pack_ref.watch.end() && !f->second) {
+            f->second = true;
+            --pack_ref.undrawn;
+        }
+    }
+}
+
+void PipelineCache::PackReferencedLog() {
+    std::fprintf(stderr,
+                 "SOTC PACK REFERENCED: materials %llu, programs %llu (of %llu in the pack), libraries %llu compiled "
+                 "at load in %.1f s; late: queued %llu, built %llu, before first draw %llu, after %llu\n",
+                 static_cast<unsigned long long>(SotcPipePredict::Stats().queued),
+                 static_cast<unsigned long long>(pack_ref.programs),
+                 static_cast<unsigned long long>(pack_ref.programs_all),
+                 static_cast<unsigned long long>(pack_ref.libs_at_load), pack_ref.load_seconds,
+                 static_cast<unsigned long long>(pack_ref.queued), static_cast<unsigned long long>(pack_ref.built),
+                 static_cast<unsigned long long>(pack_ref.before), static_cast<unsigned long long>(pack_ref.after));
+}
+
 // sotc: SOTC_PLAY_QUIET. At exit (the saver joined): the pack cache is written again when libraries were created
 // since its publication (a draw's urgent ones, predicted ones of programs the pack did not know), and the list is
 // written after it, with the new hash, so the next launch accepts it ("already compiled (listed)").
 void PipelineCache::FinalPackPublish() {
+    if (pack_ref.pack_done) { // sotc: SOTC_PACK_REFERENCED: the late libraries, listed before the list is written
+        DrainPackRef();
+        PackReferencedLog();
+    }
     if (!pack_cache) {
         return;
     }
@@ -7038,6 +7314,78 @@ void PipelineCache::MaybeHoldForPretranslate() {
                  static_cast<unsigned long long>(SotcPretranslate::JobsDone()));
 }
 
+// sotc: SOTC_COMPUTE_SPECFREE. A dispatch needs a compute permutation its program does not have. Counted against the
+// program's first permutation (the prebuilt one when the program came from a prebuild) by the first key part that
+// differs: image dimension, image integer type, a written formatted buffer, an atomic image, anything else. A program
+// without a prebuild (a dispatch translated it first) counts as other. The first 32 are logged with the reason.
+void PipelineCache::NoteSpecFreeFallback(const Program& program, const Shader::StageSpecialization& spec, u64 hash) {
+    const char* reason = "other";
+    std::atomic<u64>* counter = &g_specfree.fallback_other;
+    char detail[96] = "";
+    if (!program.modules.empty() && program.sotc_pre) {
+        // sotc: the int/float variants (InstallComputePrebuild): compared with the permutation whose image integer
+        // bits are the dispatch's, so "int" means no prebuilt combination has them.
+        const auto same_int = [&spec](const Program::Module& m) {
+            if (m.spec.images.size() != spec.images.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < spec.images.size(); ++i) {
+                if (m.spec.images[i].is_integer != spec.images[i].is_integer) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const auto ref = std::ranges::find_if(program.modules, same_int);
+        const auto& made = (ref != program.modules.end() ? *ref : program.modules[0]).spec;
+        const auto& info = program.info;
+        for (size_t i = 0; i < spec.images.size() && i < made.images.size() && detail[0] == '\0'; ++i) {
+            const auto& a = spec.images[i];
+            const auto& b = made.images[i];
+            if (a.type != b.type) {
+                reason = "dim";
+                counter = &g_specfree.fallback_dim;
+                std::snprintf(detail, sizeof detail, " image %zu type %u (prebuilt %u)", i, u32(a.type), u32(b.type));
+            } else if (a.is_integer != b.is_integer) {
+                const bool capped = program.sotc_ambiguous > Shader::kSpecFreeMaxAmbiguous;
+                reason = capped ? "int (over cap)" : "int";
+                counter = &g_specfree.fallback_int;
+                if (capped) {
+                    g_specfree.fallback_int_capped.fetch_add(1, std::memory_order_relaxed);
+                }
+                std::snprintf(detail, sizeof detail, " image %zu integer %d (%zu perms, %u ambiguous)", i,
+                              int(a.is_integer), program.modules.size(), u32{program.sotc_ambiguous});
+            } else if (!(a == b) && i < info.images.size() && info.images[i].is_atomic) {
+                reason = "atomic";
+                counter = &g_specfree.fallback_atomic;
+                std::snprintf(detail, sizeof detail, " image %zu", i);
+            } else if (!(a == b)) {
+                std::snprintf(detail, sizeof detail, " image %zu conv %u bindings %u (prebuilt %u, %u)", i,
+                              u32(a.num_conversion), a.num_bindings, u32(b.num_conversion), b.num_bindings);
+            }
+        }
+        for (size_t i = 0; i < spec.buffers.size() && i < made.buffers.size() && detail[0] == '\0'; ++i) {
+            if (spec.buffers[i] == made.buffers[i]) {
+                continue;
+            }
+            if (i < info.buffers.size() && info.buffers[i].is_written && spec.buffers[i].is_formatted) {
+                reason = "written-fmt";
+                counter = &g_specfree.fallback_written_fmt;
+            }
+            std::snprintf(detail, sizeof detail, " buffer %zu format %u/%u stride %u swizzle %u", i,
+                          u32(spec.buffers[i].data_format), u32(spec.buffers[i].num_format),
+                          u32(spec.buffers[i].stride), u32(spec.buffers[i].swizzle_enable));
+        }
+    } else {
+        std::snprintf(detail, sizeof detail, " (no prebuilt permutation)");
+    }
+    counter->fetch_add(1, std::memory_order_relaxed);
+    if (g_specfree.logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        std::fprintf(stderr, "SOTC COMPUTE SPECFREE fallback %#llx: %s%s\n", static_cast<unsigned long long>(hash),
+                     reason, detail);
+    }
+}
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding,
@@ -7089,6 +7437,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (async_ok && !program_cache.contains(params.hash) &&
         !in_place_programs.contains(params.hash)) {
         if (pending_programs.insert(params.hash).second) {
+            if (sw_stage == SwStage::Compute && Shader::ComputeSpecFree()) {
+                g_specfree.not_prebuilt.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_COMPUTE_SPECFREE
+            }
             CacheDiagNoteProgram(params.hash);
             QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, nullptr, nullptr, 0);
         } else if (pre_pending.erase(params.hash) != 0) {
@@ -7103,6 +7454,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     }
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
+        if (sw_stage == SwStage::Compute && Shader::ComputeSpecFree()) {
+            g_specfree.not_prebuilt.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_COMPUTE_SPECFREE
+        }
         CacheDiagNoteProgram(params.hash);
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
@@ -7328,6 +7682,10 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             // sotc: SOTC_PRETRANSLATE_COMPUTE_HINTS: the dispatch's key against the prebuilt one (hint file, miss log).
             SotcPretranslate::NoteComputeFirstUse(params.hash, hit, program->info, spec, program->modules[0].spec);
         }
+    }
+    if (it == program->modules.end() && sw_stage == SwStage::Compute && Shader::ComputeSpecFree() &&
+        std::ranges::find(program->pending_specs, spec) == program->pending_specs.end()) {
+        NoteSpecFreeFallback(*program, spec, params.hash); // sotc: SOTC_COMPUTE_SPECFREE
     }
     if (it == program->modules.end() && async_ok && !program->translate_in_place) {
         if (std::ranges::find(program->pending_specs, spec) == program->pending_specs.end()) {

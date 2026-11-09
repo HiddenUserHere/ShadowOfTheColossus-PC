@@ -607,6 +607,79 @@ void Commit() {
 }
 } // namespace FillSkip
 
+// sotc: SOTC_FILL_GPU=1 (off by default). The replicate fill writes the table into guest memory inline (one memcpy of
+// the table, TryFillThroughFromCpu) and fills the arena on the GPU: vkCmdFillBuffer for a repeated dword, a doubling copy
+// for a longer pattern, a copy from the source when it is resident and clean, else an upload. There is no page-wise compare
+// and no per-run replace. One read-only compare of the whole table skips a table that already holds the data (when the
+// range is not GPU-modified, so the backing is what the guest sees). The guest bytes and the arena hold the same bytes when
+// this returns, so no CPU read needs a readback. That is why the range is not marked GPU-modified: the mark would make every
+// later CPU read of the table wait for a readback of bytes that are already right. The texture cache is invalidated only
+// when an image overlaps the table. Counters every 5 s (draw thread only).
+static bool FillTableGpu(Rasterizer& rasterizer, VAddr address, u64 count, VAddr src_addr,
+                         const u32* source, u64 src_count, bool& wrote) {
+    static u64 gpu_fills = 0, guest_writes = 0, guest_bytes = 0, skipped_tc = 0, unchanged = 0;
+    static std::int64_t t0 = 0;
+    auto& buffer_cache = rasterizer.GetBufferCache();
+    const u64 table_bytes = count * 4;
+    const u64 period = src_count * 4;
+    const bool overlap = src_addr < address + table_bytes && address < src_addr + period;
+    BuildTable(source, src_count, count);
+    if (!buffer_cache.IsRegionGpuModified(address, table_bytes)) {
+        VAddr run_start = 0;
+        u64 run_size = 0;
+        const u8* run = Core::Memory::Instance()->GetBackingRun(address, &run_start, &run_size);
+        if (run && run_size && address >= run_start && address + table_bytes <= run_start + run_size &&
+            std::memcmp(run + (address - run_start), data.data(), table_bytes) == 0) {
+            ++unchanged;
+            return true; // wrote stays false: the guest copy (and so the arena) already holds the table
+        }
+    }
+    u32 path = 0;
+    if (!buffer_cache.TryFillThroughFromCpu(address, data.data(), table_bytes, period,
+                                            overlap ? 0 : src_addr, path)) {
+        return false;
+    }
+    wrote = true;
+    ++guest_writes;
+    guest_bytes += table_bytes;
+    TraceHleFill(address, table_bytes, period, path);
+    if (SotcArch::ShaderAddr::On()) { // sotc: SOTC_SHADER_ADDR, mirror coherence (as the fill_gpu path above)
+        if (path == VideoCore::BufferCache::FillPathReplace) {
+            rasterizer.SotcMirrorFromGuest(address, table_bytes);
+        } else {
+            const auto [fill_buf, fill_off] = buffer_cache.ObtainBuffer(address, static_cast<u32>(table_bytes), false);
+            rasterizer.SotcMirrorFromBuffer(*fill_buf, fill_off, address, table_bytes);
+        }
+    }
+    if (SotcStats::kCmdStats) {
+        SotcStats::inv_hle.fetch_add(table_bytes, std::memory_order_relaxed);
+    }
+    if (path == VideoCore::BufferCache::FillPathReplace) {
+        rasterizer.InvalidateMemory(address, table_bytes); // not resident: the CPU bits were set
+    } else {
+        ++gpu_fills;
+        if (rasterizer.GetTextureCache().HasImageInRange(address, table_bytes)) {
+            rasterizer.GetTextureCache().InvalidateMemory(address, table_bytes);
+        } else {
+            ++skipped_tc;
+        }
+    }
+    const auto now = static_cast<std::int64_t>(SotcStats::NowNs());
+    if (t0 == 0) {
+        t0 = now;
+    } else if (now - t0 >= 5'000'000'000LL) {
+        std::fprintf(stderr,
+                     "SOTC FILL_GPU: %llu fills on GPU, %llu guest writes (inline) %.2f MB, %llu texture "
+                     "invalidations skipped, %llu unchanged, in 5 s\n",
+                     static_cast<unsigned long long>(gpu_fills), static_cast<unsigned long long>(guest_writes),
+                     static_cast<double>(guest_bytes) / (1024.0 * 1024.0),
+                     static_cast<unsigned long long>(skipped_tc), static_cast<unsigned long long>(unchanged));
+        gpu_fills = guest_writes = guest_bytes = skipped_tc = unchanged = 0;
+        t0 = now;
+    }
+    return true;
+}
+
 static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                                       const AmdGpu::ComputeProgram& cs_program,
                                       Rasterizer& rasterizer, bool& wrote) {
@@ -685,6 +758,11 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
             }
             SotcStats::pb_fill_executed.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+    // sotc: SOTC_FILL_GPU (off by default): the whole-table fill of FillTableGpu replaces the compare and the
+    // replace below.
+    if (SotcNonBlocking::FillGpu()) {
+        return FillTableGpu(rasterizer, address, count, src.base_address, source, src_count, wrote);
     }
     // sotc: the tables are mostly the same every frame. When no byte of the destination is GPU
     // written (so its pages are not read-protected and the backing is authoritative) and it

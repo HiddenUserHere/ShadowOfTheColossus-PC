@@ -137,7 +137,9 @@ public:
     virtual ~Pipeline();
 
     vk::Pipeline Handle() const noexcept {
-        return *pipeline;
+        // sotc: SOTC_COMPUTE_FAST: a compute pipeline's handle is swapped (fast build, then optimized) on a worker while
+        // other threads bind it, so compute pipelines read the atomic copy (ComputePipeline::Install keeps it).
+        return is_compute ? vk::Pipeline{compute_handle.load(std::memory_order_acquire)} : *pipeline;
     }
 
     vk::PipelineLayout GetLayout() const noexcept {
@@ -270,6 +272,8 @@ protected:
     DescriptorHeap& desc_heap;
     const Shader::Profile& profile;
     vk::UniquePipeline pipeline;
+    /// sotc: SOTC_COMPUTE_FAST: the handle compute pipelines bind (the one `pipeline` owns, stored after it).
+    std::atomic<VkPipeline> compute_handle{};
     LayoutCache::Owned owned_layouts; ///< sotc: only when the layout cache is off
     vk::PipelineLayout pipeline_layout; ///< sotc: from LayoutCache, not owned here
     /// sotc: SOTC_NB_GPL: the layouts of the per-shader libraries (only the vertex set / only the fragment set), null

@@ -143,6 +143,8 @@ void ReportIndexExtent(std::string& out, double seconds); // sotc: SOTC_INDEX_EX
 void ReportSpecMemo(std::string& out, double seconds); // sotc: SOTC_SPEC_MEMO
 void ReportPipeGpl(std::string& out, double seconds); // sotc: SOTC_PIPE_GPL
 void ReportAddrFallback(std::string& out, double seconds); // sotc: SOTC_ADDR_FALLBACK
+void ReportComputeFast(std::string& out, double seconds); // sotc: SOTC_COMPUTE_FAST (vk_compute_pipeline.cpp)
+void ReportComputeSpecFree(std::string& out, double seconds); // sotc: SOTC_COMPUTE_SPECFREE (vk_compute_pipeline.cpp)
 void ReportPipeManifest(std::string& out, double seconds); // sotc: SOTC_PIPE_MANIFEST
 void ReportPipeFeedback(std::string& out, double seconds); // sotc: SOTC_PIPE_FEEDBACK / SOTC_PIPE_COMPILE_CHECK
 void ReportHleCopyExact(std::string& out, double seconds); // sotc: SOTC_HLE_COPY_EXACT (vk_shader_hle.cpp)
@@ -2500,6 +2502,8 @@ void VideoOutDriver::Flip(const Request& req) {
             Shader::ReportBindlessCache(report, seconds); // SOTC_BINDLESS_CACHE_VERIFY
             Vulkan::ReportPipeGpl(report, seconds); // SOTC_PIPE_GPL
             Vulkan::ReportAddrFallback(report, seconds); // sotc: SOTC_ADDR_FALLBACK (prints only in table mode with it on)
+            Vulkan::ReportComputeFast(report, seconds); // sotc: SOTC_COMPUTE_FAST (prints only when on)
+            Vulkan::ReportComputeSpecFree(report, seconds); // sotc: SOTC_COMPUTE_SPECFREE (prints only when on)
             Vulkan::ReportPipeManifest(report, seconds); // sotc: SOTC_PIPE_MANIFEST (user records, late builds)
             Vulkan::ReportHleCopyExact(report, seconds); // sotc: SOTC_HLE_COPY_EXACT (prints only when on)
             AmdGpu::ReportCpLabelSkip(report, seconds);           // SOTC_CP_LABEL_SKIP

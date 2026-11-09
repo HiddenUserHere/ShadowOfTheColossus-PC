@@ -95,6 +95,9 @@ struct Program {
     /// once its first draw compared its key with the pre-translated one.
     bool sotc_pre{};
     bool sotc_pre_checked{};
+    /// sotc: SOTC_COMPUTE_SPECFREE: the compute prebuild's ambiguous images (Info::sotc_synthetic_ambiguous); above
+    /// kSpecFreeMaxAmbiguous only the two all-int/all-float variants are prebuilt (fallback reasons).
+    u8 sotc_ambiguous{};
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
@@ -240,6 +243,9 @@ public:
     Result GetProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding,
                       bool async_ok = false);
+    /// sotc: SOTC_COMPUTE_SPECFREE: counts (and logs the first 32 of) a compute permutation a dispatch needs that its
+    /// program's prebuilt one does not serve, by reason (vk_compute_pipeline.h ComputeSpecFreeStats).
+    void NoteSpecFreeFallback(const Program& program, const Shader::StageSpecialization& spec, u64 hash);
 
     /// sotc: SOTC_ASYNC_COMPUTE_XLATE=1 (off by default; needs the pipeline workers). When a
     /// dispatch needs a compute shader not translated yet, the command processor scans the
@@ -474,11 +480,18 @@ private:
         /// is destroyed by the command processor once the job is done).
         u64 pack_program{};
         u32 pack_perm{};
+        /// sotc: SOTC_PACK_REFERENCED: a library of a material created after the first-loading pack. Its id is listed
+        /// for the next launch once it is built (PipelineCache::DrainPackRef).
+        bool late_pack{};
         struct LibWait {
             std::atomic<int> remaining{0};
         };
         std::shared_ptr<LibWait> lib_wait;
         ComputePipeline* compute{}; ///< a compute job: only Build() is run
+        /// sotc: SOTC_COMPUTE_FAST: a compute job of a dispatch's new pipeline, on the Urgent lane: BuildFast, then the
+        /// optimized build is queued (compute_opt, Background lane) unless the driver cache had it.
+        bool compute_fast{};
+        bool compute_opt{}; ///< sotc: SOTC_COMPUTE_FAST: BuildOptimized (replaces the fast handle)
         bool priority{}; ///< sotc: a depth-only (shadow) graphics job queued ahead of the others
         bool pre_compute{}; ///< sotc: SOTC_PRETRANSLATE_COMPUTE: a prebuilt compute pipeline (its build counts as done)
         /// sotc: SOTC_COMPUTE_PACK: a prebuild compiled into the pack cache (the worker notes when the last one built).
@@ -534,6 +547,7 @@ private:
             bool pretranslate{};
             std::vector<u32> owned_code;
             u8 synthetic_variant{}; ///< Info::sotc_synthetic_variant of the translation
+            u8 synthetic_mask{};    ///< sotc: Info::sotc_synthetic_mask of the translation (SOTC_COMPUTE_SPECFREE)
             bool first_variant{};   ///< the job that may queue the synthetic variant 1
             bool hinted{};          ///< sotc: SOTC_COMPUTE_PACK: a compute prebuild translated with a hint (report)
             /// sotc: SOTC_PIPE_MANIFEST: the manifest stage this synthetic translation rebuilds (-1: none), the raw
@@ -656,6 +670,9 @@ private:
     /// sotc: SOTC_PRETRANSLATE_COMPUTE (CP only): queues the translation of a predicted compute program, unless it is
     /// known (warm session: dropped as the other requests are).
     void QueueComputePrebuild(SotcPretranslate::Request& request);
+    /// sotc: SOTC_COMPUTE_FAST: queues the optimized build of a pipeline bound with its fast build (Background lane).
+    /// Any thread (the recorder, through ComputePipeline::QueueOptimizedHook; the workers).
+    void QueueComputeOptimized(ComputePipeline* pipeline);
     /// sotc: SOTC_PRETRANSLATE_COMPUTE (CP only): installs a translated compute program and queues its pipeline: the
     /// ComputePipeline is made here (its layouts are CP-only) under the key the first dispatch computes, and a worker
     /// builds the pipeline (Build, counted as done in JobsDone).
@@ -877,6 +894,28 @@ private:
     u64 pack_cache_published{}; ///< GplLibraryCache::LibraryBuilds at the last pack publication
     std::vector<u64> pack_listed_ids; ///< the ids of the last list written or read (driver_cache_cv_mutex)
     void FinalPackPublish();
+    /// sotc: SOTC_PACK_REFERENCED. The first-loading pack ran (materials created later are late), its figures for the
+    /// log line, and the late libraries: queued, built, and whether a built one came before its program's first draw.
+    struct PackRef {
+        struct Done {
+            u64 id{};
+            u64 program{};
+            bool ok{};
+        };
+        bool pack_done{};
+        u64 materials{}, programs{}, programs_all{}, libs_at_load{};
+        double load_seconds{};
+        u64 queued{}, built{}, before{}, after{};
+        std::unordered_map<u64, bool> watch; ///< program hash of a late library -> drawn yet (command processor)
+        u64 undrawn{};                       ///< watch entries not drawn yet (command processor)
+        std::unordered_set<u64> listed_late; ///< late ids appended to pack_listed_ids (command processor)
+        std::atomic<u32> done_count{};       ///< entries of done not drained yet
+        std::vector<Done> done;              ///< pack_mutex: late libraries finished on a worker
+    };
+    PackRef pack_ref;
+    void DrainPackRef();      ///< command processor: counts the late libraries finished, and lists them
+    void NotePackRefDraw();   ///< command processor: a draw's programs (the first draw of a late library's program)
+    void PackReferencedLog(); ///< the SOTC PACK REFERENCED line
     /// sotc: one VkPipelineCache to one file, whole, through a temporary (driver_cache_save_mutex). final_save skips the
     /// growth threshold of the periodic saves.
     bool SaveCacheFile(vk::PipelineCache cache, const std::filesystem::path& path, size_t& saved_size, bool final_save,
@@ -1031,6 +1070,12 @@ void ReportPipeManifest(std::string& out, double seconds);
 /// sotc: SOTC_ADDR_FALLBACK counters (vk_pipeline_cache.cpp): appends one "SOTC ADDR FALLBACK" line for the 5 s report
 /// when the fallback is on and the window had fallback ops or table pipelines pending/built. Call from one thread.
 void ReportAddrFallback(std::string& out, double seconds);
+
+/// sotc: SOTC_COMPUTE_FAST counters (vk_compute_pipeline.cpp): appends one "SOTC COMPUTE FAST (5 s)" line when the
+/// switch is on and the window had fast builds, swaps or waits. Call from one thread.
+void ReportComputeFast(std::string& out, double seconds);
+/// sotc: SOTC_COMPUTE_SPECFREE, the 5 s report line (vk_compute_pipeline.cpp; prints only when on).
+void ReportComputeSpecFree(std::string& out, double seconds);
 
 /// sotc: N5 (SOTC_N5_PSO=1 with SOTC_NATIVE on). The boot prebuild in WarmUp: every cached pipeline
 /// is built on the workers before the game needs it, in the order of its use count.

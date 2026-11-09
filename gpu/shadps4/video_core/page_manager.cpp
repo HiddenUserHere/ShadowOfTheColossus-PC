@@ -2342,6 +2342,21 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bou
     if (!SotcNative::TracksGuestPages() && !SotcN1Verify::On() && SotcNative::TrackMode() != 3) { // sotc: SOTC_NATIVE=1, see UpdatePageWatchers
         return;
     }
+    // sotc: SOTC_WATCH_SKIP with SOTC_NATIVE_TRACK_GPU_ONLY (GpuOnlyProtect). Under that policy the protection of a
+    // page depends on its read (GPU) watchers only (Perms), so the write watchers (CPU-modified tracking) never change
+    // a protection. Their counts are then bookkeeping nobody reads (N1 verify reads them: it keeps the full path), so
+    // a write-watcher change is dropped: a call with only write ops is skipped, and a mixed call walks the pages for
+    // its read ops alone. Track and Untrack are both dropped, so the counts stay balanced. The CPU bits themselves
+    // are RegionManager state, not touched here.
+    if (SotcNonBlocking::WatchSkip() && GpuOnlyProtect() && !SotcN1Verify::On()) {
+        if (write_op != PageOp::None) {
+            if (read_op == PageOp::None) {
+                SotcNonBlocking::WatchSkipStats::gpu_only_skips.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            write_op = PageOp::None;
+        }
+    }
     impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op,
                                       deferrable);
 }

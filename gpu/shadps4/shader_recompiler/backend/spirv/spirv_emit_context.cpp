@@ -1760,8 +1760,11 @@ void EmitContext::DefineBuffers() {
         const auto buf_sharp = desc.GetSharp(info);
         // MTYPE class 3 marks guest buffers shared between invocations; shared
         // memory lowered to a storage buffer needs the same guarantee.
+        // sotc: SOTC_COMPUTE_SPECFREE: the V# of the translation is not the dispatch's (MTYPE is not keyed), so every
+        // written guest buffer of a compute stage is coherent.
         const bool is_coherent =
-            desc.buffer_type == BufferType::SharedMemory || buf_sharp.mtype == 3;
+            desc.buffer_type == BufferType::SharedMemory || buf_sharp.mtype == 3 ||
+            (SpecFreeStage(info) && desc.is_written && desc.buffer_type == BufferType::Guest);
 
         // Set indexes for special buffers.
         if (desc.buffer_type == BufferType::Flatbuf) {

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdio>
+#include <string>
 #include <boost/container/small_vector.hpp>
 
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h" // sotc: SOTC_HEAP (UsesHeapImages)
@@ -13,8 +15,136 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
 #include "../../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER
+#include "../../../sotc/nonblocking.h"  // sotc: SOTC_COMPUTE_FAST
 
 namespace Vulkan {
+
+namespace {
+// sotc: SOTC_COMPUTE_FAST counters (totals; ReportComputeFast prints the 5 s window). Fast builds and their time,
+// optimized pipelines the driver cache had at the fast path (probe hits), optimized builds that replaced a fast
+// handle and their time, recorder waits on a fast-path build and their time, evidence lines printed.
+struct ComputeFastStats {
+    std::atomic<u64> fast_builds{0}, fast_ns{0};
+    std::atomic<u64> probe_hits{0};
+    std::atomic<u64> swaps{0}, opt_ns{0};
+    std::atomic<u64> rec_waits{0}, rec_wait_ns{0};
+    std::atomic<u32> logged{0};
+} g_cfast;
+
+u64 SinceNs(std::chrono::steady_clock::time_point start) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+}
+
+// sotc: SOTC_COMPUTE_FAST: an optimized build finished. Counted when it replaced a fast handle; the first 32 print the
+// evidence line (does the driver honour DISABLE_OPTIMIZATION: fast vs optimized build time).
+void NoteOptimized(u64 key, u64 fast_ns, u64 opt_ns, bool swapped) {
+    if (!swapped) {
+        return;
+    }
+    g_cfast.swaps.fetch_add(1, std::memory_order_relaxed);
+    g_cfast.opt_ns.fetch_add(opt_ns, std::memory_order_relaxed);
+    if (g_cfast.logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        std::fprintf(stderr, "SOTC COMPUTE FAST: %016llx fast build %.1f ms, optimized %.1f ms\n",
+                     static_cast<unsigned long long>(key), static_cast<double>(fast_ns) / 1e6,
+                     static_cast<double>(opt_ns) / 1e6);
+    }
+}
+} // namespace
+
+ComputeSpecFreeStats g_specfree; // sotc: SOTC_COMPUTE_SPECFREE
+
+// sotc: SOTC_COMPUTE_SPECFREE, the 5 s report line: dispatches, prebuilt hits and fallbacks of the window; prebuilt
+// programs, variants, compile time and first-dispatch translations are totals. Nothing while the switch is off or
+// nothing moved. Call from one thread.
+void ReportComputeSpecFree(std::string& out, double seconds) {
+    (void)seconds;
+    if (!Shader::ComputeSpecFree()) {
+        return;
+    }
+    static u64 prev[9]{};
+    const u64 now[9] = {
+        g_specfree.dispatches.load(std::memory_order_relaxed),
+        g_specfree.hits.load(std::memory_order_relaxed),
+        g_specfree.fallback_dim.load(std::memory_order_relaxed),
+        g_specfree.fallback_int.load(std::memory_order_relaxed),
+        g_specfree.fallback_written_fmt.load(std::memory_order_relaxed),
+        g_specfree.fallback_atomic.load(std::memory_order_relaxed),
+        g_specfree.fallback_other.load(std::memory_order_relaxed),
+        g_specfree.programs.load(std::memory_order_relaxed),
+        g_specfree.not_prebuilt.load(std::memory_order_relaxed),
+    };
+    u64 d[9];
+    bool any = false;
+    for (int i = 0; i < 9; ++i) {
+        d[i] = now[i] - prev[i];
+        prev[i] = now[i];
+        any = any || d[i] != 0;
+    }
+    if (!any) {
+        return;
+    }
+    const u64 fallback = d[2] + d[3] + d[4] + d[5] + d[6];
+    char line[640];
+    std::snprintf(line, sizeof(line),
+                  "SOTC COMPUTE SPECFREE: dispatches %llu, prebuilt hits %llu, fallback %llu (dim %llu, int %llu, "
+                  "written-fmt %llu, atomic %llu, other %llu), prebuilt programs %llu (variants %llu), compile at load "
+                  "%.1f s, first-dispatch programs %llu; perms per program 1:%llu 2:%llu 4:%llu 8:%llu over-cap:%llu "
+                  "(queued %llu), int fallbacks of over-cap programs %llu\n",
+                  static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1]),
+                  static_cast<unsigned long long>(fallback), static_cast<unsigned long long>(d[2]),
+                  static_cast<unsigned long long>(d[3]), static_cast<unsigned long long>(d[4]),
+                  static_cast<unsigned long long>(d[5]), static_cast<unsigned long long>(d[6]),
+                  static_cast<unsigned long long>(now[7]),
+                  static_cast<unsigned long long>(g_specfree.variants.load(std::memory_order_relaxed)),
+                  static_cast<double>(g_specfree.compile_ns.load(std::memory_order_relaxed)) / 1e9,
+                  static_cast<unsigned long long>(now[8]),
+                  // sotc: the int/float variant combinations (totals, ComputeSpecFreeStats::perms_hist)
+                  static_cast<unsigned long long>(g_specfree.perms_hist[0].load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_specfree.perms_hist[1].load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_specfree.perms_hist[2].load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_specfree.perms_hist[3].load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_specfree.perms_hist[4].load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_specfree.perms_queued.load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_specfree.fallback_int_capped.load(std::memory_order_relaxed)));
+    out += line;
+}
+
+// sotc: SOTC_COMPUTE_FAST, the 5 s report line (window counts). Nothing while the switch is off or the window was empty.
+// Call from one thread.
+void ReportComputeFast(std::string& out, double seconds) {
+    (void)seconds;
+    if (!SotcNonBlocking::ComputeFast()) {
+        return;
+    }
+    static u64 prev[7]{};
+    const u64 now[7] = {
+        g_cfast.fast_builds.load(std::memory_order_relaxed), g_cfast.fast_ns.load(std::memory_order_relaxed),
+        g_cfast.swaps.load(std::memory_order_relaxed),       g_cfast.opt_ns.load(std::memory_order_relaxed),
+        g_cfast.rec_waits.load(std::memory_order_relaxed),   g_cfast.rec_wait_ns.load(std::memory_order_relaxed),
+        g_cfast.probe_hits.load(std::memory_order_relaxed),
+    };
+    u64 d[7];
+    bool any = false;
+    for (int i = 0; i < 7; ++i) {
+        d[i] = now[i] - prev[i];
+        prev[i] = now[i];
+        any = any || d[i] != 0;
+    }
+    if (!any) {
+        return;
+    }
+    char line[320];
+    std::snprintf(line, sizeof(line),
+                  "SOTC COMPUTE FAST (5 s): fast builds %llu (%.1f ms total), optimized swaps %llu (%.1f ms total), "
+                  "recorder waits on fast builds %llu (%.1f ms), driver-cache hits %llu\n",
+                  static_cast<unsigned long long>(d[0]), static_cast<double>(d[1]) / 1e6,
+                  static_cast<unsigned long long>(d[2]), static_cast<double>(d[3]) / 1e6,
+                  static_cast<unsigned long long>(d[4]), static_cast<double>(d[5]) / 1e6,
+                  static_cast<unsigned long long>(d[6]));
+    out += line;
+}
 
 ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, LayoutCache& layout_cache,
@@ -180,6 +310,11 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
 ComputePipeline::~ComputePipeline() = default;
 
 void ComputePipeline::CreatePipeline() {
+    auto [result, built] = MakePipeline(BuildMode::Normal);
+    Install(std::move(built), true);
+}
+
+std::pair<vk::Result, vk::UniquePipeline> ComputePipeline::MakePipeline(BuildMode mode) {
     // sotc: 64 where every stage can be pinned to it, otherwise 32 when the device could pick a
     // wider size (AMD): the shaders were lowered for 32 lanes (vk_instance.h). On Intel the
     // recompiler's lane count (Instance::RequiredSubgroupSize).
@@ -206,22 +341,42 @@ void ComputePipeline::CreatePipeline() {
         .pName = "main",
     };
     // sotc: SOTC_DESCRIPTOR_HEAP: the heap flag is a VkPipelineCreateFlags2 bit.
+    // sotc: SOTC_COMPUTE_FAST: with the flags-2 struct chained the legacy flags are ignored, so the mode's bit goes here
+    // too. The bits are part of the create info, so the driver cache keeps the fast and the optimized builds apart.
+    const VkPipelineCreateFlags2 mode_flags2 =
+        mode == BuildMode::Fast    ? VkPipelineCreateFlags2{VK_PIPELINE_CREATE_2_DISABLE_OPTIMIZATION_BIT}
+        : mode == BuildMode::Probe ? VkPipelineCreateFlags2{VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT}
+                                   : VkPipelineCreateFlags2{0};
     const VkPipelineCreateFlags2CreateInfo heap_flags{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
-        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT,
+        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT | mode_flags2,
     };
     // sotc: pipelines whose layouts are descriptor buffer layouts carry this flag.
     const bool n5_layout = DescriptorBufferN5Layout(instance, desc_heap, false, uses_bindless_samplers);
-    const vk::PipelineCreateFlags pipeline_flags =
+    vk::PipelineCreateFlags pipeline_flags =
         instance.IsDescriptorBufferEnabled() || n5_layout
             ? vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eDescriptorBufferEXT)
             : vk::PipelineCreateFlags{};
+    if (mode == BuildMode::Fast) { // sotc: SOTC_COMPUTE_FAST
+        pipeline_flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+    } else if (mode == BuildMode::Probe) {
+        pipeline_flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+    }
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
         .pNext = heap_mode ? static_cast<const void*>(&heap_flags) : nullptr,
         .flags = pipeline_flags,
         .stage = shader_ci,
         .layout = heap_mode ? vk::PipelineLayout{} : pipeline_layout, // sotc: heap pipelines have none
     };
+    if (mode == BuildMode::Probe) {
+        // sotc: SOTC_COMPUTE_FAST: the optimized pipeline when the driver cache has it; compile-required otherwise.
+        auto [result, handle] = instance.GetDevice().createComputePipelineUnique(cache, compute_pipeline_ci);
+        if (result != vk::Result::eSuccess) {
+            return {result, vk::UniquePipeline{}};
+        }
+        SetObjectName(instance.GetDevice(), *handle, "Compute Pipeline {}", GetDebugString());
+        return {result, std::move(handle)};
+    }
     // sotc: SOTC_PIPE_FEEDBACK / SOTC_PIPE_COMPILE_CHECK: the build is measured, and with the driver
     // cache probe on, a success there is the pipeline (no second build). Heap pipelines are not probed.
     const auto debug_name = [this] { return GetDebugString(); };
@@ -239,25 +394,126 @@ void ComputePipeline::CreatePipeline() {
         debug_name);
     SotcPipeFeedback::NoteBuilt(SotcPipeFeedback::Kind::Compute, &sotc_logged, pipeline_result,
                                 debug_name);
-    if (pipeline_result != vk::Result::eSuccess && from_cache) {
+    // sotc: SOTC_COMPUTE_FAST: a refused fast build is not fatal (the caller makes the normal build instead).
+    if (pipeline_result != vk::Result::eSuccess && (from_cache || mode == BuildMode::Fast)) {
         // sotc: as for graphics pipelines, a cached one the driver refuses is dropped.
         LOG_WARNING(Render_Vulkan, "Cached compute pipeline {} failed to build: {}", GetDebugString(),
                     vk::to_string(pipeline_result));
-        return;
+        return {pipeline_result, vk::UniquePipeline{}};
     }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
-    pipeline = std::move(pipe);
-    SetObjectName(instance.GetDevice(), *pipeline, "Compute Pipeline {}", GetDebugString());
+    SetObjectName(instance.GetDevice(), *pipe, "Compute Pipeline {}", GetDebugString());
+    return {pipeline_result, std::move(pipe)};
+}
+
+bool ComputePipeline::Install(vk::UniquePipeline built, bool optimized) {
+    if (!built) {
+        return false;
+    }
+    vk::UniquePipeline retired;
+    {
+        std::scoped_lock lock{sotc_swap_mutex};
+        if (!pipeline) {
+            pipeline = std::move(built);
+            sotc_fast_live.store(!optimized, std::memory_order_release);
+            compute_handle.store(static_cast<VkPipeline>(*pipeline), std::memory_order_release);
+            return false;
+        }
+        if (!optimized || !sotc_fast_live.load(std::memory_order_relaxed)) {
+            return false; // a second build of the same kind, or a fast one after the optimized: never bound, freed here
+        }
+        retired = std::move(pipeline);
+        pipeline = std::move(built);
+        compute_handle.store(static_cast<VkPipeline>(*pipeline), std::memory_order_release);
+        sotc_fast_live.store(false, std::memory_order_release);
+    }
+    // sotc: SOTC_COMPUTE_FAST: every bind that read the fast handle was recorded into a tick up to the command
+    // processor's current one (CurrentTick advances on the command processor at each Flush; a deferred bind reads the
+    // handle when the recorder runs it, which was before this swap when it read the fast one, and it was queued in a
+    // tick no later than the current one). The fast pipeline is freed once the GPU finished that tick; later binds read
+    // the optimized handle. The async compute queue never records a fast handle (the rasterizer checks OnFastBuild).
+    scheduler.DeferOperation([old = std::move(retired)] {});
+    return true;
 }
 
 void ComputePipeline::Build() {
     if (claimed.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
-    CreatePipeline();
+    sotc_normal_claim.store(true, std::memory_order_release); // sotc: SOTC_COMPUTE_FAST (BindWhenReady)
+    const auto start = std::chrono::steady_clock::now();
+    auto [result, built] = MakePipeline(BuildMode::Normal);
+    // sotc: SOTC_COMPUTE_FAST: the recorder may have bound a fast build of it meanwhile (BuildFastBeside): swapped.
+    const bool swapped = Install(std::move(built), true);
+    NoteOptimized(compute_key.value, sotc_fast_ns.load(std::memory_order_relaxed), SinceNs(start), swapped);
     ready.store(true, std::memory_order_release);
     ready.notify_all();
+}
+
+bool ComputePipeline::BuildFast() {
+    if (claimed.exchange(true, std::memory_order_acq_rel)) {
+        return false;
+    }
+    sotc_fast_running.store(true, std::memory_order_release);
+    const auto start = std::chrono::steady_clock::now();
+    bool follow = false;
+    // The optimized pipeline when the driver cache has it (a later launch, or another build of the same create info).
+    // Heap pipelines are not probed (as in SotcPipeFeedback::Create).
+    if (!heap_mode && SotcPipeFeedback::g_compile_control.load(std::memory_order_relaxed)) {
+        auto [probe_result, hit] = MakePipeline(BuildMode::Probe);
+        if (hit) {
+            Install(std::move(hit), true);
+            g_cfast.probe_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (!compute_handle.load(std::memory_order_acquire)) {
+        auto [fast_result, fast] = MakePipeline(BuildMode::Fast);
+        if (fast) {
+            const u64 ns = SinceNs(start);
+            sotc_fast_ns.store(ns, std::memory_order_relaxed);
+            Install(std::move(fast), false);
+            g_cfast.fast_builds.fetch_add(1, std::memory_order_relaxed);
+            g_cfast.fast_ns.fetch_add(ns, std::memory_order_relaxed);
+            follow = true;
+        } else {
+            // Refused with DISABLE_OPTIMIZATION: the normal build here, as without the switch.
+            sotc_normal_claim.store(true, std::memory_order_release);
+            auto [normal_result, normal] = MakePipeline(BuildMode::Normal);
+            Install(std::move(normal), true);
+        }
+    }
+    sotc_fast_running.store(false, std::memory_order_release);
+    ready.store(true, std::memory_order_release);
+    ready.notify_all();
+    return follow;
+}
+
+void ComputePipeline::BuildFastBeside() {
+    if (sotc_fast_running.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    auto [result, fast] = MakePipeline(BuildMode::Fast);
+    if (fast) {
+        const u64 ns = SinceNs(start);
+        sotc_fast_ns.store(ns, std::memory_order_relaxed);
+        Install(std::move(fast), false); // dropped when the worker's optimized build landed first
+        g_cfast.fast_builds.fetch_add(1, std::memory_order_relaxed);
+        g_cfast.fast_ns.fetch_add(ns, std::memory_order_relaxed);
+    }
+    sotc_fast_running.store(false, std::memory_order_release);
+    if (compute_handle.load(std::memory_order_acquire)) {
+        ready.store(true, std::memory_order_release);
+        ready.notify_all();
+    }
+}
+
+void ComputePipeline::BuildOptimized() {
+    const auto start = std::chrono::steady_clock::now();
+    auto [result, built] = MakePipeline(BuildMode::Normal);
+    const bool swapped = Install(std::move(built), true);
+    NoteOptimized(compute_key.value, sotc_fast_ns.load(std::memory_order_relaxed), SinceNs(start), swapped);
 }
 
 void ComputePipeline::WaitBuilt() {
@@ -272,7 +528,8 @@ void ComputePipeline::WaitBuilt() {
 
 void ComputePipeline::BindWhenReady() const {
     if (ready.load(std::memory_order_acquire)) {
-        scheduler.CommandBuffer().bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
+        // sotc: SOTC_COMPUTE_FAST: the current handle (fast or optimized; see Install).
+        scheduler.CommandBuffer().bindPipeline(vk::PipelineBindPoint::eCompute, Handle());
         return;
     }
     scheduler.RecordDeferred([this](vk::CommandBuffer cmdbuf) {
@@ -284,15 +541,38 @@ void ComputePipeline::BindWhenReady() const {
             // sotc: demand includes a build taken by the recorder, not only ready.wait below.
             const SotcBlockLedger::Scope ledger{SotcBlockLedger::ComputeWait, compute_key.value};
             bool self_built = false;
+            auto* self = const_cast<ComputePipeline*>(this);
+            // sotc: SOTC_COMPUTE_FAST: the recorder waits only for a fast build: its own when no worker claimed the
+            // pipeline (the optimized build is queued behind it), or one beside a worker's optimized build. A pack
+            // listed (inline, a cache hit) or pack prebuild pipeline keeps the normal build.
+            const bool fast = SotcNonBlocking::ComputeFast() && !sotc_inline && !sotc_pack;
+            bool fast_wait = false;
             if (!claimed.load(std::memory_order_acquire)) {
-                const_cast<ComputePipeline*>(this)->Build();
+                if (fast) {
+                    if (self->BuildFast() && QueueOptimizedHook) {
+                        QueueOptimizedHook(self);
+                    }
+                    fast_wait = !sotc_normal_claim.load(std::memory_order_acquire);
+                } else {
+                    self->Build();
+                }
                 self_built = true;
                 SotcStats::async_compute_self_built.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (fast && !ready.load(std::memory_order_acquire)) {
+                if (sotc_normal_claim.load(std::memory_order_acquire)) {
+                    self->BuildFastBeside(); // a worker's optimized build is running (or just finished)
+                }
+                fast_wait = true; // waiting for a fast build (this one, or a worker's from the Urgent lane)
             }
             ready.wait(false, std::memory_order_acquire);
             const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - start)
                                    .count();
+            if (fast_wait) {
+                g_cfast.rec_waits.fetch_add(1, std::memory_order_relaxed);
+                g_cfast.rec_wait_ns.fetch_add(static_cast<u64>(spent), std::memory_order_relaxed);
+            }
             // sotc: SOTC_COMPUTE_PACK: a listed pipeline (pack cache hit) built here by design is an inline build,
             // not a wait for a worker.
             if (sotc_inline && self_built) {
@@ -303,7 +583,7 @@ void ComputePipeline::BindWhenReady() const {
                 SotcStats::async_compute_waits.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, Handle()); // sotc: SOTC_COMPUTE_FAST (Install)
     });
 }
 

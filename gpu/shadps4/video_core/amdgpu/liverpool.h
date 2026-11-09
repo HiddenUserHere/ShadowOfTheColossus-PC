@@ -1064,13 +1064,15 @@ private:
 
     /// sotc: SOTC_PARALLEL_RECORD=1 (default off; needs the draw thread and more than 6
     /// hardware threads). prep_workers GpuPrep threads (SOTC_PARALLEL_RECORD_WORKERS, default
-    /// clamp(threads / 4, 1, 2)) follow the back ring: each replays every op's registers into its
-    /// own prep_regs and computes the register-only inputs (draw_prep.h) of the draws with
+    /// clamp(threads / 4, 1, 2)) follow the back ring: each replays the registers into its own
+    /// prep_regs (sotc: design E0, lazily: up to an op it computes, each chunk once, see PrepLoop)
+    /// and computes the register-only inputs (draw_prep.h) of the draws with
     /// seq % prep_workers == its index into prep_ring[seq % BackRingSize]. BackAlloc reuses a
     /// slot only when the draw thread and every prep thread are past it (MinRingTail).
     static constexpr u32 MaxPrepWorkers = 2;
     u32 prep_workers{};
-    std::array<std::atomic<u64>, MaxPrepWorkers> prep_tail{}; ///< next op each will look at
+    /// the oldest op each still reads (sotc: design E0: its first op not replayed yet)
+    std::array<std::atomic<u64>, MaxPrepWorkers> prep_tail{};
     std::atomic<u32> prep_wake{0};     ///< doorbell of sleeping prep threads (BackPublish)
     std::atomic<u32> prep_sleepers{0}; ///< prep threads blocked on prep_wake
     std::unique_ptr<Vulkan::PreparedDraw[]> prep_ring;
@@ -1088,6 +1090,8 @@ private:
     /// Draw thread: the prepared inputs of op seq when they are usable, else null (counted).
     /// dispatch: a compute op; its take is not counted in the draw counters (pr_*).
     const Vulkan::PreparedDraw* TakePrepared(u64 seq, bool dispatch = false);
+    /// sotc: design E: the SOTC PREP line (draw thread, every 5 s; Vulkan::g_prep_counters).
+    void PrepReport();
 
     /// sotc: SOTC_EOP_TICK=1 (needs back_threaded). End-of-pipe labels wait for the GPU through
     /// the scheduler's deferred operations instead of being written when the command processor

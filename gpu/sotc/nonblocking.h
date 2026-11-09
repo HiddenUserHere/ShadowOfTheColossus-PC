@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
@@ -203,6 +204,17 @@ inline bool ComputePack() {
     return ComputePackRequested() && GplPackLibs();
 }
 
+/// sotc: SOTC_COMPUTE_FAST=1 (default off). A compute pipeline a dispatch needs and that is not built yet gets a first
+/// build with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT on the Urgent lane (or on the recorder when it would wait),
+/// so the recorder waits only for that; the optimized build follows on the Background lane and replaces the handle
+/// (the fast one is destroyed once the GPU finished its ticks). With the device's cache control, the optimized build
+/// is first probed in the driver cache (FAIL_ON_PIPELINE_COMPILE_REQUIRED): a hit is used directly. Pipelines prebuilt
+/// by the manifest, the compute prebuilds and pack-listed ones keep the normal build (ComputePipeline, vk_pipeline_cache).
+inline bool ComputeFast() {
+    static const bool on = SwitchOn("SOTC_COMPUTE_FAST");
+    return on;
+}
+
 /// SOTC_COMPUTE_PACK_MAX=<n> (default 10000): the most compute programs the compute pack prebuilds in one session; a
 /// shader set beyond it is capped (the rest build at their first dispatch, as before) and the pack line says so.
 inline unsigned ComputePackMax() {
@@ -336,6 +348,89 @@ inline bool FlatArena() {
 inline bool ProtectAsyncUnprotect() {
     static const bool on = SwitchOn("SOTC_PROTECT_ASYNC_UNPROTECT");
     return on;
+}
+
+/// SOTC_FILL_GPU=1 (off by default): the replicate fill of a table (vk_shader_hle.cpp FillTableGpu) writes the guest
+/// bytes inline and fills the arena on the GPU, with no page compare or per-run replace. Read once.
+inline bool FillGpu() {
+    static const bool on = SwitchOn("SOTC_FILL_GPU");
+    return on;
+}
+
+/// SOTC_BIND_CACHE_WIDE=1 (default off; needs SOTC_BIND_CACHE, _RANGES, _XTICK and _FRAME, read here on their own): the
+/// frame bind cache also takes compute dispatches and binds that write plain guest buffers, without SOTC_OP_COMPUTE_BIND
+/// being set. It applies the rules of SOTC_OP_COMPUTE_BIND=1 (vk_rasterizer.cpp, OpComputeMode): a hit replays the written
+/// bindings' side effects (Rasterizer::ReplayOwnWrites). Storage images, fmasks and written images stay refused, counted by
+/// gate in the "SOTC BIND WIDE" 5 s line. With SOTC_OP_COMPUTE_BIND=2 set as well, the verify mode runs instead of hits.
+inline bool BindCacheWide() {
+    static const bool on = [] {
+        const auto one = [](const char* name) {
+            const char* v = std::getenv(name);
+            return v != nullptr && v[0] == '1';
+        };
+        return one("SOTC_BIND_CACHE_WIDE") && one("SOTC_BIND_CACHE") && one("SOTC_BIND_CACHE_RANGES") &&
+               one("SOTC_BIND_CACHE_XTICK") && one("SOTC_BIND_CACHE_FRAME");
+    }();
+    return on;
+}
+
+// sotc: SOTC_WATCH_SKIP=1 (off by default; read once). Skips page-watcher and CPU-walk work the GPU-only protection
+// policy does not need: write-watcher changes of a page-tracker update when SOTC_NATIVE_TRACK=3 with
+// SOTC_NATIVE_TRACK_GPU_ONLY=1 (PageManager::UpdatePageWatchersForRegion), and the locked CPU-modified walk of a region
+// whose 2 MiB chunks hold no CPU bit (RegionManager::cpu_chunks). Both are exact; the counters below say how often.
+inline bool WatchSkip() {
+    static const bool on = SwitchOn("SOTC_WATCH_SKIP");
+    return on;
+}
+
+/// sotc: SOTC_WATCH_SKIP counters, cumulative since start (the 5 s line reads them and may diff them).
+/// gpu_only_skips: page-watcher updates dropped (write-only calls skipped). clean_skips: CPU-modified queries answered
+/// by a clean chunk summary. walks / pages_walked: locked CPU-modified walks and the pages they covered.
+namespace WatchSkipStats {
+inline std::atomic<uint64_t> gpu_only_skips{0};
+inline std::atomic<uint64_t> clean_skips{0};
+inline std::atomic<uint64_t> walks{0};
+inline std::atomic<uint64_t> pages_walked{0};
+} // namespace WatchSkipStats
+
+/// SOTC_PACK_REFERENCED (off unless set to 1; with SOTC_GPL_PACK_LIBS): the first-loading pack compiles the stage
+/// libraries of the programs a material the game has created so far names (the material factory hook,
+/// gpu/sotc/pipe_predict.h) and of the manifest's stages, not of every loaded program. A material created after that
+/// pack queues its libraries on the Predict lane when the command processor sees it; each one built is listed for the
+/// next launch by the exit publication.
+inline bool GplPackReferenced() {
+    static const bool on = SwitchOn("SOTC_PACK_REFERENCED");
+    return on;
+}
+
+/// sotc: design E (docs/re-stutters/DESIGN-NEXT-CUTS-2026-11-08.md section 2). A mode switch: 0 when unset or "0",
+/// 1 or 2 by its first digit (other values read as 1).
+inline int ModeSwitch(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0' || v[0] == '0') {
+        return 0;
+    }
+    return v[0] == '2' ? 2 : 1;
+}
+
+/// E1 (SOTC_PR_PRED, off; needs SOTC_PARALLEL_RECORD=1). The GpuPrep thread computes the buffer predicates of every stage
+/// of a prepared op (shader-addressed, special, written; PreparedDraw::pred_*, Rasterizer::PreparePredicates) and
+/// BindBuffers reads the shader-addressed bit from the slot instead of ShaderAddrBufferAt. 2: verify, BindBuffers
+/// computes the bits itself, uses its own, and counts every difference ("pred diff" in the SOTC PREP line).
+inline int PrPred() {
+    static const int mode = ModeSwitch("SOTC_PR_PRED");
+    return mode;
+}
+
+/// E2 (SOTC_PR_BCPROBE, off; needs SOTC_PARALLEL_RECORD=1 and SOTC_BIND_CACHE_FRAME). The GpuPrep thread computes the
+/// frame bind-cache key of a prepared draw (with the render-target key the draw thread published last) and probes the
+/// table read-only: the entry index and its sequence number, or the table's commit sequence for a miss
+/// (Rasterizer::BindCacheProbeFrame). The draw thread checks the probe (pipeline, hash, targets key, index, sequence,
+/// key) and then runs TryBindCacheFrame without its own key computation and lookup; a stale probe falls back to the
+/// lookup. 2: verify, the lookup runs too and is the one used; differences are counted ("bcprobe mismatch").
+inline int PrBcProbe() {
+    static const int mode = ModeSwitch("SOTC_PR_BCPROBE");
+    return mode;
 }
 
 } // namespace SotcNonBlocking

@@ -221,9 +221,82 @@ inline bool IsGenericBufferFormat(u32 data_format, u32 num_format) {
 /// The decision the key (FillBuffer) and the translation (resource_patching_pass.cpp, lower_buffer_format_to_raw.cpp)
 /// share: it reads only the cached BufferResource and the V# of the draw. A typed load (tbuffer_load_format_*) never
 /// reads the V# format, so it is right with either answer.
-inline bool GenericFormatBuffer(const BufferResource& desc, const AmdGpu::Buffer& sharp) {
-    return GenericBufferFormat() && desc.is_formatted && !desc.is_written && desc.buffer_type == BufferType::Guest &&
-           IsGenericBufferFormat(sharp.data_format, sharp.num_format);
+/// sotc: specfree (SOTC_COMPUTE_SPECFREE, a compute stage, SpecFreeStage) applies the generic decode whatever
+/// SOTC_GENERIC_BUFFERS says.
+inline bool GenericFormatBuffer(const BufferResource& desc, const AmdGpu::Buffer& sharp, bool specfree = false) {
+    return (GenericBufferFormat() || specfree) && desc.is_formatted && !desc.is_written &&
+           desc.buffer_type == BufferType::Guest && IsGenericBufferFormat(sharp.data_format, sharp.num_format);
+}
+
+/// sotc: SOTC_COMPUTE_SPECFREE=1 (default off). A compute stage's translation stops depending on the descriptor
+/// fields that can be read at run time from the flattened user data (the sharp dwords are there at every dispatch):
+/// buffers take their stride, swizzle (index stride, element size), add-tid bit and generic format from the V#;
+/// storage images their dst_select and images their number conversion from the T#; samplers their
+/// force_unnormalized and force_degamma from the S#. Those fields leave the compute specialization key (they are
+/// written as fixed markers, FillBuffer / FillImage / FillSampler), so the program prebuilt at shader file load
+/// (synthetic sharps, SOTC_PRETRANSLATE_COMPUTE) is the permutation its dispatches use. What stays specialized:
+/// image dimension and integer type (the prebuild derives them from the instructions; the int/float combinations of
+/// the ambiguous images are prebuilt, kSpecFreeMaxAmbiguous), written formatted buffers, formats the run-time decode
+/// does not cover, descriptor arrays and mip fallbacks (num_bindings), fmasks. Graphics stages are untouched. The shader cache
+/// version and the pipeline key version carry the switch (vk_pipeline_serialization.cpp).
+inline bool ComputeSpecFree() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_COMPUTE_SPECFREE");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+/// sotc: SOTC_COMPUTE_SPECFREE: the marker of a run-time number conversion in an image key (no real conversion uses it).
+inline constexpr u32 kSpecFreeConversionKey = 15u;
+/// sotc: SOTC_COMPUTE_SPECFREE: a compute program with up to this many type-ambiguous images (only read or written,
+/// never sampled) is prebuilt in every int/float combination of them (2^k permutations, at most 8); one with more
+/// gets the code's verdict and the all-flipped variant only.
+inline constexpr u32 kSpecFreeMaxAmbiguous = 3u;
+
+/// sotc: SOTC_COMPUTE_SPECFREE. True when the shader can read dword `index` of a sharp at run time: a load from the
+/// flattened user data or an immediate the code built it with (an invalid fetch is always the null sharp).
+template <typename T>
+inline bool SpecFreeFetchReadable(const SharpFetch<T>& fetch) {
+    return fetch.summary != SharpFetch<T>::Summary::Invalid;
+}
+
+/// sotc: SOTC_COMPUTE_SPECFREE. A buffer whose address math (stride, swizzle, index stride, element size, add-tid)
+/// reads the V# at run time. Depends only on the cached resource, never on the V# of a dispatch.
+inline bool SpecFreeBufferAddress(const BufferResource& desc) {
+    return desc.buffer_type == BufferType::Guest && SpecFreeFetchReadable(desc.sharp_fetch);
+}
+
+/// sotc: SOTC_COMPUTE_SPECFREE. The data formats whose dst_select the run-time swizzle reproduces: no RemapSwizzle,
+/// or the single-channel alpha-to-red one. Other formats keep the specialized swizzle (and their own permutation).
+inline bool SpecFreeSwizzleFormat(u32 data_format) {
+    switch (static_cast<AmdGpu::DataFormat>(data_format)) {
+    case AmdGpu::DataFormat::Format1_5_5_5:
+    case AmdGpu::DataFormat::Format11_11_10:
+    case AmdGpu::DataFormat::Format10_10_10_2:
+    case AmdGpu::DataFormat::Format4_4_4_4:
+    case AmdGpu::DataFormat::Format5_6_5:
+        return false;
+    default:
+        return true;
+    }
+}
+
+/// sotc: SOTC_COMPUTE_SPECFREE. The number conversions the run-time select reproduces (None, Uint32ToUnorm,
+/// UintToUscaled, SintToSscaled); the others keep the specialized conversion.
+inline bool SpecFreeConversion(AmdGpu::NumberConversion conversion) {
+    return conversion == AmdGpu::NumberConversion::None || conversion == AmdGpu::NumberConversion::Uint32ToUnorm ||
+           conversion == AmdGpu::NumberConversion::UintToUscaled ||
+           conversion == AmdGpu::NumberConversion::SintToSscaled;
+}
+
+/// sotc: SOTC_COMPUTE_SPECFREE. An image (single T#, no descriptor array) whose dst_select (storage) and number
+/// conversion are read from the T# at run time. The key (FillImage) and the translation (resource_patching_pass.cpp)
+/// share this decision; it reads the cached resource and the T# of the dispatch.
+inline bool SpecFreeImageRuntime(const ImageResource& desc, const AmdGpu::Image& sharp) {
+    return desc.array_size == 0 && SpecFreeFetchReadable(desc.sharp_fetch) &&
+           SpecFreeConversion(sharp.GetNumberConversion()) &&
+           (!desc.is_written || SpecFreeSwizzleFormat(static_cast<u32>(sharp.data_format)));
 }
 
 struct Info;
@@ -310,6 +383,11 @@ struct Info : InfoPersistent {
     u8 sotc_synthetic_variant{};
     /// sotc: SOTC_PRETRANSLATE: set by the synthetic sharps when an image is only read (the verdict a variant flips).
     bool sotc_synthetic_reads{};
+    /// sotc: SOTC_COMPUTE_SPECFREE: with variant 1, a nonzero mask flips only the ambiguous images whose bit is set
+    /// (bit i: the i-th image only read or written, in resource order); 0 flips them all. Not serialized.
+    u8 sotc_synthetic_mask{};
+    /// sotc: SOTC_COMPUTE_SPECFREE: the number of those ambiguous images (set by the synthetic sharps, saturates).
+    u8 sotc_synthetic_ambiguous{};
     /// sotc: implicit-LOD samples report their mip to the LOD feedback buffer (sotc_lod_stats.h)
     bool uses_lod_feedback{};
     bool uses_buffer_atomic_float_min_max{};
@@ -546,5 +624,10 @@ bool HeapStaticRefusal(const Info& info) noexcept;
 /// sotc: the heap stage rule without the profile's switches (Backend::SPIRV::UsesHeapImages applies those): the variant,
 /// the images and samplers the heap takes, and the static refusal. The answer is cached in Info::bindless.
 bool HeapStageRule(const Info& info) noexcept;
+
+/// sotc: SOTC_COMPUTE_SPECFREE (ComputeSpecFree): true for a compute stage, the only stage the switch changes.
+inline bool SpecFreeStage(const Info& info) {
+    return ComputeSpecFree() && info.sw_stage == SwStage::Compute;
+}
 
 } // namespace Shader

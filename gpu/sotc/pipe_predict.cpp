@@ -13,6 +13,7 @@
 #include <deque>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "hooks.h"
 #include "nonblocking.h" // sotc: SOTC_GPL_PREDICT
@@ -122,6 +123,7 @@ std::mutex g_mutex;
 std::deque<Pending> g_queue; // guarded by g_mutex
 std::atomic<uint64_t> g_queued{0}, g_read{0}, g_empty{0}, g_slots{0}, g_unreadable{0};
 std::atomic<size_t> g_queue_size{0}; // g_queue.size(), read without the lock (Pending)
+std::unordered_set<uint64_t> g_referenced; // guarded by g_mutex: VS and PS hashes of the materials taken
 
 // PIPE_PREDICT_MATERIAL: post phase of the factory 0xf9390; rax is the material (0 when the parse failed).
 void PostFactory(SotcHooks::GuestRegs& regs, void*) {
@@ -137,6 +139,37 @@ void PostFactory(SotcHooks::GuestRegs& regs, void*) {
     }
 }
 
+// Reads the VS+PS slots of a material, appended to out when given (count: unreadable slots are counted). any_program:
+// some slot holds a program record. Returns the number of VS+PS slots found.
+size_t ReadSlots(uintptr_t material, std::vector<Slot>* out, bool& any_program, bool count) {
+    size_t found = 0;
+    any_program = false;
+    for (uint32_t k = 0; k < kSlotCount; ++k) {
+        const uintptr_t slot = material + kSlotBase + kSlotStride * k;
+        uint64_t recs[kRecCount] = {};
+        for (int i = 0; i < kRecCount; ++i) {
+            ReadU64(slot + kSlotRecs + 8 * static_cast<uintptr_t>(i), &recs[i]);
+        }
+        any_program = any_program || recs[0] || recs[4];
+        // VS+PS only (the stage mask 17 of every material slot seen in a run): rec[0] and rec[4], nothing between.
+        if (!recs[0] || !recs[4] || recs[1] || recs[2] || recs[3]) {
+            continue;
+        }
+        Slot s{static_cast<uint8_t>(k), 0, 0};
+        if (!RecordHash(recs[0], &s.vs) || !RecordHash(recs[4], &s.ps)) {
+            if (count) {
+                g_unreadable.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+        if (out) {
+            out->push_back(s);
+        }
+        ++found;
+    }
+    return found;
+}
+
 } // namespace
 
 bool On() noexcept {
@@ -148,7 +181,8 @@ bool On() noexcept {
 }
 
 bool MaterialsWanted() noexcept {
-    static const bool on = On() || SotcNonBlocking::GplPredictRequested();
+    static const bool on = On() || SotcNonBlocking::GplPredictRequested() ||
+                           SotcNonBlocking::GplPackReferenced(); // sotc: SOTC_PACK_REFERENCED reads the queue
     return on;
 }
 
@@ -162,27 +196,14 @@ size_t TakeSlots(std::vector<Slot>& out, size_t max_materials) {
         g_queue_size.store(g_queue.size(), std::memory_order_relaxed);
     }
     std::vector<Pending> again;
+    std::vector<uint64_t> refs; // sotc: SOTC_PACK_REFERENCED: the programs these materials name
     for (const Pending& m : batch) {
-        size_t found = 0;
         bool any_program = false;
-        for (uint32_t k = 0; k < kSlotCount; ++k) {
-            const uintptr_t slot = m.material + kSlotBase + kSlotStride * k;
-            uint64_t recs[kRecCount] = {};
-            for (int i = 0; i < kRecCount; ++i) {
-                ReadU64(slot + kSlotRecs + 8 * static_cast<uintptr_t>(i), &recs[i]);
-            }
-            any_program = any_program || recs[0] || recs[4];
-            // VS+PS only (the stage mask 17 of every material slot seen in a run): rec[0] and rec[4], nothing between.
-            if (!recs[0] || !recs[4] || recs[1] || recs[2] || recs[3]) {
-                continue;
-            }
-            Slot s{static_cast<uint8_t>(k), 0, 0};
-            if (!RecordHash(recs[0], &s.vs) || !RecordHash(recs[4], &s.ps)) {
-                g_unreadable.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            out.push_back(s);
-            ++found;
+        const size_t before = out.size();
+        const size_t found = ReadSlots(m.material, &out, any_program, true);
+        for (size_t i = before; i < out.size(); ++i) {
+            refs.push_back(out[i].vs);
+            refs.push_back(out[i].ps);
         }
         if (found != 0) {
             g_read.fetch_add(1, std::memory_order_relaxed);
@@ -193,12 +214,34 @@ size_t TakeSlots(std::vector<Slot>& out, size_t max_materials) {
             g_empty.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (!again.empty()) {
+    if (!again.empty() || !refs.empty()) {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_queue.insert(g_queue.end(), again.begin(), again.end());
         g_queue_size.store(g_queue.size(), std::memory_order_relaxed);
+        g_referenced.insert(refs.begin(), refs.end());
     }
     return batch.size();
+}
+
+size_t ReferencedPrograms(std::unordered_set<uint64_t>& out) {
+    const size_t before = out.size();
+    std::vector<Pending> queued;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        out.insert(g_referenced.begin(), g_referenced.end());
+        queued.assign(g_queue.begin(), g_queue.end());
+    }
+    std::vector<Slot> slots;
+    for (const Pending& m : queued) {
+        bool any_program = false;
+        slots.clear();
+        ReadSlots(m.material, &slots, any_program, false);
+        for (const Slot& s : slots) {
+            out.insert(s.vs);
+            out.insert(s.ps);
+        }
+    }
+    return out.size() - before;
 }
 
 bool HasQueued() noexcept {

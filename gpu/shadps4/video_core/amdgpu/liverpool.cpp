@@ -2164,10 +2164,15 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
 }
 
 void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
-    // sotc: SOTC_PARALLEL_RECORD (liverpool.h). Every op's registers are replayed, in order, so
-    // prep_regs matches back_regs at each op; only this thread's share of the draws is computed,
+    // sotc: SOTC_PARALLEL_RECORD (liverpool.h). Only this thread's share of the draws is computed,
     // and none the draw thread has already passed. The op stays valid until prep_tail moves past
     // it (BackAlloc), the slot of prep_ring until the draw thread ran that op.
+    // sotc: design E0. The registers are replayed lazily: prep_regs holds every op before `applied`;
+    // before an op is computed, the ops [applied, seq] are walked newest first and each chunk is
+    // copied once (its newest value), so the chunks of the ops this thread does not compute are not
+    // copied one op at a time, and ops the draw thread passed cost nothing. prep_tail stays at
+    // `applied` (those ops' chunks are still read), and the gap is replayed once it reaches
+    // kMaxLag ops so the ring is never held back (BackRingSize is 512).
     Common::SetCurrentThreadName(index == 0 ? "shadPS4:GpuPrep0" : "shadPS4:GpuPrep1");
     BbThreads::PlaceThread(BbThreads::Role::Prep);
     Shader::g_info_slot = 2 + index; // info.h: slots 2..5 are the draw workers'
@@ -2177,6 +2182,34 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
     // sotc: SOTC_GCN_COMMIT: dispatches get a full prepared slot (PrepareDispatch).
     const bool commit_on = SotcGcn::Commit::On();
     u64 seq = 0;
+    // sotc: design E0 (see above).
+    constexpr u64 kMaxLag = 64;
+    u64 applied = 0;
+    std::array<u64, (NumRegChunks + 63) / 64> copied{};
+    Vulkan::PrepCounters::Worker& counters = Vulkan::g_prep_counters.workers[index];
+    const auto replay_to = [&](u64 last) { // prep_regs := the registers of op `last`
+        u64 chunks = 0;
+        for (u64 s = last + 1; s-- > applied;) {
+            const BackOp& past = back_ring[s % BackRingSize];
+            for (size_t i = 0; i < past.reg_chunks.size(); i += RegChunkDwords + 1) {
+                const u32 chunk = past.reg_chunks[i];
+                u64& word = copied[chunk / 64];
+                const u64 bit = u64{1} << (chunk % 64);
+                if (word & bit) {
+                    continue; // a newer op already set this chunk
+                }
+                word |= bit;
+                std::memcpy(&prep.reg_array[chunk * RegChunkDwords], &past.reg_chunks[i + 1],
+                            RegChunkDwords * sizeof(u32));
+                ++chunks;
+            }
+        }
+        copied.fill(0);
+        applied = last + 1;
+        if (chunks != 0) {
+            counters.chunks.fetch_add(chunks, std::memory_order_relaxed);
+        }
+    };
     while (!stoken.stop_requested()) {
         if (back_head.load(std::memory_order_acquire) == seq) {
             bool found = false;
@@ -2199,10 +2232,6 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
             continue;
         }
         const BackOp& op = back_ring[seq % BackRingSize];
-        for (size_t i = 0; i < op.reg_chunks.size(); i += RegChunkDwords + 1) {
-            std::memcpy(&prep.reg_array[op.reg_chunks[i] * RegChunkDwords], &op.reg_chunks[i + 1],
-                        RegChunkDwords * sizeof(u32));
-        }
         const bool is_draw = op.kind == BackOp::Kind::Draw || op.kind == BackOp::Kind::DrawIndirect;
         const bool is_disp = op.kind == BackOp::Kind::Dispatch ||
                              op.kind == BackOp::Kind::DispatchIndirect;
@@ -2221,6 +2250,7 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
         if (is_draw && seq % prep_workers == index &&
             seq >= back_tail.load(std::memory_order_acquire)) {
             Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
+            replay_to(seq); // sotc: design E0: this op's registers
             slot.map_epoch = rasterizer->MapEpoch();
             if (commit_on) { // sotc: SOTC_GCN_COMMIT: this slot is a draw (TakePrepared checks it)
                 slot.is_dispatch = false;
@@ -2237,9 +2267,11 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
                 XpFillResources(slot, op.pipeline);
             }
             slot.ready_seq.store(seq, std::memory_order_release);
+            counters.prepared.fetch_add(1, std::memory_order_relaxed); // sotc: design E counters
         } else if ((commit_on || fp_fill) && is_disp && seq % prep_workers == index &&
                    seq >= back_tail.load(std::memory_order_acquire)) {
             Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
+            replay_to(seq); // sotc: design E0: this op's registers
             if (commit_on) {
                 // sotc: SOTC_GCN_COMMIT: the dispatch's prepared inputs, as a draw's. Reset first; the
                 // computation sets valid and is_dispatch only when it finished.
@@ -2262,7 +2294,11 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
             slot.ready_seq.store(seq, std::memory_order_release);
         }
         ++seq;
-        prep_tail[index].store(seq, std::memory_order_seq_cst);
+        // sotc: design E0: the ops not replayed yet stay in the ring; a gap of kMaxLag ops is replayed now.
+        if (seq - applied >= kMaxLag) {
+            replay_to(seq - 1);
+        }
+        prep_tail[index].store(applied, std::memory_order_seq_cst);
         if (drain_waiting.load(std::memory_order_seq_cst)) {
             std::scoped_lock lk{back_mutex};
             drain_cv.notify_all();
@@ -2289,25 +2325,71 @@ const Vulkan::PreparedDraw* Liverpool::TakePrepared(u64 seq, bool dispatch) {
             counter.fetch_add(1, std::memory_order_relaxed);
         }
     };
+    // sotc: design E counters (draw_prep.h PrepCounters, the SOTC PREP line); draws only.
+    Vulkan::PrepCounters& pc = Vulkan::g_prep_counters;
+    if (!dispatch) {
+        PrepReport();
+    }
+    const auto note = [dispatch](u64& counter) {
+        counter += dispatch ? 0 : 1;
+    };
     if (slot.ready_seq.load(std::memory_order_acquire) != seq) {
         count(SotcStats::pr_not_ready);
+        note(pc.late);
         return nullptr;
     }
     // sotc: SOTC_GCN_COMMIT: a slot of the other kind (a stale dispatch slot read as a draw, or the
     // reverse) is never handed out.
     if (slot.is_dispatch != dispatch) {
+        note(pc.invalid);
         return nullptr;
     }
     if (!slot.valid) {
         count(SotcStats::pr_ineligible);
+        note(pc.invalid);
         return nullptr;
     }
     if (slot.map_epoch != rasterizer->MapEpoch()) {
         count(SotcStats::pr_epoch);
+        note(pc.epoch);
         return nullptr;
     }
     count(SotcStats::pr_prepared);
+    note(pc.taken);
     return &slot;
+}
+
+void Liverpool::PrepReport() {
+    // sotc: design E (docs/re-stutters/DESIGN-NEXT-CUTS-2026-11-08.md section 2): the SOTC PREP line, every 5 s,
+    // printed by the draw thread. The clock is read once every 256 draws.
+    Vulkan::PrepCounters& pc = Vulkan::g_prep_counters;
+    if ((++pc.calls & 255) != 0) {
+        return;
+    }
+    const u64 now = SotcStats::NowNs();
+    if (pc.next_report_ns == 0) {
+        pc.next_report_ns = now + 5'000'000'000ULL;
+        return;
+    }
+    if (now < pc.next_report_ns) {
+        return;
+    }
+    pc.next_report_ns = now + 5'000'000'000ULL;
+    u64 prepared = 0, chunks = 0;
+    for (u32 k = 0; k < prep_workers && k < Vulkan::PrepCounters::MaxWorkers; ++k) {
+        prepared += pc.workers[k].prepared.exchange(0, std::memory_order_relaxed);
+        chunks += pc.workers[k].chunks.exchange(0, std::memory_order_relaxed);
+    }
+    const auto u = [](u64 v) { return static_cast<unsigned long long>(v); };
+    std::fprintf(stderr,
+                 "SOTC PREP: ops prepared %llu, taken %llu, missed (epoch %llu, late %llu, invalid %llu); "
+                 "pred used %llu/diff %llu; bcprobe used %llu/stale %llu/mismatch %llu; reg chunks copied %llu "
+                 "(%u workers)\n",
+                 u(prepared), u(pc.taken), u(pc.epoch), u(pc.late), u(pc.invalid), u(pc.pred_used),
+                 u(pc.pred_diff), u(pc.bc_used), u(pc.bc_stale), u(pc.bc_mismatch), u(chunks), prep_workers);
+    pc.taken = pc.epoch = pc.late = pc.invalid = 0;
+    pc.pred_used = pc.pred_diff = 0;
+    pc.bc_used = pc.bc_stale = pc.bc_mismatch = 0;
 }
 
 void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {

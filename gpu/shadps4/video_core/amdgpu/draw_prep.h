@@ -76,8 +76,9 @@ struct PrBuffer {
     u64 mapped{};    ///< ClampRangeSize(base, vsize); 0 when base or vsize is 0
     u64 size{};      ///< mapped, limited to the unbounded window: what BindBuffers binds
     bool computed{}; ///< false: BindBuffers reads this descriptor itself
-    /// sotc: SOTC_PR_PRED. ShaderAddrBufferAt on the pipeline's profile (the predicate BindBuffers
-    /// asks for each buffer). Computed for every buffer of a prepared stage, specials included.
+    /// sotc: ShaderAddrBufferAt on the pipeline's profile (the predicate BindBuffers asks for each
+    /// buffer). Computed for every buffer of a prepared stage, specials included. (SOTC_PR_PRED uses
+    /// PreparedDraw::pred_addr, which does not need SOTC_PR_RESOLVE.)
     bool shader_addressed{};
     u64 gen_sum{};   ///< SOTC_PR_GEN: SotcGen::Sum(base, vsize) read before the mapping check
 };
@@ -154,6 +155,51 @@ struct PreparedDraw {
     /// hands each to TableMemo::Resolve, which uses it only for the stage pointer it was made for.
     /// Reset by every PrepareDraw (valid false unless computed for this op).
     std::array<SotcArch::TableMemo::PreKey, 2> table_keys{};
+    /// sotc: SOTC_PR_PRED (E1, gpu/sotc/nonblocking.h). The buffer predicates of each stage (index = position in
+    /// GetStages()), bit i for stage->buffers[i]: shader-addressed (ShaderAddrBufferAt on the pipeline's profile, the
+    /// call BindBuffers makes), special (BufferResource::IsSpecial) and written (is_written). Pure functions of the
+    /// pipeline's immutable profile and Shader::Info. pred_stage_ok bit s: stage s has them (at most 64 buffers);
+    /// pred_ready false: none (reset by every PrepareDraw / PrepareDispatch).
+    bool pred_ready{};
+    u8 pred_stage_ok{};
+    std::array<u64, Shader::MaxStageTypes> pred_addr{};
+    std::array<u64, Shader::MaxStageTypes> pred_special{};
+    std::array<u64, Shader::MaxStageTypes> pred_written{};
+    /// sotc: SOTC_PR_BCPROBE (E2). The frame bind-cache probe of this draw (Rasterizer::BindCacheProbeFrame): the key
+    /// inputs it used (pipeline, cache hash, the render-target key the draw thread published last) and its answer:
+    /// bc_index the entry whose key matched with that entry's sequence number, or ~0u for a miss with the table's commit
+    /// sequence in bc_seq. The draw thread uses it only when every input and sequence still matches (TryBindCacheFrame).
+    bool bc_probed{};
+    const void* bc_pipeline{};
+    u64 bc_hash{};
+    u64 bc_targets_key{};
+    u64 bc_key{};
+    u32 bc_index{~0u};
+    u32 bc_seq{};
 };
+
+/// sotc: design E counters, printed every 5 s by the draw thread (Liverpool::TakePrepared) as one "SOTC PREP" line while
+/// SOTC_PARALLEL_RECORD runs. The worker fields are written by their GpuPrep thread only (each on its own line); the rest
+/// by the draw thread only.
+struct PrepCounters {
+    static constexpr unsigned MaxWorkers = 2;
+    struct alignas(64) Worker {
+        std::atomic<u64> prepared{0}; ///< draw slots published (ready_seq stored for a graphics draw)
+        std::atomic<u64> chunks{0};   ///< register chunks copied into the worker's registers (E0)
+    };
+    std::array<Worker, MaxWorkers> workers{};
+    u64 taken{};       ///< draws that used a prepared slot
+    u64 late{};        ///< not published yet when the draw ran (ready_seq != seq)
+    u64 epoch{};       ///< a mapping changed since the slot was computed
+    u64 invalid{};     ///< published but refused (no pipeline, refused dynamic state, wrong kind)
+    u64 pred_used{};   ///< SOTC_PR_PRED: stages whose predicates came from the slot
+    u64 pred_diff{};   ///< SOTC_PR_PRED=2: predicate bits that differ from the inline ones
+    u64 bc_used{};     ///< SOTC_PR_BCPROBE: lookups answered by the probe (hit or miss)
+    u64 bc_stale{};    ///< probes refused by the draw thread's checks (the lookup ran)
+    u64 bc_mismatch{}; ///< SOTC_PR_BCPROBE=2: accepted probes whose answer differs from the lookup
+    u64 next_report_ns{};
+    u32 calls{};
+};
+inline PrepCounters g_prep_counters;
 
 } // namespace Vulkan

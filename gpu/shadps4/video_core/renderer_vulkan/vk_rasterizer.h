@@ -122,6 +122,12 @@ public:
     /// sotc: SOTC_PR_RESOLVE. Called at the end of PrepareDraw on a GpuPrep thread: the
     /// PreparedResources of a graphics draw or a dispatch (draw_prep.h). Resets everything it writes.
     void PrepareResources(const Pipeline* pipeline, PreparedResources& out) const;
+    /// sotc: SOTC_PR_PRED (E1). A GpuPrep thread: the buffer predicates of every stage of the pipeline into
+    /// PreparedDraw::pred_* (pure: the pipeline's profile and Shader::Info only).
+    void PreparePredicates(const Pipeline* pipeline, PreparedDraw& out) const;
+    /// sotc: SOTC_PR_BCPROBE (E2). A GpuPrep thread: the frame bind-cache key of the draw (cache hash `hash`, the
+    /// render-target key the draw thread published last) and a read-only probe of the table into PreparedDraw::bc_*.
+    void BindCacheProbeFrame(const Pipeline* pipeline, u64 hash, PreparedDraw& out) const;
     void PrefetchImagesShared(const Pipeline* pipeline);
     /// sotc: SOTC_PARALLEL_RECORD: moves on every MapMemory / UnmapMemory (a prepared draw is
     /// used only while it stands still).
@@ -403,7 +409,10 @@ private:
     void BindCacheSyncFrame(const Pipeline* pipeline, bool eligible);
     /// sotc: SOTC_BIND_CACHE_HEAP. heap_mask: the heap stages of this op (BindCacheEntry::heap_mask), 0 when the op
     /// resolves its heap eagerly. On a hit the held heap results are checked and replayed into bind_hold_addr / bind_hold_binds.
-    bool TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& uses_dma, u32 heap_mask);
+    /// sotc: SOTC_PR_BCPROBE: `prepared` (the op's slot, may be null) carries the GpuPrep thread's probe; when it passes
+    /// the checks it replaces the key computation and the lookup.
+    bool TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& uses_dma, u32 heap_mask,
+                           const PreparedDraw* prepared = nullptr);
     /// Returns the entry stored (null when the bind was not stored).
     struct BindCacheEntry;
     BindCacheEntry* CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool uses_dma,
@@ -715,6 +724,9 @@ private:
     struct BindCacheEntry {
         const Pipeline* pipeline{};
         u64 hash{};
+        /// sotc: SOTC_PR_BCPROBE (E2). Bumped by every CommitBindCacheFrame of this slot and every BindCacheDropFrame of
+        /// it (draw thread, atomic store); read by the GpuPrep probe (atomic load). A probe is used only while it holds.
+        u32 probe_seq{};
         u64 last_use{};
         bool valid{};
         bool uses_dma{};
@@ -822,6 +834,14 @@ private:
     static constexpr u32 BindCacheFrameProbe = 8;
     std::vector<BindCacheEntry> frame_cache;
     std::vector<u64> frame_keys;
+    /// sotc: SOTC_PR_BCPROBE (E2). frame_ready: frame_cache and frame_keys are allocated (release after the resize; the
+    /// GpuPrep probe reads nothing before). frame_commit_seq: bumped by every CommitBindCacheFrame (release, after the
+    /// key is stored), the only place a key appears, so a probe miss holds while it is unchanged. targets_pub: the
+    /// render-target key of the last graphics BindCacheSyncFrame, the probe's guess for the draws ahead. frame_keys
+    /// are written with atomic stores (BindCacheDropFrame, CommitBindCacheFrame) and read by the probe with atomic loads.
+    std::atomic<bool> frame_ready{false};
+    std::atomic<u32> frame_commit_seq{0};
+    std::atomic<u64> targets_pub{0};
     /// A cache-wide flush (BindCacheFlush) is one increment: older entries are dropped when found.
     u64 bind_cache_flush_gen{1};
     /// GPU writes to guest ranges and images (BindCacheInvalidate) and image set changes
@@ -861,6 +881,8 @@ private:
     /// the SOTC_BIND_DESC_REUSE record when the switch is on. Every draw and dispatch path binds through it.
     void BindPipelineResources(const Pipeline* pipeline);
     u32 cur_bind_stage{};             ///< index (in GetStages) of the stage being bound
+    /// sotc: SOTC_PR_PRED (E1): the op's prepared slot while BindResources binds its stages (null: none).
+    const PreparedDraw* bind_pred_slot{};
     bool bind_level2{};               ///< this bind's key is the resource identity
     Shader::PushData bind_input_push{}; ///< the draw's own push data (registers) before the bind
     /// sotc: SOTC_OP_COMPUTE_BIND. The written bindings of the bind being recorded. Their range stamps are noted after the
