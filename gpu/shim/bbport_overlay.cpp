@@ -1040,18 +1040,10 @@ void LoadingScreen(float alpha, float backdrop) {
             std::snprintf(detail, sizeof(detail),
                           SotcUi::T("Gravando no disco…  (%u arquivos)", "Writing to disk…  (%u files)"), writes);
         } else {
-            // Time left from the rate since the start (the total still grows while the game loads files).
-            char eta[64] = "";
-            const long long elapsed_ms = NowMs() - SotcStats::prep_start_ms.load(std::memory_order_relaxed);
-            if (mode == LoadingMode::Prep && done > 50 && done < total && elapsed_ms > 2000) {
-                const double rate = double(done) / double(elapsed_ms);
-                const long long left_s = static_cast<long long>(double(total - done) / rate / 1000.0);
-                std::snprintf(eta, sizeof(eta),
-                              SotcUi::T("  ·  cerca de %lld:%02lld restantes", "  ·  about %lld:%02lld left"),
-                              left_s / 60, left_s % 60);
-            }
-            std::snprintf(detail, sizeof(detail), "%d%%  ·  %u / %u%s",
-                          int(float(done) / float(total) * 100.0f + 0.5f), done, total, eta);
+            // sotc: percent and count only; the time estimate went (the total still grows while the game loads
+            // files, so it was unreliable).
+            std::snprintf(detail, sizeof(detail), "%d%%  ·  %u / %u",
+                          int(float(done) / float(total) * 100.0f + 0.5f), done, total);
         }
         centred(detail, 19.0f * unit, y, LoadingRgba(150, 150, 150, alpha));
         y += 19.0f * unit + 10.0f * unit;

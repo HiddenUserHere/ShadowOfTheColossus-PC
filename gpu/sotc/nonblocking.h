@@ -222,26 +222,41 @@ inline bool ComputeRelease() {
     return on;
 }
 
-/// sotc: SOTC_COMPILE_STREAM=1 (default off, experimental). The hold's compute prebuilds are compiled into the pack
-/// cache (sotc_vk_pack.bin) and, at the pack step, the ones no dispatch bound are destroyed with their modules (the
-/// PackComputePipelines rule of SOTC_COMPUTE_PACK, without its inline recorder builds). A released program comes back
-/// when the game loads its shader file again (the pretranslate request queues the pack load, and its pipelines are
-/// rebuilt from the pack cache on the workers); a dispatch that comes first builds it itself and is counted
-/// ("SOTC COMPILE STREAM" line). Needs SOTC_GPL_PACK_LEAN and the GPL pack. The pretranslate request of a program is
-/// made once per session (pretranslate.cpp), so a released program's shader file must load again (Forget) for the
-/// request to come; a program whose file stays loaded is only rebuilt by its dispatch. =2: every released program is
-/// also queued for its rebuild right after the hold (pack loads 2 at a time on the workers): the hold's peak is lower,
-/// and the memory comes back during the first minutes of play.
+/// sotc: SOTC_COMPILE_STREAM (default 2; =1, =0 off). The hold's compute prebuilds are compiled into the pack cache
+/// (sotc_vk_pack.bin). With 2 (the default) each one leaves memory during the pretranslate hold as soon as its
+/// worker built it and nothing needs it resident (PretranslateStreamStep: no dispatch bound its program, no
+/// permutation in flight, all its permutations in the pretranslate pack): the pipeline and its modules are destroyed
+/// and the program goes back to the index. The pack step releases the rest (the PackComputePipelines rule of
+/// SOTC_COMPUTE_PACK, without its inline recorder builds). Before the loading screen goes away, every released program
+/// is loaded back by the workers (8 pack loads at a time) and its pipelines are rebuilt from the pack cache, and the
+/// screen waits for them: play starts with every prebuilt pipeline resident, as without the switch, so no dispatch
+/// builds one ("SOTC COMPILE STREAM" line: inline must stay 0). The memory of the compute prebuilds is therefore
+/// not held while the shaders compile. =1: no rebuild at the hold: a released program comes back when the game loads
+/// its shader file again (the pretranslate request queues the pack load), and a dispatch that comes first builds it
+/// itself (counted). Needs SOTC_GPL_PACK_LEAN and the GPL pack.
 inline bool CompileStream() {
-    static const bool on = SwitchOn("SOTC_COMPILE_STREAM") && GplPackLean();
+    static const bool on = SwitchOnByDefault("SOTC_COMPILE_STREAM") && GplPackLean();
     return on && GplPackLibs();
 }
 inline bool CompileStreamAll() {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_COMPILE_STREAM");
-        return v != nullptr && v[0] == '2';
+        return v == nullptr || v[0] == '\0' || v[0] == '2';
     }();
     return on && CompileStream();
+}
+
+/// sotc: SOTC_PRETRANSLATE_STREAM (on unless set to 0; needs SOTC_GPL_PACK_LEAN). During the pretranslate hold, a
+/// translated vertex or pixel program leaves memory (its Info and modules; it goes back to the index, as at the end
+/// of the hold) as soon as all its permutations are in the pretranslate pack on disk and nothing needs it resident:
+/// no pipeline references it, no manifest stage holds it, no library job is queued or running, no translation of
+/// it is in flight, and it is not the pack step's partner of its kind. The pack step loads these programs back from
+/// the pack on the workers (8 loads at a time, at most 256 library jobs ahead), compiles their stage libraries, and
+/// sends each one back to the index once its libraries are compiled. A vertex request whose pixel program left
+/// takes the bindings that program left with. 0: the programs stay resident until the end-of-hold eviction.
+inline bool PretranslateStream() {
+    static const bool on = SwitchOnByDefault("SOTC_PRETRANSLATE_STREAM") && GplPackLean();
+    return on;
 }
 
 /// sotc: SOTC_COMPUTE_FAST=1 (default off). A compute pipeline a dispatch needs and that is not built yet gets a first

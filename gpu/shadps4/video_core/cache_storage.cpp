@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
 #include <miniz.h>
+#include <xxhash.h>
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +26,7 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#include <type_traits>
 #include "../../sotc/block_ledger.h" // sotc: SOTC_BLOCK_LEDGER
 
 namespace {
@@ -234,10 +236,73 @@ static bool CachePackEnabled() {
 
 static constexpr char PackMagic[8] = {'S', 'O', 'T', 'C', 'P', 'K', '1', '\0'};
 
+// sotc: SOTC_PREFETCH_LEAN (on unless set to 0). The cache prefetch holds no whole-file copies: the pack is read entry
+// by entry (no 1.3 GB buffer next to the entries), its background rewrite shares the prefetched bytes instead of a
+// copy of all of them, and it runs only when an entry's content changed (size and hash, not the file time: identical
+// pipeline keys saved again made ~3,000 files "newer than the pack" at every launch). Save skips a blob whose bytes are
+// on disk already, and FinishPreload drops the entries the boot preload consumed. The files the cache folder holds
+// for their own readers (sotc_pack_libraries.bin, sotc_recent_pso.bin) are not prefetched. 0: the former path.
+static bool PrefetchLean() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_PREFETCH_LEAN");
+        return !v || v[0] != '0';
+    }();
+    return on;
+}
+
+// sotc: SOTC_PREFETCH_LEAN: the content signature of a blob (its size is the hash seed).
+static u64 BlobSig(const u8* data, size_t size) {
+    return XXH3_64bits_withSeed(data, size, static_cast<u64>(size));
+}
+
+// sotc: SOTC_PREFETCH_LEAN: written into the cache folder by their own code, read by it (never through Load).
+static bool OwnReaderFile(const std::string& name) {
+    return name == "sotc_pack_libraries.bin" || name == "sotc_recent_pso.bin";
+}
+
 static void ReadCachePack(const std::filesystem::path& path,
                           std::map<std::string, std::vector<u8>>& out) {
     std::FILE* f = _wfopen(path.c_str(), L"rb");
     if (!f) {
+        return;
+    }
+    if (PrefetchLean()) {
+        // sotc: SOTC_PREFETCH_LEAN: each entry is read into its own vector (no whole-file buffer copied out).
+        std::setvbuf(f, nullptr, _IOFBF, 1u << 20);
+        char magic[8]{};
+        u32 count = 0;
+        if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, PackMagic, 8) != 0 ||
+            std::fread(&count, 4, 1, f) != 1) {
+            std::fclose(f);
+            return;
+        }
+        for (u32 i = 0; i < count; ++i) {
+            u16 name_len = 0;
+            u32 data_len = 0;
+            std::string name;
+            if (std::fread(&name_len, 2, 1, f) != 1) {
+                break;
+            }
+            name.resize(name_len);
+            if ((name_len != 0 && std::fread(name.data(), 1, name_len, f) != name_len) ||
+                std::fread(&data_len, 4, 1, f) != 1) {
+                break;
+            }
+            const auto ext = std::filesystem::path{name}.extension();
+            if (ext == ".pack" || OwnReaderFile(name)) {
+                // An entry no reader takes from here (an older pack held the 1.1 GB pretranslate pack).
+                if (_fseeki64(f, static_cast<s64>(data_len), SEEK_CUR) != 0) {
+                    break;
+                }
+                continue;
+            }
+            std::vector<u8> data(data_len);
+            if (data_len != 0 && std::fread(data.data(), 1, data_len, f) != data_len) {
+                break;
+            }
+            out.emplace(std::move(name), std::move(data));
+        }
+        std::fclose(f);
         return;
     }
     std::vector<u8> all;
@@ -283,8 +348,18 @@ static void ReadCachePack(const std::filesystem::path& path,
     }
 }
 
-static void WriteCachePack(std::filesystem::path path,
-                           std::vector<std::pair<std::string, std::vector<u8>>> files) {
+// sotc: SOTC_PREFETCH_LEAN passes shared references to the prefetched bytes (Bytes = shared_ptr), the former path a copy.
+template <typename Bytes>
+static const std::vector<u8>& PackBytes(const Bytes& b) {
+    if constexpr (std::is_same_v<Bytes, std::vector<u8>>) {
+        return b;
+    } else {
+        return *b;
+    }
+}
+
+template <typename Bytes>
+static void WriteCachePack(std::filesystem::path path, std::vector<std::pair<std::string, Bytes>> files) {
     auto tmp = path;
     tmp += L".tmp";
     std::FILE* f = _wfopen(tmp.c_str(), L"wb");
@@ -294,7 +369,8 @@ static void WriteCachePack(std::filesystem::path path,
     bool ok = std::fwrite(PackMagic, 1, 8, f) == 8;
     const u32 count = static_cast<u32>(files.size());
     ok = ok && std::fwrite(&count, 4, 1, f) == 1;
-    for (const auto& [name, data] : files) {
+    for (const auto& [name, bytes] : files) {
+        const std::vector<u8>& data = PackBytes(bytes);
         const u16 name_len = static_cast<u16>(name.size());
         const u32 data_len = static_cast<u32>(data.size());
         ok = ok && std::fwrite(&name_len, 2, 1, f) == 1 &&
@@ -317,6 +393,11 @@ static void WriteCachePack(std::filesystem::path path,
 // take them from memory until FinishPreload.
 void DataBase::Prefetch() {
     const auto start = std::chrono::steady_clock::now();
+    const bool lean = PrefetchLean();
+    {
+        std::scoped_lock lock{known_mutex};
+        dropped_sigs.clear();
+    }
     const auto pack_path = cache_path / "cache.sotcpack";
     std::map<std::string, std::vector<u8>> packed;
     if (CachePackEnabled()) {
@@ -325,6 +406,9 @@ void DataBase::Prefetch() {
     std::vector<std::filesystem::path> files;
     std::error_code ec;
     size_t in_pack = 0, on_disk = 0, newer = 0;
+    // sotc: SOTC_PREFETCH_LEAN: the signature of the pack's copy of each newer file, compared with the loose file's
+    // bytes below: only a different content (or an added or removed file) rewrites the pack.
+    std::unordered_map<std::string, u64> newer_sigs;
     // sotc: a loose file written after the pack (a shader translated again in a later session,
     // e.g. after a ShaderBinaryVersion change) holds the current data: it wins over the pack's
     // copy, and the pack is rewritten with it below. Taking the pack's copy left those entries
@@ -333,9 +417,15 @@ void DataBase::Prefetch() {
     std::error_code time_ec;
     const auto pack_time = std::filesystem::last_write_time(pack_path, time_ec);
     const bool have_pack_time = !time_ec && !packed.empty();
+    const auto keep = [this](const std::string& name, std::shared_ptr<const std::vector<u8>> data) {
+        prefetched.try_emplace(name).first->second.data = std::move(data);
+    };
     for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
         const auto ext = entry.path().extension();
-        if (!entry.is_regular_file(ec) || ext == ".tmp" || ext == ".sotcpack") {
+        // sotc: ".pack" is the pretranslate pack (sotc_pretranslate.pack, ~1.1 GB): its readers open the
+        // file themselves (PrePackPath), so a prefetched copy only held 1.1 GB of RAM for the session.
+        if (!entry.is_regular_file(ec) || ext == ".tmp" || ext == ".sotcpack" || ext == ".pack" ||
+            (lean && OwnReaderFile(entry.path().filename().string()))) {
             continue;
         }
         ++on_disk;
@@ -344,6 +434,9 @@ void DataBase::Prefetch() {
             std::error_code entry_ec;
             const auto entry_time = entry.last_write_time(entry_ec);
             if (!entry_ec && entry_time > pack_time) {
+                if (lean) {
+                    newer_sigs.emplace(it->first, BlobSig(it->second.data(), it->second.size()));
+                }
                 packed.erase(it);
                 it = packed.end();
                 ++newer;
@@ -351,13 +444,15 @@ void DataBase::Prefetch() {
         }
         if (it != packed.end()) {
             ++in_pack;
-            prefetched.emplace(it->first, std::move(it->second));
+            keep(it->first, std::make_shared<const std::vector<u8>>(std::move(it->second)));
             packed.erase(it);
         } else {
             files.push_back(entry.path());
         }
     }
     // Pack entries whose loose file is gone (a cleared cache) are dropped with `packed`.
+    const size_t gone = packed.size();
+    packed.clear();
     {
         // sotc: the same listing, kept for MayExist once prefetch_active ends below.
         std::scoped_lock lock{known_mutex};
@@ -365,7 +460,7 @@ void DataBase::Prefetch() {
         for (const auto& file : files) {
             known_files.insert(file.filename().string());
         }
-        for (const auto& [name, data] : prefetched) { // taken from the pack, on disk too
+        for (const auto& [name, entry] : prefetched) { // taken from the pack, on disk too
             known_files.insert(name);
         }
         known_valid = !ec;
@@ -394,25 +489,60 @@ void DataBase::Prefetch() {
         }
     }
     u64 bytes = 0;
+    size_t added = 0, changed = 0, same = 0;
     for (auto& list : results) {
         for (auto& [name, data] : list) {
             bytes += data.size();
-            prefetched.emplace(std::move(name), std::move(data));
+            if (lean) {
+                const auto sig = newer_sigs.find(name);
+                if (sig == newer_sigs.end()) {
+                    ++added;
+                } else if (sig->second != BlobSig(data.data(), data.size())) {
+                    ++changed;
+                } else {
+                    ++same;
+                }
+            }
+            keep(name, std::make_shared<const std::vector<u8>>(std::move(data)));
         }
     }
     prefetch_active = true;
-    if (CachePackEnabled() && (!files.empty() || !packed.empty())) {
-        std::vector<std::pair<std::string, std::vector<u8>>> copy;
-        copy.reserve(prefetched.size());
-        for (const auto& [name, data] : prefetched) {
-            copy.emplace_back(name, data);
+    // sotc: SOTC_PREFETCH_LEAN: a file that could not be read (gone meanwhile) counts as a change.
+    const size_t unread = files.size() - std::min(files.size(), added + changed + same);
+    const bool rewrite = lean ? (added + changed + gone + unread) != 0 : (!files.empty() || gone != 0);
+    if (CachePackEnabled() && rewrite) {
+        if (lean) {
+            std::vector<std::pair<std::string, std::shared_ptr<const std::vector<u8>>>> refs;
+            refs.reserve(prefetched.size());
+            for (const auto& [name, entry] : prefetched) {
+                refs.emplace_back(name, entry.data);
+            }
+            std::thread{WriteCachePack<std::shared_ptr<const std::vector<u8>>>, pack_path, std::move(refs)}.detach();
+        } else {
+            std::vector<std::pair<std::string, std::vector<u8>>> copy;
+            copy.reserve(prefetched.size());
+            for (const auto& [name, entry] : prefetched) {
+                copy.emplace_back(name, *entry.data);
+            }
+            std::thread{WriteCachePack<std::vector<u8>>, pack_path, std::move(copy)}.detach();
         }
-        std::thread{WriteCachePack, pack_path, std::move(copy)}.detach();
+    } else if (CachePackEnabled() && lean && newer != 0) {
+        // sotc: SOTC_PREFETCH_LEAN: the newer files hold the pack's bytes: the pack's time moves past them, so the
+        // next launch takes them from the pack again instead of reading them one by one.
+        std::error_code touch_ec;
+        std::filesystem::last_write_time(pack_path, std::filesystem::file_time_type::clock::now(), touch_ec);
     }
     std::fprintf(stderr,
                  "SOTC shader cache: %zu files, %zu from the pack, %zu read one by one (%zu newer "
                  "than the pack)\n",
                  on_disk, in_pack, files.size(), newer);
+    if (lean) {
+        std::fprintf(stderr,
+                     "SOTC PREFETCH LEAN: pack %s (added %zu, changed %zu, same bytes %zu, removed %zu)\n",
+                     !CachePackEnabled() ? "off" : rewrite ? "rewritten in the background (shared bytes, no copy)"
+                                                           : "unchanged, not rewritten",
+                     added, changed, same, gone + unread);
+    }
     LOG_INFO(Render, "Prefetched {} cache files ({} MiB) in {} ms with {} threads",
              prefetched.size(), bytes >> 20,
              std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -432,8 +562,29 @@ bool DataBase::TakePrefetched(const std::filesystem::path& path, std::vector<u8>
         return true;
     }
     // Copied, not moved: a shader's .meta and .spv are loaded once per pipeline that uses it.
-    data = it->second;
+    // sotc: SOTC_PREFETCH_LEAN: marked consumed, so FinishPreload may drop it.
+    data = *it->second.data;
+    it->second.consumed.store(true, std::memory_order_relaxed);
     return true;
+}
+
+bool DataBase::SameOnDisk(const std::string& file_name, const std::vector<u8>& bytes) {
+    if (!PrefetchLean()) {
+        return false;
+    }
+    std::scoped_lock lock{known_mutex}; // FinishPreload drops entries under it
+    if (const auto it = prefetched.find(file_name); it != prefetched.end()) {
+        return *it->second.data == bytes;
+    }
+    const auto sig = dropped_sigs.find(file_name);
+    if (sig == dropped_sigs.end()) {
+        return false;
+    }
+    if (sig->second == BlobSig(bytes.data(), bytes.size())) {
+        return true;
+    }
+    dropped_sigs.erase(sig); // written below with other bytes
+    return false;
 }
 
 u32 DataBase::PendingWrites() const noexcept {
@@ -480,6 +631,7 @@ void DataBase::Clear() {
     {
         std::scoped_lock lock{known_mutex};
         known_files.clear();
+        dropped_sigs.clear(); // sotc: SOTC_PREFETCH_LEAN: nothing is on disk any more
     }
     std::error_code ec;
     u64 removed = 0;
@@ -577,6 +729,13 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& da
     if (!EmulatorSettings.IsPipelineCacheArchived()) {
         AddKnown(std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)));
     }
+    if (!EmulatorSettings.IsPipelineCacheArchived() && PrefetchLean()) {
+        // sotc: SOTC_PREFETCH_LEAN: the same bytes are on disk: not written again (the file keeps its time).
+        const auto file_name = std::filesystem::path{name + "." + GetBlobFileExtension(type)}.filename().string();
+        if (SameOnDisk(file_name, data)) {
+            return true;
+        }
+    }
     return WriteVector(type, std::move(path), std::move(data));
 }
 
@@ -590,6 +749,17 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& d
                                                            : cache_path / name;
     if (!EmulatorSettings.IsPipelineCacheArchived()) {
         AddKnown(std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)));
+    }
+    if (!EmulatorSettings.IsPipelineCacheArchived() && PrefetchLean()) {
+        // sotc: SOTC_PREFETCH_LEAN: the same bytes are on disk: not written again (the file keeps its time).
+        const auto file_name = std::filesystem::path{name + "." + GetBlobFileExtension(type)}.filename().string();
+        std::vector<u8> bytes(data.size() * sizeof(u32));
+        if (!data.empty()) {
+            std::memcpy(bytes.data(), data.data(), bytes.size());
+        }
+        if (SameOnDisk(file_name, bytes)) {
+            return true;
+        }
     }
     return WriteVector(type, std::move(path), std::move(data));
 }
@@ -611,7 +781,7 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
         auto file = path;
         file.replace_extension(GetBlobFileExtension(type));
         if (const auto it = prefetched.find(file.filename().string()); it != prefetched.end()) {
-            data = it->second;
+            data = *it->second.data;
             return;
         }
     }
@@ -645,9 +815,10 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
         auto file = path;
         file.replace_extension(GetBlobFileExtension(type));
         if (const auto it = prefetched.find(file.filename().string()); it != prefetched.end()) {
-            data.resize(it->second.size() / sizeof(u32));
+            const std::vector<u8>& bytes = *it->second.data;
+            data.resize(bytes.size() / sizeof(u32));
             if (!data.empty()) {
-                std::memcpy(data.data(), it->second.data(), data.size() * sizeof(u32));
+                std::memcpy(data.data(), bytes.data(), data.size() * sizeof(u32));
             }
             return;
         }
@@ -689,9 +860,10 @@ void DataBase::ForEachNamedBlob(
             }
         }
     } else if (prefetch_active) {
-        for (const auto& [file_name, data] : prefetched) {
+        for (auto& [file_name, entry] : prefetched) {
             if (std::filesystem::path{file_name}.extension().string().ends_with(ext)) {
-                func(std::vector<u8>{data}, BlobName(file_name));
+                entry.consumed.store(true, std::memory_order_relaxed); // sotc: SOTC_PREFETCH_LEAN
+                func(std::vector<u8>{*entry.data}, BlobName(file_name));
             }
         }
     } else {
@@ -720,7 +892,7 @@ size_t DataBase::CountBlobs(BlobType type) {
             count += std::string{file_name.data()}.ends_with(ext);
         }
     } else if (prefetch_active) {
-        for (const auto& [file_name, data] : prefetched) {
+        for (const auto& [file_name, entry] : prefetched) {
             count += std::filesystem::path{file_name}.extension().string().ends_with(ext);
         }
     } else {
@@ -754,6 +926,32 @@ void DataBase::FinishPreload() {
     // there. Dropping them sent every later lookup to the disk, one small file at a time, while
     // the game loaded a save from the same hard disk: the game stood still for 27 s (22 Oct).
     prefetch_active = false;
+    if (PrefetchLean() && !prefetched.empty()) {
+        // sotc: SOTC_PREFETCH_LEAN: the entries the boot preload consumed (pipeline keys, the stages the warm-up
+        // loaded: those programs stay resident) leave memory; their signatures stay for Save. The others are kept,
+        // as before: a later load of an unloaded program reads them from here, not one small file from the disk.
+        size_t dropped = 0, kept = 0;
+        u64 dropped_bytes = 0, kept_bytes = 0;
+        std::scoped_lock lock{known_mutex};
+        for (auto it = prefetched.begin(); it != prefetched.end();) {
+            const std::vector<u8>& bytes = *it->second.data;
+            if (!it->second.consumed.load(std::memory_order_relaxed)) {
+                ++kept;
+                kept_bytes += bytes.size();
+                ++it;
+                continue;
+            }
+            ++dropped;
+            dropped_bytes += bytes.size();
+            dropped_sigs[it->first] = BlobSig(bytes.data(), bytes.size());
+            it = prefetched.erase(it);
+        }
+        std::fprintf(stderr,
+                     "SOTC PREFETCH LEAN: preload done: %zu consumed files dropped (%llu MB), %zu kept for later "
+                     "loads (%llu MB)\n",
+                     dropped, static_cast<unsigned long long>(dropped_bytes >> 20), kept,
+                     static_cast<unsigned long long>(kept_bytes >> 20));
+    }
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;

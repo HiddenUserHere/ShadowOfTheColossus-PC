@@ -107,6 +107,52 @@ inline constexpr size_t UnmapParkMaxImages = 256;
 /// sotc: parked images older than this many GC ticks are reclaimed (GarbageCollectImages).
 inline constexpr u64 UnmapParkMaxAgeTicks = 300;
 
+/// sotc: SOTC_TC_OP_LOCK, one texture-cache hold per back op (TextureCache::OpLock, taken by the
+/// draw thread around a draw or dispatch in Liverpool::ExecuteBackOp).
+///   0 (default): no op hold; every binding pass and lookup locks as before.
+///   1: the op takes `mutex` once; the passes and lookups inside only count depth. Every decision
+///      that asks "does this thread hold the lock" (BatchLock's guest-invalidation drain,
+///      GetImage's LRU touch, the SOTC_TC_FAST_LOOKUP nested skip) ignores the op's own hold, so
+///      they are made where they were made before.
+///   2: as 1, and each op checks on exit that the lock is back at the op's depth with the op as
+///      owner; a difference counts as a mismatch (and the hold is still released).
+/// Read once. One "SOTC TC OPLOCK" line per window (TextureCache::ReportTcFast).
+namespace TcOpLock {
+
+inline u32 Mode() {
+    static const u32 mode = [] {
+        const char* v = std::getenv("SOTC_TC_OP_LOCK");
+        return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    return mode;
+}
+
+/// Monotonic counters of the draw thread (single writer: relaxed load + store, no RMW on that
+/// thread); the report keeps the previous values and prints the change.
+inline std::atomic<u64> ops{};      ///< op holds taken
+inline std::atomic<u64> nested{};   ///< op scopes opened while this thread already held the lock (no hold)
+inline std::atomic<u64> inner{};    ///< lock calls served by an op hold (each was an acquisition before)
+inline std::atomic<u64> mismatch{}; ///< mode 2: op holds left with a different depth or owner
+inline std::atomic<u64> checks{};   ///< mode 2: op holds checked
+/// Other threads (guest faults, unmaps): lock() calls that took the slow path while the mode is
+/// on, their total and longest wait (fetch_add / CAS on their side only).
+inline std::atomic<u64> slow_locks{};
+inline std::atomic<u64> slow_wait_ns{};
+inline std::atomic<u64> slow_wait_max_ns{};
+
+inline void Bump(std::atomic<u64>& c, u64 n = 1) {
+    c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+}
+inline void NoteSlowWait(u64 ns) {
+    slow_locks.fetch_add(1, std::memory_order_relaxed);
+    slow_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+    u64 prev = slow_wait_max_ns.load(std::memory_order_relaxed);
+    while (ns > prev && !slow_wait_max_ns.compare_exchange_weak(prev, ns, std::memory_order_relaxed)) {
+    }
+}
+
+} // namespace TcOpLock
+
 /// sotc: the texture cache lock, re-entrant on its owner thread. The command processor holds it
 /// over a whole binding pass (Rasterizer::BindTextures, BeginRendering, PrepareRenderState), so the
 /// FindImage and UpdateImage calls inside (two per texture, ~62,000 per frame at the Shrine) only
@@ -146,8 +192,13 @@ public:
                 mode = Mode::FastSlow;
             }
         } else {
+            // sotc: SOTC_TC_OP_LOCK: times the other threads' waits (an op hold is longer).
+            const u64 t0 = TcOpLock::Mode() != 0 ? SotcStats::NowNs() : 0;
             RawLock();
             AnnounceAndWait();
+            if (t0) {
+                TcOpLock::NoteSlowWait(SotcStats::NowNs() - t0);
+            }
             mode = Mode::Slow;
         }
         owner.store(self, std::memory_order_relaxed);
@@ -179,6 +230,33 @@ public:
     }
     bool HeldByThisThread() const {
         return owner.load(std::memory_order_relaxed) == Token();
+    }
+    /// sotc: SOTC_TC_OP_LOCK. Held by this thread through anything other than its op hold alone
+    /// (equal to HeldByThisThread when no op hold is open).
+    bool HeldOutsideOp() const {
+        return HeldByThisThread() && !(op_depth != 0 && depth == op_depth);
+    }
+    /// sotc: SOTC_TC_OP_LOCK. This thread holds the lock through its op hold alone.
+    bool OnlyOpHold() const {
+        return HeldByThisThread() && op_depth != 0 && depth == op_depth;
+    }
+    /// sotc: SOTC_TC_OP_LOCK, owner only (TextureCache::OpLockScope).
+    u32 Depth() const {
+        return depth;
+    }
+    void SetOpDepth(u32 d) {
+        op_depth = d;
+    }
+    u32 OpDepth() const {
+        return op_depth;
+    }
+    void NoteOpInner() {
+        ++op_inner;
+    }
+    u64 TakeOpInner() {
+        const u64 n = op_inner;
+        op_inner = 0;
+        return n;
     }
     void unlock() {
         if (--depth != 0) {
@@ -284,6 +362,8 @@ private:
     std::atomic<const void*> owner{nullptr};
     u32 depth = 0;
     Mode mode = Mode::Fast;
+    u32 op_depth = 0; ///< sotc: SOTC_TC_OP_LOCK: depth of the owner's op hold (0: none); owner only
+    u64 op_inner = 0; ///< sotc: lock calls served by the open op hold; owner only
     alignas(64) std::atomic<u32> fast_held{0}; ///< the biased owner holds it (written by it only)
 };
 
@@ -623,7 +703,8 @@ public:
         mutex.SetFastThread();
         // sotc: SOTC_TC_SINGLE_WRITER: the guest invalidations queued by faults go first. Skipped
         // inside a hold (nested batch): the outermost pass drained them already.
-        if (!mutex.HeldByThisThread()) {
+        // SOTC_TC_OP_LOCK: the op hold alone does not count as a hold here (HeldOutsideOp).
+        if (!mutex.HeldOutsideOp()) {
             DrainGuestInvalidations();
         }
         if (!TextureLockBatching()) {
@@ -634,6 +715,68 @@ public:
         return lk;
     }
 
+    /// sotc: SOTC_TC_OP_LOCK. Holds `mutex` over one back op (an RAII scope, like BatchLock).
+    /// Empty (no lock, no effect) when the mode is 0, when `eligible` is false, or when this
+    /// thread already holds the lock (counted as nested). Draw thread only.
+    class [[nodiscard]] OpLockScope {
+    public:
+        OpLockScope() = default;
+        explicit OpLockScope(ReentrantMutex& m) : mtx{&m} {
+            // Counted like the first pass's lock it replaces (contention, the draw thread's wait).
+            std::unique_lock lk{m, std::defer_lock};
+            LockCounted(lk);
+            lk.release();
+            base = mtx->Depth();
+            mtx->SetOpDepth(base);
+            owner_check = mtx->HeldByThisThread();
+            TcOpLock::Bump(TcOpLock::ops);
+        }
+        OpLockScope(const OpLockScope&) = delete;
+        OpLockScope& operator=(const OpLockScope&) = delete;
+        OpLockScope(OpLockScope&& o) noexcept
+            : mtx{o.mtx}, base{o.base}, owner_check{o.owner_check} {
+            o.mtx = nullptr;
+        }
+        OpLockScope& operator=(OpLockScope&&) = delete;
+        ~OpLockScope() {
+            if (!mtx) {
+                return;
+            }
+            const bool held = mtx->HeldByThisThread();
+            if (TcOpLock::Mode() == 2) {
+                TcOpLock::Bump(TcOpLock::checks);
+                if (!owner_check || !held || mtx->Depth() != base || mtx->OpDepth() != base) {
+                    TcOpLock::Bump(TcOpLock::mismatch);
+                }
+            }
+            if (!held) {
+                return; // released by someone else (a mode 2 mismatch): nothing of ours to drop
+            }
+            TcOpLock::Bump(TcOpLock::inner, mtx->TakeOpInner());
+            mtx->SetOpDepth(0);
+            mtx->unlock();
+        }
+
+    private:
+        ReentrantMutex* mtx = nullptr;
+        u32 base = 0;
+        bool owner_check = false;
+    };
+    [[nodiscard]] OpLockScope OpLock(bool eligible = true) {
+        if (TcOpLock::Mode() == 0 || !eligible) {
+            return {};
+        }
+        if (mutex.HeldByThisThread()) {
+            TcOpLock::Bump(TcOpLock::nested);
+            return {};
+        }
+        // sotc: the draw thread becomes the biased owner here if no batch hold did it yet (the
+        // same thread). Guest invalidations are not drained here: BatchLock still drains them at
+        // the same points (the op hold alone does not count as a hold for it).
+        mutex.SetFastThread();
+        return OpLockScope{mutex};
+    }
+
     /// sotc: locks `mutex`, counting contention (SOTC_CMD_STATS, SOTC sys line) and the draw
     /// thread's wait for it (SOTC_FPS, SotcStats::DrawWait).
     static void LockCounted(std::unique_lock<ReentrantMutex>& lk) {
@@ -641,7 +784,14 @@ public:
         // outer lookup). A nested hold only counts depth, which the outer hold already covers, so
         // the lock is left unowned: its destructor then unlocks nothing, the same net effect.
         // Callers never unlock these locks early (texture_cache.cpp), so none of them checks ownership.
-        if (TcFast::Mode() != 0 && lk.mutex()->HeldByThisThread()) {
+        // SOTC_TC_OP_LOCK: under the op hold alone the lock is taken as a nested hold (depth only),
+        // so the depth still tells whether a pass or lookup holds it (HeldOutsideOp).
+        if (TcFast::Mode() != 0 && lk.mutex()->HeldOutsideOp()) {
+            return;
+        }
+        if (TcOpLock::Mode() != 0 && lk.mutex()->OnlyOpHold()) {
+            lk.mutex()->NoteOpInner();
+            lk.lock();
             return;
         }
         // sotc: SOTC_FPS alone only times the draw thread; other threads keep the plain lock()
@@ -804,7 +954,8 @@ public:
         // sotc: the LRU is only safe under `mutex`: unlocked, a guest unmap can unregister the
         // image (freeing its LRU node) between TouchImage's Registered check and the touch. Calls
         // outside a batch hold skip it; the locked FindImage/UpdateImage of a bound image touch it.
-        if (mutex.HeldByThisThread()) {
+        // SOTC_TC_OP_LOCK: the op hold alone does not count (same touches as without it).
+        if (mutex.HeldOutsideOp()) {
             TouchImage(image);
         }
         return image;

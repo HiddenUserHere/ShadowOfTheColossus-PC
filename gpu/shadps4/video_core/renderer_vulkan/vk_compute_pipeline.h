@@ -149,6 +149,9 @@ public:
     /// sotc: SOTC_COMPILE_STREAM: rebuilt from the pack cache by StreamRehydrate (its first lookup counts a late
     /// rehydrate when it is not built yet, and clears this).
     bool sotc_rehydrated{};
+    /// sotc: SOTC_COMPILE_STREAM: the worker that built this prebuild no longer touches it (set last by the worker),
+    /// so the command processor may destroy it during the hold.
+    std::atomic<bool> sotc_worker_done{false};
     u64 KeyValue() const {
         return compute_key.value;
     }

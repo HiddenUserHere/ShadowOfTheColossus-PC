@@ -7,11 +7,14 @@
 #include "common/singleton.h"
 #include "common/types.h"
 
+#include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -79,8 +82,20 @@ private:
     std::string variant_key{}; ///< sotc: SetVariant
     bool opened{};
     /// sotc: every loose cache file read up front (in parallel) for the boot preload, by file
-    /// name; ordered like an NTFS directory listing. Emptied by FinishPreload.
-    std::map<std::string, std::vector<u8>> prefetched{};
+    /// name; ordered like an NTFS directory listing. SOTC_PREFETCH_LEAN: the bytes are shared with
+    /// the background pack writer (no copy), and FinishPreload drops the entries the boot preload
+    /// consumed (marked by Load / ForEachBlob); the others stay for later loads, as before.
+    struct PrefetchEntry {
+        std::shared_ptr<const std::vector<u8>> data;
+        std::atomic<bool> consumed{false};
+    };
+    std::map<std::string, PrefetchEntry> prefetched{};
+    /// sotc: SOTC_PREFETCH_LEAN: the content signature (size and hash) of each entry FinishPreload dropped, so
+    /// that Save skips a blob that is on disk with the same bytes (under known_mutex). Rewriting identical
+    /// pipeline keys made ~3,000 files newer than the pack at every launch, and the whole pack was rewritten.
+    std::unordered_map<std::string, u64> dropped_sigs{};
+    /// sotc: SOTC_PREFETCH_LEAN: true when Save may skip this blob (the same bytes are on disk already).
+    bool SameOnDisk(const std::string& file_name, const std::vector<u8>& bytes);
     bool prefetch_active{};
     std::unordered_set<std::string> known_files{};
     std::mutex known_mutex{};

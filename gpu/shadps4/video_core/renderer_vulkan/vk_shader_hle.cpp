@@ -171,6 +171,117 @@ bool MarkRunsMatch(std::span<const vk::BufferCopy> pieces, const std::vector<Mar
     return runs_len == union_len;
 }
 
+// sotc: SOTC_HLE_GPU_MORE (off by default; PARALLEL-RECORD-60FPS step P4). The replicate fill's
+// changed-page runs (ReplaceChangedPages) go through TryFillThroughFromCpu instead of
+// TryWriteThroughFromCpu: the guest backing is still written by the CPU (the command processor
+// reads the tables), but the resident arena gets its bytes from the GPU when it can (vkCmdFillBuffer
+// for a 4-byte pattern, a seed plus doubling copies for a longer one, a copy from the source's
+// clean arena range for a plain copy) instead of a staging memcpy of every changed byte. Not
+// resident, or nothing better: the same replace or staging upload as before. One difference:
+// TryFillThroughFromCpu also bumps SotcStats::mem_epoch (conservative for reused binds).
+//   0 / unset: off, the old path, no counters.
+//   1: on.
+//   2: on, plus verify: the bytes each GPU path produces are predicted on the CPU (the run's bytes
+//      are periodic with the period the fill or doubling assumes; a GPU copy's source guest bytes
+//      equal the run's bytes) and every difference counts as a mismatch. No readback, no stall.
+//   3: off (the old path) with the counters, for an A/B of the CPU time.
+// Every 5 s (draw thread): "SOTC HLE GPU MORE: ..." with the window's counters.
+const int kHleGpuMore = [] {
+    const char* v = std::getenv("SOTC_HLE_GPU_MORE");
+    if (!v || v[0] < '1' || v[0] > '3') {
+        return 0;
+    }
+    return v[0] - '0';
+}();
+
+bool HleGpuMoreOn() {
+    return kHleGpuMore == 1 || kHleGpuMore == 2;
+}
+
+struct HleGpuMoreStats {
+    u64 fills = 0;          ///< replicate dispatches
+    u64 refused = 0;        ///< refused by the HLE (the shader ran on the GPU)
+    u64 ns = 0;             ///< draw-thread time inside the replicate HLE
+    u64 path_runs[6] = {};  ///< TryFillThroughFromCpu calls by FillGpuPath (index 0: unknown)
+    u64 old_runs = 0;       ///< TryWriteThroughFromCpu calls (the old page-run path)
+    u64 staged = 0;         ///< bytes copied through staging (upload, doubling seed, old write-through)
+    u64 gpu_made = 0;       ///< bytes the GPU produced without staging (fill, doubling copies, GPU copy)
+    u64 mismatches = 0;     ///< mode 2
+    std::int64_t t0 = 0;
+};
+HleGpuMoreStats gpu_more;
+
+// Counts one TryFillThroughFromCpu result (`period` as passed to it).
+void HleGpuMoreNotePath(u32 path, u64 size, u64 period) {
+    if (kHleGpuMore == 0) {
+        return;
+    }
+    gpu_more.path_runs[path < 6 ? path : 0]++;
+    switch (path) {
+    case VideoCore::BufferCache::FillPathFill:
+    case VideoCore::BufferCache::FillPathGpuCopy:
+        gpu_more.gpu_made += size;
+        break;
+    case VideoCore::BufferCache::FillPathDouble: {
+        // The seed TryFillThroughFromCpu uploads (the same formula).
+        constexpr u64 SeedTarget = 1_MB;
+        const u64 seed = std::min(size, period * std::max<u64>(1, SeedTarget / period));
+        gpu_more.staged += seed;
+        gpu_more.gpu_made += size - seed;
+        break;
+    }
+    case VideoCore::BufferCache::FillPathUpload:
+        gpu_more.staged += size;
+        break;
+    default: // FillPathReplace: marked CPU-written, uploaded later by the sweep or bind
+        break;
+    }
+}
+
+// Mode 2: true when the bytes the GPU path writes into the arena are `bytes`.
+bool HleGpuMoreVerify(u32 path, const u8* bytes, u64 size, u64 period, VAddr from) {
+    switch (path) {
+    case VideoCore::BufferCache::FillPathFill:
+        return size % 4 == 0 && (size <= 4 || std::memcmp(bytes, bytes + 4, size - 4) == 0);
+    case VideoCore::BufferCache::FillPathDouble:
+        return period != 0 && period < size &&
+               std::memcmp(bytes, bytes + period, size - period) == 0;
+    case VideoCore::BufferCache::FillPathGpuCopy:
+        return from != 0 && std::memcmp(std::bit_cast<const u8*>(from), bytes, size) == 0;
+    default: // replace / upload: the same bytes through the CPU, as before
+        return true;
+    }
+}
+
+void HleGpuMoreTick() {
+    const auto now = static_cast<std::int64_t>(SotcStats::NowNs());
+    if (gpu_more.t0 == 0) {
+        gpu_more.t0 = now;
+        return;
+    }
+    if (now - gpu_more.t0 < 5'000'000'000LL) {
+        return;
+    }
+    const auto& s = gpu_more;
+    std::fprintf(stderr,
+                 "SOTC HLE GPU MORE: mode %d, fills %llu (refused %llu), cpu %.2f ms, page runs: "
+                 "replace %llu, fill %llu, double %llu, upload %llu, gpucopy %llu, old write-through "
+                 "%llu; staged %.2f MB, gpu-made %.2f MB, verify mismatches %llu\n",
+                 kHleGpuMore, static_cast<unsigned long long>(s.fills),
+                 static_cast<unsigned long long>(s.refused), static_cast<double>(s.ns) / 1e6,
+                 static_cast<unsigned long long>(s.path_runs[VideoCore::BufferCache::FillPathReplace]),
+                 static_cast<unsigned long long>(s.path_runs[VideoCore::BufferCache::FillPathFill]),
+                 static_cast<unsigned long long>(s.path_runs[VideoCore::BufferCache::FillPathDouble]),
+                 static_cast<unsigned long long>(s.path_runs[VideoCore::BufferCache::FillPathUpload]),
+                 static_cast<unsigned long long>(s.path_runs[VideoCore::BufferCache::FillPathGpuCopy]),
+                 static_cast<unsigned long long>(s.old_runs),
+                 static_cast<double>(s.staged) / (1024.0 * 1024.0),
+                 static_cast<double>(s.gpu_made) / (1024.0 * 1024.0),
+                 static_cast<unsigned long long>(s.mismatches));
+    gpu_more = HleGpuMoreStats{};
+    gpu_more.t0 = now;
+}
+
 } // namespace
 
 static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
@@ -369,9 +480,18 @@ struct TableData {
     }
 };
 
+// sotc: SOTC_HLE_GPU_MORE. Where the table's bytes come from, for the GPU paths of a page run:
+// `period` is the repeat in bytes (0: no repeat, byte o of the table is byte o of `source`), and
+// `source` the guest address of the source words (0: not usable, e.g. it overlaps the table).
+struct FillSource {
+    u64 period = 0;
+    VAddr source = 0;
+};
+
 // `wrote` is set when bytes were written (false: every page already held the table).
 static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8* current,
-                                const TableData& data, u64 size, bool& wrote) {
+                                const TableData& data, u64 size, bool& wrote,
+                                const FillSource& fill = {}) {
     auto& buffer_cache = rasterizer.GetBufferCache();
     VAddr run_start = 0;
     VAddr run_end = 0; // the pending run of changed pages, empty while run_end == run_start
@@ -382,9 +502,40 @@ static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8*
         const u64 offset = run_start - address;
         const u64 run_size = run_end - run_start;
         run_start = run_end;
-        if (!buffer_cache.TryWriteThroughFromCpu(address + offset, data.Run(offset, run_size),
-                                                 run_size)) {
-            return false;
+        if (HleGpuMoreOn()) { // sotc: SOTC_HLE_GPU_MORE (see the top)
+            const u8* bytes = data.Run(offset, run_size);
+            u64 period = 0;
+            VAddr from = 0;
+            if (fill.period != 0) {
+                // The run starts at phase offset % period of the pattern: the run's bytes repeat
+                // with the same period, and they are the source's bytes from that phase on while
+                // the run stays inside one period.
+                const u64 phase = offset % fill.period;
+                period = fill.period;
+                if (fill.source != 0 && phase + run_size <= fill.period) {
+                    from = fill.source + phase;
+                }
+            } else if (fill.source != 0) {
+                from = fill.source + offset;
+            }
+            u32 path = 0;
+            if (!buffer_cache.TryFillThroughFromCpu(address + offset, bytes, run_size, period, from,
+                                                    path)) {
+                return false;
+            }
+            HleGpuMoreNotePath(path, run_size, period);
+            if (kHleGpuMore == 2 && !HleGpuMoreVerify(path, bytes, run_size, period, from)) {
+                gpu_more.mismatches++;
+            }
+        } else {
+            if (!buffer_cache.TryWriteThroughFromCpu(address + offset, data.Run(offset, run_size),
+                                                     run_size)) {
+                return false;
+            }
+            if (kHleGpuMore == 3) {
+                gpu_more.old_runs++;
+                gpu_more.staged += run_size;
+            }
         }
         wrote = true;
         if (SotcArch::ShaderAddr::On()) { // sotc: SOTC_SHADER_ADDR, mirror coherence (the CPU wrote guest memory)
@@ -532,17 +683,23 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                 table.pattern = pattern.data();
                 table.period = period;
             }
+            // sotc: SOTC_HLE_GPU_MORE: no overlap here, so the source is usable for GPU copies.
+            const FillSource fill{src_count == count ? 0 : period, src.base_address};
             return ReplaceChangedPages(rasterizer, address, run + (address - run_start), table,
-                                       count * 4, wrote);
+                                       count * 4, wrote, fill);
         }
         BuildTable(source, src_count, count);
         if (in_run) {
             const u8* current = run + (address - run_start);
             same = std::memcmp(current, data.data(), count * 4) == 0;
             if (!same && page_replace) {
+                // sotc: SOTC_HLE_GPU_MORE: the source is read before any write, so an overlap
+                // leaves it unusable for GPU copies (the repeat stays usable).
+                const FillSource fill{src_count == count ? 0 : period,
+                                      overlap ? 0 : src.base_address};
                 return ReplaceChangedPages(rasterizer, address, current,
                                            TableData{reinterpret_cast<const u8*>(data.data())},
-                                           count * 4, wrote);
+                                           count * 4, wrote, fill);
             }
         } else {
             static std::vector<u32> current;
@@ -577,6 +734,7 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
             return false;
         }
         TraceHleFill(address, table_bytes, period, path);
+        HleGpuMoreNotePath(path, table_bytes, period); // sotc: SOTC_HLE_GPU_MORE counters (whole tables)
         wrote = true;
         if (SotcArch::ShaderAddr::On()) { // sotc: SOTC_SHADER_ADDR, mirror coherence
             if (path == VideoCore::BufferCache::FillPathReplace) {
@@ -647,7 +805,18 @@ bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
         if (kHleSkipMode != 0) {
             hle_skip_stats.runs.fetch_add(1, std::memory_order_relaxed);
         }
-        if (!ExecuteReplicateShaderHLE(info, cs_program, rasterizer, wrote)) {
+        bool handled;
+        if (kHleGpuMore != 0) { // sotc: SOTC_HLE_GPU_MORE counters and CPU time
+            const u64 t0 = SotcStats::NowNs();
+            handled = ExecuteReplicateShaderHLE(info, cs_program, rasterizer, wrote);
+            gpu_more.ns += SotcStats::NowNs() - t0;
+            gpu_more.fills++;
+            gpu_more.refused += handled ? 0 : 1;
+            HleGpuMoreTick();
+        } else {
+            handled = ExecuteReplicateShaderHLE(info, cs_program, rasterizer, wrote);
+        }
+        if (!handled) {
             NoteFillOnGpu(true);
             return false;
         }

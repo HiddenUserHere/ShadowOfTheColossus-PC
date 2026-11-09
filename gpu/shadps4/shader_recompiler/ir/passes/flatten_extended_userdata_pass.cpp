@@ -6,6 +6,8 @@
 #include <mutex>
 #include <string>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -190,15 +192,41 @@ void MarkSrtCleanPages(u64 address, u32 size) {
     }
 }
 
+// sotc: the walkers in the buffer by their bytes (under g_srt_codegen_mutex), so a program loaded again runs the copy
+// that is there (RegisterWalkerCode).
+static std::unordered_map<u64, std::vector<PFN_SrtWalker>> g_srt_walkers_by_code;
+
+static u64 WalkerCodeKey(const u8* ptr, size_t size) {
+    u64 key = 1469598103934665603ULL ^ size;
+    for (size_t i = 0; i < size; i += 8) {
+        u64 word = 0;
+        std::memcpy(&word, ptr + i, std::min<size_t>(8, size - i));
+        key = (key ^ word) * 1099511628211ULL;
+    }
+    return key;
+}
+
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     std::scoped_lock lock{g_srt_codegen_mutex};
     EnsureSrtWalkerFaultHandler();
+    // sotc: a walker loaded with the same bytes as one already in the buffer runs that copy (the code is
+    // position independent: it is copied here from the cache as it is). A program that leaves memory and is loaded
+    // again (the end-of-hold eviction, SOTC_PRETRANSLATE_STREAM, SOTC_COMPILE_STREAM, the lazy loads of play) appended
+    // its walker once more each time: the 256 MB buffer filled up during the first loading (later walkers skipped,
+    // shaders translated without their flattened user data).
+    auto& same = g_srt_walkers_by_code[WalkerCodeKey(ptr, size)];
+    for (const PFN_SrtWalker f : same) {
+        if (std::memcmp(reinterpret_cast<const void*>(f), ptr, size) == 0) {
+            return f;
+        }
+    }
     if (!SrtCodeFits(size)) {
         return nullptr;
     }
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
     g_srt_codegen.db(ptr, size);
     g_srt_codegen.ready();
+    same.push_back(func_addr);
     return func_addr;
 }
 
@@ -1320,6 +1348,10 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
 
     info.srt_info.walker_func_size =
         c.getCurr() - reinterpret_cast<const u8*>(info.srt_info.walker_func);
+    // sotc: noted by its bytes: the program's later loads from the cache run this copy (RegisterWalkerCode).
+    g_srt_walkers_by_code[WalkerCodeKey(reinterpret_cast<const u8*>(info.srt_info.walker_func),
+                                        info.srt_info.walker_func_size)]
+        .push_back(info.srt_info.walker_func);
 
     if (EmulatorSettings.IsDumpShaders()) {
         DumpSrtProgram(info, reinterpret_cast<const u8*>(info.srt_info.walker_func),

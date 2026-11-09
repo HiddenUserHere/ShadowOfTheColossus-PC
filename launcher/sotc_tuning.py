@@ -1194,14 +1194,15 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   'choice',
   'threads',
   ('Deixar o processador de comandos adiantar', 'Let the command processor run ahead'),
-  ('Desligado por padrão. Modo 1: o envio espera só o processador de comandos ler os buffers, não '
-   'a GPU ficar ociosa. Modo 2: marcas por quadro, com limite em “Quadros fechados pendentes (modo '
-   '2)”. Sem medição registrada.',
-   'Off by default. Mode 1: a submit waits only until the command processor has read the buffers, '
-   'not for the GPU to idle. Mode 2: per-frame marks, limited by "Pending closed frames (mode 2)". '
-   'No measurement recorded.'),
+  ('Modo 2 por padrão (marcas por quadro): o fim de cada quadro é registrado sozinho, sem esperar o '
+   'próximo. Medido em 9/11 no modo PS4 Pro a 60 FPS: p99 de 59 para 50 ms, pior quadro de 85 para '
+   '50 ms. Modo 1: o envio espera só o processador de comandos ler os buffers.',
+   "Mode 2 by default (per-frame marks): each frame's end is recorded on its own, without waiting for "
+   'the next. Measured on 9 Nov in PS4 Pro mode at 60 FPS: p99 59 to 50 ms, worst frame 85 to 50 ms. '
+   'Mode 1: a submit waits only until the command processor has read the buffers.'),
   '',
-  (('', ('Desligado', 'Off')),
+  (('', ('Padrão (modo 2)', 'Default (mode 2)')),
+   ('0', ('Desligado', 'Off')),
    ('1', ('Modo 1: espera só a leitura', 'Mode 1: wait for read only')),
    ('2', ('Modo 2: marcas por quadro', 'Mode 2: per-frame marks')))),
  ('SOTC_CP_AHEAD_FRAMES',

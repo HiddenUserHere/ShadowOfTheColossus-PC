@@ -469,8 +469,11 @@ private:
 
     /// sotc: records vertex input, vertex and index buffers again when a submit happened since
     /// vertex_tick (the draw moved to a new command buffer).
+    /// sotc: bind_index is any callable (a template, not std::function: a std::function per draw cost ~2.4% of the
+    /// draw thread). Defined in vk_rasterizer.cpp, its only user.
+    template <typename BindIndex>
     void RebindVertexIfSubmitted(const GraphicsPipeline* pipeline, u64& vertex_tick,
-                                 bool is_indexed, const std::function<void()>& bind_index,
+                                 bool is_indexed, const BindIndex& bind_index,
                                  const SotcVertexExtent::Draw* extent = nullptr); // sotc: SOTC_VERTEX_EXTENT
     /// sotc: extent narrows the sizes to the draw's vertices (SOTC_VERTEX_EXTENT); nullptr keeps the V# sizes.
     void BindVertexBuffers(const GraphicsPipeline* pipeline,
@@ -747,6 +750,29 @@ private:
         bool note_again{};       ///< the bind ran NoteHostWrite after ObtainBuffer (kBindMarkOnce did not skip it)
         const VideoCore::Buffer* buffer{}; ///< the binding ObtainBuffer answered
         u64 offset{};
+        /// sotc: SOTC_BIND_OFFSET_HIT. ObtainBuffer already ran for this write in the current hit (OffsetRefresh moved it):
+        /// ReplayOwnWrites takes the recorded answer instead of calling it again. Cleared by every OffsetRefresh.
+        bool obtained{};
+    };
+    /// sotc: SOTC_BIND_OFFSET_HIT. One guest buffer binding whose V# base the resource identity key leaves out (a plain,
+    /// not texel, not shader-addressed buffer of a dispatch): the V# it was bound from, the range bound, and where the full
+    /// bind put its results (buffer info, push offset slot, bound buffer, bind cache range, repair, own write; kNoIndex when
+    /// it made none). A hit whose V# base moved rebinds it (OffsetRefresh) when it is refreshable: the range was the whole
+    /// V# (no clamp, no limit), so the same V# size at the new base gives the same range length.
+    struct BindCacheOffsetSlot {
+        u32 stage{};
+        u32 desc{};
+        VAddr vbase{};
+        u32 vsize{};
+        u64 size{};
+        u32 info{kNoIndex};
+        u32 push_binding{};
+        u32 bound{kNoIndex}; ///< index into bound_buffers (absolute while recording, entry-relative once stored)
+        u32 range{kNoIndex};
+        u32 repair{kNoIndex};
+        u32 write{kNoIndex};
+        bool written{};
+        bool refreshable{};
     };
     struct BindCacheEntry {
         const Pipeline* pipeline{};
@@ -841,6 +867,9 @@ private:
         /// sotc: SOTC_OP_COMPUTE_BIND. The written bindings of the bind, in the order the full bind made them; a hit
         /// replays them (ReplayOwnWrites).
         std::vector<BindCacheWrite> own_writes;
+        /// sotc: SOTC_BIND_OFFSET_HIT. Made under the base-free key (offset_key): the slots a hit checks and rebinds.
+        bool offset_key{};
+        std::vector<BindCacheOffsetSlot> offset_slots;
     };
     /// The state every live entry was made in; a change flushes them all.
     struct BindCacheState {
@@ -915,6 +944,20 @@ private:
     /// sotc: SOTC_OP_COMPUTE_BIND. The written bindings of the bind being recorded. Their range stamps are noted after the
     /// commit (ApplyOwnWriteStamps), so the commit does not reject the entry for the bind's own writes.
     std::vector<BindCacheWrite> bind_cache_writes_rec;
+    /// sotc: SOTC_BIND_OFFSET_HIT. This bind's key leaves the plain buffer bases out (bind_offset_key), and the slots the
+    /// full bind recorded for them (BindBuffers). offset_would: mode 2, the range each slot of the would-be hit binds.
+    bool bind_offset_key{};
+    std::vector<BindCacheOffsetSlot> bind_offset_rec;
+    std::vector<std::pair<VAddr, u64>> offset_would;
+    std::vector<u8> offset_moved_scratch;
+    /// sotc: SOTC_BIND_OFFSET_HIT. Rebinds the moved slots of an offset-keyed entry for this op (ObtainBuffer at the new
+    /// base, then the entry's descriptor, push offset, bound buffer, range, repair and own write are rewritten). 0: the
+    /// entry is this op's (moved: slots rebound); 1: refused (the entry is unchanged); 2: stale (the caller drops it).
+    int OffsetRefresh(BindCacheEntry& entry, u32& moved);
+    /// sotc: SOTC_BIND_OFFSET_HIT=2. The entry a hit would take with its would-be ranges (offset_would), or null.
+    BindCacheEntry* OffsetVerifyFind(const Pipeline* pipeline, u64 hash);
+    /// sotc: SOTC_BIND_OFFSET_HIT=2. The would-be hit against the full bind just made; counted, changes no state.
+    void OffsetVerify(const BindCacheEntry& ref);
     /// sotc: SOTC_OP_COMPUTE_BIND. Replays the written bindings of a hit: ObtainBuffer, the texture invalidation and the
     /// host write note each made, then their stamps (the entry is fresh again after them). 0: replayed; 1: a binding
     /// changed (the hit is refused); 2: the entry is stale (reason set).

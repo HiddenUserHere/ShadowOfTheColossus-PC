@@ -446,6 +446,17 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
         Common::g_inline_function_enabled =
             back_threaded && ((fuse && fuse[0] == '1') || (inline_func && inline_func[0] == '1'));
     }
+    // sotc: SOTC_OP_NOALLOC=1 (=2 verify; off by default, needs the draw thread): see op_noalloc in
+    // liverpool.h. It also keeps the op ring's small closures inline (SOTC_INLINE_FUNC).
+    if (const char* v = std::getenv("SOTC_OP_NOALLOC");
+        back_threaded && v && (v[0] == '1' || v[0] == '2')) {
+        op_noalloc = static_cast<u8>(v[0] - '0');
+        Common::g_inline_function_enabled = true;
+        LOG_INFO(Render,
+                 "SOTC_OP_NOALLOC: on{} (flat buffer swap, register chunks in place, inline "
+                 "closures)",
+                 op_noalloc == 2 ? ", verify" : "");
+    }
     // sotc: SOTC_CP_IDLE_US / SOTC_CP_IDLE_TIMEOUT_US, see Process and CpIdleSleep. Read before
     // any thread that calls NotifyCpWait starts.
     if (const char* v = std::getenv("SOTC_CP_IDLE_US")) {
@@ -797,7 +808,68 @@ void OpStatTick() {
     g_opstat_last_frame = frames;
     std::copy(cur, cur + OsCount, g_opstat_last);
 }
+
+// sotc: SOTC_OP_NOALLOC counters. One writer each (the draw thread, except cp_* written by the
+// command processor), relaxed load and store; the draw thread prints them every 5 s.
+struct OpNoallocCounters {
+    std::atomic<u64> ops{};      // ops that took the swap path
+    std::atomic<u64> swaps{};    // stage flat buffers swapped instead of copied
+    std::atomic<u64> dwords{};   // dwords the old path would have copied
+    std::atomic<u64> grow{};     // copies that would have reallocated (size > capacity)
+    std::atomic<u64> fallback{}; // ops copied the old way (prep threads on)
+    std::atomic<u64> verified{}; // stages checked (=2)
+    std::atomic<u64> mismatch{}; // stages whose swapped buffer differs from the old copy (=2)
+    std::atomic<u64> cp_ops{};   // command processor: ops whose chunks were built in place
+    std::atomic<u64> cp_grow{};  // of which the chunk vector had to grow (one allocation)
+};
+OpNoallocCounters g_noalloc;
+constexpr u32 kNoallocCounters = 9;
+u64 g_noalloc_last[kNoallocCounters]{}; // draw thread only
+u64 g_noalloc_last_ns{};                // draw thread only
+u32 g_noalloc_tick{};                   // draw thread only
+
+inline void NoallocAdd(std::atomic<u64>& counter, u64 n) {
+    counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+}
 } // namespace
+
+/// sotc: SOTC_OP_NOALLOC. Draw thread, after each op; reads the clock once per 256 ops.
+void Liverpool::OpNoallocTick() {
+    if ((++g_noalloc_tick & 255) != 0) {
+        return;
+    }
+    const u64 now = SotcStats::NowNs();
+    std::atomic<u64>* const src[kNoallocCounters] = {
+        &g_noalloc.ops,      &g_noalloc.swaps,    &g_noalloc.dwords,
+        &g_noalloc.grow,     &g_noalloc.fallback, &g_noalloc.verified,
+        &g_noalloc.mismatch, &g_noalloc.cp_ops,   &g_noalloc.cp_grow};
+    u64 cur[kNoallocCounters];
+    for (u32 i = 0; i < kNoallocCounters; ++i) {
+        cur[i] = src[i]->load(std::memory_order_relaxed);
+    }
+    if (g_noalloc_last_ns == 0) { // the first window starts now
+        g_noalloc_last_ns = now;
+        std::copy(cur, cur + kNoallocCounters, g_noalloc_last);
+        return;
+    }
+    if (now - g_noalloc_last_ns < 5'000'000'000ULL) {
+        return;
+    }
+    u64 d[kNoallocCounters];
+    for (u32 i = 0; i < kNoallocCounters; ++i) {
+        d[i] = cur[i] - g_noalloc_last[i];
+    }
+    const auto ull = [](u64 v) { return static_cast<unsigned long long>(v); };
+    std::fprintf(stderr,
+                 "SOTC OP NOALLOC mode=%u window=%.1fs ops=%llu swaps=%llu copy_dwords_saved=%llu "
+                 "reallocs_saved=%llu fallback_ops=%llu cp_ops=%llu cp_grow=%llu verified=%llu "
+                 "mismatch=%llu (total %llu)\n",
+                 u32{op_noalloc}, static_cast<double>(now - g_noalloc_last_ns) / 1e9, ull(d[0]),
+                 ull(d[1]), ull(d[2]), ull(d[3]), ull(d[4]), ull(d[7]), ull(d[8]), ull(d[5]),
+                 ull(d[6]), ull(cur[6]));
+    g_noalloc_last_ns = now;
+    std::copy(cur, cur + kNoallocCounters, g_noalloc_last);
+}
 
 // sotc: SOTC_REG_SAME=1 (off by default). Why skipping an unchanged write is safe. Invariant I: a
 // chunk that is not in dirty_list has regs == the value the last op carrying it copied into
@@ -1361,12 +1433,31 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
     if (opstat) { // sotc: SOTC_OPSTAT
         OpStatAdd(OsCpDirty, dirty_list.size());
     }
-    op.reg_chunks.clear();
-    for (const u16 chunk : dirty_list) {
-        const u32* src = &regs.reg_array[u32{chunk} * RegChunkDwords];
-        op.reg_chunks.push_back(chunk);
-        op.reg_chunks.insert(op.reg_chunks.end(), src, src + RegChunkDwords);
-        dirty_chunks[chunk / 64] &= ~(u64{1} << (chunk % 64));
+    if (op_noalloc) {
+        // sotc: SOTC_OP_NOALLOC: the same layout, sized once (a slot keeps its capacity, so the
+        // resize allocates only when this op has more dirty chunks than the slot ever had).
+        const size_t dwords = dirty_list.size() * (RegChunkDwords + 1);
+        if (dwords > op.reg_chunks.capacity()) {
+            NoallocAdd(g_noalloc.cp_grow, 1);
+        }
+        NoallocAdd(g_noalloc.cp_ops, 1);
+        op.reg_chunks.resize(dwords);
+        u32* dst = op.reg_chunks.data();
+        for (const u16 chunk : dirty_list) {
+            *dst++ = chunk;
+            std::memcpy(dst, &regs.reg_array[u32{chunk} * RegChunkDwords],
+                        RegChunkDwords * sizeof(u32));
+            dst += RegChunkDwords;
+            dirty_chunks[chunk / 64] &= ~(u64{1} << (chunk % 64));
+        }
+    } else {
+        op.reg_chunks.clear();
+        for (const u16 chunk : dirty_list) {
+            const u32* src = &regs.reg_array[u32{chunk} * RegChunkDwords];
+            op.reg_chunks.push_back(chunk);
+            op.reg_chunks.insert(op.reg_chunks.end(), src, src + RegChunkDwords);
+            dirty_chunks[chunk / 64] &= ~(u64{1} << (chunk % 64));
+        }
     }
     dirty_list.clear();
     op.cb_extent = last_cb_extent;
@@ -1827,14 +1918,45 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
     }
     back_cb_extent = op.cb_extent;
     back_db_extent = op.db_extent;
+    // sotc: SOTC_OP_NOALLOC: the op's flat buffer is swapped in rather than copied. Nothing reads
+    // op.stages[].flat after this op ran except the command processor's next CaptureBackOp of the
+    // slot, which assigns it (after back_tail passed the op). The prep threads do read it while the
+    // draw thread runs the op, so with them the copy stays.
+    const bool flat_swap = op_noalloc && !prep_workers;
+    if (op_noalloc) {
+        NoallocAdd(flat_swap ? g_noalloc.ops : g_noalloc.fallback, 1);
+    }
     for (u32 i = 0; i < op.num_stages; ++i) {
         BackStage& stage = op.stages[i];
         Shader::InfoRuntime& rt = stage.info->runtime[1];
         rt.user_data = stage.num_user_data == ~0u
                            ? std::span<const u32>{}
                            : std::span<const u32>{stage.user_data.data(), stage.num_user_data};
-        rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+        if (flat_swap) {
+            if (stage.flat.size() > rt.flattened_ud_buf.capacity()) {
+                NoallocAdd(g_noalloc.grow, 1);
+            }
+            NoallocAdd(g_noalloc.swaps, 1);
+            NoallocAdd(g_noalloc.dwords, stage.flat.size());
+            if (op_noalloc == 2) {
+                // Verify: the old path's copy, made into a scratch buffer, against the swap.
+                static thread_local std::vector<u32> shadow;
+                shadow.assign(stage.flat.begin(), stage.flat.end());
+                rt.flattened_ud_buf.swap(stage.flat);
+                NoallocAdd(g_noalloc.verified, 1);
+                if (rt.flattened_ud_buf != shadow) {
+                    NoallocAdd(g_noalloc.mismatch, 1);
+                }
+            } else {
+                rt.flattened_ud_buf.swap(stage.flat);
+            }
+        } else {
+            rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+        }
         rt.pgm_base = stage.pgm_base;
+    }
+    if (op_noalloc) {
+        OpNoallocTick();
     }
     const u64 ob_t1 = opstat ? SotcStats::NowNs() : 0; // sotc: SOTC_OPSTAT
     if (n5_on) { // sotc: SOTC_N5_GRAPH: this op's pass sample, before its own work
@@ -1846,6 +1968,8 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
     if (ovl_on) { // sotc: SOTC_OP_OVERLAP (7c.0): back_regs now holds this op's registers
         NoteOpOverlap(op);
     }
+    // sotc: SOTC_TC_OP_LOCK: one texture-cache hold per draw/dispatch op (Func ops can block, so they are left out).
+    const auto tc_op_lock = rasterizer->GetTextureCache().OpLock(op.kind != BackOp::Kind::Func);
     switch (op.kind) {
     case BackOp::Kind::Func:
         if (op.func) { // sotc: empty for a flushed batch of WRITE_DATA (FlushWd)
@@ -6441,11 +6565,14 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     NotifyCpWait(); // sotc: SOTC_CP_IDLE_US
 }
 
-// sotc: SOTC_CP_AHEAD. Read once; gnmdriver.cpp reads the same value through this.
+// sotc: SOTC_CP_AHEAD. Read once; gnmdriver.cpp reads the same value through this. Default 2 since 9 Nov 2026:
+// per-frame frame-end marks, so a frame's end is no longer recorded only together with the next one when the
+// command processor stays busy (Pro 60 route: p99 59 -> 50 ms, worst frame 85 -> 50 ms, 3-vblank frames 20 -> 11%;
+// docs/re-stutters/FRAME-CHAIN-PRO60-2026-11-09.md). =0 turns it off.
 int Liverpool::CpAheadMode() noexcept {
     static const int mode = [] {
         const char* v = std::getenv("SOTC_CP_AHEAD");
-        const int n = v ? std::atoi(v) : 0;
+        const int n = v && v[0] ? std::atoi(v) : 2;
         return n == 0 ? 0 : (n == 2 ? 2 : 1);
     }();
     return mode;

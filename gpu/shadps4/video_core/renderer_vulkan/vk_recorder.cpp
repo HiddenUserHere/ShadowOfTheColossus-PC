@@ -2464,7 +2464,10 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     // / 8 threads even (82.1 both).
     static const auto SpinTime = [] {
         const char* v = std::getenv("SOTC_REC_SPIN_US");
-        return std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : (few_cpus ? 0 : 250)};
+        // sotc: default 0 since 9 Nov 2026 on every machine: the spin was ~10 of the recorder's 16 ms CPU per frame
+        // in PS4 Pro mode at 60 FPS (busy 5.3 ms), with no frame-time gain from it.
+        (void)few_cpus;
+        return std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : 0};
     }();
     // sotc: SOTC_REC_SLEEP_US sets the idle wait. On Windows the default 500 us rounds to 0 and the
     // thread spins: 61.1 vs 57.7 FPS on the attract demo (i9-13900K + RTX 2060 SUPER) against a

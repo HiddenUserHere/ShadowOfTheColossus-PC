@@ -887,6 +887,15 @@ private:
     bool back_pf{};
     bool reg_same{};
     bool opstat{};
+    /// sotc: SOTC_OP_NOALLOC (off by default; needs the draw thread): 1 on, 2 on plus verify.
+    /// ExecuteBackOp swaps each stage's captured flat buffer into the shader's slot-1 runtime
+    /// instead of copying it (no copy, no reallocation; only without the prep threads, which read
+    /// op.stages[].flat while the draw thread runs the op); BackAlloc builds the register chunks
+    /// with one resize and plain copies; small Func closures stay inline (as SOTC_INLINE_FUNC=1).
+    /// Verify (=2) checks the swapped buffer against a copy made the old way; one
+    /// "SOTC OP NOALLOC" line every 5 s.
+    u8 op_noalloc{};
+    void OpNoallocTick();
     /// sotc: doorbell BackLoop blocks on under back_nospin; see WakeBackAtomic.
     std::atomic<u32> back_wake{0};
     std::thread::id back_id{};

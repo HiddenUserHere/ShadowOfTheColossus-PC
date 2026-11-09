@@ -1086,6 +1086,20 @@ bool PackRead(u64 offset, void* out, size_t n) {
            std::fread(out, 1, n, g_pack_in) == n;
 }
 
+// sotc: SOTC_PRETRANSLATE_STREAM: the pack being written this hold is read back before it is finished (its entries are
+// indexed as they are written). The writer's buffer is flushed and a read handle opened. Command processor only (the
+// writer's thread): the workers' reads of the entries indexed before this call see their bytes.
+void PackFlushForRead() {
+    if (!g_pack_out) {
+        return;
+    }
+    std::fflush(g_pack_out);
+    std::scoped_lock lock{g_pack_mutex};
+    if (!g_pack_in) {
+        g_pack_in = std::fopen(PackPath().string().c_str(), "rb");
+    }
+}
+
 bool PackStageMeta(u64 stage_hash, std::vector<u8>& meta) {
     const auto it = g_pack_by_stage.find(stage_hash);
     if (it == g_pack_by_stage.end()) {
@@ -1122,9 +1136,21 @@ bool PipelineCache::PrePackAdd(u64 hash, u32 perm_idx, std::vector<u8>&& meta, c
     if (!pack_on || g_pack_closed || !Storage::DataBase::Instance().IsOpened()) {
         return false;
     }
+    const bool stream = pre_holding && (SotcNonBlocking::PretranslateStream() || SotcNonBlocking::CompileStream());
     if (!g_pack_out) {
         std::error_code ec;
         std::filesystem::create_directories(PackPath().parent_path(), ec);
+        if (stream) {
+            // sotc: SOTC_PRETRANSLATE_STREAM: the file is rewritten from the start: the earlier index no longer
+            // describes it, and the read handle is opened again on the new file when needed (PackFlushForRead).
+            std::scoped_lock lock{g_pack_mutex};
+            if (g_pack_in) {
+                std::fclose(g_pack_in);
+                g_pack_in = nullptr;
+            }
+            g_pack_index.clear();
+            g_pack_by_stage.clear();
+        }
         g_pack_out = std::fopen(PackPath().string().c_str(), "wb");
         if (!g_pack_out || std::fwrite(kPackMagic, 1, sizeof kPackMagic, g_pack_out) != sizeof kPackMagic) {
             g_pack_closed = true;
@@ -1141,6 +1167,16 @@ bool PipelineCache::PrePackAdd(u64 hash, u32 perm_idx, std::vector<u8>&& meta, c
     std::fwrite(meta.data(), 1, meta_size, g_pack_out);
     std::fwrite(spv.data(), 1, spv_size, g_pack_out);
     g_pack_written.push_back({hash, perm_idx, offset, meta_size, spv_size});
+    if (stream) {
+        // sotc: SOTC_PRETRANSLATE_STREAM / SOTC_COMPILE_STREAM: indexed now (after its bytes), so a program that leaves
+        // memory during the hold can be loaded back before PrePackFinish; and counted for PretranslateStreamStep.
+        const PackEntry e{hash, perm_idx, offset, meta_size, spv_size};
+        g_pack_index[hash].push_back(e);
+        g_pack_by_stage[HashCombine(hash, u64{perm_idx})] = e;
+        if (++pre_stream_packed[hash] == 1) {
+            pre_stream_candidates.push_back(hash);
+        }
+    }
     return true;
 }
 
@@ -1222,6 +1258,7 @@ bool PipelineCache::LoadLazyProgram(u64 hash) {
     if (entry == lazy_programs.end()) {
         return false;
     }
+    PackFlushForRead(); // sotc: SOTC_PRETRANSLATE_STREAM: the pack may still be written (no-op otherwise)
     const u32 count = entry->second;
     lazy_programs.erase(entry);
     const auto packed = g_pack_index.find(hash);
@@ -1348,6 +1385,7 @@ bool PipelineCache::QueueLazyPrefetch(u64 hash) {
         }
         load->entries.push_back({e->perm, e->offset, e->meta_size, e->spv_size});
     }
+    PackFlushForRead(); // sotc: SOTC_PRETRANSLATE_STREAM: the pack may still be written (no-op otherwise)
     auto job = std::make_unique<AsyncPipelineJob>();
     job->lazy = std::move(load);
     lazy_prefetch.insert(hash);
@@ -1360,7 +1398,8 @@ bool PipelineCache::QueueLazyPrefetch(u64 hash) {
 void PipelineCache::FeedLazyPrefetch() {
     // At most 2 pack loads on the workers: the rest of the workers stay free for the jobs the frame waits for
     // (compute pipelines, translations). The first P1 run gave every worker to 11,465 loads at once.
-    constexpr u32 kInFlight = 2;
+    // sotc: 8 while a loading hold streams programs back (lazy_in_flight_max): the screen is held, nothing else waits.
+    const u32 kInFlight = lazy_in_flight_max;
     bool fed = false;
     while (lazy_in_flight < kInFlight && !lazy_backlog.empty()) {
         {
@@ -1380,8 +1419,20 @@ void PipelineCache::RunLazyLoad(AsyncPipelineJob::LazyLoad& load) {
     for (const auto& e : load.entries) {
         std::vector<u8> meta_blob(e.meta_size);
         std::vector<u32> spv(e.spv_size / sizeof(u32));
+        // sotc: the first failed reads are logged with their reason (the "read failure" count of SOTC NB IO).
+        const auto failed = [&](const char* reason, size_t got) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::fprintf(stderr,
+                             "SOTC NB IO: pack load of %#llx permutation %u failed: %s (%zu; offset %llu, meta %u, "
+                             "spv %u bytes)\n",
+                             static_cast<unsigned long long>(load.hash), e.perm, reason, got,
+                             static_cast<unsigned long long>(e.offset), e.meta_size, e.spv_size);
+            }
+        };
         if (!PackRead(e.offset, meta_blob.data(), e.meta_size) ||
             !PackRead(e.offset + e.meta_size, spv.data(), e.spv_size)) {
+            failed("read", 0);
             continue;
         }
         // No loose copies (the warm-up reads the pack, PackStageMeta / PackStageSpv).
@@ -1392,10 +1443,16 @@ void PipelineCache::RunLazyLoad(AsyncPipelineJob::LazyLoad& load) {
         size_t perm_idx{};
         try {
             Serialization::Archive ar{std::move(meta_blob)};
-            if (!LoadShaderMeta(ar, perm.program->info, perm.spec, perm_idx) || perm_idx != e.perm) {
+            if (!LoadShaderMeta(ar, perm.program->info, perm.spec, perm_idx)) {
+                failed("meta", 0);
+                continue;
+            }
+            if (perm_idx != e.perm) {
+                failed("permutation index", perm_idx);
                 continue;
             }
         } catch (...) {
+            failed("exception", 0);
             continue;
         }
         perm.module = CompileSPV(spv, instance.GetDevice());
@@ -1431,7 +1488,14 @@ void PipelineCache::InstallLazyLoad(AsyncPipelineJob::LazyLoad& load) {
         }
     }
     // A permutation the worker could not read is left to the program's draws (translated again if needed).
+    // sotc: a program none of whose permutations could be read stays in the index (its first use loads it here).
+    if (!program_cache.contains(load.hash) && !load.entries.empty()) {
+        lazy_programs.try_emplace(load.hash, static_cast<u32>(load.entries.size()));
+    }
     StreamRehydrate(load.hash); // sotc: SOTC_COMPILE_STREAM: its released pipelines, rebuilt on the workers
+    if (pack_streaming && pack_stream_wanted.erase(load.hash) != 0) {
+        pack_stream_loaded.push_back(load.hash); // sotc: SOTC_PRETRANSLATE_STREAM: the pack step queues its libraries
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now - g_lazy_stats.last >= std::chrono::seconds(5)) {
         g_lazy_stats.last = now;

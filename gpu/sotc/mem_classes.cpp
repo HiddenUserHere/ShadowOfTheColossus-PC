@@ -1095,8 +1095,8 @@ int Mode() {
         if (n == 1) {
             // Mode 1 publishes through SotcUntrack's auto list, and the CP ahead gate turns the
             // untracking off (as Parse()).
-            const char* ahead = std::getenv("SOTC_CP_AHEAD");
-            if (ahead && std::atoi(ahead) != 0) {
+            const char* ahead = std::getenv("SOTC_CP_AHEAD"); // sotc: default 2 (Liverpool::CpAheadMode)
+            if (!(ahead && ahead[0]) || std::atoi(ahead) != 0) {
                 std::fprintf(stderr, "SOTC CLASS: SOTC_CLASS_TRACK=1 refused, SOTC_CP_AHEAD is "
                                      "set; class mode stays off\n");
                 return 0;

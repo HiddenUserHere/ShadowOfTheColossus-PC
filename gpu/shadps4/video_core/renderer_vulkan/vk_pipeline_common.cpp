@@ -5,10 +5,13 @@
 #include <array>
 #include <atomic> // sotc: BindSets guard counter
 #include <bit>
+#include <chrono> // sotc: SOTC_DESC_ON_REC report
+#include <memory> // sotc: SOTC_DESC_ON_REC
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <boost/container/static_vector.hpp>
+#include <tsl/robin_map.h> // sotc: SOTC_DESC_ON_REC verify
 
 #include "common/assert.h"
 #include "common/logging/log.h" // sotc: BindSets guard
@@ -455,6 +458,293 @@ void VerifyN5Set(const Instance& instance, DescriptorHeap& desc_heap,
 
 } // namespace
 
+// sotc: SOTC_DESC_ON_REC (off by default). The vkUpdateDescriptorSets of the classic set paths runs on the
+// recording thread (Scheduler::RecordDeferred) instead of the draw thread. The set is still allocated here
+// (Commit / AcquirePersistent): the bind-cache record keeps its handle. The writes and their info arrays are deep
+// copied into one block the closure owns; the closure is queued before the bindDescriptorSets of the same op, so
+// the replay order gives write-before-bind, also for a later bind-cache hit that rebinds the set unwritten.
+// Pools roll and persistent sets recycle only after the GPU finished their tick, which is after the recorder ran.
+//   0: inline write (as before).
+//   1: write on the recorder.
+//   2: verify: inline write (its result is the one used), and the recorder closure hashes its copy and compares
+//      with the hash of the inline writes; on a match it writes the same contents again, on a mismatch it skips.
+//      The draw thread also counts writes into a set whose previous write tick the GPU has not finished
+//      ("in-flight"), which the precondition of mode 1 forbids.
+// Report: "SOTC DESC ON REC" line every 5 s on stderr.
+namespace DescOnRec {
+
+static const int kMode = [] {
+    const char* v = std::getenv("SOTC_DESC_ON_REC");
+    return v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+}();
+
+std::atomic<u64> calls{};         ///< classic set writes seen (mode 1 or 2)
+std::atomic<u64> deferred{};      ///< write batches queued on the recorder
+std::atomic<u64> fallback{};      ///< batches written inline (no record thread, pNext or an unknown type)
+std::atomic<u64> sets_bytes{};    ///< bytes copied for the recorder
+std::atomic<u64> verify_checks{}; ///< mode 2: batches compared on the recorder
+std::atomic<u64> verify_mismatches{}; ///< mode 2: copies whose hash differs from the inline writes
+std::atomic<u64> inflight{};      ///< mode 2: writes into a set whose last write tick is still in flight
+std::atomic<u64> total_mismatches{};
+std::atomic<u64> total_inflight{};
+
+enum class InfoKind { Image, Buffer, Texel, Unknown };
+
+InfoKind KindOf(vk::DescriptorType type) {
+    switch (type) {
+    case vk::DescriptorType::eSampler:
+    case vk::DescriptorType::eCombinedImageSampler:
+    case vk::DescriptorType::eSampledImage:
+    case vk::DescriptorType::eStorageImage:
+    case vk::DescriptorType::eInputAttachment:
+        return InfoKind::Image;
+    case vk::DescriptorType::eUniformBuffer:
+    case vk::DescriptorType::eStorageBuffer:
+    case vk::DescriptorType::eUniformBufferDynamic:
+    case vk::DescriptorType::eStorageBufferDynamic:
+        return InfoKind::Buffer;
+    case vk::DescriptorType::eUniformTexelBuffer:
+    case vk::DescriptorType::eStorageTexelBuffer:
+        return InfoKind::Texel;
+    default:
+        return InfoKind::Unknown;
+    }
+}
+
+u64 Mix(u64 h, u64 v) {
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return h * 0xFF51AFD7ED558CCDull;
+}
+
+/// The contents a write gives its set: header and every element of the info array its type reads.
+u64 HashWrites(const vk::WriteDescriptorSet* writes, u32 count) {
+    u64 h = count;
+    for (u32 w = 0; w < count; ++w) {
+        const auto& write = writes[w];
+        h = Mix(h, std::bit_cast<u64>(write.dstSet));
+        h = Mix(h, u64{write.dstBinding} | (u64{write.dstArrayElement} << 32));
+        h = Mix(h, u64{write.descriptorCount} | (static_cast<u64>(write.descriptorType) << 32));
+        for (u32 i = 0; i < write.descriptorCount; ++i) {
+            switch (KindOf(write.descriptorType)) {
+            case InfoKind::Image:
+                if (write.pImageInfo) {
+                    const auto& info = write.pImageInfo[i];
+                    h = Mix(h, std::bit_cast<u64>(info.sampler));
+                    h = Mix(h, std::bit_cast<u64>(info.imageView));
+                    h = Mix(h, static_cast<u64>(info.imageLayout));
+                }
+                break;
+            case InfoKind::Buffer:
+                if (write.pBufferInfo) {
+                    const auto& info = write.pBufferInfo[i];
+                    h = Mix(h, std::bit_cast<u64>(info.buffer));
+                    h = Mix(h, info.offset);
+                    h = Mix(h, info.range);
+                }
+                break;
+            case InfoKind::Texel:
+                if (write.pTexelBufferView) {
+                    h = Mix(h, std::bit_cast<u64>(write.pTexelBufferView[i]));
+                }
+                break;
+            case InfoKind::Unknown:
+                break;
+            }
+        }
+    }
+    return h;
+}
+
+void Report() {
+    // Checked every 256 calls: the clock read stays off the draw path.
+    static std::atomic<u64> last_report_ns{};
+    const u64 n = calls.fetch_add(1, std::memory_order_relaxed);
+    if ((n & 255) != 0) {
+        return;
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    constexpr u64 period_ns = 5'000'000'000;
+    u64 due = last_report_ns.load(std::memory_order_relaxed);
+    if (due != 0 && static_cast<u64>(now) < due) {
+        return;
+    }
+    if (!last_report_ns.compare_exchange_strong(due, static_cast<u64>(now) + period_ns,
+                                                std::memory_order_relaxed)) {
+        return;
+    }
+    if (due == 0) {
+        return; // the first call only starts the window
+    }
+    const u64 mism = verify_mismatches.exchange(0, std::memory_order_relaxed);
+    const u64 infl = inflight.exchange(0, std::memory_order_relaxed);
+    const u64 tot_mism = total_mismatches.fetch_add(mism, std::memory_order_relaxed) + mism;
+    const u64 tot_infl = total_inflight.fetch_add(infl, std::memory_order_relaxed) + infl;
+    std::fprintf(stderr,
+                 "SOTC DESC ON REC: mode %d, deferred %llu, inline fallback %llu, copied %llu KiB, "
+                 "verify checks %llu, mismatches %llu (total %llu), in-flight writes %llu (total %llu)\n",
+                 kMode, static_cast<unsigned long long>(deferred.exchange(0, std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(fallback.exchange(0, std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(sets_bytes.exchange(0, std::memory_order_relaxed) >> 10),
+                 static_cast<unsigned long long>(verify_checks.exchange(0, std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(mism), static_cast<unsigned long long>(tot_mism),
+                 static_cast<unsigned long long>(infl), static_cast<unsigned long long>(tot_infl));
+}
+
+/// Mode 2, draw thread: counts a write into a set whose previous write tick the GPU has not finished.
+void CheckInFlight(Scheduler& scheduler, const vk::WriteDescriptorSet* writes, u32 count) {
+    static thread_local tsl::robin_map<u64, u64> last_write_tick;
+    if (last_write_tick.size() >= (1u << 18)) {
+        last_write_tick.clear();
+    }
+    const u64 tick = scheduler.CurrentTick();
+    vk::DescriptorSet last_set{};
+    for (u32 w = 0; w < count; ++w) {
+        const vk::DescriptorSet set = writes[w].dstSet;
+        if (set == last_set) {
+            continue;
+        }
+        last_set = set;
+        auto [it, is_new] = last_write_tick.try_emplace(std::bit_cast<u64>(set), tick);
+        if (!is_new) {
+            if (it->second != tick && !scheduler.IsFree(it->second)) {
+                inflight.fetch_add(1, std::memory_order_relaxed);
+            }
+            it.value() = tick;
+        }
+    }
+}
+
+/// The writes of one batch, deep copied: the write array, then the buffer, image and texel view infos.
+struct Batch {
+    std::unique_ptr<u8[]> blob;
+    u32 count{};
+};
+
+/// Copies writes and the info arrays they point to into one block. False when a write cannot be copied
+/// (a pNext chain or a descriptor type without a known info array): the caller writes inline then.
+bool CopyWrites(const vk::WriteDescriptorSet* writes, u32 count, Batch& out, size_t& bytes_out) {
+    size_t num_buffer = 0, num_image = 0, num_texel = 0;
+    for (u32 w = 0; w < count; ++w) {
+        const auto& write = writes[w];
+        if (write.pNext) {
+            return false;
+        }
+        switch (KindOf(write.descriptorType)) {
+        case InfoKind::Image:
+            num_image += write.pImageInfo ? write.descriptorCount : 0;
+            break;
+        case InfoKind::Buffer:
+            num_buffer += write.pBufferInfo ? write.descriptorCount : 0;
+            break;
+        case InfoKind::Texel:
+            num_texel += write.pTexelBufferView ? write.descriptorCount : 0;
+            break;
+        case InfoKind::Unknown:
+            return false;
+        }
+    }
+    static_assert(alignof(vk::WriteDescriptorSet) <= 8 && alignof(vk::DescriptorBufferInfo) <= 8 &&
+                  alignof(vk::DescriptorImageInfo) <= 8 && alignof(vk::BufferView) <= 8);
+    static_assert(sizeof(vk::WriteDescriptorSet) % 8 == 0 && sizeof(vk::DescriptorBufferInfo) % 8 == 0 &&
+                  sizeof(vk::DescriptorImageInfo) % 8 == 0);
+    const size_t writes_bytes = sizeof(vk::WriteDescriptorSet) * count;
+    const size_t buffer_bytes = sizeof(vk::DescriptorBufferInfo) * num_buffer;
+    const size_t image_bytes = sizeof(vk::DescriptorImageInfo) * num_image;
+    const size_t texel_bytes = sizeof(vk::BufferView) * num_texel;
+    const size_t bytes = writes_bytes + buffer_bytes + image_bytes + texel_bytes;
+    // operator new[] returns memory aligned for any fundamental type, which covers every array below.
+    out.blob = std::make_unique_for_overwrite<u8[]>(bytes);
+    out.count = count;
+    u8* base = out.blob.get();
+    auto* dst_writes = reinterpret_cast<vk::WriteDescriptorSet*>(base);
+    auto* dst_buffer = reinterpret_cast<vk::DescriptorBufferInfo*>(base + writes_bytes);
+    auto* dst_image = reinterpret_cast<vk::DescriptorImageInfo*>(base + writes_bytes + buffer_bytes);
+    auto* dst_texel = reinterpret_cast<vk::BufferView*>(base + writes_bytes + buffer_bytes + image_bytes);
+    std::memcpy(static_cast<void*>(dst_writes), writes, writes_bytes);
+    for (u32 w = 0; w < count; ++w) {
+        auto& write = dst_writes[w];
+        const u32 n = write.descriptorCount;
+        // Only the array the type reads is kept; the others are cleared (Vulkan ignores them).
+        const vk::DescriptorImageInfo* image = nullptr;
+        const vk::DescriptorBufferInfo* buffer = nullptr;
+        const vk::BufferView* texel = nullptr;
+        switch (KindOf(write.descriptorType)) {
+        case InfoKind::Image:
+            if (write.pImageInfo && n) {
+                std::memcpy(static_cast<void*>(dst_image), write.pImageInfo, sizeof(*dst_image) * n);
+                image = dst_image;
+                dst_image += n;
+            }
+            break;
+        case InfoKind::Buffer:
+            if (write.pBufferInfo && n) {
+                std::memcpy(static_cast<void*>(dst_buffer), write.pBufferInfo, sizeof(*dst_buffer) * n);
+                buffer = dst_buffer;
+                dst_buffer += n;
+            }
+            break;
+        case InfoKind::Texel:
+            if (write.pTexelBufferView && n) {
+                std::memcpy(static_cast<void*>(dst_texel), write.pTexelBufferView, sizeof(*dst_texel) * n);
+                texel = dst_texel;
+                dst_texel += n;
+            }
+            break;
+        case InfoKind::Unknown:
+            break;
+        }
+        write.pImageInfo = image;
+        write.pBufferInfo = buffer;
+        write.pTexelBufferView = texel;
+    }
+    bytes_out = bytes;
+    return true;
+}
+
+/// The classic set write of Pipeline::BindResources / BindStageSets. Mode 0 is the inline call as before.
+void WriteSets(const Instance& instance, Scheduler& scheduler, const Pipeline::DescriptorWrites& set_writes) {
+    if (kMode == 0) {
+        instance.GetDevice().updateDescriptorSets(set_writes, {});
+        return;
+    }
+    Report();
+    const u32 count = static_cast<u32>(set_writes.size());
+    if (kMode == 2) {
+        instance.GetDevice().updateDescriptorSets(set_writes, {});
+        CheckInFlight(scheduler, set_writes.data(), count);
+    }
+    Batch batch;
+    size_t bytes = 0;
+    if (!scheduler.HasRecordThread() || !CopyWrites(set_writes.data(), count, batch, bytes)) {
+        if (kMode == 1) {
+            instance.GetDevice().updateDescriptorSets(set_writes, {});
+        }
+        fallback.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    deferred.fetch_add(1, std::memory_order_relaxed);
+    sets_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    const u64 expect = kMode == 2 ? HashWrites(set_writes.data(), count) : 0;
+    const vk::Device device = instance.GetDevice();
+    // Runs before the bindDescriptorSets queued next by the caller (same stream, in order). Without a record
+    // thread at this point (a real command buffer), RecordDeferred runs it right away, which is the inline order.
+    scheduler.RecordDeferred([device, expect, batch = std::move(batch)](vk::CommandBuffer) {
+        const auto* writes = reinterpret_cast<const vk::WriteDescriptorSet*>(batch.blob.get());
+        if (kMode == 2) {
+            verify_checks.fetch_add(1, std::memory_order_relaxed);
+            if (HashWrites(writes, batch.count) != expect) {
+                verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+                return; // the inline write stands
+            }
+        }
+        device.updateDescriptorSets(batch.count, writes, 0, nullptr);
+    });
+}
+
+} // namespace DescOnRec
+
 bool Pipeline::PlanHeapMode(std::span<const HeapBinding> bindings, HeapFallback pre) {
     // Off: nothing is planned or counted, the layout is built as before.
     if (!instance.IsDescriptorHeapEnabled()) {
@@ -703,7 +993,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
     }
     DynamicPatch patch{};
     const u32 num_dyn = dyn_flat.empty() ? 0u : PrepareDynamicFlat(set_writes, write_sets, dyn_offsets, &patch);
-    instance.GetDevice().updateDescriptorSets(set_writes, {});
+    DescOnRec::WriteSets(instance, scheduler, set_writes); // sotc: SOTC_DESC_ON_REC
     RestoreDynamicWrites(set_writes, patch);
     BindSets(cmdbuf, bind_point, 0, 1, &desc_set, num_dyn, dyn_offsets.data());
     if (reuse) { // sotc: SOTC_BIND_DESC_REUSE: kept for the entry
@@ -762,7 +1052,7 @@ void Pipeline::BindStageSets(DescriptorWrites& set_writes, std::span<const u32> 
     }
     DynamicPatch patch{};
     const u32 num_dyn = dyn_flat.empty() ? 0u : PrepareDynamicFlat(set_writes, write_sets, dyn_offsets, &patch);
-    instance.GetDevice().updateDescriptorSets(set_writes, {});
+    DescOnRec::WriteSets(instance, scheduler, set_writes); // sotc: SOTC_DESC_ON_REC
     RestoreDynamicWrites(set_writes, patch);
     BindSets(cmdbuf, bind_point, 0, num_sets, desc_sets.data(), num_dyn, dyn_offsets.data());
 }

@@ -4090,6 +4090,34 @@ ImageId TextureCache::MemoLookup(const ImageInfo& info, bool exact_fmt, bool wri
 }
 
 void TextureCache::ReportTcFast(std::string& out, double seconds) {
+    // sotc: SOTC_TC_OP_LOCK: its line goes with this report (the draw thread's counters are
+    // monotonic, single writer: the change since the last window is printed).
+    if (TcOpLock::Mode() != 0) {
+        static u64 last_ops = 0, last_nested = 0, last_inner = 0, last_mismatch = 0, last_checks = 0;
+        const auto delta = [](const std::atomic<u64>& c, u64& last) {
+            const u64 now = c.load(std::memory_order_relaxed);
+            const u64 d = now - last;
+            last = now;
+            return static_cast<unsigned long long>(d);
+        };
+        const unsigned long long ops = delta(TcOpLock::ops, last_ops);
+        const unsigned long long nested = delta(TcOpLock::nested, last_nested);
+        const unsigned long long inner = delta(TcOpLock::inner, last_inner);
+        const unsigned long long mismatch = delta(TcOpLock::mismatch, last_mismatch);
+        const unsigned long long checks = delta(TcOpLock::checks, last_checks);
+        const u64 slow = TcOpLock::slow_locks.exchange(0, std::memory_order_relaxed);
+        const u64 slow_ns = TcOpLock::slow_wait_ns.exchange(0, std::memory_order_relaxed);
+        const u64 slow_max = TcOpLock::slow_wait_max_ns.exchange(0, std::memory_order_relaxed);
+        char line[320];
+        std::snprintf(line, sizeof(line),
+                      "SOTC TC OPLOCK: op holds %llu, nested %llu, inner locks %llu (%.1f per op), "
+                      "verify mismatches %llu (checks %llu), other-thread locks %llu wait %.2f ms "
+                      "max %.1f us (mode %u, %.1f s)\n",
+                      ops, nested, inner, ops ? static_cast<double>(inner) / ops : 0.0, mismatch,
+                      checks, static_cast<unsigned long long>(slow), slow_ns / 1e6,
+                      slow_max / 1e3, TcOpLock::Mode(), seconds);
+        out += line;
+    }
     if (TcFast::Mode() == 0) {
         return;
     }

@@ -3057,6 +3057,8 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only,
                         std::memory_order_relaxed);
                 }
                 pre_builds_pending.fetch_sub(1, std::memory_order_relaxed);
+                // sotc: SOTC_COMPILE_STREAM: the last access of this worker (the hold may destroy it from now on).
+                job->compute->sotc_worker_done.store(true, std::memory_order_release);
             }
             if (job->manifest) { // sotc: SOTC_PIPE_MANIFEST: the hold counts it as done (built or refused)
                 job->compute->WaitBuilt();
@@ -3692,6 +3694,9 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
         }
         return;
     }
+    if (!t.program && t.pretranslate) {
+        PreJobDone(t.hash); // sotc: SOTC_PRETRANSLATE_STREAM / SOTC_COMPILE_STREAM
+    }
     if (!t.program && t.pretranslate && t.sw_stage == SwStage::Compute) {
         InstallComputePrebuild(t); // sotc: SOTC_PRETRANSLATE_COMPUTE
         return;
@@ -3726,6 +3731,7 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
             v.pretranslate = true;
             v.synthetic_variant = 1;
             SotcPretranslate::NoteQueued(stage);
+            PreJobQueued(t.hash); // sotc: SOTC_PRETRANSLATE_STREAM
             pre_backlog.push_back(std::move(job));
         }
         if (pre_pending.erase(t.hash) != 0) {
@@ -6413,8 +6419,8 @@ void PipelineCache::DrainPretranslate() {
                 // sotc: a forced preparation of warm SPIR-V must recreate its modules too, otherwise
                 // the GPL pack sees only drawn programs and a missing driver cache stays unprepared.
                 LoadLazyProgram(r.hash); // loading-only process: no gameplay deadline to block
-            } else if (SotcNonBlocking::Prefetch()) {
-                QueueLazyPrefetch(r.hash);
+            } else if (SotcNonBlocking::Prefetch() && !(pre_holding && pre_stream_evicted_gfx.contains(r.hash))) {
+                QueueLazyPrefetch(r.hash); // sotc: SOTC_PRETRANSLATE_STREAM: not one the hold just sent to the index
             }
             continue;
         }
@@ -6480,7 +6486,15 @@ void PipelineCache::DrainPretranslate() {
         } else if (r.pair != 0) {
             // The vertex stage's bindings start where its pixel stage's end (the pixel stage is bound first).
             const auto pair = program_cache.find(r.pair);
-            if (pair == program_cache.end()) {
+            const auto left = pair == program_cache.end() ? pre_stream_pair_start.find(r.pair)
+                                                          : pre_stream_pair_start.end();
+            if (left != pre_stream_pair_start.end()) {
+                // sotc: SOTC_PRETRANSLATE_STREAM: the pixel program is on disk; its bindings were kept when it left.
+                start = left->second;
+                if (profile.stage_bindings) {
+                    start.unified = 0;
+                }
+            } else if (pair == program_cache.end()) {
                 const bool waiting = pending_programs.contains(r.pair);
                 if (waiting && (r.deferred_ns == 0 || now_ns - r.deferred_ns < 10'000'000'000LL)) {
                     if (r.deferred_ns == 0) {
@@ -6495,10 +6509,12 @@ void PipelineCache::DrainPretranslate() {
                 SotcPretranslate::NoteDropped(stage, 1);
                 continue;
             }
-            const auto& pair_info = pair.value()->info;
-            pair_info.AddBindings(start, Shader::UsesBindlessSamplers(pair_info));
-            if (profile.stage_bindings) {
-                start.unified = 0;
+            if (left == pre_stream_pair_start.end()) {
+                const auto& pair_info = pair.value()->info;
+                pair_info.AddBindings(start, Shader::UsesBindlessSamplers(pair_info));
+                if (profile.stage_bindings) {
+                    start.unified = 0;
+                }
             }
         }
         // The variants of the key the file leaves open: every color layout of the pixel program's pass; both draw
@@ -6533,6 +6549,7 @@ void PipelineCache::DrainPretranslate() {
             t.pretranslate = true;
             t.first_variant = true; // each layout variant gets its integer-verdict twin
             SotcPretranslate::NoteQueued(stage);
+            PreJobQueued(r.hash); // sotc: SOTC_PRETRANSLATE_STREAM
             pre_backlog.push_back(std::move(job));
         }
         pending_programs.insert(r.hash);
@@ -6586,7 +6603,9 @@ void PipelineCache::QueueComputePrebuild(SotcPretranslate::Request& r) {
         SotcPretranslate::NoteDropped(2, 0); // known: a warm session has it (as the other requests)
         // sotc: loaded from the pack by a worker before its first dispatch. SOTC_COMPILE_STREAM: a released program's
         // file loaded again: the pack load is queued in any case, and its install rebuilds the pipelines on workers.
-        if (SotcNonBlocking::Prefetch() || stream_released_programs.contains(program_hash)) {
+        // Not during the hold that released it (it is rebuilt at the hold's end, StreamRebuildBeforePlay).
+        const bool released = stream_released_programs.contains(program_hash);
+        if ((SotcNonBlocking::Prefetch() || released) && !(pre_holding && released)) {
             if (!QueueLazyPrefetch(program_hash)) {
                 StreamRehydrate(program_hash); // resident already (no pack load needed)
             }
@@ -6629,6 +6648,7 @@ void PipelineCache::QueueComputePrebuild(SotcPretranslate::Request& r) {
     t.runtime_info = rt;
     t.pretranslate = true;
     SotcPretranslate::NoteQueued(2);
+    PreJobQueued(program_hash); // sotc: SOTC_COMPILE_STREAM
     pre_backlog.push_back(std::move(job));
 }
 
@@ -6675,7 +6695,8 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
         if (IsProgramKnown(plain_hash) || lazy_programs.contains(plain_hash) ||
             compute_pipelines.contains(ComputePipelineKey{HashCombine(plain_hash, size_t{0})})) {
             SotcPretranslate::NoteDropped(2, 0); // known: a warm session has the plain variant
-            if (SotcNonBlocking::Prefetch() || stream_released_programs.contains(plain_hash)) {
+            const bool released = stream_released_programs.contains(plain_hash);
+            if ((SotcNonBlocking::Prefetch() || released) && !(pre_holding && released)) {
                 if (!QueueLazyPrefetch(plain_hash)) {
                     StreamRehydrate(plain_hash); // sotc: SOTC_COMPILE_STREAM, resident already
                 }
@@ -6695,6 +6716,7 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
         v.start = t.start;
         v.pretranslate = true;
         g_specfree.heap_refused_prebuilds.fetch_add(1, std::memory_order_relaxed);
+        PreJobQueued(plain_hash); // sotc: SOTC_COMPILE_STREAM
         pre_backlog.push_back(std::move(job)); // counted queued once, as the candidate (FeedNext sends it)
         return;
     }
@@ -6809,6 +6831,7 @@ void PipelineCache::InstallComputePrebuild(AsyncPipelineJob::Translate& t) {
         v.synthetic_mask = mask;
         ++pack_compute_queued;
         SotcPretranslate::NoteQueued(2);
+        PreJobQueued(t.hash); // sotc: SOTC_COMPILE_STREAM
         pre_backlog.push_back(std::move(job));
     }
     const ComputePipelineKey key{HashCombine(t.hash, perm_idx)};
@@ -7121,16 +7144,17 @@ bool PipelineCache::BuildPackLibraries() {
     }
     pack_failed.store(0, std::memory_order_relaxed);
     // sotc: pack_compiled + pack_failed counts this batch only; other library jobs may complete too.
-    for (auto it = program_cache.begin(); it != program_cache.end(); ++it) {
-        Program& p = *it.value();
+    // sotc: the library jobs of one program (its key in the program cache); the count it queued.
+    const auto queue_program = [&](u64 key, Program& p) -> u64 {
         size_t first = 0;
         if (!usable(p, first)) {
-            continue;
+            return 0;
         }
-        if (!is_referenced(it.key(), p)) {
+        if (!is_referenced(key, p)) {
             ++unreferenced; // sotc: SOTC_PACK_REFERENCED: no material the game created names this program
-            continue;
+            return 0;
         }
+        const u64 queued_before = queued;
         const bool vertex = p.info.sw_stage == Shader::SwStage::Vertex;
         const auto found = partners.find(u32{p.info.variant});
         const Partner* partner = found == partners.end() ? nullptr : &found->second[vertex ? 1 : 0];
@@ -7157,7 +7181,7 @@ bool PipelineCache::BuildPackLibraries() {
                 continue;
             }
             job->pack_id = id;
-            job->pack_program = it.key(); // sotc: SOTC_GPL_PACK_LEAN
+            job->pack_program = key; // sotc: SOTC_GPL_PACK_LEAN
             job->pack_perm = static_cast<u32>(perm);
             ++queued;
             queued_vs += vertex;
@@ -7167,6 +7191,10 @@ bool PipelineCache::BuildPackLibraries() {
                 PushJobLocked(JobLane::Predict, std::move(job));
             }
         }
+        return queued - queued_before;
+    };
+    for (auto it = program_cache.begin(); it != program_cache.end(); ++it) {
+        queue_program(it.key(), *it.value());
     }
     async_cv.notify_all();
     urgent_cv.notify_all(); // sotc: SOTC_GPL_URGENT_WORKERS: the Predict lane is theirs too
@@ -7205,20 +7233,152 @@ bool PipelineCache::BuildPackLibraries() {
             ++modules_destroyed;
         }
     };
-    while (completed() < queued && Clock::now() - start < std::chrono::minutes{30}) {
+    // sotc: SOTC_PRETRANSLATE_STREAM: the programs the hold sent to the index are loaded back by the workers (8 at a
+    // time, while fewer than 256 library jobs wait), their libraries queued as each one arrives, and each one goes back
+    // to the index once its modules were destroyed (every library compiled). The partners stay (pre_stream_keepers).
+    std::vector<u64> stream_list;
+    std::unordered_map<u64, u32> stream_counts;
+    std::unordered_set<u64> stream_programs;
+    size_t stream_next = 0, stream_loading = 0;
+    if (lean && !pre_stream_evicted_gfx.empty()) {
+        for (const u64 h : pre_stream_evicted_gfx) {
+            const auto l = lazy_programs.find(h);
+            if (l != lazy_programs.end() && !program_cache.contains(h)) {
+                stream_list.push_back(h);
+                stream_counts[h] = l->second;
+            }
+        }
+        std::ranges::sort(stream_list);
+        pack_streaming = !stream_list.empty();
+        lazy_in_flight_max = 8;
+    }
+    const auto stream_feed = [&] {
+        while (stream_next < stream_list.size() && stream_loading < 16 &&
+               queued - std::min(queued, completed()) < 256) {
+            const u64 h = stream_list[stream_next++];
+            if (program_cache.contains(h) || !lazy_programs.contains(h)) {
+                continue;
+            }
+            pack_stream_wanted.insert(h);
+            ++stream_loading;
+            if (!QueueLazyPrefetch(h)) {
+                pack_stream_wanted.erase(h);
+                LoadLazyProgram(h); // its loose files (not in the pack index): here, the screen is held
+                pack_stream_loaded.push_back(h);
+            }
+        }
+    };
+    const auto stream_take = [&] {
+        std::vector<u64> loaded;
+        loaded.swap(pack_stream_loaded);
+        for (const u64 h : loaded) {
+            stream_loading -= std::min<size_t>(stream_loading, 1);
+            const auto found = program_cache.find(h);
+            if (found == program_cache.end()) {
+                lazy_programs.try_emplace(h, stream_counts[h]); // a read failure: it stays on disk
+                continue;
+            }
+            Program& p = *found.value();
+            p.sotc_pre = true; // loaded during the hold: still a prepared program (the eviction takes it)
+            ++pre_stream_reloaded;
+            size_t perm = 0;
+            if (usable(p, perm)) {
+                ++programs_all;
+                programs_ref += is_referenced(h, p) ? 1 : 0;
+            }
+            if (queue_program(h, p) == 0 && !partner_programs.contains(&p)) {
+                // Nothing to compile for it (listed, unreferenced): its modules leave now.
+                for (auto& m : p.modules) {
+                    if (m.module) {
+                        instance.GetDevice().destroyShaderModule(m.module);
+                        m.module = vk::ShaderModule{};
+                    }
+                }
+            }
+            stream_programs.insert(h);
+        }
+        if (!loaded.empty()) {
+            async_cv.notify_all();
+            urgent_cv.notify_all();
+        }
+    };
+    const auto stream_evict = [&] {
+        if (stream_programs.empty() ||
+            lib_jobs_pending.load(std::memory_order_acquire) > queued - std::min(queued, completed())) {
+            return; // another library job runs (it may hold any program)
+        }
+        std::optional<LiveProgramRefs> refs;
+        bool evicted = false;
+        for (auto it = stream_programs.begin(); it != stream_programs.end();) {
+            const auto found = program_cache.find(*it);
+            if (found == program_cache.end()) {
+                it = stream_programs.erase(it);
+                continue;
+            }
+            Program& p = *found.value();
+            if (partner_programs.contains(&p) ||
+                std::ranges::any_of(p.modules, [](const Program::Module& m) { return bool(m.module); })) {
+                ++it; // libraries still compiling (or one failed: the end-of-hold eviction decides)
+                continue;
+            }
+            if (!refs) {
+                refs = CollectLiveProgramRefs();
+            }
+            if (p.sotc_pre_checked || !p.pending_specs.empty() || pending_programs.contains(*it) ||
+                refs->Referenced(*it, p)) {
+                it = stream_programs.erase(it); // stays resident; the end-of-hold eviction decides
+                continue;
+            }
+            lazy_programs[*it] = std::max(static_cast<u32>(p.modules.size()), stream_counts[*it]);
+            program_cache.erase(found);
+            ++pre_stream_reevicted;
+            evicted = true;
+            it = stream_programs.erase(it);
+        }
+        if (evicted) {
+            last_graphics_pipeline = nullptr;
+            pipe_fast_gfx.valid = false;
+        }
+    };
+    int pack_decile = 0;
+    while ((completed() < queued || stream_next < stream_list.size() || stream_loading != 0) &&
+           Clock::now() - start < std::chrono::minutes{30}) {
         if (async_done_count.load(std::memory_order_acquire) != 0) {
             CollectAsyncPipelines();
         }
+        if (pack_streaming) {
+            stream_take();
+            stream_feed();
+        }
         if (lean) {
             drain_modules();
+            if (pack_streaming) {
+                stream_evict();
+            }
         }
         const u64 left = queued - std::min(queued, completed());
+        SotcStats::prep_total.store(static_cast<u32>(queued), std::memory_order_relaxed);
         SotcStats::prep_done.store(static_cast<u32>(queued - std::min<u64>(queued, left)), std::memory_order_relaxed);
+        // sotc: SOTC RAM: one line per tenth of the pack step (jobs done; streamed programs loaded).
+        if (queued != 0) {
+            const u64 job_tenths = (queued - left) * 10 / queued;
+            const u64 load_tenths = stream_list.empty() ? 10 : stream_next * 10 / stream_list.size();
+            const int decile = static_cast<int>(std::min<u64>(job_tenths, load_tenths));
+            if (decile > pack_decile) {
+                pack_decile = decile;
+                char where[64];
+                std::snprintf(where, sizeof where, "pack step %d%%", decile * 10);
+                LogRam(where);
+            }
+        }
         if (Clock::now() - last_log > std::chrono::seconds{5}) {
             last_log = Clock::now();
-            std::fprintf(stderr, "SOTC GPL PACK LIBS: compiling %.1f s, %llu of %llu left\n",
+            std::fprintf(stderr, "SOTC GPL PACK LIBS: compiling %.1f s, %llu of %llu left%s\n",
                          std::chrono::duration<double>(last_log - start).count(), static_cast<unsigned long long>(left),
-                         static_cast<unsigned long long>(queued));
+                         static_cast<unsigned long long>(queued),
+                         stream_list.empty() ? ""
+                                             : fmt::format("; programs loaded back {} of {}", stream_next,
+                                                           stream_list.size()).c_str());
         }
         std::unique_lock lock{async_mutex};
         translate_done_cv.wait_for(lock, std::chrono::milliseconds{20},
@@ -7230,11 +7390,28 @@ bool PipelineCache::BuildPackLibraries() {
     const size_t extra_count = extra_workers.size();
     if (lean) {
         drain_modules();
+        if (pack_streaming) {
+            stream_take();
+            stream_evict();
+        }
         StopExtraWorkers(); // back to the normal worker count for play
     }
-    if (completed() < queued) {
-        std::fprintf(stderr, "SOTC GPL PACK LIBS: incomplete: %llu of %llu jobs finished; no list published\n",
-                     static_cast<unsigned long long>(completed()), static_cast<unsigned long long>(queued));
+    if (pack_streaming) {
+        std::fprintf(stderr,
+                     "SOTC PRETRANSLATE STREAM: pack step loaded back %llu programs (of %zu on disk), %llu went back to "
+                     "the index after their libraries, %zu left to the end-of-hold eviction\n",
+                     static_cast<unsigned long long>(pre_stream_reloaded), stream_list.size(),
+                     static_cast<unsigned long long>(pre_stream_reevicted), stream_programs.size());
+    }
+    pack_streaming = false;
+    pack_stream_wanted.clear();
+    pack_stream_loaded.clear();
+    lazy_in_flight_max = 2;
+    if (completed() < queued || stream_next < stream_list.size()) {
+        std::fprintf(stderr, "SOTC GPL PACK LIBS: incomplete: %llu of %llu jobs finished (programs loaded back %zu of "
+                             "%zu); no list published\n",
+                     static_cast<unsigned long long>(completed()), static_cast<unsigned long long>(queued), stream_next,
+                     stream_list.size());
         return false;
     }
     const auto compiled_end = Clock::now();
@@ -7383,6 +7560,13 @@ void PipelineCache::PackComputePipelines(const std::unordered_set<u64>& listed, 
         std::this_thread::sleep_for(std::chrono::milliseconds{5});
     }
     u64 programs = 0, built = 0, hinted = 0, synthetic = 0, failed = 0, already = 0, resident = 0, destroyed = 0;
+    // sotc: SOTC_COMPILE_STREAM: the prebuilds PretranslateStreamStep released during the hold (in the pack cache).
+    for (const u64 id : stream_compiled_ids) {
+        if (!listed.contains(id)) {
+            compiled.push_back(id);
+        }
+    }
+    stream_compiled_ids.clear();
     std::vector<ComputePipelineKey> gone;
     // sotc: SOTC_COMPUTE_SPECFREE: a program can have several pack pipelines (the int/float variants). Its modules stay
     // while either one is still on a worker (the build reads the module).
@@ -7451,6 +7635,7 @@ void PipelineCache::PackComputePipelines(const std::unordered_set<u64>& listed, 
     }
     if (!gone.empty()) {
         last_compute_pipeline = nullptr; // the memo and the fast record see a smaller map
+        pipe_fast_cs.valid = false;
     }
     pack_compute_hinted.clear();
     const s64 first = pack_compute_first_ns.load(std::memory_order_relaxed);
@@ -7540,6 +7725,310 @@ void PipelineCache::ReleaseBuiltComputeModules(bool force) {
                      static_cast<unsigned long long>(released),
                      static_cast<unsigned long long>(compute_modules_released), compute_release_queue.size());
     }
+}
+
+void PipelineCache::PreJobQueued(u64 hash) {
+    ++pre_jobs_inflight[hash];
+}
+
+void PipelineCache::PreJobDone(u64 hash) {
+    const auto it = pre_jobs_inflight.find(hash);
+    if (it != pre_jobs_inflight.end() && --it->second == 0) {
+        pre_jobs_inflight.erase(it);
+    }
+}
+
+bool PipelineCache::LiveProgramRefs::Referenced(u64 program_key, const Program& program) const {
+    if (programs.contains(&program) || infos.contains(&program.info)) {
+        return true;
+    }
+    const u64 cache_hash = program.info.CacheHash();
+    for (size_t perm = 0; perm < std::max<size_t>(program.modules.size(), 1); ++perm) {
+        if (stage_hashes.contains(HashCombine(program_key, u64{perm})) ||
+            (cache_hash != program_key && stage_hashes.contains(HashCombine(cache_hash, u64{perm})))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// sotc: a pipeline keeps raw pointers to its programs' Info (Pipeline::GetStages), read by every draw that binds it
+// (Liverpool::CaptureBackOp, the rasterizer). A prepared program a pipeline was built with but that no draw bound yet
+// (sotc_pre_checked unset) is one of those: a manifest pipeline over a pretranslated program, a prediction, a pipeline
+// still on a worker. Evicting it freed the Info under a live pipeline (the next draw of that key read freed memory:
+// the PS4 Pro 60 FPS crash in SubmitDraw). Every program a pipeline references stays: by the Info pointers of the built
+// ones (the retired fast-linked ones too, a queued BackOp may hold them) and by the stage hashes of every key, which
+// also covers the null entries of builds in flight. A manifest stage holds its program (ManifestState::StageRt::program,
+// read when its pipelines are scheduled) and the Info its specialization was compared with.
+PipelineCache::LiveProgramRefs PipelineCache::CollectLiveProgramRefs() const {
+    LiveProgramRefs refs;
+    const auto note_pipeline = [&](const Pipeline* pipeline) {
+        if (!pipeline) {
+            return;
+        }
+        for (const Shader::Info* info : pipeline->GetStages()) {
+            if (info) {
+                refs.infos.insert(info);
+            }
+        }
+    };
+    refs.infos.reserve(graphics_pipelines.size() * 2 + compute_pipelines.size());
+    refs.stage_hashes.reserve(graphics_pipelines.size() * 2);
+    for (auto it = graphics_pipelines.begin(); it != graphics_pipelines.end(); ++it) {
+        for (const u64 stage_hash : it.key().stage_hashes) {
+            if (stage_hash != 0) {
+                refs.stage_hashes.insert(stage_hash);
+            }
+        }
+        note_pipeline(it.value().get());
+    }
+    for (auto it = compute_pipelines.begin(); it != compute_pipelines.end(); ++it) {
+        note_pipeline(it.value().get());
+    }
+    {
+        std::scoped_lock lock{g_retired_mutex};
+        for (const auto& retired : RetiredLinkedPipelines()) {
+            note_pipeline(retired.get());
+        }
+    }
+    if (manifest) {
+        for (const auto& st : manifest->stages) {
+            if (st.program) {
+                refs.programs.insert(st.program);
+            }
+            if (st.spec.info) {
+                refs.infos.insert(st.spec.info);
+            }
+        }
+    }
+    return refs;
+}
+
+// sotc: SOTC_PRETRANSLATE_STREAM / SOTC_COMPILE_STREAM. Called by the pretranslate hold every 500 ms (force: now). A
+// program leaves only when it is in the hold's pack whole (every permutation written: LoadLazyProgram brings it back),
+// no draw or dispatch bound it, no translation of it is queued or running, and nothing points at it (see
+// CollectLiveProgramRefs). Compute: its prebuilt pipelines (pack cache) were built and left by their workers.
+void PipelineCache::PretranslateStreamStep(bool force) {
+    using Clock = std::chrono::steady_clock;
+    if (!pre_stream_active || !pre_holding) {
+        return;
+    }
+    const auto now = Clock::now();
+    if (!force && now - pre_stream_last < std::chrono::milliseconds{500}) {
+        return;
+    }
+    pre_stream_last = now;
+    const bool release_cs = SotcNonBlocking::CompileStream() && !SotcNonBlocking::ComputePack();
+    // A library job holds pointers to its programs' Info and modules: graphics programs leave only while none runs.
+    const bool evict_gfx = SotcNonBlocking::PretranslateStream() && lib_jobs_pending.load(std::memory_order_acquire) == 0;
+    if (!release_cs && !evict_gfx) {
+        return;
+    }
+    std::optional<LiveProgramRefs> refs;
+    const auto in_pack = [&](u64 hash, const Program& p) {
+        const auto it = pre_stream_packed.find(hash);
+        return it != pre_stream_packed.end() && !p.modules.empty() && it->second == p.modules.size();
+    };
+    const auto idle = [&](u64 hash, const Program& p) {
+        return p.sotc_pre && !p.sotc_pre_checked && p.pending_specs.empty() && !pending_programs.contains(hash) &&
+               !pre_jobs_inflight.contains(hash);
+    };
+    const auto evict = [&](u64 hash, Program& p) {
+        for (auto& m : p.modules) {
+            if (m.module) {
+                instance.GetDevice().destroyShaderModule(m.module);
+                m.module = vk::ShaderModule{};
+            }
+        }
+        lazy_programs[hash] = static_cast<u32>(p.modules.size());
+        program_cache.erase(hash);
+    };
+    u64 released_cs = 0, evicted_gfx = 0;
+    if (release_cs) {
+        std::vector<u64> programs;
+        for (auto it = compute_pipelines.begin(); it != compute_pipelines.end(); ++it) {
+            const ComputePipeline& pipe = *it.value();
+            if (pipe.sotc_pack && pipe.sotc_worker_done.load(std::memory_order_acquire)) {
+                programs.push_back(pipe.sotc_pack_program);
+            }
+        }
+        std::ranges::sort(programs);
+        programs.erase(std::unique(programs.begin(), programs.end()), programs.end());
+        std::vector<ComputePipelineKey> keys;
+        for (const u64 hash : programs) {
+            const auto found = program_cache.find(hash);
+            if (found == program_cache.end()) {
+                continue;
+            }
+            Program& p = *found.value();
+            if (!idle(hash, p) || !in_pack(hash, p)) {
+                continue;
+            }
+            // Every compute pipeline of the program is one of its pack prebuilds, built, left by its worker and
+            // accepted by the driver (a refused one is left to the pack step's rule).
+            keys.clear();
+            bool ok = true;
+            const u64 cache_hash = p.info.CacheHash();
+            for (size_t perm = 0; perm < p.modules.size() && ok; ++perm) {
+                if (cache_hash != hash && compute_pipelines.contains(ComputePipelineKey{HashCombine(cache_hash, perm)})) {
+                    ok = false; // a pipeline under the cache hash (the manifest's) points at the program too
+                    break;
+                }
+                const ComputePipelineKey key{HashCombine(hash, perm)};
+                const auto pit = compute_pipelines.find(key);
+                if (pit == compute_pipelines.end()) {
+                    continue;
+                }
+                const ComputePipeline& pipe = *pit.value();
+                ok = pipe.sotc_pack && pipe.sotc_worker_done.load(std::memory_order_acquire) && pipe.IsReady() &&
+                     pipe.Handle() != vk::Pipeline{};
+                keys.push_back(key);
+            }
+            if (!ok || keys.empty()) {
+                continue;
+            }
+            if (!refs) {
+                refs = CollectLiveProgramRefs();
+            }
+            if (refs->programs.contains(&p)) {
+                continue; // a manifest stage holds it
+            }
+            for (const ComputePipelineKey key : keys) {
+                stream_released_keys.insert(key.value);
+                stream_compiled_ids.push_back(PackComputeId(key.value));
+                compute_pipelines.erase(key);
+                ++stream_released;
+                ++released_cs;
+            }
+            if (stream_released_programs.insert(hash).second) {
+                SotcPretranslate::Forget(p.info.pgm_hash); // its shader file's next load requests it again
+            }
+            evict(hash, p);
+        }
+        if (released_cs != 0) {
+            last_compute_pipeline = nullptr;
+            pipe_fast_cs.valid = false;
+            refs.reset(); // the compute pipelines changed
+        }
+    }
+    if (evict_gfx) {
+        size_t keep = 0;
+        for (size_t i = 0; i < pre_stream_candidates.size(); ++i) {
+            const u64 hash = pre_stream_candidates[i];
+            const auto found = program_cache.find(hash);
+            if (found == program_cache.end()) {
+                continue; // left (or a compute program the step above released)
+            }
+            Program& p = *found.value();
+            const bool vs = p.info.sw_stage == Shader::SwStage::Vertex && p.info.hw_stage == Shader::HwStage::Vertex;
+            const bool ps = p.info.sw_stage == Shader::SwStage::Fragment && p.info.hw_stage == Shader::HwStage::Fragment;
+            if ((!vs && !ps) || !p.sotc_pre || p.sotc_pre_checked) {
+                continue; // not a pack stage kind, or a draw uses it: not looked at again
+            }
+            const bool modules = std::ranges::all_of(p.modules, [](const Program::Module& m) { return bool(m.module); });
+            if (!idle(hash, p) || !in_pack(hash, p) || !modules) {
+                pre_stream_candidates[keep++] = hash;
+                continue;
+            }
+            if (!refs) {
+                refs = CollectLiveProgramRefs();
+            }
+            if (refs->Referenced(hash, p)) {
+                pre_stream_candidates[keep++] = hash;
+                continue;
+            }
+            // The first usable program of each kind stays: the pack step's partner (BuildPackLibraries).
+            if (!Shader::UsesBindlessSamplers(p.info) &&
+                pre_stream_keepers.insert((u32{p.info.variant} << 1) | (vs ? 0u : 1u)).second) {
+                continue;
+            }
+            if (ps) {
+                Shader::Backend::Bindings left{};
+                p.info.AddBindings(left, Shader::UsesBindlessSamplers(p.info));
+                pre_stream_pair_start[hash] = left;
+            }
+            pre_stream_evicted_gfx.insert(hash);
+            evict(hash, p);
+            ++evicted_gfx;
+        }
+        pre_stream_candidates.resize(keep);
+        if (evicted_gfx != 0) {
+            last_graphics_pipeline = nullptr;
+            pipe_fast_gfx.valid = false;
+        }
+    }
+    pre_stream_released_cs += released_cs;
+    pre_stream_evicted_count += evicted_gfx;
+}
+
+void PipelineCache::StreamRebuildBeforePlay() {
+    using Clock = std::chrono::steady_clock;
+    if (!SotcNonBlocking::CompileStreamAll() || stream_released_programs.empty()) {
+        return;
+    }
+    // sotc: SOTC_COMPILE_STREAM=2: every released program is loaded back by the workers (8 pack loads at a time) and its
+    // pipelines rebuilt from the pack cache (a driver hit), while the loading screen is still up: play starts with
+    // every prebuilt pipeline resident (no dispatch builds one).
+    const auto start = Clock::now();
+    std::vector<u64> programs(stream_released_programs.begin(), stream_released_programs.end());
+    std::ranges::sort(programs);
+    const u64 rehydrated0 = stream_rehydrated;
+    lazy_in_flight_max = 8;
+    size_t on_workers = 0, here = 0;
+    for (const u64 hash : programs) {
+        if (QueueLazyPrefetch(hash)) {
+            ++on_workers;
+            continue;
+        }
+        const auto found = program_cache.find(hash);
+        if (found != program_cache.end()) {
+            // Resident (a pipeline kept it): the destroyed permutations are loaded into it in place.
+            if (std::ranges::any_of(found.value()->modules, [](const Program::Module& m) { return !m.module; })) {
+                lazy_programs[hash] = static_cast<u32>(found.value()->modules.size());
+                LoadLazyProgram(hash);
+                lazy_programs.erase(hash);
+                last_compute_pipeline = nullptr;
+                pipe_fast_cs.valid = false;
+            }
+        } else if (lazy_programs.contains(hash)) {
+            LoadLazyProgram(hash); // not in the pack index: its loose files
+        }
+        StreamRehydrate(hash);
+        ++here;
+    }
+    SotcStats::prep_total.store(static_cast<u32>(programs.size()), std::memory_order_relaxed);
+    SotcStats::prep_done.store(0, std::memory_order_relaxed);
+    SotcStats::prep_active.store(true, std::memory_order_release); // the loading screen while they build
+    size_t building = 0;
+    while (Clock::now() - start < std::chrono::minutes{3}) {
+        if (async_done_count.load(std::memory_order_acquire) != 0) {
+            CollectAsyncPipelines();
+        }
+        ReleaseBuiltComputeModules(false);
+        building = 0;
+        for (auto it = compute_pipelines.begin(); it != compute_pipelines.end(); ++it) {
+            building += it.value()->sotc_rehydrated && !it.value()->IsReady() ? 1 : 0;
+        }
+        const size_t out = std::ranges::count_if(programs, [this](u64 h) { return stream_released_programs.contains(h); });
+        SotcStats::prep_done.store(static_cast<u32>(programs.size() - out), std::memory_order_relaxed);
+        if (lazy_prefetch.empty() && lazy_backlog.empty() && building == 0) {
+            break;
+        }
+        std::unique_lock lock{async_mutex};
+        translate_done_cv.wait_for(lock, std::chrono::milliseconds{20},
+                                   [this] { return async_done_count.load(std::memory_order_relaxed) != 0; });
+    }
+    SotcStats::prep_active.store(false, std::memory_order_release);
+    lazy_in_flight_max = 2;
+    ReleaseBuiltComputeModules(true);
+    std::fprintf(stderr,
+                 "SOTC COMPILE STREAM: rebuilt before play: %zu released programs (%zu loaded on the workers, %zu here), "
+                 "%llu pipelines from the pack cache in %.1f s; programs still out %zu, pipelines still building %zu, "
+                 "released keys not rebuilt %zu\n",
+                 programs.size(), on_workers, here, static_cast<unsigned long long>(stream_rehydrated - rehydrated0),
+                 std::chrono::duration<double>(Clock::now() - start).count(), stream_released_programs.size(), building,
+                 stream_released_keys.size());
+    LogRam("after compute rebuild"); // sotc: SOTC RAM
 }
 
 void PipelineCache::StreamRehydrate(u64 program_hash) {
@@ -7831,6 +8320,12 @@ void PipelineCache::MaybeHoldForPretranslate() {
     pre_hold_done = true;
     pre_holding = true;
     SetCompileHold(true, "pretranslate hold start"); // sotc: SOTC_COMPILE_THREADS, SOTC RAM
+    // sotc: SOTC_PRETRANSLATE_STREAM / SOTC_COMPILE_STREAM: programs leave memory during the hold (not when it restores
+    // the GPL pack's modules: those are all loaded for it).
+    pre_stream_active = (SotcNonBlocking::PretranslateStream() ||
+                         (SotcNonBlocking::CompileStream() && !SotcNonBlocking::ComputePack())) &&
+                        !restore_pack && !async_workers.empty();
+    pre_ram_decile = 0;
     const auto start = Clock::now();
     std::fprintf(stderr, "SOTC PRETRANSLATE: preparing the game's shaders (%zu translations) before play\n",
                  pre_backlog.size() + pre_in_flight);
@@ -7845,10 +8340,22 @@ void PipelineCache::MaybeHoldForPretranslate() {
         if (async_done_count.load(std::memory_order_acquire) != 0) {
             CollectAsyncPipelines();
         }
+        PretranslateStreamStep(false); // sotc: SOTC_PRETRANSLATE_STREAM / SOTC_COMPILE_STREAM
         const u64 queued = SotcPretranslate::JobsQueued();
         const u64 done = SotcPretranslate::JobsDone();
         SotcStats::prep_total.store(static_cast<u32>(queued), std::memory_order_relaxed);
         SotcStats::prep_done.store(static_cast<u32>(done), std::memory_order_relaxed);
+        // sotc: SOTC RAM: one line per tenth of the translations done (of those queued so far, which grow).
+        if (queued != 0) {
+            const int decile = static_cast<int>(std::min<u64>(done * 10 / queued, 10));
+            if (decile > pre_ram_decile) {
+                pre_ram_decile = decile;
+                char where[96];
+                std::snprintf(where, sizeof where, "pretranslate %d%% (%llu of %llu)", decile * 10,
+                              static_cast<unsigned long long>(done), static_cast<unsigned long long>(queued));
+                LogRam(where);
+            }
+        }
         // The cache files (one meta and one binary per variant, ~38,000 for the game) are written before play: a
         // write queue left to drain during play slowed every thread by ~40% (file creation, antivirus scans).
         const u32 writes = Storage::DataBase::Instance().PendingWrites();
@@ -7870,6 +8377,16 @@ void PipelineCache::MaybeHoldForPretranslate() {
         std::unique_lock lock{async_mutex};
         translate_done_cv.wait_for(lock, std::chrono::milliseconds{50},
                                    [this] { return async_done_count.load(std::memory_order_relaxed) != 0; });
+    }
+    PretranslateStreamStep(true); // sotc: the last translations' programs, before the pack step
+    if (pre_stream_active) {
+        std::fprintf(stderr,
+                     "SOTC PRETRANSLATE STREAM: during the translations %llu programs left memory for the index "
+                     "(graphics %llu; compute pipelines released %llu), %zu programs kept as pack partners\n",
+                     static_cast<unsigned long long>(pre_stream_evicted_count + stream_released_programs.size()),
+                     static_cast<unsigned long long>(pre_stream_evicted_count),
+                     static_cast<unsigned long long>(pre_stream_released_cs), pre_stream_keepers.size());
+        LogRam("translations done");
     }
     if (restore_pack) {
         // sotc: these cached modules were never needed by this session's translations, but are required
@@ -7932,7 +8449,13 @@ void PipelineCache::MaybeHoldForPretranslate() {
     // are evicted even when the wait above timed out (a pack-touched program whose modules are gone must not stay).
     const bool libs_idle = lib_jobs_pending.load(std::memory_order_relaxed) == 0;
     if (libs_idle || SotcNonBlocking::ComputeRelease()) {
-        size_t evicted = 0, evicted_compute = 0;
+        // sotc: every program a pipeline or a manifest stage points at stays (CollectLiveProgramRefs).
+        const LiveProgramRefs refs = CollectLiveProgramRefs();
+        const auto referenced = [&refs](u64 program_key, const Program& program) {
+            return refs.Referenced(program_key, program);
+        };
+        size_t evicted = 0, evicted_compute = 0, kept_referenced = 0;
+        std::vector<u64> restore;
         for (auto it = program_cache.begin(); it != program_cache.end();) {
             Program& program = *it.value();
             // sotc: a compute pipeline keeps a pointer to its program's Info, so a compute program stays while one
@@ -7949,6 +8472,16 @@ void PipelineCache::MaybeHoldForPretranslate() {
                 ++it;
                 continue;
             }
+            if (referenced(it.key(), program)) {
+                ++kept_referenced; // sotc: a pipeline holds its Info (see above)
+                // The lean pack may have destroyed some of its modules (it expected the eviction to send the program
+                // back to the index): they are loaded again below, so a new key over the program can still build.
+                if (std::ranges::any_of(program.modules, [](const Program::Module& m) { return !m.Present(); })) {
+                    restore.push_back(it.key());
+                }
+                ++it;
+                continue;
+            }
             evicted_compute += compute ? 1 : 0;
             for (auto& module : program.modules) {
                 if (module.module) {
@@ -7959,23 +8492,36 @@ void PipelineCache::MaybeHoldForPretranslate() {
             it = program_cache.erase(it);
             ++evicted;
         }
-        std::fprintf(stderr,
-                     "SOTC PRETRANSLATE: %zu prepared programs left for their first draw (on disk; compute %zu)\n",
-                     evicted, evicted_compute);
-    }
-    if (SotcNonBlocking::CompileStreamAll() && !stream_released_programs.empty()) {
-        // sotc: SOTC_COMPILE_STREAM=2: every released program is loaded back by the workers (2 pack loads at a time) and
-        // its pipelines rebuilt from the pack cache, without waiting for its shader file to load again.
-        std::vector<u64> programs(stream_released_programs.begin(), stream_released_programs.end());
-        size_t queued = 0;
-        for (const u64 hash : programs) {
-            queued += QueueLazyPrefetch(hash) ? 1 : 0;
+        // sotc: the destroyed modules of the kept programs, from the hold's pack (written above) or the loose files.
+        // LoadLazyProgram loads only the permutations that are not present, into the program in place (its Info stays).
+        size_t restored = 0;
+        for (const u64 hash : restore) {
+            const auto found = program_cache.find(hash);
+            if (found == program_cache.end()) {
+                continue;
+            }
+            lazy_programs[hash] = static_cast<u32>(found.value()->modules.size());
+            restored += LoadLazyProgram(hash) ? 1 : 0;
+            lazy_programs.erase(hash);
         }
-        std::fprintf(stderr, "SOTC COMPILE STREAM: %zu of %zu released programs queued for their rebuild after the "
-                             "hold\n",
-                     queued, programs.size());
+        if (evicted != 0 || !restore.empty()) {
+            // sotc: no lookup record may keep a pointer into an erased program or a replaced permutation.
+            last_graphics_pipeline = nullptr;
+            last_compute_pipeline = nullptr;
+            pipe_fast_gfx.valid = false;
+            pipe_fast_cs.valid = false;
+        }
+        std::fprintf(stderr,
+                     "SOTC PRETRANSLATE: %zu prepared programs left for their first draw (on disk; compute %zu); %zu "
+                     "kept, a pipeline references them (modules loaded again for %zu of %zu)\n",
+                     evicted, evicted_compute, kept_referenced, restored, restore.size());
     }
     LogRam("after pretranslate eviction"); // sotc: SOTC RAM
+    StreamRebuildBeforePlay(); // sotc: SOTC_COMPILE_STREAM=2
+    pre_stream_active = false;
+    pre_stream_candidates.clear();
+    pre_stream_candidates.shrink_to_fit();
+    pre_stream_packed.clear();
     std::fprintf(stderr, "SOTC PRETRANSLATE: shaders prepared in %.1f s (%llu translations)\n",
                  std::chrono::duration<double>(Clock::now() - start).count(),
                  static_cast<unsigned long long>(SotcPretranslate::JobsDone()));

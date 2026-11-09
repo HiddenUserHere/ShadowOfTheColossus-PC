@@ -633,6 +633,22 @@ private:
     void StreamRehydrate(u64 program_hash);
     /// sotc: SOTC_COMPILE_STREAM: the counters line (every 5 s when they changed, or now with force).
     void StreamLog(bool force);
+    /// sotc: SOTC_PRETRANSLATE_STREAM / SOTC_COMPILE_STREAM (CP, pretranslate hold): sends the translated programs
+    /// and compute prebuilds that nothing needs resident back to the index (see nonblocking.h).
+    void PretranslateStreamStep(bool force);
+    /// sotc: a pretranslate job of this program was queued / installed (pre_jobs_inflight).
+    void PreJobQueued(u64 hash);
+    void PreJobDone(u64 hash);
+    /// sotc: the programs a pipeline, a retired pipeline or a manifest stage points at (their Info must stay).
+    struct LiveProgramRefs {
+        std::unordered_set<const Shader::Info*> infos;
+        std::unordered_set<u64> stage_hashes;
+        std::unordered_set<const Program*> programs;
+        bool Referenced(u64 program_key, const Program& program) const;
+    };
+    LiveProgramRefs CollectLiveProgramRefs() const;
+    /// sotc: SOTC_COMPILE_STREAM=2: loads the released programs back and rebuilds their pipelines before play.
+    void StreamRebuildBeforePlay();
     /// sotc: a worker can take a job now (async_mutex held).
     bool HasRunnableJobLocked(bool urgent_only = false) const;
     /// sotc: SOTC_GPL_URGENT_WORKERS: a lane the reserved workers serve.
@@ -1089,6 +1105,29 @@ private:
     std::unordered_set<u64> stream_released_programs;
     u64 stream_released{}, stream_rehydrated{}, stream_inline{}, stream_late{};
     std::chrono::steady_clock::time_point stream_logged{};
+    /// sotc: SOTC_COMPILE_STREAM: pack ids of the compute pipelines PretranslateStreamStep released during the hold
+    /// (they join the pack list at the pack step, as PackComputePipelines' own).
+    std::vector<u64> stream_compiled_ids;
+    /// sotc: SOTC_PRETRANSLATE_STREAM / SOTC_COMPILE_STREAM (CP only). The hold's state: the pretranslate jobs queued per
+    /// program and not installed yet; the permutations of each program written to the pretranslate pack in this hold
+    /// (and the programs to look at); the programs sent back to the index during the hold (graphics ones also for the
+    /// pack step); the bindings an evicted pixel program left with (its vertex requests start there); the partners kept
+    /// for the pack step (variant << 1 | stage); the counters of the "SOTC PRETRANSLATE STREAM" line.
+    std::unordered_map<u64, u32> pre_jobs_inflight;
+    std::unordered_map<u64, u32> pre_stream_packed;
+    std::vector<u64> pre_stream_candidates;
+    std::unordered_set<u64> pre_stream_evicted_gfx;
+    std::unordered_map<u64, Shader::Backend::Bindings> pre_stream_pair_start;
+    std::unordered_set<u32> pre_stream_keepers;
+    bool pre_stream_active{}; ///< this hold streams (off when it restores the GPL pack's modules)
+    std::chrono::steady_clock::time_point pre_stream_last{};
+    u64 pre_stream_evicted_count{}, pre_stream_released_cs{}, pre_stream_reloaded{}, pre_stream_reevicted{};
+    int pre_ram_decile{}; ///< sotc: SOTC RAM: the last tenth of the pretranslate progress logged
+    /// sotc: SOTC_PRETRANSLATE_STREAM: the pack step's loads (InstallLazyLoad reports the wanted programs here).
+    bool pack_streaming{};
+    std::unordered_set<u64> pack_stream_wanted;
+    std::vector<u64> pack_stream_loaded;
+    u32 lazy_in_flight_max{2}; ///< sotc: pack loads on the workers at once (8 while a hold streams)
     std::vector<std::jthread> async_workers;
     unsigned reserved_workers{}; ///< sotc: SOTC_GPL_URGENT_WORKERS: of them, the Urgent/Predict-only ones
 };

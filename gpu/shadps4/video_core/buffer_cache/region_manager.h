@@ -341,8 +341,8 @@ private:
         }
         // Liverpool::CpAheadMode() read directly (liverpool.h is not included here). The other
         // SOTC_CP_AHEAD modes move the uploads, which this has not been checked against.
-        const char* ahead = std::getenv("SOTC_CP_AHEAD");
-        if (ahead && std::atoi(ahead) != 0) {
+        const char* ahead = std::getenv("SOTC_CP_AHEAD"); // sotc: default 2 (Liverpool::CpAheadMode)
+        if (!(ahead && ahead[0]) || std::atoi(ahead) != 0) {
             std::fprintf(stderr, "SOTC untrack: off, SOTC_CP_AHEAD is set\n");
             return out;
         }

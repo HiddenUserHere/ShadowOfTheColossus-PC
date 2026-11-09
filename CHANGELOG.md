@@ -2,6 +2,24 @@
 
 ## Em desenvolvimento
 
+**Modo PS4 Pro a 60 FPS mais regular e sem crash (ligado por padrão)**
+- O fim de cada quadro é registrado sozinho (`SOTC_CP_AHEAD=2`, agora o padrão; `=0` desliga). Antes, com o
+  processador de comandos sempre ocupado, o fim de um quadro só era marcado junto com o do seguinte e o jogo
+  esperava em pares (um quadro curto, um longo). Rota no modo Pro a 60 FPS: p99 de 59 para 50 ms, pior quadro
+  de 85 para 50 ms, quadros exibidos por 3 vblanks de 20% para 11%.
+- O gravador de comandos não fica mais girando à espera de trabalho (`SOTC_REC_SPIN_US`, padrão 0): de 16 para
+  ~9 ms de CPU por quadro, sem perda.
+- Corrigido o crash logo após o loading no modo Pro: a limpeza do fim do loading apagava traduções de shader
+  que pipelines prontas ainda usavam.
+
+**Menos memória durante a compilação dos shaders (ligado por padrão)**
+- Cada shader traduzido vai para o disco e sai da memória na hora (`SOTC_PRETRANSLATE_STREAM`); os pipelines
+  de compute são compilados no cache em disco e recriados antes do jogo começar (`SOTC_COMPILE_STREAM=2`).
+- O cache de shaders não é mais lido inteiro nem regravado a cada abertura (`SOTC_PREFETCH_LEAN`); o pacote
+  de shaders traduzidos (~1,1 GB) não é mais copiado para a memória.
+- Primeira abertura medida: pico durante a tradução de 8,2 para 6,7 GB; loading e rota iguais ou melhores.
+- A tela de loading dos shaders mostra só a porcentagem e a contagem (sem estimativa de tempo).
+
 **Primeira abertura mais leve (ligado por padrão)**
 - Durante o loading, a compilação de shaders usa no máximo um thread por núcleo físico, em prioridade
   abaixo do normal (`SOTC_COMPILE_THREADS`; `=0` volta ao anterior). Os caches de pipeline são lidos e
