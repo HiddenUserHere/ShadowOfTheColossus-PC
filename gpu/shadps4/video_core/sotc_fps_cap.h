@@ -25,8 +25,36 @@ inline std::atomic<bool> uncapped{[] {
 /// Uncapped frame limit set by the in-game menu: 60, 0 (unlimited), -1 the start's (SOTC_FPS_LIMIT).
 inline std::atomic<int> limit_fps{-1};
 
+/// sotc: SOTC_FPS_DYNAMIC=<fps> (dynamic FPS, as some emulators do for games with a 60/30 mode):
+/// with the 60 FPS limit, when the game cannot keep 60 for 1.5 s the limit drops to <fps> (40 on a
+/// 120 Hz screen, 30 on 60 Hz, any value with G-Sync/FreeSync), steady instead of swinging between
+/// 45 and 60; every 10 s it tries 60 again for 2 s and stays when the game keeps up. The game's
+/// logic follows the real time, so a lower limit does not slow it down. 0 or unset: off.
+inline const int dynamic_low = [] {
+    const char* v = std::getenv("SOTC_FPS_DYNAMIC");
+    const long n = v ? std::strtol(v, nullptr, 10) : 0;
+    return n > 0 && n < 60 ? int(n) : 0;
+}();
+/// The limit the dynamic FPS applies now: 0 = the normal limit (60), else dynamic_low.
+inline std::atomic<int> dynamic_limit{0};
+
 /// The flip rate the game asked, -1 while it asked none (with the fps60 code patch it never does).
 inline std::atomic<int> game_rate{-1};
+
+/// Uncapped flip pacing (videoout driver.cpp): flips released at the game's own rate (true) or on
+/// the vblank grid (false). F6 switches it while playing; SOTC_FLIP_PACER=0 starts on the grid.
+inline std::atomic<bool> flip_pacer{[] {
+    const char* v = std::getenv("SOTC_FLIP_PACER");
+    return !v || v[0] != '0';
+}()};
+
+/// F6: the game's own rate <-> the vblank grid. Returns true when now paced.
+inline bool TogglePacer() {
+    const bool now = !flip_pacer.load(std::memory_order_relaxed);
+    flip_pacer.store(now, std::memory_order_relaxed);
+    std::fprintf(stderr, "SOTC FLIP PACER: %s\n", now ? "game rate" : "vblank grid");
+    return now;
+}
 
 /// The flip rate the vblank thread applies.
 inline int EffectiveRate() {

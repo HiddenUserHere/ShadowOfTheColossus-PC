@@ -2562,10 +2562,13 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
             }
         }
         const bool perf = Common::PerfStats::Enabled();
-        const auto busy_start = perf ? Clock::now() : Clock::time_point{};
         // sotc: SOTC_FPS: recording thread busy time (blocks run, not the wait for work)
         // sotc: SOTC_TRACE reads it too (its "rec busy" span)
         const u64 sotc_busy_start = (SotcStats::kFpsLog || SotcTrace::kOn) ? SotcStats::NowNs() : 0;
+        // sotc: with SOTC_FPS=1 the busy time (replaying commands, not waiting for them) also
+        // feeds the "SOTC threads per frame" line (SotcStats::recorder_busy_ns).
+        const bool fps = SotcStats::kFpsLog;
+        const auto busy_start = perf || fps ? Clock::now() : Clock::time_point{};
         while (pos < committed) {
             auto* header = reinterpret_cast<BlockHeader*>(chunk->data + pos);
             // sotc: SOTC_PASS_WORKERS: the look-ahead drops its copy of the table when the walk reaches it
@@ -2609,11 +2612,16 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         if (SotcTrace::kOn) { // sotc: SOTC_TRACE
             SotcTrace::Span("rec busy", sotc_busy_start, SotcStats::NowNs());
         }
-        if (perf) {
-            Common::PerfStats::Add(
-                Common::PerfStats::Id::RecorderBusyNs,
+        if (perf || fps) {
+            const u64 busy_ns = static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - busy_start)
                     .count());
+            if (perf) {
+                Common::PerfStats::Add(Common::PerfStats::Id::RecorderBusyNs, busy_ns);
+            }
+            if (fps) {
+                SotcStats::recorder_busy_ns.fetch_add(busy_ns, std::memory_order_relaxed);
+            }
         }
     }
 }

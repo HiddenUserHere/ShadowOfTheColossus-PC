@@ -91,6 +91,9 @@ struct RangeSet {
 
     void Subtract(VAddr base_address, size_t size) {
         ForgetKnown();
+        // sotc: BbToggle::WriteMarkMemo: a counter of removals; while it is unchanged, what Add
+        // put into the set is still there.
+        __atomic_fetch_add(&generation, 1, __ATOMIC_RELEASE);
         if (SotcGen::FlatNotesMode() == 2) {
             SubtractIn(shadow_set, base_address, size);
         }
@@ -99,23 +102,30 @@ struct RangeSet {
 
     void Clear() {
         ForgetKnown();
+        __atomic_fetch_add(&generation, 1, __ATOMIC_RELEASE);
         if (SotcGen::FlatNotesMode() == 2) {
             shadow_set.clear();
         }
         m_ranges_set.clear();
     }
 
+    /// sotc: removals (Subtract, Clear, Swap) so far; read with __atomic_load_n.
+    u64 generation{};
+
     /// sotc: SOTC_RB_TICK write ring.
     bool Empty() const {
         return Answer([](const IntervalSet& set) { return set.empty(); });
     }
 
-    /// sotc: exchanges the contents without copying (the ring files a tick's writes).
+    /// sotc: exchanges the contents without copying (the ring files a tick's writes). Both sets
+    /// lose what they held, so both generations move (WriteMarkMemo).
     void Swap(RangeSet& other) {
         m_ranges_set.swap(other.m_ranges_set);
         shadow_set.swap(other.shadow_set);
         ForgetKnown();
         other.ForgetKnown();
+        __atomic_fetch_add(&generation, 1, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&other.generation, 1, __ATOMIC_RELEASE);
     }
 
     bool Contains(VAddr base_address, size_t size) const {

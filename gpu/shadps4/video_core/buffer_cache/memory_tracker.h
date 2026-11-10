@@ -479,6 +479,38 @@ public:
         }
     }
 
+    /// sotc: BbToggle::BufferBindMemo. The CPU-bit generation (RegionManager::CpuGenSum) of the
+    /// words a range covers, remembered by a bind that found no CPU-modified page in it.
+    static constexpr u64 MemoMaxWords = 16; // larger ranges are not remembered
+
+    /// Reads the key of [cpu_addr, cpu_addr + size): false when the range spans two regions,
+    /// covers more than MemoMaxWords words or lies in no region yet. Call it BEFORE looking for
+    /// CPU-modified pages, and store it only when that look found none.
+    bool SnapshotCpuGen(VAddr cpu_addr, u64 size, CpuGenKey& key) const noexcept {
+        const u64 first = cpu_addr >> HIGHER_PAGE_BITS;
+        if (size == 0 || ((cpu_addr + size - 1) >> HIGHER_PAGE_BITS) != first) {
+            return false;
+        }
+        RegionManager* region = __atomic_load_n(&top_tier[first], __ATOMIC_ACQUIRE);
+        if (!region) {
+            return false;
+        }
+        const u64 first_word = (cpu_addr & HIGHER_PAGE_MASK) / BYTES_PER_WORD;
+        const u64 last_word = ((cpu_addr + size - 1) & HIGHER_PAGE_MASK) / BYTES_PER_WORD;
+        const u64 count = last_word - first_word + 1;
+        if (count > MemoMaxWords) {
+            return false;
+        }
+        key = {region, static_cast<u32>(first_word), static_cast<u32>(count),
+               region->CpuGenSum(first_word, count)};
+        return true;
+    }
+
+    /// True while no CPU bit of the key's words has risen since SnapshotCpuGen.
+    static bool CpuGenUnchanged(const CpuGenKey& key) noexcept {
+        return key.region->CpuGenSum(key.first_word, key.words) == key.sum;
+    }
+
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified.
     /// sotc: SOTC_SYNC_PIPE. Returns true when every tracking region of the range was clean at its
     /// unlocked look (RegionManager::ForEachModifiedRange returned true for it). Then func was not

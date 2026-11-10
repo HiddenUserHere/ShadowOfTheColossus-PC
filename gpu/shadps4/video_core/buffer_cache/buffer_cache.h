@@ -472,6 +472,8 @@ private:
         /// sotc: SOTC_HRR=1: every copy's bytes are read from the host-visible arena chunk they sit
         /// in, not from a staging copy (no vkCmdCopyBuffer; see BeginAsyncReadbackImpl).
         bool direct = false;
+        /// sotc: a GPU write landed on this region while the readback was in flight.
+        bool dirty = false;
     };
     /// Collects what a readback of [device_addr, +size) and the hot readbacks must copy. Returns
     /// the bytes to download. sotc: the ranges stay in the GPU-modified set until the caller
@@ -483,6 +485,8 @@ private:
                         bool subtract = true);
     /// sotc: takes the downloaded ranges of items out of the GPU-modified set.
     void SubtractDownloaded(std::span<const ReadbackItem> items);
+    /// sotc: a read fault's readback found nothing to download (see the definition).
+    void LiftStaleReadProtection(VAddr addr, u64 size);
     /// Writes downloaded data (mapped, at the copies' destination offsets minus mapped_offset)
     /// into guest memory and unmarks the ranges as GPU-modified.
     /// sotc: keep_gpu (SOTC_RB_KEEP_LATER): ranges [start, end) whose pages stay GPU-modified
@@ -587,10 +591,6 @@ private:
         u64 group_bytes{};
         u64 group_tick{};
         bool data_ready{}; ///< sotc (SOTC_RB_AGE): its last GPU write had completed when asked
-        /// sotc (SOTC_RB_DIRTY_RETRY): a dirty readback hands the reread to its guest thread
-        /// instead of reading back on the draw thread; set when it did.
-        bool allow_retry{};
-        bool retried{};
         boost::container::small_vector<ReadbackItem, 16> pending;
         /// sotc: SOTC_WRITE_DIET (C1): hull [hull_lo, hull_hi) over every pending item's
         /// [addr, addr + size) and every gpu_ranges entry (RbHullCover). Widened wherever pending
@@ -631,7 +631,9 @@ private:
     /// (a bind uploads them whatever happens here); a later drain only pre-uploads them. Draw thread only.
     std::deque<std::pair<VAddr, u64>> native_warm;
     u64 native_warm_bytes{};
-    void FinishAsyncReadback(AsyncReadback& readback);
+    /// sotc: SOTC_RB_REQUEUE: true when the window was dirtied in flight and allow_requeue let the
+    /// guest thread begin a fresh readback of it (ReadMemory) instead of a re-read here.
+    bool FinishAsyncReadback(AsyncReadback& readback, bool allow_requeue = false);
     /// sotc: true once the GPU copied an in-flight readback's data (its ahead copy, or its tick).
     bool IsReadbackComplete(const AsyncReadback& readback);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);

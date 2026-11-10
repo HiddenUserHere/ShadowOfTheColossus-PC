@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <optional>
@@ -80,6 +81,7 @@ enum class ImageLeave : u32 {
     DepthNoTwin,    ///< ResolveDepthOverlap with SOTC_DEPTH_TWIN=0
     DepthTwin,      ///< ParkImage: depth/colour twin (a park, not a free)
     UnmapPark,      ///< ParkImage: parked by UnmapMemory (SOTC_UNMAP_PARK=1, a park, not a free)
+    RtStash,        ///< ParkImage: stashed render target (SOTC_RT_STASH, a park, not a free)
     Count,
 };
 inline constexpr size_t NumImageLeave = static_cast<size_t>(ImageLeave::Count);
@@ -398,10 +400,11 @@ private:
 };
 
 class TextureCache {
-    // Default values for garbage collection
+    // sotc: fallback thresholds when the driver cannot report a memory budget (V14 derives the
+    // normal ones from the budget, see the constructor).
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
-    static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
+    static constexpr s64 TARGET_GC_THRESHOLD = 8_GB; // sotc: upstream pressure/critical thresholds
 
     using ImageIds = boost::container::small_vector<ImageId, 16>;
 
@@ -512,9 +515,10 @@ public:
         return tile_manager;
     }
 
-    /// sotc: SOTC_RS_MEMO: moves whenever a CMASK/HTILE clear bit may have been set (ClearMeta,
-    /// TouchMeta with is_clear, a new metadata surface). While it stands still, a slice whose
-    /// bit a draw cleared is still clear.
+    /// sotc: SOTC_RS_MEMO, BbToggle::DepthFastPath: moves whenever a CMASK/HTILE clear bit may
+    /// have been set (ClearMeta, TouchMeta with is_clear) or a metadata surface is added or
+    /// removed. While it stands still, a slice whose bit a draw cleared is still clear and a
+    /// missing entry is still missing.
     u64 MetaEpoch() const noexcept {
         return meta_epoch.load(std::memory_order_relaxed);
     }
@@ -690,6 +694,45 @@ public:
     /// sotc: update=false (the second pass of a texture bind, SOTC_TSLOT) skips UpdateImage when it
     /// cannot change the image (TexUpdateIsNoOp); the touch and the bind evidence still run.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc, bool update = true);
+
+    /// sotc: FindTexture from the parts of the descriptor it reads (the draw bind memo keeps only
+    /// those, not the ImageInfo).
+    /// sotc (fork): `update` as in the overload above.
+    [[nodiscard]] ImageView& FindTexture(ImageId image_id, BindingType type,
+                                         const ImageViewInfo& view_info, bool update = true);
+
+    /// sotc: what FindImage does for an image it found by memo: marks it used this tick. For
+    /// callers that already know the image (Rasterizer draw bind memo).
+    void NoteFound(Image& image);
+
+    /// sotc: true when `image_id` (what FindImage returned for `desc`) covers exactly the guest
+    /// range the descriptor asks for, i.e. FindImage matched it as a whole and not as a part of a
+    /// larger image or after an overlap was resolved.
+    [[nodiscard]] bool FoundExactly(ImageId image_id, const ImageDesc& desc) const {
+        const ImageInfo& found = slot_images[image_id].info;
+        const ImageInfo& asked = desc.info;
+        return found.guest_address == asked.guest_address &&
+               found.guest_size == asked.guest_size && found.size == asked.size;
+    }
+
+    /// sotc: the image with this id, without the LRU touch GetImage does (callers that touch it
+    /// otherwise: NoteFound, UpdateImage).
+    [[nodiscard]] Image& PeekImage(ImageId id) {
+        return slot_images[id];
+    }
+
+    /// sotc: moves on every RegisterImage/UnregisterImage: while it stays, a lookup that found an
+    /// image for the same descriptor finds it again (see the draw bind memo, vk_rasterizer.cpp).
+    [[nodiscard]] u64 ImageSetGeneration() const noexcept {
+        return image_set_generation;
+    }
+
+    /// sotc: FindImage's own per-address generation (MemoGeneration): moves when an image is
+    /// registered or unregistered at `address`. While it stays, a lookup that matched an image
+    /// exactly at `address` matches it again.
+    [[nodiscard]] u64 FindGeneration(VAddr address) const {
+        return MemoGeneration(address);
+    }
 
     /// Retrieves the render target with specified properties
     /// sotc: update=false (BeginRendering, SOTC_RT_FAST) skips the second UpdateImage when the
@@ -1038,7 +1081,7 @@ public:
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
             it.value().clear_mask = u32(-1);
-            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_RS_MEMO
+            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_RS_MEMO, DepthFastPath
             return true;
         }
         return false;
@@ -1050,13 +1093,55 @@ public:
         if (it != surface_metas.end()) {
             if (is_clear) {
                 it.value().clear_mask |= 1u << slice;
-                meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_RS_MEMO
+                meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_RS_MEMO, DepthFastPath
             } else {
                 it.value().clear_mask &= ~(1u << slice);
             }
             return true;
         }
         return false;
+    }
+
+    // sotc: BbToggle::DepthFastPath also reads MetaEpoch (declared above with SOTC_RS_MEMO): while
+    // it stays, the clear bit TestAndTouchMeta left cleared for a slice is still clear and a
+    // missing metadata entry is still missing.
+    /// sotc: the stencil image FindDepthTarget linked to the depth target of its last call (and
+    /// touched in the LRU), or the null id.
+    [[nodiscard]] ImageId LastDepthStencil() const noexcept {
+        return last_depth_stencil_id;
+    }
+    /// sotc: SOTC_DEPTHFAST_VERIFY: the tick an image was last touched in the LRU with (0 when it
+    /// has no LRU node), and the clear mask of a metadata surface (0 when there is none).
+    [[nodiscard]] u64 LruTickOf(ImageId id) {
+        const Image& image = slot_images[id];
+        return True(image.flags & ImageFlagBits::Registered) ? lru_cache.TickOf(image.lru_id) : 0;
+    }
+    [[nodiscard]] u32 MetaClearMask(VAddr address) const {
+        const auto it = surface_metas.find(address);
+        return it != surface_metas.end() ? it->second.clear_mask : 0;
+    }
+    /// sotc: BbToggle::GBufferFastPath. True when FindRenderTarget(image) has no side effect that
+    /// a repeated call would have to redo (its download_images queueing, only for linear or
+    /// narrow images under readback_linear_images).
+    [[nodiscard]] bool RenderTargetReplayable(const Image& image) const noexcept {
+        return !readback_linear_images ||
+               (image.info.props.is_tiled && image.info.size.width > 8);
+    }
+    /// sotc: the LRU touch FindDepthTarget gives the stencil image it links, for a caller that
+    /// replays the call (needs the batch hold like GetImage).
+    void TouchLinked(ImageId id) {
+        if (id) {
+            TouchImage(slot_images[id]);
+        }
+    }
+    /// sotc: UpdateImage(image_id) apart from its LRU touch changes nothing: the image is not
+    /// Dirty (RefreshImage returns at once) and is tracked over its whole range (TrackImage
+    /// returns at once). The same test FindRenderTarget(update=false) makes.
+    [[nodiscard]] static bool UpdateIsNoop(const Image& image) noexcept {
+        return False(image.flags & ImageFlagBits::Dirty) && image.info.num_samples <= 1 &&
+               (False(image.flags & ImageFlagBits::Registered) ||
+                (image.track_addr == image.info.guest_address &&
+                 image.track_addr_end == image.info.guest_address + image.info.guest_size));
     }
 
     /// Runs the garbage collector.
@@ -1198,6 +1283,14 @@ private:
     /// registers it again as if new.
     void ParkImage(ImageId image_id, ImageLeave why);
     void UnparkImage(ImageId image_id);
+    /// sotc: SOTC_RT_STASH. The game's transient allocator places render targets of one frame in
+    /// the same memory, so a target's next use finds another image there and each frame freed and
+    /// recreated the same targets. Stash: FreeImage for such an image, keeping its Vulkan objects
+    /// parked. Take: the parked image with exactly this layout, as new, or nothing.
+    /// sotc (fork): `why` is the FreeImage reason when it is not stashed (B4 counters).
+    void StashOrFreeImage(ImageId image_id, ImageLeave why);
+    ImageId TakeStashedImage(const ImageInfo& info);
+    void ClearImageStash();
     void ReclaimImage(ImageId image_id);
 
     /// sotc: B4 counters (SOTC_FPS), read and reset by ReportImageFrees.
@@ -1222,6 +1315,10 @@ private:
     void ShadowTake(const ImageInfo& info);
 
     void GarbageCollectImages();
+
+    /// sotc: ColdImageSweep (MEMORIA-PLAN.md), see the definitions.
+    /// The newest gc_tick whose wall time is at least `seconds` ago; false when the cache has not
+    /// run that long.
 
     /// sotc: image memory by class, every 5 s with SOTC_FPS (telemetry only).
     void Census();
@@ -1254,6 +1351,8 @@ private:
     TileManager tile_manager;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
+    std::vector<ImageId> image_stash; ///< sotc: oldest first, see StashOrFreeImage
+    u64 image_stash_bytes = 0;
     tsl::robin_map<u64, Sampler> samplers;
     BindlessSamplers bindless_samplers{instance}; // sotc: SOTC_BINDLESS_SAMP heap (samplers_mutex)
     std::unordered_set<ImageId> download_images;
@@ -1268,6 +1367,22 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
+    /// sotc: (gc_tick, wall time) about once a second, newest last: the LRU counts submits, the
+    /// cold sweep and the idle census need seconds.
+    struct TickMark {
+        u64 tick;
+        std::chrono::steady_clock::time_point time;
+    };
+    std::deque<TickMark> tick_marks;
+    std::chrono::steady_clock::time_point next_sweep{};
+    std::chrono::steady_clock::time_point next_mem_census{};
+    /// sotc: guest address -> (time, host bytes) of the images the cold sweep freed, to count the
+    /// ones that came back.
+    struct SweptImage {
+        std::chrono::steady_clock::time_point time;
+        u64 bytes;
+    };
+    std::unordered_map<VAddr, SweptImage> swept_images;
     const bool readback_linear_images;
     PageTable page_table;
     /// sotc: images registered per page_table page (1 MiB), read without the lock by
@@ -1398,6 +1513,7 @@ private:
     u64 image_set_generation{};
     /// sotc: SOTC_BIND_CACHE_FRAME: (un)registered image ranges (ImageChangedSince).
     VideoCore::RangeStamps image_stamps;
+    ImageId last_depth_stencil_id{}; ///< sotc: see LastDepthStencil
     /// sotc: per-address generations for FindMemo. A perfect match needs the same
     /// guest_address, so only (un)registering an image at that address can change the
     /// result; bumped in RegisterImage/UnregisterImage at the image's guest_address.

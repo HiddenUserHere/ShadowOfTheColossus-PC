@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <bit>
+#include <chrono>
+#include <cstdio>
 #include <utility>
 #include <cstdio>  // sotc: SOTC_OPSTAT
 #include <unordered_map>
@@ -14,6 +18,9 @@
 #include <windows.h>
 #endif
 #include <boost/preprocessor/stringize.hpp>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <x86intrin.h>
+#endif
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -57,12 +64,16 @@
 #include "../../../sotc/nonblocking.h"     // sotc: plan C switches (SOTC_BACK_WRITE_EXACT, SOTC_CP_LABEL_SLEEP, ...)
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include <xmmintrin.h>
+#include "video_core/sotc_opstats.h"
+#include "bbport_toggles.h"
 
 // sotc: writes guest memory through the backing view (runtime_memory.c).
 extern "C" int runtime_memory_write_backing(unsigned long long address, const void* data,
                                             unsigned long long size);
 // sotc: SOTC_RING8_CACHE: generation of the runtime memory table (odd while a change is in progress).
 extern "C" uint64_t runtime_memory_generation(void);
+// sotc: marks this thread as the draw thread for the split of the guest memory lock waits
+// (runtime_memory.c / sotc_stats.h).
 
 // Counted for the SOTC_PROBE diagnostic log (emulator.cpp).
 std::atomic<u64> g_sotc_zpass_dumps{0};
@@ -90,6 +101,7 @@ static const char* ccb_task_name{"CCB_TASK"};
 
 #define MAX_NAMES 56
 static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
+static_assert(BbToggle::MicroCostSweep == (1u << 23), "Liverpool::OnBackThread hard-codes the bit");
 
 #define NAME_NUM(z, n, name) BOOST_PP_STRINGIZE(name) BOOST_PP_STRINGIZE(n),
 #define NAME_ARRAY(name, num) {BOOST_PP_REPEAT(num, NAME_NUM, name)}
@@ -104,6 +116,19 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 #define YIELD_CE() YIELD(ccb_task_name)
 #define YIELD_GFX() YIELD(dcb_task_name)
 #define YIELD_ASC(id) YIELD(acb_task_name[id])
+
+// sotc: yield of a packet wait loop (WaitRegMem, MemSemaphore, Rewind). `first` is a local bool,
+// true until the loop yielded once: the first yield of a wait means this resume reached it, i.e.
+// made progress (cp_progress, read by Process for the CpPollBackoff stall detection); the later
+// ones only re-checked a condition that is still false.
+#define YIELD_WAIT(name, first)                                                                    \
+    if (first) {                                                                                   \
+        cp_progress = true;                                                                        \
+        first = false;                                                                             \
+    }                                                                                              \
+    YIELD(name)
+#define YIELD_WAIT_GFX(first) YIELD_WAIT(dcb_task_name, first)
+#define YIELD_WAIT_ASC(id, first) YIELD_WAIT(acb_task_name[id], first)
 
 #define RESUME(task, name)                                                                         \
     FIBER_EXIT;                                                                                    \
@@ -406,6 +431,46 @@ void ReportCpLabelSkip(std::string& out, double seconds) {
     out += line;
 }
 
+/// sotc: SOTC_HASH_STATS clock: the TSC (a few ns per read, against ~25 ns for the steady clock on
+/// Windows), calibrated against the steady clock at report time (HashStatsReport). Off x86-64 it
+/// is the steady clock itself (ratio 1).
+static inline u64 HashTicks() {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __rdtsc();
+#else
+    return SotcStats::NowNs();
+#endif
+}
+
+// sotc: the BackOp::reg_chunks layout (BackAlloc, BbToggle::DrawFixedCostOpt): per chunk its index,
+// the 64-bit mask of the dwords it carries (two u32), then those dwords (RegChunkDwords of them when
+// the mask is all ones). Calls fn(chunk, mask, values) for each chunk, in order.
+template <typename F>
+static void ForEachRegChunk(const std::vector<u32>& rc, F&& fn) {
+    for (size_t i = 0; i < rc.size();) {
+        const u32 chunk = rc[i];
+        const u64 mask = u64{rc[i + 1]} | (u64{rc[i + 2]} << 32);
+        fn(chunk, mask, &rc[i + 3]);
+        i += 3 + static_cast<size_t>(std::popcount(mask));
+    }
+}
+static size_t CountRegChunks(const std::vector<u32>& rc) {
+    size_t n = 0;
+    ForEachRegChunk(rc, [&](u32, u64, const u32*) { ++n; });
+    return n;
+}
+// sotc: writes one chunk entry of that layout into `dst` (the chunk's RegChunkDwords dwords).
+static void ApplyRegChunk(u32* dst, u64 mask, const u32* values) {
+    if (mask == ~u64{0}) {
+        std::memcpy(dst, values, 64 * sizeof(u32)); // one mask bit per dword: 64 (RegChunkDwords)
+        return;
+    }
+    u32 n = 0;
+    for (u64 m = mask; m != 0; m &= m - 1) {
+        dst[std::countr_zero(m)] = values[n++];
+    }
+}
+
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     // sotc: SOTC_CP_THREADS=0 binds and records the draws on the command processor thread.
@@ -413,6 +478,32 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     back_threaded = !threads || threads[0] != '0';
     const char* strict = std::getenv("SOTC_CP_STRICT");
     back_strict = strict && strict[0] == '1';
+    // sotc: A/B knobs of the draw thread ring; the defaults keep the old behaviour (512 entries,
+    // 4096 spin iterations). The capacity is rounded down to a power of two so every wrap-around
+    // stays a mask.
+    if (const char* ring = std::getenv("SOTC_BACK_RING")) {
+        u64 capacity = std::strtoull(ring, nullptr, 0);
+        capacity = std::max(BackRingMin, std::min(capacity, BackRingMax));
+        while (capacity & (capacity - 1)) {
+            capacity &= capacity - 1;
+        }
+        back_ring_capacity = capacity;
+        back_ring_mask = capacity - 1;
+    }
+    if (const char* spin = std::getenv("SOTC_BACK_SPIN")) {
+        const u64 iterations = std::strtoull(spin, nullptr, 0);
+        back_spin = static_cast<u32>(std::min<u64>(iterations, BackSpinMax));
+    }
+    if (back_threaded && SotcStats::kHashStats) {
+        // sotc: SOTC_HASH_STATS=1 table (value-initialised: counters and `used` start at 0); the
+        // last slot is the overflow bucket for keys that do not fit.
+        hash_slots = std::make_unique<HashSlot[]>(HashSlots + 1);
+        HashSlot& overflow = hash_slots[HashSlots];
+        overflow.kind = 0xff;
+        overflow.used.store(1, std::memory_order_release);
+        hash_tsc0 = HashTicks();
+        hash_ns0 = SotcStats::NowNs();
+    }
     // sotc: SOTC_WAIT_NOSPIN=1: BackLoop spins ~20 us, then blocks on back_wake (off by default).
     const char* nospin = std::getenv("SOTC_WAIT_NOSPIN");
     back_nospin = nospin && nospin[0] == '1';
@@ -563,7 +654,7 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
         xp_forced_addr = env_u64("SOTC_CULL_EXPRESS_ADDR", 0);
         xp_max_seg = static_cast<u32>(std::clamp<u64>(env_u64("SOTC_CULL_EXPRESS_SEG", 256), 1, 480));
         xp_max_skip = static_cast<u32>(
-            std::clamp<u64>(env_u64("SOTC_CULL_EXPRESS_SKIP", 480), 1, BackRingSize - 2));
+            std::clamp<u64>(env_u64("SOTC_CULL_EXPRESS_SKIP", 480), 1, back_ring_capacity - 2));
         xp_budget_ns = env_u64("SOTC_CULL_EXPRESS_US", 500) * 1000ULL;
         xp_undo.reserve(64 * (RegChunkDwords + 1));
         LOG_INFO(Render,
@@ -572,7 +663,8 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
                  xp_max_seg, xp_max_skip, xp_budget_ns / 1000, xp_signals, xp_marks);
     }
     if (back_threaded) {
-        back_ring.resize(BackRingSize);
+        back_shadow.assign(Regs::NumRegs, 0);
+        back_ring.resize(back_ring_capacity);
         dirty_list.reserve(NumRegChunks);
         back_thread = std::jthread{std::bind_front(&Liverpool::BackLoop, this)};
         back_id = back_thread.get_id();
@@ -601,7 +693,7 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
             prep_workers = workers;
             // sotc: SOTC_OP_OVERLAP needs the prep threads' footprints; set before they start.
             ovl_on = SotcStats::kOpOverlap;
-            prep_ring = std::make_unique<Vulkan::PreparedDraw[]>(BackRingSize);
+            prep_ring = std::make_unique<Vulkan::PreparedDraw[]>(back_ring_capacity);
             for (u32 k = 0; k < prep_workers; ++k) {
                 prep_regs.push_back(std::make_unique<Regs>());
             }
@@ -913,6 +1005,8 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     SotcStats::RegisterThreadRole(SotcStats::RoleDraw); // sotc: SOTC_FPS thread accounting
     SotcRaiseGpuThread();
     BbThreads::PlaceThread(BbThreads::Role::Draw);
+    // sotc: MicroCostSweep, see Liverpool::OnBackThread.
+    t_on_back_thread = true;
     Shader::g_info_slot = 1;
     SotcStats::t_draw_thread = true;
     SotcStats::RegisterSplitThread(SotcStats::SplitThreadDraw);
@@ -1143,7 +1237,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             bool ready = false;
             {
                 const SotcStats::SplitTimer spin_split{SotcStats::SplitIdleSpin};
-                for (u32 spin = 0; spin < 4096; ++spin) {
+                for (u32 spin = 0; spin < back_spin; ++spin) {
                     if (back_head.load(std::memory_order_acquire) != tail ||
                         num_commands.load(std::memory_order_acquire)) {
                         ready = true;
@@ -1169,13 +1263,13 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             xp_head.load(std::memory_order_acquire) != xp_tail.load(std::memory_order_relaxed)) {
             XpPoll(tail);
         }
-        BackOp& op = back_ring[tail % BackRingSize];
+        BackOp& op = back_ring[tail & back_ring_mask];
         back_exec_seq = tail;
         // sotc: SOTC_FRAME_METRICS: this op's busy time and count, in the frame it was queued in.
         const SotcFrameMetrics::DrawOpScope fm_op{tail};
         const u64 xp_t0 = xp_on ? SotcStats::NowNs() : 0;
         if (prep_workers) { // sotc: SOTC_PARALLEL_RECORD: the next prepared draw's first lines
-            const char* next = reinterpret_cast<const char*>(&prep_ring[(tail + 1) % BackRingSize]);
+            const char* next = reinterpret_cast<const char*>(&prep_ring[(tail + 1) & back_ring_mask]);
             for (u32 line = 0; line < 4; ++line) {
                 _mm_prefetch(next + line * 64, _MM_HINT_T0);
             }
@@ -1185,7 +1279,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         // that op and does not reuse its slot before the draw thread passes it. Without
         // SOTC_BACK_HEAD_CACHE draw_known_head stays 0 and this never runs.
         if (back_pf && tail + 1 < draw_known_head) {
-            const BackOp& next = back_ring[(tail + 1) % BackRingSize];
+            const BackOp& next = back_ring[(tail + 1) & back_ring_mask];
             const char* rc = reinterpret_cast<const char*>(next.reg_chunks.data());
             const size_t bytes = std::min<size_t>(next.reg_chunks.size() * sizeof(u32), 2048);
             for (size_t off = 0; off < bytes; off += 64) {
@@ -1344,7 +1438,7 @@ void Liverpool::WaitBackTail(u64 head) {
         return;
     }
     for (u32 spin = 0; back_tail.load(std::memory_order_acquire) < head; ++spin) {
-        if (spin < 4096) {
+        if (spin < back_spin) {
             CpuRelax();
             continue;
         }
@@ -1368,14 +1462,14 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
                !SotcStats::pr_lag_max.compare_exchange_weak(seen, lag, std::memory_order_relaxed)) {
         }
     }
-    if (head - MinRingTail(std::memory_order_acquire) >= BackRingSize) {
+    if (head - MinRingTail(std::memory_order_acquire) >= back_ring_capacity) {
         // sotc: SOTC_FPS: the ring is full, the command processor is blocked on the draw thread.
         const SotcStats::RoleTimer blocked{SotcStats::RoleCp, SotcStats::cp_blocked_ns,
                                          "cp blocked on draw"};
         // sotc: SOTC_PARALLEL_RECORD: the wait counts as the prep threads' when the draw thread
         // alone would have left room.
         const bool prep_throttle = prep_workers && SotcStats::kFpsTimers && // sotc: SOTC_FPS_LEAN
-                                   head - back_tail.load(std::memory_order_acquire) < BackRingSize;
+                                   head - back_tail.load(std::memory_order_acquire) < back_ring_capacity;
         const u64 throttle_start = prep_throttle ? SotcStats::NowNs() : 0;
         if (futex_wait && !prep_workers) {
             // sotc: SOTC_FUTEX_WAIT: without the prep threads MinRingTail is back_tail, so the wait
@@ -1384,33 +1478,33 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
             SotcFutexCpCounters& c = g_futex_cp;
             c.waits.fetch_add(1, std::memory_order_relaxed);
             u64 seen = back_tail.load(std::memory_order_acquire);
-            for (u32 spin = 0; head - seen >= BackRingSize && spin < kFutexSpin; ++spin) {
+            for (u32 spin = 0; head - seen >= back_ring_capacity && spin < kFutexSpin; ++spin) {
                 CpuRelax();
                 seen = back_tail.load(std::memory_order_acquire);
             }
-            if (head - seen < BackRingSize) {
+            if (head - seen < back_ring_capacity) {
                 c.spins.fetch_add(1, std::memory_order_relaxed);
             } else {
                 drain_waiting.store(true, std::memory_order_seq_cst);
-                while (head - (seen = back_tail.load(std::memory_order_seq_cst)) >= BackRingSize) {
+                while (head - (seen = back_tail.load(std::memory_order_seq_cst)) >= back_ring_capacity) {
                     if (!FutexSleep(back_tail, seen) &&
-                        head - back_tail.load(std::memory_order_seq_cst) < BackRingSize) {
+                        head - back_tail.load(std::memory_order_seq_cst) < back_ring_capacity) {
                         c.safety_met.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
                 drain_waiting.store(false, std::memory_order_relaxed);
             }
         } else {
-            for (u32 spin = 0; head - MinRingTail(std::memory_order_acquire) >= BackRingSize;
+            for (u32 spin = 0; head - MinRingTail(std::memory_order_acquire) >= back_ring_capacity;
                  ++spin) {
-                if (spin < 4096) {
+                if (spin < back_spin) {
                     CpuRelax();
                     continue;
                 }
                 std::unique_lock lk{back_mutex};
                 drain_waiting.store(true, std::memory_order_seq_cst);
                 drain_cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
-                    return head - MinRingTail(std::memory_order_seq_cst) < BackRingSize;
+                    return head - MinRingTail(std::memory_order_seq_cst) < back_ring_capacity;
                 });
                 drain_waiting.store(false, std::memory_order_relaxed);
             }
@@ -1420,7 +1514,7 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
                                                 std::memory_order_relaxed);
         }
     }
-    BackOp& op = back_ring[head % BackRingSize];
+    BackOp& op = back_ring[head & back_ring_mask];
     op.pipeline = nullptr;
     op.num_stages = 0;
     op.wd.num_segs = 0;
@@ -1433,10 +1527,26 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
     if (opstat) { // sotc: SOTC_OPSTAT
         OpStatAdd(OsCpDirty, dirty_list.size());
     }
-    if (op_noalloc) {
-        // sotc: SOTC_OP_NOALLOC: the same layout, sized once (a slot keeps its capacity, so the
-        // resize allocates only when this op has more dirty chunks than the slot ever had).
-        const size_t dwords = dirty_list.size() * (RegChunkDwords + 1);
+    // sotc: BbToggle::DrawFixedCostOpt. Per chunk: its index, a 64-bit mask of the dwords that
+    // differ from what the draw thread already holds (back_shadow, kept equal to its back_regs:
+    // both only ever take the dwords an op carries, in order), then those dwords. A chunk the
+    // command stream wrote with the same values is not sent at all. With the toggle set (old
+    // path) every dirty chunk goes whole (mask all ones); the shadow follows either way.
+    op.reg_chunks.clear();
+    op.verify_chunks.clear();
+    // sotc: BbToggle::DepthFastPath also needs the changed dwords (the draw thread tells render
+    // register changes from per-draw ones by them); the old path needs both bits set.
+    // sotc: SOTC_PARALLEL_RECORD replays the chunks newest first, one whole chunk each (PrepLoop),
+    // so with the prep threads every dirty chunk goes whole as well.
+    const bool whole = (BbToggle::Disabled(BbToggle::DrawFixedCostOpt) &&
+                        BbToggle::Disabled(BbToggle::DepthFastPath)) ||
+                       prep_workers != 0;
+    static const bool verify = std::getenv("SOTC_DRAW_OPT_VERIFY") != nullptr;
+    if (op_noalloc && whole && !verify) {
+        // sotc: SOTC_OP_NOALLOC: the whole-chunk layout (index, all-ones mask, the dwords), sized
+        // once (a slot keeps its capacity, so the resize allocates only when this op has more dirty
+        // chunks than the slot ever had). The shadow follows as on the other path.
+        const size_t dwords = dirty_list.size() * (RegChunkDwords + 3);
         if (dwords > op.reg_chunks.capacity()) {
             NoallocAdd(g_noalloc.cp_grow, 1);
         }
@@ -1444,19 +1554,49 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
         op.reg_chunks.resize(dwords);
         u32* dst = op.reg_chunks.data();
         for (const u16 chunk : dirty_list) {
+            const u32* src = &regs.reg_array[u32{chunk} * RegChunkDwords];
             *dst++ = chunk;
-            std::memcpy(dst, &regs.reg_array[u32{chunk} * RegChunkDwords],
-                        RegChunkDwords * sizeof(u32));
+            *dst++ = ~0u;
+            *dst++ = ~0u;
+            std::memcpy(dst, src, RegChunkDwords * sizeof(u32));
             dst += RegChunkDwords;
+            std::memcpy(&back_shadow[u32{chunk} * RegChunkDwords], src, RegChunkDwords * sizeof(u32));
             dirty_chunks[chunk / 64] &= ~(u64{1} << (chunk % 64));
         }
     } else {
-        op.reg_chunks.clear();
         for (const u16 chunk : dirty_list) {
             const u32* src = &regs.reg_array[u32{chunk} * RegChunkDwords];
-            op.reg_chunks.push_back(chunk);
-            op.reg_chunks.insert(op.reg_chunks.end(), src, src + RegChunkDwords);
+            if (verify) {
+                op.verify_chunks.push_back(chunk);
+                op.verify_chunks.insert(op.verify_chunks.end(), src, src + RegChunkDwords);
+            }
+            u32* shadow = &back_shadow[u32{chunk} * RegChunkDwords];
             dirty_chunks[chunk / 64] &= ~(u64{1} << (chunk % 64));
+            u64 mask = ~u64{0};
+            if (!whole) {
+                mask = 0;
+                for (u32 i = 0; i < RegChunkDwords; i += 4) {
+                    const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+                    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(shadow + i));
+                    const u32 equal =
+                        static_cast<u32>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a, b))));
+                    mask |= u64{(~equal) & 0xFu} << i;
+                }
+                if (mask == 0) {
+                    continue;
+                }
+            }
+            op.reg_chunks.push_back(chunk);
+            op.reg_chunks.push_back(static_cast<u32>(mask));
+            op.reg_chunks.push_back(static_cast<u32>(mask >> 32));
+            if (mask == ~u64{0}) {
+                op.reg_chunks.insert(op.reg_chunks.end(), src, src + RegChunkDwords);
+            } else {
+                for (u64 m = mask; m != 0; m &= m - 1) {
+                    op.reg_chunks.push_back(src[std::countr_zero(m)]);
+                }
+            }
+            std::memcpy(shadow, src, RegChunkDwords * sizeof(u32));
         }
     }
     dirty_list.clear();
@@ -1899,7 +2039,7 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         if (op.kind == BackOp::Kind::Func) {
             OpStatAdd(OsFunc + (op.func_kind & 3), 1);
         }
-        OpStatAdd(OsRegChunks, op.reg_chunks.size() / (RegChunkDwords + 1));
+        OpStatAdd(OsRegChunks, CountRegChunks(op.reg_chunks)); // sotc: masked chunk layout
         OpStatAdd(OsStages, op.num_stages);
         u64 flat = 0;
         for (u32 i = 0; i < op.num_stages; ++i) {
@@ -1912,10 +2052,85 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
     if (op.wd.num_segs) {
         ApplyBackWd(op.wd);
     }
-    for (size_t i = 0; i < op.reg_chunks.size(); i += RegChunkDwords + 1) {
-        std::memcpy(&back_regs.reg_array[op.reg_chunks[i] * RegChunkDwords], &op.reg_chunks[i + 1],
-                    RegChunkDwords * sizeof(u32));
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1, op composition
+        SotcOps::NoteBackOp(static_cast<u32>(op.kind));
     }
+    const u64 phase_t0 = Vulkan::DrawPhase::kOn ? Vulkan::DrawPhase::Now() : 0;
+    // sotc: back_chunk_serial: the chunks an op carries changed in value (BackAlloc sends only
+    // those, or every dirty one with DrawFixedCostOpt set); see DrawChunksChangedSince.
+    const u32 serial = ++back_serial;
+    u32 changed_dwords = 0, changed_chunks = 0;
+    bool rel_render = !back_rel_ready, rel_dynamic = !back_rel_ready, rel_color = !back_rel_ready;
+    u32 partial_old[3][2];
+    for (u32 k = 0; k < 3; ++k) {
+        for (u32 i = 0; i < rel_partial_n[k]; ++i) {
+            partial_old[k][i] = back_regs.reg_array[rel_partial[k][i].dword];
+        }
+    }
+    for (size_t i = 0; i < op.reg_chunks.size();) {
+        ++changed_chunks;
+        const u32 chunk = op.reg_chunks[i];
+        const u64 mask = u64{op.reg_chunks[i + 1]} | (u64{op.reg_chunks[i + 2]} << 32);
+        rel_render |= (rel_mask[RelRender][chunk] & mask) != 0; // sotc: DrawRelSerial
+        rel_dynamic |= (rel_mask[RelDynamic][chunk] & mask) != 0;
+        rel_color |= (rel_mask[RelColor][chunk] & mask) != 0;
+        const u32* values = &op.reg_chunks[i + 3];
+        u32* dst = &back_regs.reg_array[chunk * RegChunkDwords];
+        if (mask == ~u64{0}) {
+            std::memcpy(dst, values, RegChunkDwords * sizeof(u32));
+            i += 3 + RegChunkDwords;
+            changed_dwords += RegChunkDwords;
+        } else {
+            u32 n = 0;
+            for (u64 m = mask; m != 0; m &= m - 1) {
+                dst[std::countr_zero(m)] = values[n++];
+            }
+            i += 3 + n;
+            changed_dwords += n;
+        }
+        back_chunk_serial[chunk] = serial;
+    }
+    if (!op.verify_chunks.empty()) {
+        // SOTC_DRAW_OPT_VERIFY: the draw thread's registers must now hold what the command
+        // processor had in every chunk it marked dirty, sent or not.
+        static std::atomic<u64> checked{0}, bad{0};
+        for (size_t i = 0; i < op.verify_chunks.size(); i += RegChunkDwords + 1) {
+            const u32 chunk = op.verify_chunks[i];
+            const bool same =
+                std::memcmp(&back_regs.reg_array[chunk * RegChunkDwords], &op.verify_chunks[i + 1],
+                            RegChunkDwords * sizeof(u32)) == 0;
+            const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!same && bad.fetch_add(1, std::memory_order_relaxed) < 20) {
+                std::fprintf(stderr,
+                             "SOTC DRAW OPT VERIFY: register chunk %u differs on the draw thread\n",
+                             chunk);
+            }
+            if ((n & 0xFFFFF) == 0) {
+                std::fprintf(stderr, "SOTC DRAW OPT VERIFY: register chunks checked %llu, bad %llu\n",
+                             static_cast<unsigned long long>(n),
+                             static_cast<unsigned long long>(bad.load()));
+            }
+        }
+    }
+    for (u32 i = 0; i < rel_partial_n[RelRender]; ++i) {
+        const auto& part = rel_partial[RelRender][i];
+        rel_render |= ((partial_old[RelRender][i] ^ back_regs.reg_array[part.dword]) & part.bits) != 0;
+    }
+    for (u32 i = 0; i < rel_partial_n[RelDynamic]; ++i) {
+        const auto& part = rel_partial[RelDynamic][i];
+        rel_dynamic |=
+            ((partial_old[RelDynamic][i] ^ back_regs.reg_array[part.dword]) & part.bits) != 0;
+    }
+    for (u32 i = 0; i < rel_partial_n[RelColor]; ++i) {
+        const auto& part = rel_partial[RelColor][i];
+        rel_color |= ((partial_old[RelColor][i] ^ back_regs.reg_array[part.dword]) & part.bits) != 0;
+    }
+    rel_render |= back_db_extent.raw != op.db_extent.raw; // sotc: DrawRelSerial
+    rel_color |= std::memcmp(back_cb_extent.data(), op.cb_extent.data(),
+                             sizeof(back_cb_extent)) != 0;
+    back_rel_serial[RelRender] += rel_render;
+    back_rel_serial[RelDynamic] += rel_dynamic;
+    back_rel_serial[RelColor] += rel_color;
     back_cb_extent = op.cb_extent;
     back_db_extent = op.db_extent;
     // sotc: SOTC_OP_NOALLOC: the op's flat buffer is swapped in rather than copied. Nothing reads
@@ -1970,6 +2185,10 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
     }
     // sotc: SOTC_TC_OP_LOCK: one texture-cache hold per draw/dispatch op (Func ops can block, so they are left out).
     const auto tc_op_lock = rasterizer->GetTextureCache().OpLock(op.kind != BackOp::Kind::Func);
+    if (Vulkan::DrawPhase::kOn && (op.kind == BackOp::Kind::Draw || op.kind == BackOp::Kind::DrawIndirect)) {
+        Vulkan::DrawPhase::AddOpPrefix(Vulkan::DrawPhase::Now() - phase_t0, changed_chunks,
+                                       changed_dwords);
+    }
     switch (op.kind) {
     case BackOp::Kind::Func:
         if (op.func) { // sotc: empty for a flushed batch of WRITE_DATA (FlushWd)
@@ -2034,7 +2253,7 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
     // copied once (its newest value), so the chunks of the ops this thread does not compute are not
     // copied one op at a time, and ops the draw thread passed cost nothing. prep_tail stays at
     // `applied` (those ops' chunks are still read), and the gap is replayed once it reaches
-    // kMaxLag ops so the ring is never held back (BackRingSize is 512).
+    // kMaxLag ops so the ring is never held back (back_ring_capacity, 512 by default).
     Common::SetCurrentThreadName(index == 0 ? "shadPS4:GpuPrep0" : "shadPS4:GpuPrep1");
     BbThreads::PlaceThread(BbThreads::Role::Prep);
     Shader::g_info_slot = 2 + index; // info.h: slots 2..5 are the draw workers'
@@ -2052,19 +2271,19 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
     const auto replay_to = [&](u64 last) { // prep_regs := the registers of op `last`
         u64 chunks = 0;
         for (u64 s = last + 1; s-- > applied;) {
-            const BackOp& past = back_ring[s % BackRingSize];
-            for (size_t i = 0; i < past.reg_chunks.size(); i += RegChunkDwords + 1) {
-                const u32 chunk = past.reg_chunks[i];
+            const BackOp& past = back_ring[s & back_ring_mask];
+            // sotc: with the prep threads BackAlloc sends every dirty chunk whole (all-ones mask),
+            // so the newest op's copy of a chunk is the whole chunk.
+            ForEachRegChunk(past.reg_chunks, [&](u32 chunk, u64 mask, const u32* values) {
                 u64& word = copied[chunk / 64];
                 const u64 bit = u64{1} << (chunk % 64);
                 if (word & bit) {
-                    continue; // a newer op already set this chunk
+                    return; // a newer op already set this chunk
                 }
                 word |= bit;
-                std::memcpy(&prep.reg_array[chunk * RegChunkDwords], &past.reg_chunks[i + 1],
-                            RegChunkDwords * sizeof(u32));
+                ApplyRegChunk(&prep.reg_array[chunk * RegChunkDwords], mask, values);
                 ++chunks;
-            }
+            });
         }
         copied.fill(0);
         applied = last + 1;
@@ -2093,7 +2312,7 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
             }
             continue;
         }
-        const BackOp& op = back_ring[seq % BackRingSize];
+        const BackOp& op = back_ring[seq & back_ring_mask];
         const bool is_draw = op.kind == BackOp::Kind::Draw || op.kind == BackOp::Kind::DrawIndirect;
         const bool is_disp = op.kind == BackOp::Kind::Dispatch ||
                              op.kind == BackOp::Kind::DispatchIndirect;
@@ -2111,7 +2330,7 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
         };
         if (is_draw && seq % prep_workers == index &&
             seq >= back_tail.load(std::memory_order_acquire)) {
-            Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
+            Vulkan::PreparedDraw& slot = prep_ring[seq & back_ring_mask];
             replay_to(seq); // sotc: design E0: this op's registers
             slot.map_epoch = rasterizer->MapEpoch();
             if (commit_on) { // sotc: SOTC_GCN_COMMIT: this slot is a draw (TakePrepared checks it)
@@ -2132,7 +2351,7 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
             counters.prepared.fetch_add(1, std::memory_order_relaxed); // sotc: design E counters
         } else if ((commit_on || fp_fill) && is_disp && seq % prep_workers == index &&
                    seq >= back_tail.load(std::memory_order_acquire)) {
-            Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
+            Vulkan::PreparedDraw& slot = prep_ring[seq & back_ring_mask];
             replay_to(seq); // sotc: design E0: this op's registers
             if (commit_on) {
                 // sotc: SOTC_GCN_COMMIT: the dispatch's prepared inputs, as a draw's. Reset first; the
@@ -2178,8 +2397,8 @@ const Vulkan::PreparedDraw* Liverpool::TakePrepared(u64 seq, bool dispatch) {
         return nullptr;
     }
     // sotc: SOTC_PARALLEL_RECORD: published for this very op (the slot is reused every
-    // BackRingSize ops) and no mapping changed since it was computed.
-    const Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
+    // back_ring_capacity ops) and no mapping changed since it was computed.
+    const Vulkan::PreparedDraw& slot = prep_ring[seq & back_ring_mask];
     // sotc: SOTC_GCN_COMMIT: the draw counters (pr_*) count draws only; a dispatch take is counted
     // by SotcGcn::Commit::NoteDispatchPrepared.
     const auto count = [dispatch](std::atomic<uint64_t>& counter) {
@@ -2254,6 +2473,167 @@ void Liverpool::PrepReport() {
     pc.bc_used = pc.bc_stale = pc.bc_mismatch = 0;
 }
 
+Liverpool::HashSlot& Liverpool::HashFind(u32 kind, u64 h1, u64 h2) {
+    constexpr u32 MaxProbes = 32;
+    u64 mix = (h1 ^ ((h2 << 29) | (h2 >> 35)) ^ (u64{kind} << 56)) * 0x9E3779B97F4A7C15ull;
+    mix ^= mix >> 31;
+    u32 index = static_cast<u32>((mix * 0xC2B2AE3D27D4EB4Full) >> (64 - HashSlotBits));
+    for (u32 probe = 0; probe < MaxProbes; ++probe, index = (index + 1) & (HashSlots - 1)) {
+        HashSlot& slot = hash_slots[index];
+        if (slot.used.load(std::memory_order_relaxed) == 0) {
+            if (hash_used >= HashSlots / 4 * 3) {
+                break;
+            }
+            slot.kind = kind;
+            slot.h1 = h1;
+            slot.h2 = h2;
+            ++hash_used;
+            slot.used.store(1, std::memory_order_release); // publishes the key to the reporter
+            return slot;
+        }
+        if (slot.kind == kind && slot.h1 == h1 && slot.h2 == h2) {
+            return slot;
+        }
+    }
+    return hash_slots[HashSlots];
+}
+
+void Liverpool::ExecuteBackOpTimed(BackOp& op) {
+    // Key: kind plus the hashes of the VS (or CS) and PS; other stages are folded into the first.
+    u64 h1 = 0;
+    u64 h2 = 0;
+    for (u32 i = 0; i < op.num_stages; ++i) {
+        const Shader::Info& info = *op.stages[i].info;
+        switch (info.sw_stage) {
+        case Shader::SwStage::Fragment:
+            h2 = info.pgm_hash;
+            break;
+        case Shader::SwStage::Vertex:
+        case Shader::SwStage::Compute:
+            h1 ^= info.pgm_hash;
+            break;
+        default:
+            h1 = h1 * 31 + info.pgm_hash;
+            break;
+        }
+    }
+    HashSlot& slot = HashFind(static_cast<u32>(op.kind), h1, h2);
+    // sotc: the draw thread's own counts (SotcStats::hash_tl): the global counters are bumped by
+    // the other threads too and reset by the printers.
+    const SotcStats::HashThreadCounts before = SotcStats::hash_tl;
+    const u64 t0 = HashTicks();
+    ExecuteBackOp(op);
+    const u64 t1 = HashTicks();
+    const SotcStats::HashThreadCounts& after = SotcStats::hash_tl;
+    slot.ticks.fetch_add(t1 - t0, std::memory_order_relaxed);
+    slot.ops.fetch_add(1, std::memory_order_relaxed);
+    slot.protects.fetch_add(after.protects - before.protects, std::memory_order_relaxed);
+    slot.readbacks.fetch_add(after.readbacks - before.readbacks, std::memory_order_relaxed);
+    slot.finishes.fetch_add(after.finishes - before.finishes, std::memory_order_relaxed);
+    slot.upload.fetch_add(after.upload - before.upload, std::memory_order_relaxed);
+}
+
+void Liverpool::HashStatsReport(std::string& out, double seconds) {
+    char line[256];
+    if (!hash_slots) {
+        out += "SOTC hash: no table (SOTC_CP_THREADS=0: the draw thread is off)\n";
+        return;
+    }
+    // Ticks to ns over the whole run so far (no sleep needed to calibrate).
+    const u64 elapsed_ns = SotcStats::NowNs() - hash_ns0;
+    const u64 elapsed_ticks = HashTicks() - hash_tsc0;
+    const double ns_per_tick =
+        elapsed_ns > 50'000'000 && elapsed_ticks > 0 ? double(elapsed_ns) / double(elapsed_ticks)
+                                                     : 1.0;
+    struct Entry {
+        const HashSlot* slot;
+        u64 ticks, ops, protects, readbacks, finishes, upload;
+    };
+    std::vector<Entry> entries;
+    u64 total_ticks = 0;
+    u64 total_ops = 0;
+    u64 kind_ticks[6]{}, kind_ops[6]{};
+    for (u32 i = 0; i <= HashSlots; ++i) {
+        HashSlot& slot = hash_slots[i];
+        if (slot.used.load(std::memory_order_acquire) == 0) {
+            continue;
+        }
+        Entry e{&slot,
+                slot.ticks.exchange(0, std::memory_order_relaxed),
+                slot.ops.exchange(0, std::memory_order_relaxed),
+                slot.protects.exchange(0, std::memory_order_relaxed),
+                slot.readbacks.exchange(0, std::memory_order_relaxed),
+                slot.finishes.exchange(0, std::memory_order_relaxed),
+                slot.upload.exchange(0, std::memory_order_relaxed)};
+        if (e.ops == 0) {
+            continue;
+        }
+        total_ticks += e.ticks;
+        total_ops += e.ops;
+        {
+            // sotc: per op kind totals (printed after the table; 5 = overflow bucket)
+            const u32 k = std::min<u32>(slot.kind, 5);
+            kind_ticks[k] += e.ticks;
+            kind_ops[k] += e.ops;
+        }
+        entries.push_back(e);
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) { return a.ticks > b.ticks; });
+    static constexpr const char* kKindNames[] = {"func", "draw", "draw-indirect", "dispatch",
+                                                 "dispatch-indirect"};
+    const double per_s = 1.0 / std::max(seconds, 1e-3);
+    const auto ms = [&](u64 ticks) { return double(ticks) * ns_per_tick / 1e6; };
+    for (u32 k = 0; k < 6; ++k) {
+        if (kind_ops[k] == 0) {
+            continue;
+        }
+        std::snprintf(line, sizeof(line),
+                      "SOTC hash kind total %s: %.1f ms/s, %.0f ops/s (%.2f us/op)\n",
+                      k < std::size(kKindNames) ? kKindNames[k] : "overflow",
+                      ms(kind_ticks[k]) * per_s, double(kind_ops[k]) * per_s,
+                      ms(kind_ticks[k]) * 1000.0 / double(kind_ops[k]));
+        out += line;
+    }
+    const size_t shown = std::min<size_t>(entries.size(), 15);
+    u64 shown_ticks = 0;
+    for (size_t i = 0; i < shown; ++i) {
+        const Entry& e = entries[i];
+        shown_ticks += e.ticks;
+        const char* kind = e.slot->kind < std::size(kKindNames) ? kKindNames[e.slot->kind]
+                                                                : "overflow";
+        char hash[48];
+        if (e.slot->h1 == 0 && e.slot->h2 == 0) {
+            std::snprintf(hash, sizeof(hash), "-");
+        } else if (e.slot->h2 == 0) {
+            std::snprintf(hash, sizeof(hash), "%016llx",
+                          static_cast<unsigned long long>(e.slot->h1));
+        } else {
+            std::snprintf(hash, sizeof(hash), "%016llx/%016llx",
+                          static_cast<unsigned long long>(e.slot->h1),
+                          static_cast<unsigned long long>(e.slot->h2));
+        }
+        std::snprintf(line, sizeof(line),
+                      "SOTC hash %s %s : %.2f ms/s, %.0f ops/s, %.1f protects/s, %.1f readbacks/s "
+                      "(%.1f finishing), %.2f MB/s uploaded\n",
+                      kind, hash, ms(e.ticks) * per_s, double(e.ops) * per_s,
+                      double(e.protects) * per_s, double(e.readbacks) * per_s,
+                      double(e.finishes) * per_s, double(e.upload) / 1048576.0 * per_s);
+        out += line;
+    }
+    const double idle_ms = double(SotcStats::hash_idle_ns.exchange(0)) / 1e6;
+    const double busy_ms = std::max(seconds * 1000.0 - idle_ms, 0.0);
+    const double table_ms = ms(total_ticks);
+    std::snprintf(line, sizeof(line),
+                  "SOTC hash coverage: ops %.0f ms/s of %.0f ms/s draw-thread busy (%.0f%%), top "
+                  "%zu of %zu keys %.0f%% of the ops, %.0f ops/s\n",
+                  table_ms * per_s, busy_ms * per_s, busy_ms > 0.0 ? 100.0 * table_ms / busy_ms : 0.0,
+                  shown, entries.size(),
+                  total_ticks ? 100.0 * double(shown_ticks) / double(total_ticks) : 0.0,
+                  double(total_ops) * per_s);
+    out += line;
+}
+
 void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
     const OpCostScope op_cost{SotcArch::OpCost::Thread::CommandProcessor,
                               SotcArch::OpCost::Op::Draw}; // sotc: SOTC_OPCOST
@@ -2280,17 +2660,26 @@ void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
         return;
     }
     // sotc: no pipeline for a draw FilterDraw drops on the draw thread (review of #99).
+    const u64 pt0 = Vulkan::DrawPhase::kOn ? Vulkan::DrawPhase::Now() : 0;
     const bool looks_up = !rasterizer->IsDrawFilteredOut();
     const auto* pipeline = LookupAfterWrites(
         looks_up, [&] { return rasterizer->LookupGraphicsPipeline(0, 0); });
     if (!prep_workers) { // sotc: SOTC_PARALLEL_RECORD: the prep threads do it (PrepLoop)
         rasterizer->PrefetchImages(pipeline); // sotc: SOTC_ASYNC_IMAGE_CREATE
     }
+    const u64 pt1 = Vulkan::DrawPhase::kOn ? Vulkan::DrawPhase::Now() : 0;
     BackOp& op = BackAlloc();
+    const u64 pt2 = Vulkan::DrawPhase::kOn ? Vulkan::DrawPhase::Now() : 0;
     op.kind = BackOp::Kind::Draw;
     op.is_indexed = is_indexed;
     op.index_offset = index_offset;
     CaptureBackOp(op, pipeline);
+    if (Vulkan::DrawPhase::kOn) {
+        const u64 pt3 = Vulkan::DrawPhase::Now();
+        Vulkan::DrawPhase::AddCp(0, pt1 - pt0);
+        Vulkan::DrawPhase::AddCp(1, pt2 - pt1);
+        Vulkan::DrawPhase::AddCp(2, pt3 - pt2);
+    }
     const bool pipe_writes = PipelineWrites(pipeline);
     BackPublish(back_strict && pipe_writes, pipe_writes);
 }
@@ -2356,6 +2745,7 @@ void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u
     // sotc: SOTC_WD_FUSE: WRITE_DATA packets held back for this draw's arguments (or queued).
     NotePairs();
     PrepareWdForIndirect(address + offset, u64{stride} * max_count, count_address == 0);
+    const u64 pt0 = Vulkan::DrawPhase::kOn ? Vulkan::DrawPhase::Now() : 0;
     const bool looks_up = !rasterizer->IsDrawFilteredOut();
     const auto* pipeline = LookupAfterWrites(looks_up, [&] {
         return rasterizer->LookupGraphicsPipeline(vertex_sgpr_offset, instance_sgpr_offset);
@@ -2363,7 +2753,9 @@ void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u
     if (!prep_workers) { // sotc: SOTC_PARALLEL_RECORD: the prep threads do it (PrepLoop)
         rasterizer->PrefetchImages(pipeline); // sotc: SOTC_ASYNC_IMAGE_CREATE
     }
+    const u64 pt1 = Vulkan::DrawPhase::kOn ? Vulkan::DrawPhase::Now() : 0;
     BackOp& op = BackAlloc();
+    const u64 pt2 = Vulkan::DrawPhase::kOn ? Vulkan::DrawPhase::Now() : 0;
     AttachWd(op);
     op.kind = BackOp::Kind::DrawIndirect;
     op.is_indexed = is_indexed;
@@ -2386,6 +2778,12 @@ void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u
             }
         }
         op.prepass_mark = SotcPrepassProbe::CpClassify(regs, address + offset, pipeline != nullptr, discard);
+    }
+    if (Vulkan::DrawPhase::kOn) {
+        const u64 pt3 = Vulkan::DrawPhase::Now();
+        Vulkan::DrawPhase::AddCp(0, pt1 - pt0);
+        Vulkan::DrawPhase::AddCp(1, pt2 - pt1);
+        Vulkan::DrawPhase::AddCp(2, pt3 - pt2);
     }
     const bool pipe_writes = PipelineWrites(pipeline);
     BackPublish(back_strict && pipe_writes, pipe_writes);
@@ -2617,7 +3015,7 @@ void Liverpool::NoteOpOverlap(const BackOp& op) {
     if (!op.pipeline) {
         return; // dropped by the draw filter: runs as nothing
     }
-    const Vulkan::PreparedDraw& slot = prep_ring[back_exec_seq % BackRingSize];
+    const Vulkan::PreparedDraw& slot = prep_ring[back_exec_seq & back_ring_mask];
     if (slot.ready_seq.load(std::memory_order_acquire) != back_exec_seq ||
         !slot.resources_ready) {
         add(SotcStats::ovl_not_ready);
@@ -2710,7 +3108,7 @@ void Liverpool::N5Begin(const BackOp& op) {
     s.active = true;
     s.cls = dispatch ? Vulkan::FrameGraph::Class::Compute : Vulkan::FrameGraph::Class::Graphics;
     if (prep_workers) {
-        const Vulkan::PreparedDraw& slot = prep_ring[back_exec_seq % BackRingSize];
+        const Vulkan::PreparedDraw& slot = prep_ring[back_exec_seq & back_ring_mask];
         if (slot.ready_seq.load(std::memory_order_acquire) == back_exec_seq &&
             slot.resources_ready) {
             OpArgs args;
@@ -2759,9 +3157,20 @@ void Liverpool::XpPublishSeg(const XpSeg& seg) {
     }
 }
 
+// sotc: SOTC_CULL_EXPRESS changed back_regs outside ExecuteBackOp: every chunk counts as changed
+// (DrawChunksChangedSince) and every relevance serial moves (DrawRelSerial), so the memos built on
+// them recompute.
+void Liverpool::NoteBackRegsReplaced() {
+    static_assert(RegChunkDwords == 64, "ApplyRegChunk: one 64-bit mask bit per chunk dword");
+    const u32 serial = ++back_serial;
+    back_chunk_serial.fill(serial);
+    for (u32& rel : back_rel_serial) {
+        ++rel;
+    }
+}
+
 void Liverpool::XpApplyState(const BackOp& op) {
-    for (size_t i = 0; i < op.reg_chunks.size(); i += RegChunkDwords + 1) {
-        const u32 chunk = op.reg_chunks[i];
+    ForEachRegChunk(op.reg_chunks, [&](u32 chunk, u64 mask, const u32* values) {
         const u64 bit = u64{1} << (chunk % 64);
         if (!(xp_undo_mask[chunk / 64] & bit)) {
             xp_undo_mask[chunk / 64] |= bit;
@@ -2770,9 +3179,9 @@ void Liverpool::XpApplyState(const BackOp& op) {
             const u32* src = &back_regs.reg_array[chunk * RegChunkDwords];
             xp_undo.insert(xp_undo.end(), src, src + RegChunkDwords);
         }
-        std::memcpy(&back_regs.reg_array[chunk * RegChunkDwords], &op.reg_chunks[i + 1],
-                    RegChunkDwords * sizeof(u32));
-    }
+        ApplyRegChunk(&back_regs.reg_array[chunk * RegChunkDwords], mask, values);
+    });
+    NoteBackRegsReplaced(); // sotc: the DrawRelSerial / DrawChunksChangedSince memos recompute
     back_cb_extent = op.cb_extent;
     back_db_extent = op.db_extent;
     if (op.kind == BackOp::Kind::Dispatch || op.kind == BackOp::Kind::DispatchIndirect) {
@@ -2785,6 +3194,7 @@ void Liverpool::XpUndoState() {
         std::memcpy(&back_regs.reg_array[xp_undo[i] * RegChunkDwords], &xp_undo[i + 1],
                     RegChunkDwords * sizeof(u32));
     }
+    NoteBackRegsReplaced(); // sotc: as in XpApplyState
     for (const u16 chunk : xp_undo_list) {
         xp_undo_mask[chunk / 64] &= ~(u64{1} << (chunk % 64));
     }
@@ -2796,10 +3206,10 @@ void Liverpool::XpUndoState() {
 }
 
 void Liverpool::XpReplayState(const BackOp& op) {
-    for (size_t i = 0; i < op.reg_chunks.size(); i += RegChunkDwords + 1) {
-        std::memcpy(&back_regs.reg_array[op.reg_chunks[i] * RegChunkDwords], &op.reg_chunks[i + 1],
-                    RegChunkDwords * sizeof(u32));
-    }
+    ForEachRegChunk(op.reg_chunks, [&](u32 chunk, u64 mask, const u32* values) {
+        ApplyRegChunk(&back_regs.reg_array[chunk * RegChunkDwords], mask, values);
+    });
+    NoteBackRegsReplaced(); // sotc: as in XpApplyState
     back_cb_extent = op.cb_extent;
     back_db_extent = op.db_extent;
     if (op.kind == BackOp::Kind::Dispatch || op.kind == BackOp::Kind::DispatchIndirect) {
@@ -2868,7 +3278,7 @@ bool Liverpool::XpEvaluate(const XpSeg& seg, u64 tail) {
     XpReason fail = XpOk;
     bool retry = false;
     for (u64 seq = tail; seq < seg.end && fail == XpOk; ++seq) {
-        BackOp& op = back_ring[seq % BackRingSize];
+        BackOp& op = back_ring[seq & back_ring_mask];
         XpApplyState(op); // back_regs now holds the registers this op runs with
         const bool express = seq >= seg.start && op.qid == GfxQueueId;
         if (op.xp_done && !express) {
@@ -2925,7 +3335,7 @@ bool Liverpool::XpEvaluate(const XpSeg& seg, u64 tail) {
             if (!op.pipeline) {
                 break; // dropped by the draw filter: runs as nothing
             }
-            const Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
+            const Vulkan::PreparedDraw& slot = prep_ring[seq & back_ring_mask];
             if (slot.ready_seq.load(std::memory_order_acquire) != seq || !slot.resources_ready) {
                 not_ready = true;
                 break;
@@ -3056,7 +3466,7 @@ bool Liverpool::XpEvaluate(const XpSeg& seg, u64 tail) {
     xp_saved_cs = back_cs;
     u64 label_exec_ns = 0;
     for (u64 seq = tail; seq < seg.end; ++seq) {
-        BackOp& op = back_ring[seq % BackRingSize];
+        BackOp& op = back_ring[seq & back_ring_mask];
         XpApplyState(op);
         if (seq >= seg.start && op.qid == GfxQueueId && !op.xp_done) {
             back_exec_seq = seq;
@@ -4097,7 +4507,62 @@ void Liverpool::Process(std::stop_token stoken) {
         VideoCore::StartCapture();
 
         curr_qid = -1;
-        u32 since_progress = 0;
+        // sotc: SOTC_CP_YIELD (default 1, upstream 0.60.6-plus): with few cores (<= 6 logical) the
+        // spin of a waiting queue took a core from the game's threads and the draw thread, so the
+        // backoff below gives up its time slice at once instead of pausing first. With a core to
+        // spare yield returns at once anyway.
+        static const bool cp_yield_few_cores = [] {
+            const char* v = std::getenv("SOTC_CP_YIELD");
+            return (!v || std::atoi(v) != 0) && std::thread::hardware_concurrency() <= 6;
+        }();
+
+        // sotc: BbToggle::CpPollBackoff. A packet that waits (WaitRegMem, MemSemaphore, Rewind)
+        // yields and is polled again on the next visit, so a queue that waits used to spin this
+        // loop at full speed, taking queue.m_access every time. Count the iterations in a row
+        // that made no progress (a command ran, a task finished or reached a new wait); once a
+        // whole pass over the mapped queues made none, back off once per pass: first a few
+        // pauses, then a thread yield, and after 500 us of stall a short wait on submit_cv
+        // (woken by a new submit or command; the condition itself is changed by other threads
+        // without a notification, so the wait is capped at 100 us, which Windows rounds up to its
+        // timer resolution). Packets are polled exactly as before, only less often.
+        u32 stalled = 0;
+        u64 stall_since_ns = 0;
+        const auto progress = [&] {
+            stalled = 0;
+            stall_since_ns = 0;
+        };
+        const auto no_progress = [&] {
+            if (BbToggle::Disabled(BbToggle::CpPollBackoff)) {
+                return;
+            }
+            const u32 queues = std::max(num_mapped_queues, 1u);
+            if (++stalled < queues || stalled % queues != 0) {
+                return;
+            }
+            if (stalled / queues <= 32) {
+                if (cp_yield_few_cores) {
+                    std::this_thread::yield();
+                    return;
+                }
+                for (u32 i = 0; i < 16; ++i) {
+                    CpuRelax();
+                }
+                return;
+            }
+            const u64 now_ns = SotcStats::NowNs();
+            if (stall_since_ns == 0) {
+                stall_since_ns = now_ns;
+            }
+            if (now_ns - stall_since_ns < 500'000) {
+                std::this_thread::yield();
+                return;
+            }
+            const u32 submits = num_submits.load(std::memory_order_relaxed);
+            std::unique_lock lk{submit_mutex};
+            submit_cv.wait_for(lk, std::chrono::microseconds(100), [&] {
+                return num_ordered || (num_commands && !back_threaded) || num_submits != submits;
+            });
+        };
 
         // sotc: no-progress tracking, for the SOTC_FPS spin accounting and SOTC_CP_IDLE_US.
         // A resume made progress when it finished its task, left a wait loop (cp_wait_exits) or
@@ -4164,10 +4629,8 @@ void Liverpool::Process(std::stop_token stoken) {
         };
 
         while (num_submits || (num_commands && !back_threaded) || num_ordered) {
-            if (num_commands && !back_threaded) {
-                since_progress = 0;
-            }
-            if (track && ((num_commands && !back_threaded) || num_ordered)) {
+            const bool had_commands = num_ordered || (num_commands && !back_threaded);
+            if (track && had_commands) {
                 end_streak(); // the commands are progress (and may be what a task waits for)
             }
             ProcessCommands();
@@ -4207,7 +4670,7 @@ void Liverpool::Process(std::stop_token stoken) {
                             SotcTrace::Span("cp idle", sleep_start, mark_ns, notified);
                         }
                         streak_resumes = 0;
-                        since_progress = 0;
+                        progress(); // sotc: CpPollBackoff starts over after the sleep
                         // After a notification the full spin window runs again (the condition
                         // probably just changed); after a timeout one round re-tests the waits
                         // the guest CPU writes, then the thread sleeps again.
@@ -4232,7 +4695,7 @@ void Liverpool::Process(std::stop_token stoken) {
                         const bool notified = CpRoundSleep(round_epoch);
                         mark_ns = SotcStats::NowNs();
                         streak_resumes = 0;
-                        since_progress = 0;
+                        progress(); // sotc: CpPollBackoff starts over after the sleep
                         // sotc: a run of 1 s without progress is logged (then at 2, 4, 8 s ...) with what the CP
                         // waits on: the last WAIT_REG_MEM of the streak and the state of its possible writers.
                         if (const u64 run = mark_ns - sleep_run_start;
@@ -4260,8 +4723,6 @@ void Liverpool::Process(std::stop_token stoken) {
             }
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
-            ++since_progress;
-
             auto& queue = mapped_queues[curr_qid];
 
             // sotc: skip the lock entirely for a queue that almost certainly has nothing queued
@@ -4274,6 +4735,11 @@ void Liverpool::Process(std::stop_token stoken) {
             {
                 std::scoped_lock lock{queue.m_access};
                 if (queue.submits.empty()) {
+                    if (had_commands) {
+                        progress();
+                    } else {
+                        no_progress();
+                    }
                     continue;
                 }
                 task = queue.submits.front();
@@ -4285,13 +4751,14 @@ void Liverpool::Process(std::stop_token stoken) {
                 mark_ns = SotcStats::NowNs();
             }
             const u64 exits_before = cp_wait_exits;
+            cp_progress = false; // sotc: CpPollBackoff (set by YIELD_WAIT)
             task.resume();
             if (track) {
                 void* const resumed = task.done() ? nullptr : task.address();
-                const bool progress = !resumed || cp_wait_exits != exits_before ||
+                const bool made_progress = !resumed || cp_wait_exits != exits_before ||
                                       resumed != last_resumed[curr_qid];
                 last_resumed[curr_qid] = resumed;
-                if (progress) {
+                if (made_progress) {
                     if ((SotcStats::kFpsLog || SotcTrace::kOn) && cp_timed) {
                         const u64 parse_ns = SotcStats::NowNs() - mark_ns;
                         if (SotcStats::kFpsLog) { // sotc: the sums are SOTC_FPS only
@@ -4339,17 +4806,13 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
             }
 
-            if (!task.done()) {
-                // sotc: every YIELD sits in a wait loop (WaitRegMem, MemSemaphore, Rewind, the
-                // CE/DE counters, or a child buffer's wait). When a whole round over the mapped
-                // queues finishes no task and runs no command, the thread gives up its time slice
-                // instead of spinning.
-                if (since_progress >= num_mapped_queues) {
-                    since_progress = 0;
-                    std::this_thread::yield();
-                }
+            // sotc: a left wait loop (cp_wait_exits: SOTC_CP_LABEL_SKIP) is progress too.
+            if (had_commands || cp_progress || task.done() || cp_wait_exits != exits_before) {
+                progress();
             } else {
-                since_progress = 0;
+                no_progress();
+            }
+            if (task.done()) {
                 task.destroy();
 
                 {
@@ -4721,9 +5184,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             // sotc: SOTC_DRAW_RUNS (sotc_draw_runs.h): any packet but an indirect draw or a NOP ends a run.
             SotcDrawRuns::NotePacket(opcode == PM4ItOpcode::DrawIndexIndirect, opcode == PM4ItOpcode::Nop);
+            if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+                SotcOps::CpPacket(static_cast<u32>(opcode), count + 1, false);
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+                if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+                    SotcOps::CpNop(count + 1, nop->header.count.Value() == 0
+                                                  ? 0xFFFFFFFFu
+                                                  : static_cast<u32>(nop->data_block[0]));
+                }
                 if (nop->header.count.Value() == 0) {
                     break;
                 }
@@ -4950,7 +5421,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 rasterizer->ScopeMarker("gfx:{}:DrawIndex2", fmt::make_format_args(cmd_address),
-                                        [&] { SubmitDraw(true, 0); });
+                                        [&] {
+                                            SubmitDraw(true, 0);
+                                        });
                 break;
             }
             case PM4ItOpcode::DrawIndexOffset2: {
@@ -4971,7 +5444,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 rasterizer->ScopeMarker(
                     "gfx:{}:DrawIndexOffset2", fmt::make_format_args(cmd_address),
-                    [&] { SubmitDraw(true, draw_index_off->index_offset); });
+                    [&] {
+                        SubmitDraw(true, draw_index_off->index_offset);
+                    });
                 break;
             }
             case PM4ItOpcode::DrawIndexAuto: {
@@ -4988,7 +5463,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 rasterizer->ScopeMarker("gfx:{}:DrawIndexAuto", fmt::make_format_args(cmd_address),
-                                        [&] { SubmitDraw(false, 0); });
+                                        [&] {
+                                            SubmitDraw(false, 0);
+                                        });
                 break;
             }
             case PM4ItOpcode::DrawIndirect: {
@@ -5128,7 +5605,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                              : std::span<const u32>{});
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 rasterizer->ScopeMarker("gfx:{}:DispatchDirect", fmt::make_format_args(cmd_address),
-                                        [&] { SubmitDispatch(false, 0, 0, 0); });
+                                        [&] {
+                                            SubmitDispatch(false, 0, 0, 0);
+                                        });
                 break;
             }
             case PM4ItOpcode::DispatchIndirect: {
@@ -5149,7 +5628,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 rasterizer->ScopeMarker(
                     "gfx:{}:DispatchIndirect", fmt::make_format_args(cmd_address),
-                    [&] { SubmitDispatch(true, indirect_args_addr, offset, size); });
+                    [&] {
+                        SubmitDispatch(true, indirect_args_addr, offset, size);
+                    });
                 break;
             }
             case PM4ItOpcode::NumInstances: {
@@ -5644,9 +6125,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    bool first_poll = true;
                     while (!mem_semaphore->Signaled()) {
                         cp_wait_kind = CpWaitOther; // sotc: SOTC_FPS CP spin accounting
-                        YIELD_GFX();
+                        YIELD_WAIT_GFX(first_poll);
                     }
                     ++cp_wait_exits; // sotc: progress marker (Process)
                     mem_semaphore->Decrement();
@@ -5663,9 +6145,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                bool first_poll = true;
                 while (!rewind->Valid()) {
                     cp_wait_kind = CpWaitOther; // sotc: SOTC_FPS CP spin accounting
-                    YIELD_GFX();
+                    YIELD_WAIT_GFX(first_poll);
                 }
                 ++cp_wait_exits; // sotc: progress marker (Process)
                 break;
@@ -5696,6 +6179,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // sotc: SOTC_CMD_COUNTERS: this wait's rounds and wall time by label (observe only).
                 SotcCmdCounters::SpinScope spin_scope{reinterpret_cast<uint64_t>(wait_addr)};
                 bool ring8_flushed = false; // sotc: SOTC_PC_RING8_LABELS, this wait
+                bool first_poll = true; // sotc: CpPollBackoff (YIELD_WAIT_GFX)
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     // sotc: SOTC_PC_RING8_LABELS: a wait on a deferred label that has not landed
                     // submits the open buffer and makes the draw thread land what the GPU finished.
@@ -5718,7 +6202,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     spin_scope.Round(); // sotc: SOTC_CMD_COUNTERS
                     g_cp_last_wait = wait_reg_mem; // sotc: SOTC_CP_LABEL_SLEEP long-run log
                     g_cp_last_wait_q = GfxQueueId;
-                    YIELD_GFX();
+                    YIELD_WAIT_GFX(first_poll);
                 }
                 ++cp_wait_exits; // sotc: progress marker (Process)
                 break;
@@ -5852,6 +6336,33 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     FIBER_EXIT;
 }
 
+// sotc: the compute queue's read pointer lives in guest memory and the command processor moved it
+// with plain stores. When the page was write-protected by the GPU page tracking and protected
+// again before the store retried, the store faulted forever (SOTC FAULT LOOP: 4096+ writes at the
+// read pointer from ProcessCompute, 9 Nov): the compute queue stopped and the game froze on the
+// same frame while flips went on. It is now written as fence values are (WriteFenceValue): the
+// GPU copy of those bytes invalidated, then the backing written directly, which no protection
+// stops. SOTC_RPTR_BACKING=0: plain stores.
+void Liverpool::AdvanceReadPointer(u32* read_addr, u32 dwords, u32 ring_size_dw) {
+    static const bool backing = [] {
+        const char* v = std::getenv("SOTC_RPTR_BACKING");
+        return !v || v[0] != '0';
+    }();
+    auto* memory = Core::Memory::Instance();
+    u32 value;
+    if (!backing || !memory->TryReadBacking(reinterpret_cast<VAddr>(read_addr), &value, 4)) {
+        *read_addr = (*read_addr + dwords) % ring_size_dw;
+        return;
+    }
+    value = (value + dwords) % ring_size_dw;
+    if (rasterizer) {
+        rasterizer->InvalidateMemory(reinterpret_cast<VAddr>(read_addr), 4, true);
+    }
+    if (!memory->TryWriteBacking(read_addr, &value, 4, 2)) {
+        *read_addr = value;
+    }
+}
+
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
@@ -5911,8 +6422,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
                 if (asc_rptr_mode != 2) { // sotc: SOTC_ASC_RPTR=2 moved it at the doorbell
-                    *queue.read_addr += acb.size();
-                    *queue.read_addr %= queue.ring_size_dw;
+                    AdvanceReadPointer(queue.read_addr, acb.size(), queue.ring_size_dw);
                     NoteAscRptr(vqid, queue);
                 }
             }
@@ -5925,8 +6435,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
                 if (asc_rptr_mode != 2) { // sotc: SOTC_ASC_RPTR=2 moved it at the doorbell
-                    *queue.read_addr += next_dw_off;
-                    *queue.read_addr %= queue.ring_size_dw;
+                    AdvanceReadPointer(queue.read_addr, next_dw_off, queue.ring_size_dw);
                     NoteAscRptr(vqid, queue);
                 }
             }
@@ -5943,6 +6452,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+            SotcOps::CpPacket(static_cast<u32>(opcode), header->type3.NumWords() + 1, true);
+        }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -5965,8 +6477,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             // its waits.
             if constexpr (!is_indirect) {
                 if (asc_rptr_mode == 1) {
-                    *queue.read_addr += next_dw_off;
-                    *queue.read_addr %= queue.ring_size_dw;
+                    AdvanceReadPointer(queue.read_addr, next_dw_off, queue.ring_size_dw);
                     rptr_moved = true;
                     NoteAscRptr(vqid, queue);
                 }
@@ -6047,9 +6558,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            bool first_poll = true;
             while (!rewind->Valid()) {
                 cp_wait_kind = CpWaitOther; // sotc: SOTC_FPS CP spin accounting
-                YIELD_ASC(vqid);
+                YIELD_WAIT_ASC(vqid, first_poll);
             }
             ++cp_wait_exits; // sotc: progress marker (Process)
             break;
@@ -6159,9 +6671,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                bool first_poll = true;
                 while (!mem_semaphore->Signaled()) {
                     cp_wait_kind = CpWaitOther; // sotc: SOTC_FPS CP spin accounting
-                    YIELD_ASC(vqid);
+                    YIELD_WAIT_ASC(vqid, first_poll);
                 }
                 ++cp_wait_exits; // sotc: progress marker (Process)
                 mem_semaphore->Decrement();
@@ -6182,6 +6695,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             bool ring8_flushed = false; // sotc: SOTC_LABELS_HONEST, this wait (as in the graphics wait)
+            bool first_poll = true; // sotc: CpPollBackoff (YIELD_WAIT_ASC)
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 // sotc: SOTC_LABELS_HONEST: a wait on a deferred label submits the open buffer once and
                 // makes the draw thread land what the GPU finished (Ring8CpWaitStep). Without it a compute
@@ -6206,7 +6720,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 }
                 g_cp_last_wait = wait_reg_mem; // sotc: SOTC_CP_LABEL_SLEEP long-run log
                 g_cp_last_wait_q = vqid + 1;   // the mapped queue (0 is graphics)
-                YIELD_ASC(vqid);
+                YIELD_WAIT_ASC(vqid, first_poll);
             }
             ++cp_wait_exits; // sotc: progress marker (Process)
             break;
@@ -6355,8 +6869,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         if constexpr (!is_indirect) {
             if (!rptr_moved && asc_rptr_mode != 2) { // sotc: SOTC_ASC_RPTR
-                *queue.read_addr += next_dw_off;
-                *queue.read_addr %= queue.ring_size_dw;
+                AdvanceReadPointer(queue.read_addr, next_dw_off, queue.ring_size_dw);
                 NoteAscRptr(vqid, queue);
             }
         }

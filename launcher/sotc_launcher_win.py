@@ -49,7 +49,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.72.2'
+VERSION = '0.74'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -170,16 +170,16 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'fps_dynamic': True, 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': False, 'skip_logos': True, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'fx_motionblur': False, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'vram_profile': 'auto', 'gpu_vram_mb': 0, 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True,
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True, 'fg_mult': '2',
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
-                'dlss_compare': False, 'hdr': False,
+                'dlss_compare': False, 'hdr_sdr': False,
                 'check_updates': True, 'skip_version': '', 'play_mode': 'custom', 'exit_backup': True, 'news_seen': '', 'expert_view': False, 'windows_title_bar': False, 'game_monitor': '', 'minimize_to_tray': False}
 # The tuning switches of the streaming-stutter work, each at the build's default (sotc_tuning.py).
 APP_DEFAULTS.update(sotc_tuning.defaults())
@@ -194,6 +194,8 @@ DEFAULT_UPGRADES = [
     # fast GPU readbacks (rb_hot) on here; this fork keeps them off by default (load_settings).
     ('0.72', {'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1',
               'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1'}),
+    # Dynamic FPS in the 60 FPS mode (a steady step below 60 when the game cannot keep it).
+    ('0.73', {'fps_dynamic': True}),
 ]
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
@@ -383,13 +385,20 @@ FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
             ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
             ('fsr', ('AMD FSR 3 (qualquer placa)', 'AMD FSR 3 (any GPU)'))]
+# DLSS-G multi frame generation (SOTC_DLSSG_FRAMES / SOTC_DLSSG_MODE, Lucas-blip-png #314): the
+# card's limit applies (RTX 40: 2x).
+FG_MULT = [('2', ('2x (padrão)', '2x (default)')), ('3', ('3x (RTX 50)', '3x (RTX 50)')),
+           ('4', ('4x (RTX 50)', '4x (RTX 50)')), ('6', ('6x (RTX 50)', '6x (RTX 50)')),
+           ('dynamic', ('Dinâmico (se o driver suportar; senão 6x)', 'Dynamic (if the driver supports it; else 6x)'))]
 # DLSS super resolution (bb-probe: SOTC_UPSCALER=dlss): the game renders at the output size
-# divided by the mode's factor and DLSS picks its mode from that ratio (vk_dlssg.cpp).
-DLSS_MODES = [('quality', ('Qualidade (1,5×)', 'Quality (1.5×)')),
+# divided by the mode's factor and DLSS picks its mode from that ratio (vk_dlssg.cpp: DLAA at 1:1,
+# DLAA mode from tabnul's fork PR #112).
+DLSS_MODES = [('dlaa', ('DLAA (nativo)', 'DLAA (native)')),
+              ('quality', ('Qualidade (1,5×)', 'Quality (1.5×)')),
               ('balanced', ('Equilibrado (1,72×)', 'Balanced (1.72×)')),
               ('performance', ('Desempenho (2×)', 'Performance (2×)')),
               ('ultra', ('Ultra Desempenho (3×)', 'Ultra Performance (3×)'))]
-DLSS_FACTORS = {'quality': 1.5, 'balanced': 1.724, 'performance': 2.0, 'ultra': 3.0}
+DLSS_FACTORS = {'dlaa': 1.0, 'quality': 1.5, 'balanced': 1.724, 'performance': 2.0, 'ultra': 3.0}
 # RCAS after DLSS (SOTC_DLSS_SHARPEN, attenuation in stops: 0 = sharpest).
 DLSS_SHARPNESS = [('0', ('Alta (padrão)', 'High (default)')), ('0.5', ('Média', 'Medium')), ('1', ('Baixa', 'Low')),
                   ('off', ('Desligada', 'Off'))]
@@ -778,6 +787,24 @@ def monitors():
             for device, w, h, centre, primary in found]
 
 
+def screen_refresh_hz():
+    """The primary screen's refresh rate (60 when unknown)."""
+    class DEVMODEW(ctypes.Structure):
+        _fields_ = [('name', ctypes.c_wchar * 32), ('spec', ctypes.c_ushort), ('driver', ctypes.c_ushort),
+                    ('size', ctypes.c_ushort), ('extra', ctypes.c_ushort), ('fields', ctypes.c_ulong),
+                    ('pos', ctypes.c_byte * 16), ('color', ctypes.c_short * 5), ('form', ctypes.c_wchar * 32),
+                    ('logpixels', ctypes.c_ushort), ('bpp', ctypes.c_ulong), ('width', ctypes.c_ulong),
+                    ('height', ctypes.c_ulong), ('flags', ctypes.c_ulong), ('hz', ctypes.c_ulong)]
+    try:
+        mode = DEVMODEW()
+        mode.size = ctypes.sizeof(DEVMODEW)
+        if ctypes.windll.user32.EnumDisplaySettingsW(None, -1, ctypes.byref(mode)) and mode.hz > 1:
+            return int(mode.hz)
+    except (AttributeError, OSError):
+        pass
+    return 60
+
+
 def game_environment(s):
     env = dict(os.environ)
     info = game_info(s['game_dir'])
@@ -804,9 +831,18 @@ def game_environment(s):
     # At this resolution the grass overflows the game's grass buffers: the farthest grass then pops
     # in and out in patches, in a band ahead with longer grass distances. grassbuf makes them 4x larger.
     modes.append('grassbuf')
+    if s.get('hdr'):
+        modes.append('hdr')
     env['SOTC_MODES'] = ','.join(modes)
     env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
+    # sotc: 0.73 dynamic FPS (videoout driver.cpp, SOTC_FPS_DYNAMIC): with the 60 FPS limit, frames
+    # that cannot keep 60 lower it to a step that divides the screen's refresh (48 at 144 Hz, 40 at
+    # 120/240 Hz, 30 at 60 Hz), steady instead of swinging; it tries 60 again every 10 s.
+    if fps_mode == '60' and s.get('fps_dynamic', True):
+        hz = screen_refresh_hz()
+        step = 48 if hz % 48 == 0 else 40 if hz % 40 == 0 else 45 if hz % 45 == 0 else 30
+        env.setdefault('SOTC_FPS_DYNAMIC', str(step))
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     # The monitor the game window opens on (window.cpp): the centre of the chosen one, found again now
@@ -844,6 +880,8 @@ def game_environment(s):
         # no intro film and no title screen, the game goes straight in (user, 26 Oct).
         cvars.append('nointro')
     cvars += str(s.get('engine_cvars', '')).split()
+    # Tools (tools/sotc_route.py --boss) add cvars for one run without editing the settings.
+    cvars += os.environ.get('SOTC_EXTRA_CVARS', '').split()
     env['SOTC_CVARS'] = ' '.join(cvars)
     # Multipliers for the grass shaders' view distances and blade height (vk_rasterizer.cpp).
     env['SOTC_GRASS'] = ' '.join(str(s.get(k) or '1') for k in
@@ -875,6 +913,12 @@ def game_environment(s):
     env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
     if s.get('fg_hudless'):  # Lucas-blip-png's option (#206, #210)
         env['SOTC_FG_HUDLESS'] = '1'
+    fg_mult = str(s.get('fg_mult') or '2')  # DLSS-G multiplier (#314)
+    if fg_mult == 'dynamic':
+        env['SOTC_DLSSG_MODE'] = 'dynamic'
+        env['SOTC_DLSSG_FRAMES'] = '5'  # the most the card allows; Streamline picks the number
+    elif fg_mult in ('3', '4', '6'):
+        env['SOTC_DLSSG_FRAMES'] = str(int(fg_mult) - 1)
     # sotc: high quality textures: the texture banks sampled since the last report read as sampled
     # (sotc_lod_stats.h; before, none ever did and the game never streamed its fine mips: blurry
     # leaves and rocks). Off: the old behaviour, for cards short of video memory.
@@ -886,17 +930,20 @@ def game_environment(s):
         # the measured mips, finer mips (High 1, Maximum 0, both were 2) and, on Maximum, banks
         # kept sampled for 3 s (they had exhausted the pool, 0x1a371).
         env.setdefault('SOTC_LOD_FEEDBACK', '1')
-        # sotc: 0.72.2: the finer mips (High 1, Maximum 0) and Maximum's 3 s linger without the
-        # page pool switch brought back the hard FPS drop at area changes that 0.70 had removed:
-        # texture copies of up to 1.1 GB in one frame, worst frames 134-293 ms at the forest
-        # entrance (5 Nov). Mip 1 alone dropped as hard; mip 2 with the 1-tick linger and the
-        # switch (as in 0.71) was "much smoother, 2-3 FPS for 2 s". Both qualities stay at mip 2
-        # (sotc_lod_stats.h default); SOTC_LOD_LEVEL / SOTC_LOD_LINGER / SOTC_LOD_POOL_LOW in the
-        # extra variables still choose otherwise.
-    # sotc: the heap guard's two shortcuts, off since 0.70 for the 0x49800 crash, which came from
-    # the same double free: on again (tested with the above).
-    env.setdefault('SOTC_GUARD_STALE', '1')
-    env.setdefault('SOTC_GUARD_USER_POINTER', '1')
+        # sotc: 0.72.2 had put both qualities back at mip 2: the finer mips with Maximum's 3 s
+        # linger and no page pool switch copied up to 1.1 GB of textures in a frame at the forest
+        # entrance (5 Nov). That left Maximum (the Extreme mode) blurry. Now the finer mips are
+        # back (High 1, Maximum 0, light profile Maximum 1 / High 2), without the 3 s linger and
+        # with the pool switch: the copies go through the GPU (SOTC_TEX_DIRECT) and the area
+        # change fixes since then (T48). SOTC_LOD_LEVEL / _LINGER / _POOL_LOW still override.
+        if light:
+            env.setdefault('SOTC_LOD_LEVEL', '1' if textures == 'max' else '2')
+        else:
+            env.setdefault('SOTC_LOD_LEVEL', '0' if textures == 'max' else '1')
+    # sotc: the heap guard's two shortcuts (SOTC_GUARD_STALE, SOTC_GUARD_USER_POINTER) stay off
+    # again (0.73): on since 0.72, they spoilt the game's heap at the ending (objects found cleared
+    # at 0x144c60 / 0x14cce7 / 0x564d24, the allocator at 0x499cc, 9 Nov), as T49 had suspected for
+    # 0x49800; with them off the ending and the intro skip went through with nothing to repair.
     # sotc: 0.72.2 (T51): at the end of the game the game returns page pool pages under textures
     # it goes on drawing; a refresh then uploaded another texture's bytes into them (stretched
     # textures, flicker, the close between the ending and the intro). Two clean ending runs.
@@ -941,7 +988,8 @@ def game_environment(s):
         env['SOTC_DLSS_SKY_SHARPEN'] = str(s.get('dlss_sky_sharpen') or '2')
         if s.get('dlss_compare'):
             env['SOTC_DLSS_COMPARE'] = '1'
-    if s.get('hdr'):
+    # Upstream's SDR-to-HDR10 output (post_process.frag hdr 2); 'hdr' is the game's own HDR rendering.
+    if s.get('hdr_sdr'):
         env['SOTC_HDR'] = '1'
     if s.get('sharpness') == 'off':
         env['BB_RCAS'] = '0'
@@ -951,11 +999,11 @@ def game_environment(s):
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
-    # Hot readbacks (buffer_cache.cpp GatherDownloads): off by default (rainbow garbage and
-    # crashes on reused memory). Checked: mode 2, the measured one (attract demo ~57 / 40 FPS
-    # against 54.8 / 36.4).
-    if s.get('rb_hot'):
-        env['SOTC_RB_HOT'] = '2'
+    # Hot readbacks (buffer_cache.cpp GatherDownloads): off by default in this fork (rainbow garbage
+    # and crashes on reused memory; upstream turns them on since 0.72). Checked: mode 2, the measured
+    # one (attract demo ~57 / 40 FPS against 54.8 / 36.4). Always written, so a GPU-side default
+    # cannot turn them on behind the launcher's back.
+    env['SOTC_RB_HOT'] = '2' if s.get('rb_hot') else '0'
     # Bluepoint's debug menu (+RetailBuild=0 served by the port; the game files are not touched).
     if s.get('debug_menu'):
         env['SOTC_DEBUG_MENU'] = '1'
@@ -981,12 +1029,14 @@ def game_environment(s):
 
 
 def dlss_render(output, mode):
-    """The render size for DLSS mode at output WxH: multiples of 8, at least 640x360 (sotc.py still
-    caps it at 1080 lines). The exact aspect when a size within 6% of the factor has it: the
+    """The render size for DLSS mode at output WxH: multiples of 8, at least 640x360 (DLAA: the
+    output size). The exact aspect when a size within 6% of the factor has it: the
     presenter keeps the render's aspect, so 2552x1064 for 3840x1600 gave a 3838 wide output."""
     try:
         w, h = map(int, output.split('x'))
     except ValueError:
+        return output
+    if mode == 'dlaa':
         return output
     target = h / DLSS_FACTORS.get(mode, 1.5)
     exact = [rh for rh in range(360, h + 1, 8) if rh * w % (h * 8) == 0 and abs(rh - target) <= target * 0.06]
@@ -1528,6 +1578,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(quick, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(quick, 'sharpness', SHARPNESS, 24))
         self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
+        self.check(quick, 'fps_dynamic', _('FPS dinâmico (no modo 60)', 'Dynamic FPS (60 FPS mode)'),
+                   _('Quando o jogo não segura 60, trava num degrau estável que combina com a tela (48 em 144 Hz, '
+                     '40 em 120 Hz, 30 em 60 Hz) em vez de oscilar, e volta a 60 quando sobra folga.',
+                     'When the game cannot keep 60 it locks to a steady step that suits the screen (48 at '
+                     '144 Hz, 40 at 120 Hz, 30 at 60 Hz) instead of swinging, and goes back to 60 when it can.'))
         self.row(quick, _('Texturas', 'Textures'), self.choice(quick, 'textures', TEXTURES, 24))
         self.row(quick, _('Memória da placa', 'Card memory'), self.choice(quick, 'vram_profile', VRAM_PROFILES, 24))
         self.vram_profile_hint = ttk.Label(quick, text='', style='Muted.TLabel', wraplength=self.px(300),
@@ -1536,11 +1591,12 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.var('vram_profile').trace_add('write', lambda *_a: self.show_vram_profile_hint())
         self.show_vram_profile_hint()
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
+        self.check(quick, 'hdr', _('HDR (HDR do Windows ligado)', 'HDR (Windows HDR on)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
         self.check(quick, 'rb_hot', _('Mais FPS: leituras rápidas da GPU',
                                       'More FPS: fast GPU readbacks'))
-        for key in ('af16', 'textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
+        for key in ('af16', 'textures', 'fps_mode', 'hdr', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
         self.applying_mode = False
         self.var('play_mode').trace_add('write', lambda *_a: self.apply_play_mode())
@@ -1702,6 +1758,9 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(f, _('Idioma do sistema', 'System language'), self.choice(f, 'language', LANGUAGES),
                  _('O idioma que o jogo vê no "console".', 'The language the game sees on the "console".'))
         self.row(f, _('Nome do jogador', 'Player name'), ttk.Entry(f, textvariable=self.var('player_name'), width=30))
+        self.check(f, 'skip_logos', _('Pular os logotipos de abertura', 'Skip the opening logos'),
+                   _('O jogo abre direto no menu, sem os logotipos de abertura e o aviso de salvamento automático.',
+                     'The game opens straight to the menu, without the opening logos and the autosave notice.'))
 
     def build_graphics(self):
         f = self.scrolled_page('graphics', _('Imagem e FPS', 'Display & FPS'),
@@ -1733,7 +1792,25 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                    'the GPU has it, else FSR 3. Experimental: it only matters with the 60 FPS mode off, and the '
                    'health and stamina bars may shake (the generated frame includes the interface). '
                    'In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
-                   'screen at 60 or 120 Hz, or G-SYNC/FreeSync.'))
+                   'screen at 60 or 120 Hz, or G-SYNC/FreeSync.') + ' ' +
+                 _('FSR 3 é experimental: numa RTX 3060 a taxa real do jogo caiu (24-30 FPS em vez de 40-50), '
+                   'com mais travadas e falhas na imagem. DLSS-G só funciona nas RTX 40/50: nas outras placas '
+                   'ela fica desligada e o F8 passa para FSR 3.',
+                   "FSR 3 is experimental: on an RTX 3060 the game's real frame rate dropped (24-30 FPS instead of "
+                   '40-50), with more stutter and image glitches. DLSS-G only works on RTX 40/50: on other cards '
+                   'it stays off and F8 switches to FSR 3.'))
+        self.row(f, _('Multiplicador do DLSS-G', 'DLSS-G multiplier'), self.choice(f, 'fg_mult', FG_MULT),
+                 _('Só vale com a geração de quadros em DLSS-G. 2x é uma imagem gerada por imagem do jogo; 3x, 4x e '
+                   '6x geram 2, 3 ou 5 (NVIDIA RTX 50; na RTX 40 vale 2x). Dinâmico escolhe sozinho para chegar à '
+                   'taxa da tela (só se o driver suportar; senão vale 6x) e não funciona com limitador de FPS '
+                   'nem V-Sync. Experimental: mais quadros gerados aumentam a latência.',
+                   'Only with frame generation set to DLSS-G. 2x is one generated frame per game frame; 3x, 4x '
+                   'and 6x generate 2, 3 or 5 (NVIDIA RTX 50; RTX 40 stays at 2x). Dynamic picks the number to '
+                   "reach the screen's refresh rate (only if the driver supports it; else it is 6x) and does "
+                   'not work with a frame limiter or V-Sync. Experimental: more generated frames mean more latency.'))
+        self.check(f, 'hdr', _('HDR', 'HDR'),
+                   _('Saída HDR10 e a renderização HDR do jogo. Ligue o HDR do Windows antes de jogar.',
+                     'HDR10 output and the game\'s HDR rendering. Turn on Windows HDR before playing.'))
         self.check(f, 'fg_hudless', _('Geração de quadros sem a interface (experimental)',
                                       'Frame generation without the interface (experimental)'),
                    _('Gera os quadros intermediários só com a cena e põe a interface por cima, sem interpolá-la: '
@@ -1767,10 +1844,10 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                        'or the files, FSR 1 enlarges the same smaller image. The settings below apply to both.'),
                   top=2)
         self.row(f, _('Modo', 'Mode'), self.choice(f, 'dlss_mode', DLSS_MODES),
-                 _('Fator entre a saída e o tamanho renderizado. O jogo renderiza no máximo 1080 linhas: '
-                   'acima de 1620p (Qualidade) ou 1860p (Equilibrado) o DLSS amplia mais que o fator.',
-                   'Factor between the output and the render size. The game renders at most 1080 lines: '
-                   'above 1620p (Quality) or 1860p (Balanced) DLSS enlarges more than the factor.'))
+                 _('Fator entre a saída e o tamanho renderizado. DLAA: tamanho nativo com o anti-aliasing do '
+                   'DLSS (mais pesado, usa mais memória de vídeo; sem memória bastante, volta ao FSR 1).',
+                   'Factor between the output and the render size. DLAA: native size with DLSS anti-aliasing '
+                   '(heavier, uses more video memory; without enough of it, back to FSR 1).'))
         self.row(f, _('Nitidez da cena', 'Scene sharpening'), self.choice(f, 'dlss_sharpen', DLSS_SHARPNESS))
         self.row(f, _('Nitidez do texto', 'Text sharpening'), self.choice(f, 'dlss_ui_sharpen', DLSS_UI_SHARPNESS))
         self.row(f, _('Nitidez do céu', 'Sky sharpening'), self.choice(f, 'dlss_sky_sharpen', DLSS_SKY_SHARPNESS))
@@ -1797,11 +1874,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                                      'Full water reflections (direct memory access)'),
                    _('Deixa os shaders lerem tabelas da memória do jogo direto (como o Pink-shadPS4): o lago ondula '
                      'e reflete até longe. Desligado ganha ~10% de FPS, mas a água longe fica mais lisa. '
-                     'Ao trocar, os shaders são compilados de novo na primeira vez. Em placas AMD fica '
+                     'Ao trocar, os shaders são compilados de novo na primeira vez. Em placas AMD e Intel fica '
                      'desligado (desenhava listras nas sombras e na água).',
                      'Lets shaders read tables straight from game memory (as Pink-shadPS4 does): the lake ripples '
                      'and reflects far away. Off gains ~10% FPS, but distant water is flatter. After a change '
-                     'the shaders are compiled again the first time. Off on AMD cards (it drew stripes over '
+                     'the shaders are compiled again the first time. Off on AMD and Intel cards (it drew stripes over '
                      'shadows and water).'))
         self.row(f, _('Envio de trabalho à GPU', 'GPU work submission'), self.choice(f, 'gpu_submit', GPU_SUBMIT),
                  _('Manda trabalho à GPU a cada 0,5 ms e lê resultados por um atalho (técnicas do Pink-shadPS4). '
@@ -1879,7 +1956,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                        'Which monitor the game window opens on (fullscreen too). Applies the next time the game starts.'))
         self.check(f, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.row(f, _('Apresentação', 'Presentation'), self.choice(f, 'present_mode', PRESENT_MODES))
-        self.check(f, 'hdr', _('HDR (experimental)', 'HDR (experimental)'),
+        self.check(f, 'hdr_sdr', _('HDR da imagem SDR (experimental)', 'HDR from the SDR image (experimental)'),
                    _('Saída HDR10 a partir da imagem do jogo. Precisa de HDR ligado no Windows e de um monitor '
                      'HDR; sem isso nada muda. Ajustes: SOTC_HDR_PAPER e SOTC_HDR_GAIN em "Variáveis extras".',
                      'HDR10 output from the game image. Needs HDR on in Windows and an HDR monitor; otherwise '
@@ -2175,6 +2252,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                           'fsr': 'FSR 3'}.get(framegen, framegen))
         if self.var('af16').get():
             parts.append(_('AF 16x', '16x AF'))
+        if self.var('hdr').get():
+            parts.append('HDR')
         if self.var('neo').get():
             parts.append('PS4 Pro' if not is_wide(self.var('output_res').get())
                          else _('PS4 Pro desligado (tela larga)', 'PS4 Pro off (wide screen)'))
@@ -3335,6 +3414,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                                                                   'Choose the game folder with eboot.bin (CUSA08809 or CUSA08034).'))
             self.show('game')
             return
+        free = free_commit_gb()
+        if free is not None and free < MIN_FREE_COMMIT_GB and not self.messagebox.askyesno(
+                'Shadow of the Colossus', _('O Windows só tem {:.1f} GB livres para programas (RAM + arquivo de paginação). O jogo reserva cerca de 6 GB ao abrir e precisa de mais alguns GB depois; com menos, ele fecha logo no início (erro 1455 no log).\n\nPara resolver: Iniciar → "Ajustar a aparência e o desempenho do Windows" → Avançado → Memória virtual → Alterar… → marque "Gerenciar automaticamente o tamanho do arquivo de paginação" (ou defina pelo menos 16 GB) e reinicie o PC. Fechar navegadores e outros programas grandes também ajuda.\n\nAbrir o jogo mesmo assim?',
+                                            'Windows has only {:.1f} GB free for programs (RAM + page file). The game reserves about 6 GB when it starts and needs a few GB more after that; with less it closes right at the start (error 1455 in the log).\n\nTo fix it: Start → "Adjust the appearance and performance of Windows" → Advanced → Virtual memory → Change… → tick "Automatically manage paging file size for all drives" (or set at least 16 GB) and restart the PC. Closing browsers and other big programs also helps.\n\nStart the game anyway?').format(free)):
+            return
         self.set_log('')
         try:
             write_key_bindings(self.app.get('keys'))
@@ -3654,6 +3738,29 @@ class GameJob:
         if self.handle:
             ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self.handle))
             self.handle = None
+
+
+def free_commit_gb():
+    """Commit memory Windows can still give programs (RAM + page file), in GB; None if unknown."""
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [('length', ctypes.c_uint32), ('load', ctypes.c_uint32),
+                    ('total_phys', ctypes.c_uint64), ('avail_phys', ctypes.c_uint64),
+                    ('total_commit', ctypes.c_uint64), ('avail_commit', ctypes.c_uint64),
+                    ('total_virtual', ctypes.c_uint64), ('avail_virtual', ctypes.c_uint64),
+                    ('avail_extended', ctypes.c_uint64)]
+    status = MemoryStatus()
+    status.length = ctypes.sizeof(status)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except (AttributeError, OSError):
+        return None
+    return status.avail_commit / 1e9
+
+
+# The guest memory pool (~6 GB, committed at once when the game starts) plus the process itself:
+# below this the game stops at boot with error 1455 (issue #95).
+MIN_FREE_COMMIT_GB = 8.0
 
 
 def play_without_window(settings):

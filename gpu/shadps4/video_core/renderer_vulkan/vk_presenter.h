@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstdlib>
 
 #include "core/emulator_settings.h"
 #include "core/libraries/videoout/buffer.h"
@@ -108,6 +109,9 @@ public:
     void SetHDR(bool enable) {
         if (!IsHDRSupported()) {
             return;
+        }
+        if (const char* white = std::getenv("SOTC_HDR_WHITE"); white && std::atof(white) > 0) {
+            pp_settings.hdr_white = static_cast<float>(std::atof(white));
         }
         if (EmulatorSettings.IsSdrToHdr()) {
             // sotc: the swapchain stays HDR10; an SDR game frame (hdr 2) is expanded by the pp pass.

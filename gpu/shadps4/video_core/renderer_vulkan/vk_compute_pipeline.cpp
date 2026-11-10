@@ -588,6 +588,7 @@ void ComputePipeline::BindWhenReady() const {
                 fast_wait = true; // waiting for a fast build (this one, or a worker's from the Urgent lane)
             }
             ready.wait(false, std::memory_order_acquire);
+            LogSlowBuild("compute wait (recorder)", start);
             const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - start)
                                    .count();

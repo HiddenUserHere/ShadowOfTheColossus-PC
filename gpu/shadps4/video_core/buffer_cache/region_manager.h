@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -449,6 +450,7 @@ public:
         }
         if (raised) {
             sweep_words.fetch_or(raised, std::memory_order_release);
+            BumpCpuGen(raised); // sotc: CPU bits rose (see CpuGenSum)
             Bounds watcher_bounds;
             if (GetWatcherBounds<StateOp::Set, StateOp::None>(full, write_prot, read_prot,
                                                               watcher_bounds)) {
@@ -738,6 +740,7 @@ public:
         if constexpr (cpu_op == StateOp::Set) {
             if (raised) {
                 sweep_words.fetch_or(raised, std::memory_order_release);
+                BumpCpuGen(raised); // sotc: after the bits are set (see CpuGenSum)
             }
         }
         const auto write_op = WriteWatcherOp<cpu_op, gpu_op>(); // sotc: SOTC_PC_RING
@@ -756,6 +759,22 @@ public:
         if constexpr (locked) {
             mutex.unlock();
         }
+    }
+
+    /// sotc: BbToggle::BufferBindMemo. Generation of the CPU bits of the 256 KiB words
+    /// [first_word, first_word + count): the sum of per-word counters, each bumped (release) by
+    /// ChangeRegionState right after bits of that word went 0 -> 1 (and by SetUntrackedMask and
+    /// RetrackDownloadedLocked, the fork's other UpdateStateAndProtection<Set> callers). CPU
+    /// bits rise nowhere else (region creation sets them all, but a region cannot be remembered
+    /// before it exists), so a sum equal to one read before an unlocked "no CPU-modified page"
+    /// look proves the look still
+    /// holds. The counters only grow, so equal sums mean equal counters.
+    u64 CpuGenSum(u64 first_word, u64 count) const noexcept {
+        u64 sum = 0;
+        for (u64 i = first_word; i < first_word + count; ++i) {
+            sum += cpu_word_gen[i].load(std::memory_order_acquire);
+        }
+        return sum;
     }
 
     /// sotc: SOTC_SYNC_PIPE. Returns true only when the unlocked look below found nothing to do: no
@@ -1232,6 +1251,7 @@ private:
             return;
         }
         sweep_words.fetch_or(raised, std::memory_order_release);
+        BumpCpuGen(raised); // sotc: CPU bits rose (see CpuGenSum)
         Bounds watcher_bounds;
         if (GetWatcherBounds<StateOp::Set, StateOp::None>(bounds, write_prot, read_prot,
                                                           watcher_bounds)) {
@@ -1240,6 +1260,12 @@ private:
         }
     }
 
+    std::array<std::atomic<u32>, NUM_REGION_WORDS> cpu_word_gen{}; // sotc: see CpuGenSum
+    void BumpCpuGen(u64 raised_words) noexcept {
+        for (; raised_words; raised_words &= raised_words - 1) {
+            cpu_word_gen[std::countr_zero(raised_words)].fetch_add(1, std::memory_order_release);
+        }
+    }
     void ResetGrace() {
         fault_cur.Fill(0);
         fault_prev.Fill(0);

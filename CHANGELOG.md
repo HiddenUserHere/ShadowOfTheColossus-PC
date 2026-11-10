@@ -210,6 +210,22 @@ quando não diz outra coisa):
 
 </details>
 
+## 0.74 — 2026-11-10
+- **Thread de desenho mais leve: caminhos rápidos do Lukto02 (#308)** para os desenhos só de profundidade e os de G-buffer: quando nenhum registro de renderização, imagem ou estado mudou desde o último desenho, o preparo dos alvos, o início da renderização e o estado dinâmico são reaproveitados (99% de acerto no mapa aberto). Verificação: 0 diferenças em mais de 45 milhões de checagens. Demonstração com texturas Máximas e PS4 Pro: 83,0 → 85,4 FPS, mínimo 62,6 → 66,2; no mapa aberto o jogo fica em 60 FPS 40–50% do tempo (antes 23–32%). Desligáveis pelos bits 28 e 29 de `BB_TOGGLE_FILE`.
+- **Geração de quadros DLSS-G 3x, 4x, 6x e Dinâmica** (Lucas-blip-png, #314): opção "Multiplicador do DLSS-G" no lançador (padrão 2x, como antes); limitada ao que a placa aceita (RTX 50 até 6x, RTX 40 fica em 2x). `SOTC_DLSSG_FRAMES` / `SOTC_DLSSG_MODE=dynamic`.
+- **Prioridade de threads em CPUs com 4 threads ou menos** (Lucas-blip-png, #312, #267): workers do jogo abaixo do normal, som no máximo, leitura de arquivos acima do normal. CPUs maiores não mudam. `SOTC_JOB_PRIORITY=0` desliga.
+
+## 0.73 — 2026-11-09
+- **Final do jogo sem quedas:** os dois atalhos da guarda do heap (`SOTC_GUARD_STALE`, `SOTC_GUARD_USER_POINTER`), religados na 0.72, estragavam a memória do jogo no final (objetos zerados, alocador em `0x499cc`), como o T49 já suspeitava para a `0x49800`. Voltam a ficar desligados; com eles desligados o final e o pulo da intro passaram sem nenhuma queda e sem nada a reparar.
+- **Quedas no final do jogo (tela "Fim" e passagem para a intro) corrigidas do mesmo jeito que a `0x564d24`:** o jogo ia destruir um objeto cuja memória já estava zerada (`0x144c60`, `0x14934f`) ou soltar uma referência de um objeto inexistente (`0x14cce7`); o port pula esse objeto como o jogo faz quando ele não existe (`SOTC_FIX_NULL_OBJECTS=0` desliga).
+- **Mosaico no Time Attack corrigido** (vinha da correção do final, `SOTC_POOL_FREEZE`): ao entrar numa arena o jogo põe texturas novas onde estavam as antigas, e a correção mantinha o conteúdo antigo por 400 quadros. Agora um carregamento (save, área, arena) solta tudo o que ela segurava e ela não age nos 90 s seguintes; no final do jogo, onde ela é necessária, não há carregamento no meio.
+- **Jogo congelado na mesma imagem (FPS normal) corrigido:** o ponteiro de leitura da fila de compute, que fica na memória do jogo, era movido com escrita direta; quando o rastreamento de páginas da GPU protegia a página de novo antes da escrita repetir, ela falhava sem fim (`SOTC FAULT LOOP` em `ProcessCompute`), a fila de compute parava e o jogo congelava. Agora é escrito como os rótulos de fim de pipe, direto na memória do jogo (`SOTC_RPTR_BACKING=0` volta ao antigo).
+- **Queda `0x564d24` corrigida** (a mais frequente: 4 vezes desde 03/11, sempre 30–40 s depois de carregar um save): o jogo percorre uma lista de objetos e pede a cada um uma peça (eboot 0x660fc0), que vem vazia para um objeto apagado ou de outro tipo, e lia essa peça sem conferir. O item é pulado como o jogo pula um objeto que não existe (`SOTC_FIX_564D24=0` desliga).
+- **Exe compilado com ThinLTO e PGO, como o do Oussama268:** o perfil de uso foi gravado em duas voltas pelo mapa aberto (câmera girando, 60 FPS) e o compilador otimizou o que mais roda ali. O código era o mesmo e o FPS do nosso ficava abaixo do dele por isso; no teste do usuário ficou "igual ou melhor". (O perfil fica em `pgo/`, fora do repositório; `tools/pgo_train.sh` refaz.)
+- **FPS dinâmico (ligado por padrão no modo 60 FPS; caixa nos Ajustes rápidos):** quando o jogo fica abaixo de 50 FPS por 1,5 s o limite cai para um degrau que combina com a tela (48 em 144 Hz, 40 em 120 Hz, 30 em 60 Hz) e fica estável em vez de oscilar; a cada 10 s tenta 60 de novo. A lógica do jogo segue o tempo real, então não fica em câmera lenta.
+- **Junta a 0.72.1-opt13 do Oussama268:** muito menos engasgos ao percorrer o mundo (menos travas de memória na thread de desenho, guarda do heap do jogo e tabelas de memória em blocos), alvos de renderização temporários reaproveitados nos colossos pesados (`SOTC_RT_STASH`), leitura suja da GPU refeita pela própria thread do jogo (`SOTC_RB_REQUEUE`, no lugar do nosso `SOTC_RB_DIRTY_RETRY` experimental), limite de envio de texturas desligado (texturas pretas), quadros que não se acumulam atrás do limitador (atraso de controle a 30 FPS, #128), nova tentativa no erro 487 ao abrir (#110), DLAA no lançador e quedas raras corrigidas (formato SnormNz, falha aninhada no tratador de exceções). Nossa consulta de memória sem trava (`SOTC_CLAMP_GAP`) foi trocada pela dele (`SOTC_CLAMP_FAST`).
+- **Modo Extremo nítido de novo:** a 0.72.2 tinha posto Alta e Máxima no mip 2 e a Máxima (texturas do modo Extremo) ficou borrada. Voltam a Alta no mip 1 e a Máxima no mip 0 (perfil leve: Máxima 1, Alta 2), agora sem os 3 s de bancos mantidos e com a proteção do reservatório de páginas, que causavam as cópias de até 1,1 GB num quadro na floresta.
+
 ## 0.72.2 — 2026-11-05
 - **Título da janela com a versão do port e o tempo de jogo:** `SHADOW OF THE COLOSSUS™ · v01.01 · Port v0.72.2 · 60 FPS · 0:12:34`.
 - **Atualizar o port limpa o cache de shaders uma vez** (o lançador guarda a versão que montou o cache em `user/cache/port_version.txt`): shaders montados pela versão anterior podiam conflitar com a nova. A primeira partida depois da atualização engasga um pouco enquanto o cache é refeito. O botão "Limpar cache de shaders" continua nas configurações.
@@ -991,6 +1007,27 @@ modo Pro, HUD com geração de quadros).
 
 </details>
 
+## 0.70-opt12 — 2026-11-01 (fork do Oussama268)
+Tudo da 0.70, mais o trabalho contra as travadinhas (stutter):
+- **Quadros num ritmo regular (tabnul):** os quadros saem no ritmo em que o jogo os entrega, em
+  vez de esperar o próximo vblank. A variação entre quadros caiu de 5,2 ms para 1,2–1,8 ms e as
+  travadas acima de 100 ms de 15 para 2 por demo de 5 min. Também do tabnul: a varredura de
+  memória `SOTC MEM` saiu da thread de apresentação, leituras da GPU terminadas em partes e uma
+  swapchain mais funda contra a pausa periódica do driver NVIDIA.
+- **Modo 60 FPS com o mesmo ritmo:** abaixo de 60 os quadros alternavam 16,7 / 25 ms. Agora saem
+  quando estão prontos, sem passar de 60. Demo em 60 FPS: quadros acima de 50 ms 23 → 12, pior
+  quadro 194 → 113 ms, 1% low 22,3 → 26,3 FPS.
+- **Sem congelamentos de ~900 ms do cache de shaders da 0.70:** o pacote do cache ganhava dos
+  arquivos mais novos, e milhares de shaders eram traduzidos de novo a cada sessão. O arquivo
+  mais novo vence agora (correção do HiddenUserHere, PR #339 do repositório principal).
+- **Texturas pequenas velhas ou com manchas coloridas:** a textura inteira é conferida, não só os
+  primeiros 8x8 pixels; e o limite de envio de texturas por quadro não deixa mais texturas
+  pretas para trás (PR #339).
+- Travas do jogo esperam 20 µs antes de dormir (`SOTC_MUTEX_SPIN_US`, `0` desliga) e os buffers
+  grandes de envio ficam guardados entre quadros (`SOTC_STAGING_LARGE_POW2=0` desliga), do PR #339.
+- Santuário: 40,1 → 43,5 FPS. Sessão de 45 min sem falhas.
+- O cache de shaders é refeito na primeira abertura.
+
 ## 0.70 — 2026-10-29
 > ⚠️ **Atenção: instale o jogo num SSD (de preferência NVMe).** Cada área nova lê centenas de MB
 > de texturas e modelos da pasta do jogo; num HD as trocas de área travam muito mais e podem
@@ -1103,6 +1140,22 @@ JihedMrouki, testados com texturas **Máxima + modo PS4 Pro + 60 FPS** (RTX 2060
 - Ferramentas (`tools/`) e o modelo de save dos benchmarks aceitam os dois seriais. Testes novos
   (`tests/test_games.py`) falham se algum código voltar a testar um serial só.
 - A versão americana não tem os 3 textos em árabe da atualização europeia 1.01.
+
+## 0.60.6-opt11 — 2026-10-24 (fork do Oussama268)
+- **+25% de FPS no Santuário e quadros mais estáveis:** as leituras antecipadas da GPU
+  ("hot readbacks", da fusão de 8/10) voltam ligadas por padrão (`SOTC_RB_HOT=1`; `=0` desliga).
+  Antes de escrever, cada página é conferida sob a trava da sua região: se o jogo já escreveu
+  nela, a cópia é pulada. Era a corrida que deixava o arco-íris nas texturas na 0.60.5.
+  Santuário 34,6 → 43,3 FPS, demonstração da tela título 54 → 60,7.
+- Descritores reaproveitados ligados por padrão (`SOTC_FAST_BIND`, `=0` desliga).
+- Correções do tabnul: grama, HDR, menu do DLSS, pular os logos (#91, #92, #94, #96).
+- Lançador: aviso de pouca memória (#95).
+- Do upstream #258 (JihedMrouki): o cache de shaders confere se o arquivo existe, dica de
+  trabalho na fila do Liverpool, posição invariante nos shaders de vértice (GTX 10xx).
+  **O cache de shaders é refeito na primeira abertura.**
+- Diagnóstico: `SOTC_PROFILE_SLOW_MS=<ms>` só guarda amostras dos quadros mais longos que isso.
+- A travada ao cavalgar continua: nos quadros lentos as threads do jogo esperam umas pelas
+  outras (mutex e event flags do próprio jogo) e há cópias de ~200 MB nas trocas de cena.
 
 ## 0.60.6 — 2026-10-22
 - **Fim do ruído arco-íris nas texturas e das quedas "do nada" (`0x49500`).** A causa eram as

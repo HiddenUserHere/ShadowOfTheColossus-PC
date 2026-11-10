@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <chrono>
+#include <cstdlib>
 #include <unordered_map>
 
 #include "common/recursive_lock.h"
@@ -38,6 +39,20 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+
+/// sotc: SOTC_DRAW_PHASES=1: TSC timers per phase of a graphics draw on the draw thread (and of
+/// its capture on the command processor), by class (depth-only, G-buffer, other), printed every
+/// 32768 draws as "SOTC DRAWPHASE". Off: one predictable branch per phase.
+namespace DrawPhase {
+inline const bool kOn = std::getenv("SOTC_DRAW_PHASES") != nullptr;
+inline u64 Now() {
+    return __builtin_ia32_rdtsc();
+}
+/// Draw thread: ExecuteBackOp's register chunk copy and per-stage user data copy, per op.
+void AddOpPrefix(u64 ticks, u32 chunks, u32 dwords);
+/// Command processor: 0 = pipeline lookup, 1 = BackAlloc (dirty chunk copy), 2 = CaptureBackOp.
+void AddCp(u32 what, u64 ticks);
+} // namespace DrawPhase
 
 class Rasterizer {
 public:
@@ -249,6 +264,26 @@ private:
     RsMemoHit RsMemoBeginCheck();
     bool RsMemoSameImage(u32 slot, VideoCore::ImageId image_id);
     void RsMemoVerify(const RenderState& full, RsMemoHit hit);
+    /// sotc: BbToggle::DepthFastPath (docs/sotc/DEPTH-FASTPATH.md). BeginRendering for a depth-only
+    /// draw replays the RenderState of the last full one when everything it was derived from is
+    /// provably the same (registers by Liverpool::DrawRelSerial, registry and metadata epochs,
+    /// image flags and layout state); `storage` takes the state of a full call, `token` is what
+    /// Scheduler::BeginRendering uses to skip comparing a replayed state.
+    const RenderState& BeginRenderingFast(const GraphicsPipeline* pipeline, RenderState& storage,
+                                          u64& token);
+    bool DepthFastActive() const;
+    void DepthFastEnsureRelevance();
+    u32 DepthFastBeginCheck(const GraphicsPipeline* pipeline);
+    void DepthFastBeginApply();
+    void DepthFastRecord(const RenderState& state);
+    /// sotc: BbToggle::GBufferFastPath (docs/sotc/GBUFFER-FASTPATH.md): the same for a draw with
+    /// colour targets. GBufferFastCheck is 0 when the RenderState BeginRendering would derive is
+    /// gb_memo.state and its effects are the few GBufferFastApply repeats; else why not.
+    const RenderState& GBufferFast(const GraphicsPipeline* pipeline, RenderState& storage,
+                                   u64& token);
+    u32 GBufferFastCheck(const GraphicsPipeline* pipeline);
+    void GBufferFastApply();
+    void GBufferFastRecord(const RenderState& state, const GraphicsPipeline* pipeline);
     void RefreshImageLayouts();
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
@@ -284,6 +319,49 @@ private:
     /// a difference. Draw thread.
     const PreparedDraw* CheckPreparedDispatch(const PreparedDraw* prepared, bool use_resolved,
                                               const Pipeline* pipeline);
+    /// sotc: BbToggle::DrawFixedCostOpt. UpdateDynamicState, skipped when none of the registers it
+    /// reads changed in value since the last time it ran (and the pipeline's write masks and the
+    /// feedback loop flag are the same): the dynamic state object still holds what it derived.
+    /// sotc: `prepared` (SOTC_PARALLEL_RECORD) goes to UpdateDynamicState on a derivation.
+    void CommitDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
+                            const PreparedDraw* prepared = nullptr);
+    void CommitDynamicStateOld(const GraphicsPipeline* pipeline, bool is_indexed,
+                               const PreparedDraw* prepared);
+    /// sotc: what a memo hit still does for our inputs beyond the registers (vk_rasterizer.cpp).
+    void DynamicMemoHitExtras(const GraphicsPipeline* pipeline, const PreparedDraw* prepared) const;
+    /// sotc: ComputeDynamic + ApplyDynamic from the draw registers, no Commit (the memo verifies).
+    void UpdateDynamicStateValues(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    struct DynMemo {
+        bool valid{};
+        bool feedback_loop{};
+        u32 serial{};
+        std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS> write_masks{};
+    };
+    DynMemo dyn_memo;
+    /// sotc: BbToggle::DepthFastPath. The inputs of the last derivation of the dynamic state values
+    /// (by any draw): no relevant register changed since (Liverpool::DrawRelSerial), the pipeline's
+    /// write masks, the feedback loop flag and indexed-ness are those; valid only while every
+    /// derivation went through this memo (the old path clears it).
+    struct DynFast {
+        bool valid{};
+        bool feedback_loop{};
+        bool is_indexed{};
+        u32 rel_serial{}; ///< Liverpool::RelDynamic
+        std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS> write_masks{};
+    };
+    DynFast df_dyn;
+    std::vector<std::pair<u32, u32>> dyn_fields; ///< byte offset in the registers and size of each input
+    std::vector<u8> dyn_snap;                    ///< the inputs as of the last derivation
+    /// sotc: the vertex input last recorded with setVertexInputEXT (BindVertexBuffers), and the
+    /// DynamicState::invalidations count it was recorded at.
+    struct ViMemo {
+        bool valid{};
+        u32 invalidations{};
+        VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+        VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    };
+    ViMemo vi_memo;
+    std::vector<u16> dyn_chunks; ///< register chunks UpdateDynamicState reads (built on first use)
 
     bool FilterDraw();
 
@@ -325,6 +403,21 @@ private:
     /// Returns false, having made nothing, when the classic bind must run instead (a render target, a stencil image,
     /// a rebind pending); the reason is counted.
     bool BindHeapImages(const Shader::Info& stage, const SotcArch::TableMemo::TableBinds& binds);
+    static bool DrawBindMemoOn();
+    struct TexBindMemo;
+    struct TexBindMemoBinding;
+    void BindResolvedImage(VideoCore::ImageId image_id, VideoCore::TextureCache::BindingType type,
+                           const VideoCore::ImageViewInfo& view_info);
+    bool TexBindMemoFresh(const TexBindMemo& memo) const;
+    /// sotc: BbToggle::TexBindFastPath. 0 when BindResolvedImage for this memoized binding would
+    /// only add the descriptor the memo remembers (no upload, no barrier, same view); else why not.
+    u32 TexBindFastCheck(const TexBindMemoBinding& b, VideoCore::ImageId image_id);
+    void TexBindFastApply(const TexBindMemoBinding& b, VideoCore::ImageId image_id);
+    bool ReplayTexBindMemo(const Shader::Info& stage, TexBindMemo& memo,
+                           const AmdGpu::Image* sharps,
+                           boost::container::small_vector<u32, 8>& array_sizes,
+                           std::array<VideoCore::ImageId, Shader::NUM_IMAGES>& bind_ids,
+                           std::array<bool, Shader::NUM_IMAGES>& bind_storage, u32& num_binds);
 
     /// sotc: SOTC_TEX_BLOCK=1 (default off; 2 also runs the full bind and compares). A stage's
     /// texture block (its image descriptors and samplers) is memoized by the raw T#/S# words it
@@ -581,6 +674,7 @@ private:
     /// as reads after the draw so later writes to the same ranges wait for it.
     std::vector<BoundBuffer> fixed_function_reads;
 
+
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
     std::vector<u32> set_write_sets; ///< sotc: descriptor set of each set_writes entry
@@ -596,6 +690,127 @@ private:
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+
+    /// sotc: BbToggle::DrawBindMemo. The texture bindings of a stage, resolved: for an exact set
+    /// of T#s (what ImageDesc is built from) the image each one found and the view it asked for.
+    /// A binding stays valid while the images registered at its guest address do not change (the
+    /// per-address generation FindImage's own memo uses; for a mip-tail candidate also those at
+    /// the address of the other form of the chain) and the GPU-modified epoch stays; the
+    /// per-draw effects (found tick, binding flags, image update, layout transition, usage)
+    /// are redone on every replay (BindTextures). Direct mapped on the stage and the T#s.
+    struct TexBindMemoBinding {
+        VideoCore::ImageId image_id{}; ///< as FindImage returned it (before the depth redirect)
+        VideoCore::ImageViewInfo view_info;
+        VideoCore::TextureCache::BindingType type{};
+        VAddr addr{};        ///< guest address FindImage matched the image at (0: no image)
+        u64 addr_gen{};      ///< TextureCache::FindGeneration(addr) when it did
+        VAddr other_addr{};  ///< mip-tail candidates: the address of the other form of the chain
+        u64 other_gen{};
+        // sotc: BbToggle::TexBindFastPath: what BindResolvedImage produced when this binding was
+        // stored (the image after the stencil redirect, its backing, the view and the layout the
+        // descriptor got); `fast` only for a plain texture binding that was no render target.
+        VideoCore::ImageId bound_id{};
+        const void* backing{};
+        vk::ImageView view{};
+        bool fast{};
+    };
+    static constexpr u32 MemoMaxImages = 16;
+    struct TexBindMemo {
+        const Shader::Info* stage{};
+        u64 gpu_epoch{};
+        u32 count{};
+        std::array<AmdGpu::Image, MemoMaxImages> sharps;
+        std::array<TexBindMemoBinding, MemoMaxImages> bindings;
+    };
+    /// sotc: BbToggle::DrawBindMemo. What PrepareRenderState read for the last draw (the render
+    /// target registers and extents, the pipeline's attachment mask) and the registry state it
+    /// resolved them in. While they stay the same, cb_descs/db_desc already hold what it would
+    /// compute again (the images, found by FindImage), so a draw only redoes its per-draw
+    /// effects (found tick, bound list, target flag).
+    struct RtMemo {
+        bool valid{};
+        u32 mrt_mask{};
+        u32 active_mask{}; ///< attachments with a non-empty write mask
+        bool cb_disabled{};
+        bool depth_enable{};
+        bool stencil_enable{};
+        bool depth_write{}; ///< sotc: db_desc.view_info.is_storage follows depth_write_enable
+        u32 htile{};
+        u64 image_generation{};
+        u64 gpu_epoch{};
+        u32 rel_depth{}, rel_color{}; ///< sotc: Liverpool::DrawRelSerial when stored (DepthFastPath)
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthView depth_view{};
+        AmdGpu::CbDbExtent db_extent{};
+        std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent{};
+        std::array<AmdGpu::ColorBuffer, AmdGpu::NUM_COLOR_BUFFERS> color_buffers{};
+    };
+    RtMemo rt_memo;
+    /// sotc: BbToggle::DepthFastPath. What the last full BeginRendering of a depth-only draw
+    /// derived its RenderState from, and the state itself (see BeginRenderingFast).
+    struct DepthFastMemo {
+        bool valid{};
+        u32 rel_serial{};
+        u64 image_generation{}, gpu_epoch{}, meta_epoch{};
+        VideoCore::ImageId db_id{};
+        VideoCore::ImageId stencil_id{};
+        const void* backing{};
+        vk::ImageLayout layout{};
+        vk::AccessFlags2 access{};
+        vk::PipelineStageFlags2 stage{};
+        std::optional<VideoCore::SubresourceRange> range;
+        u64 token{};
+        RenderState state{};
+    };
+    DepthFastMemo df_memo;
+    /// sotc: BbToggle::GBufferFastPath. What the last full BeginRendering of a draw with colour
+    /// targets derived its RenderState from, and the state itself (see GBufferFast).
+    struct GBufferFastMemo {
+        bool valid{};
+        u32 rel_render{}, rel_color{}, mrt_mask{}, num_cb{};
+        std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> samples{};
+        u64 image_generation{}, gpu_epoch{}, meta_epoch{};
+        std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS> color_id{};
+        std::array<const void*, AmdGpu::NUM_COLOR_BUFFERS> color_backing{};
+        VideoCore::ImageId db_id{};
+        VideoCore::ImageId stencil_id{};
+        const void* db_backing{};
+        vk::ImageLayout db_layout{};
+        vk::AccessFlags2 db_access{};
+        vk::PipelineStageFlags2 db_stage{};
+        std::optional<VideoCore::SubresourceRange> db_range;
+        u64 token{};
+        RenderState state{};
+    };
+    GBufferFastMemo gb_memo;
+    /// SOTC_DEPTHFAST_WHY=1: the depth side registers as of the last record, to tell which one
+    /// moved when the register serial says the memo is out.
+    struct DepthRegsSnap {
+        AmdGpu::DepthControl depth_control{};
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthRenderControl depth_render_control{};
+        AmdGpu::ColorControl color_control{};
+        AmdGpu::DepthView depth_view{};
+        u32 htile{};
+        u32 depth_clear{};
+        u32 stencil_clear{};
+        u64 db_extent{};
+    };
+    DepthRegsSnap df_snap;
+    /// The Transit BeginRendering made on the depth image (captured there, used by the memo).
+    vk::ImageLayout df_transit_layout{};
+    vk::AccessFlags2 df_transit_access{};
+    vk::PipelineStageFlags2 df_transit_stage{};
+    std::optional<VideoCore::SubresourceRange> df_transit_range;
+    u64 df_next_token{1};
+    bool df_rel_built{};
+    static constexpr u32 NumTexBindMemos = 4096;
+    struct FreeDeleter {
+        void operator()(void* p) const noexcept {
+            std::free(p);
+        }
+    };
+    std::unique_ptr<TexBindMemo[], FreeDeleter> tex_bind_memos; ///< zeroed pages, committed on use
     bool attachment_feedback_loop{};
     /// The image side of the op's barrier (layouts and hazards of its images and render targets, Transit).
     bool needs_barrier{};
@@ -611,6 +826,9 @@ private:
     bool DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
                                   const VideoCore::TextureCache::ImageDesc& desc,
                                   bool compute) const;
+    bool DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
+                                  const VideoCore::ImageViewInfo& view_info) const;
+    bool bind_stage_compute{}; ///< the stage BindTextures is binding is a compute shader
 
     /// sotc: TakeHudless. BeginHudless starts the redraw of this draw (the final composite) into
     /// its HUD-less image; false when this draw is not the composite.
@@ -667,7 +885,9 @@ private:
         bool compute_cleared{};
         /// sotc: SOTC_PACKET: the addressed ranges of that bind, touched again by each fast or wide hit.
         std::vector<PacketAddr> addr;
+        boost::container::small_vector<u32, 8> lod_marks{}; ///< SotcLod banks the bind marked
     };
+    boost::container::small_vector<u32, 8> lod_marks; ///< banks marked by the bind in progress
     FastBindState fast_bind{};
     bool fast_bind_hit{};
 

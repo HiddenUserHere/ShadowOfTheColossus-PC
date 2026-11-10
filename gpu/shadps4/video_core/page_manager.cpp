@@ -1345,8 +1345,12 @@ public:
 #endif // __linux__
 
 struct SignalImpl : public PageManager::Impl {
+    /// sotc: for the fault handlers, which are static.
+    inline static SignalImpl* self = nullptr;
+
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
+        self = this;
 
         // Splitting a mapped placeholder on Windows recreates the neighbouring views with their
         // default protection, silently dropping the write/read tracking of those pages.
@@ -1768,6 +1772,69 @@ struct SignalImpl : public PageManager::Impl {
         return !rasterizer->GetBufferCache().IsRegionGpuModified(page, PageManager::PM_PAGE_SIZE);
     }
 
+    /// sotc: a read fault on a page the watchers do not read-protect: the host protection is out
+    /// of step with them, and no readback will ever change it, because only a change of the
+    /// watchers touches the page. The load faulted forever while the game waited for it: a freeze
+    /// about once in 30 rides, the page PAGE_NOACCESS with no GPU bit (ride benchmark, 5 Nov; a job
+    /// worker at eboot 0xf9c40, the draw thread in the replicate HLE). Applies what the watchers
+    /// say. SOTC_STALE_READ_REPAIR=0: off. Returns true when the load can be retried.
+    /// sotc (fork): only while the tracker protects guest pages (not SOTC_NATIVE without TRACK=3);
+    /// the protect queue (SOTC_PROTECT_ASYNC) is applied first and the watchers' protection is
+    /// applied at once (ProtectNow), under the page lock (LockPage, PageLockWatch).
+    static bool RepairOutOfStepRead(VAddr addr) {
+#ifdef _WIN32
+        static const bool enabled = [] {
+            const char* v = std::getenv("SOTC_STALE_READ_REPAIR");
+            return !v || v[0] != '0';
+        }();
+        // Any read fault of the process comes here, also at addresses past the guest's: the table
+        // only spans ADDRESS_BITS.
+        if (!enabled || !self || (addr >> Impl::ADDRESS_BITS) != 0) {
+            return false;
+        }
+        if (!SotcNative::TracksGuestPages() && SotcNative::TrackMode() != 3) {
+            return false; // the tracker protects nothing: no watcher can be out of step
+        }
+        const u64 page = addr >> PageManager::PM_PAGE_BITS;
+        PageState* state = self->cached_pages.find(page);
+        if (!state || state->num_read_watchers != 0) {
+            return false; // the usual case: a readback follows
+        }
+        const VAddr page_addr = page << PageManager::PM_PAGE_BITS;
+        const auto refuses_reads = [&] {
+            MEMORY_BASIC_INFORMATION mbi{};
+            return VirtualQuery(reinterpret_cast<void*>(page_addr), &mbi, sizeof(mbi)) &&
+                   mbi.State == MEM_COMMIT && mbi.Protect == PAGE_NOACCESS;
+        };
+        if (!refuses_reads()) {
+            return false;
+        }
+        FlushProtectQueue(); // sotc: SOTC_PROTECT_ASYNC, a queued protect of this page comes first
+        if (!refuses_reads()) {
+            return true; // the queue held the page's unprotect
+        }
+        self->LockPage(page);
+        if (state->num_read_watchers != 0) {
+            self->UnlockPage(page);
+            return false; // a GPU write protected it just now
+        }
+        self->ProtectNow(page_addr, PageManager::PM_PAGE_SIZE, state->Perms());
+        self->UnlockPage(page);
+        if (refuses_reads()) {
+            return false; // the guest's own protection, not the watchers'
+        }
+        SotcStats::read_fault_out_of_step.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            std::fprintf(stderr, "SOTC read protection out of step at %#llx, lifted\n",
+                         static_cast<unsigned long long>(addr));
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
     static bool HandleGuestFault(void* context, void* fault_address, bool is_gpu_thread) {
         // sotc: SOTC_PROTECT_BATCH. The updates a fault makes protect at once, also on a thread
         // with a batch open (the draw thread also handles other threads' faults,
@@ -1779,6 +1846,9 @@ struct SignalImpl : public PageManager::Impl {
         } const batch_suspend;
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
+        if (!Common::IsWriteError(context) && RepairOutOfStepRead(addr)) {
+            return true;
+        }
         if (!Common::IsWriteError(context) && !is_gpu_thread && TryCleanGuestLoad(context)) {
             return true;
         }
@@ -2358,6 +2428,15 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 PageManager::~PageManager() {
     // sotc: SOTC_PROTECT_ASYNC: the queue is applied and the worker stopped before impl goes.
     g_protect_async.reset();
+}
+
+/// sotc: does the tracker want this page read-protected? 1 when it does not know.
+extern "C" int bbgpu_page_read_watched(uintptr_t address) {
+    if (!SignalImpl::self || (address >> SignalImpl::ADDRESS_BITS) != 0) {
+        return 1;
+    }
+    const auto* state = SignalImpl::self->cached_pages.find(address >> 12); // PageManager::PM_PAGE_BITS (private)
+    return !state || state->num_read_watchers != 0;
 }
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {

@@ -18,6 +18,7 @@
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
+#include "bbport_toggles.h"
 #include "common/elf_info.h"
 #include "common/assert_scope.h"
 #include "common/hash.h"
@@ -796,6 +797,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (amd64_lds) {
         std::fprintf(stderr, "GPU: LDS barriers on for 64-wide AMD (SOTC_AMD64_LDS=0: off)\n");
     }
+    if (instance.IsAmdWave32Forced()) {
+        std::fprintf(stderr, "GPU: AMD wave32 on: shaders lowered for 32 lanes, LDS barriers on "
+                             "(SOTC_AMD_WAVE32)\n");
+    }
     // Wave64 uniform branches on every driver. Tested on a Radeon RX 6650 XT (32-wide path):
     // off, the shadows next to the Wander and Agro on grass get horizontal stripes; on, the
     // image is right and the characters are not black in the shade (save with 5 colossi).
@@ -1500,6 +1505,23 @@ struct AddrFallbackStats {
 };
 AddrFallbackStats g_addr_fb;
 } // namespace
+
+// sotc: a pipeline built on a pipeline worker that took SOTC_SLOW_BUILD_MS (default 500) or longer
+// is logged: the recorder waits for compute pipelines at their dispatch, so on drivers that compile
+// slowly (Intel Arc users saw 13 s freezes on first visits) these are the freezes.
+void LogSlowBuild(const char* kind, std::chrono::steady_clock::time_point start) {
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    static const double min_ms = [] {
+        const char* v = std::getenv("SOTC_SLOW_BUILD_MS");
+        return v ? std::atof(v) : 500.0;
+    }();
+    static std::atomic<int> logged{0};
+    if (ms >= min_ms && logged.fetch_add(1, std::memory_order_relaxed) < 500) {
+        std::fprintf(stderr, "SOTC SLOW BUILD %s %.0f ms\n", kind, ms);
+    }
+}
 
 bool PipelineCache::AsyncPipelineEligible() const {
     return AsyncIneligibleReason() == nullptr;
@@ -3033,6 +3055,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only,
         if (job->compute) {
             const auto start = std::chrono::steady_clock::now();
             job->compute->Build();
+            LogSlowBuild("compute", start);
             if (job->addr_table) { // sotc: SOTC_ADDR_FALLBACK: its dispatches take it from now on (IsReady)
                 g_addr_fb.pending.fetch_sub(1, std::memory_order_relaxed);
                 g_addr_fb.ready.fetch_add(1, std::memory_order_relaxed);
@@ -3083,6 +3106,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only,
             if (job->manifest_libs) {
                 GplLibraryCache::SetOrigin(GplLibraryCache::OriginManifest); // sotc: SOTC_GPL_PREDICT: never evicted
             }
+            const auto graphics_start = std::chrono::steady_clock::now();
             job->pipeline = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, layout_cache, StagesProfile(job->infos), job->key, *pipeline_cache,
                 job->infos,
@@ -3090,6 +3114,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token, bool urgent_only,
                 job->sdata, job->preloaded, true, job->link_only ? &gpl_libs : nullptr);
             GplLibraryCache::SetLibrariesOnly(false);
             GplLibraryCache::SetOrigin(GplLibraryCache::OriginDefault);
+            LogSlowBuild("graphics", graphics_start);
             SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         }
         note_job();
@@ -4204,6 +4229,18 @@ void PipelineCache::QueueComputeOptimized(ComputePipeline* pipeline) {
     async_cv.notify_one();
 }
 
+// sotc: PipelineKeyMemo. The pipeline the last whole graphics lookup returned (null: none) and its indirect parameters;
+// the memo in GetGraphicsPipelineLookupSlow returns it only while it is also last_graphics_pipeline. Command processor
+// thread only (as the rest of the lookup state).
+static const GraphicsPipeline* g_key_memo_pipeline = nullptr;
+static DrawIndirectParams g_key_memo_params{};
+
+static const GraphicsPipeline* NoteKeyMemo(const GraphicsPipeline* pipeline, const DrawIndirectParams& params) {
+    g_key_memo_pipeline = pipeline;
+    g_key_memo_params = params;
+    return pipeline;
+}
+
 // sotc: N5. Counts the draws that bind each pipeline (its use count, saved at teardown).
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     const GraphicsPipeline* pipeline = GetGraphicsPipelineLookup(params);
@@ -4268,6 +4305,37 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
                          liverpool->regs.num_indices > 6 && instance.IsVertexInputDynamicState() &&
                          !EmulatorSettings.IsShaderCollect() && !depth_only;
     translation_pending = false;
+    // sotc: PipelineKeyMemo (BbToggle::PipelineKeyMemo disables it, SOTC_PIPE_KEY_MEMO=0 too):
+    // RefreshGraphicsKey only reads the registers and the draw's indirect parameters, so a draw
+    // that wrote no register chunk and passes the same parameters would rebuild exactly the key
+    // of the previous draw and then hit the pipe memo below anyway. Return its pipeline without
+    // walking the shader stages (GetProgram, specializations, flat buffers: ~15% of the command
+    // processor at the Shrine). Without the draw thread MarkRegs does not track chunks.
+    static const bool key_memo_env = [] {
+        const char* v = std::getenv("SOTC_PIPE_KEY_MEMO");
+        return !v || v[0] != '0';
+    }();
+    // sotc: the memo holds only the pipeline the last whole lookup returned (g_key_memo_pipeline, set by
+    // GetGraphicsPipelineLookup) while it is still last_graphics_pipeline (every install or erase that may replace it
+    // clears that), so no early return of this lookup can leave an older key's pipeline behind. Not with
+    // SOTC_ADDR_FALLBACK: a descriptor-mode draw must look for its table pipeline again.
+    if (key_memo_env && !BbToggle::Disabled(BbToggle::PipelineKeyMemo) && last_graphics_pipeline &&
+        g_key_memo_pipeline == last_graphics_pipeline && !AddrFallbackOn() &&
+        liverpool->IsBackThreaded() && !liverpool->HasDirtyRegChunks() &&
+        params.vertex_sgpr_offset == g_key_memo_params.vertex_sgpr_offset &&
+        params.instance_sgpr_offset == g_key_memo_params.instance_sgpr_offset) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::pipe_key_memo_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (last_graphics_pipeline->IsLinked()) {
+            g_gpl_counters.linked_served.fetch_add(1, std::memory_order_relaxed);
+        }
+        return last_graphics_pipeline;
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::pipe_key_memo_misses.fetch_add(1, std::memory_order_relaxed);
+    }
+    const u64 key_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
     // sotc: SOTC_ADDR_FALLBACK. The table key first. Its stages are never translated here (a stage not translated yet
     // goes to a worker, for every draw kind), and when its pipeline is not ready (AddrTableGraphicsReady queues it),
     // the key is made again with the descriptor-mode stages, which the rest of this lookup builds or finds by the rules
@@ -4318,7 +4386,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
                 g_nodrop.drop_translate.fetch_add(1, std::memory_order_relaxed);
             }
         }
+        last_graphics_pipeline = nullptr; // sotc: the key is not usable for the next draw
         return nullptr;
+    }
+    if (key_start) {
+        SotcStats::pipe_key_ns.fetch_add(SotcStats::NowNs() - key_start,
+                                         std::memory_order_relaxed);
+        SotcStats::pipe_key_draws.fetch_add(1, std::memory_order_relaxed);
     }
     // sotc: consecutive draws mostly use the same pipeline: when the freshly built key equals the
     // previous draw's byte for byte, skip the map's hash and probe. The stage state (infos,
@@ -4338,7 +4412,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
         if (last_graphics_pipeline->IsLinked()) {
             g_gpl_counters.linked_served.fetch_add(1, std::memory_order_relaxed);
         }
+        if (SotcStats::kFpsLog) {
+            SotcStats::pipe_same_key_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        last_graphics_params = params;
         return last_graphics_pipeline;
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::pipe_same_key_misses.fetch_add(1, std::memory_order_relaxed);
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (pack_ref.undrawn != 0) { // sotc: SOTC_PACK_REFERENCED: a late library's program drawn for the first time
@@ -4397,6 +4478,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
             }
             note_skip_demand();
             SotcStats::pipeline_pending_drops.fetch_add(1, std::memory_order_relaxed); // sotc: the 5 s line
+            last_graphics_pipeline = nullptr; // sotc: key memo off until one is installed
             return nullptr;
         }
         std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
@@ -4648,6 +4730,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookupSlow(const DrawI
     if (manifest && it->second && !it->second->manifest_noted) {
         it->second->manifest_noted = CaptureManifestGraphics();
     }
+    last_graphics_params = params;
     return it->second.get();
 }
 
@@ -5316,7 +5399,7 @@ void PipelineCache::RecordComputeFast(const ComputePipeline* pipeline) {
 const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookup(const DrawIndirectParams params) {
     const int fast_mode = PipeFastMode();
     if (fast_mode == 0) {
-        return GetGraphicsPipelineLookupSlow(params);
+        return NoteKeyMemo(GetGraphicsPipelineLookupSlow(params), params);
     }
     // The full lookup sets these too; the check needs them first (BuildRuntimeInfo reads them).
     draw_indirect_params = params;
@@ -5336,7 +5419,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookup(const DrawIndir
         if (cand.pipeline->IsLinked()) {
             g_gpl_counters.linked_served.fetch_add(1, std::memory_order_relaxed);
         }
-        return cand.pipeline;
+        return NoteKeyMemo(cand.pipeline, params);
     }
     pipe_fast_gfx.valid = false;
     const GraphicsPipeline* result = GetGraphicsPipelineLookupSlow(params);
@@ -5350,7 +5433,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineLookup(const DrawIndir
     if (result) {
         RecordGraphicsFast(result);
     }
-    return result;
+    return NoteKeyMemo(result, params);
 }
 
 // sotc: SOTC_PIPE_FAST. The compute lookup: the check first, then as GetGraphicsPipelineLookup.

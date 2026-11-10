@@ -6,6 +6,7 @@
 #include "bbport_settings.h"
 #include "bbport_copy.h"
 #include "bbport_thread_cpu.h" // sotc: SOTC_STALL_DETAIL guest CPU
+#include "bbport_mem_report.h"
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -247,20 +248,32 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
         // sotc: the backing view's pages are mapped in one call before a large copy
         // (SOTC_COPY_PREFETCH=0: one fault per page as before). At an area change (forest
         // entrance, 3 Nov) texture copies of 175-215 MB per frame took 10-59 thousand page faults,
-        // one per 4 KiB page of the view; with it 311 MB took 6.5 thousand. Only for the backing-view
-        // copy: with SOTC_COPY_GUEST_VIEW (default) runs are read through the guest address.
+        // one per 4 KiB page of the view; with it 311 MB took 6.5 thousand. With SOTC_COPY_GUEST_VIEW (default)
+        // runs are read through the guest address, so that range is prefetched instead.
         static const bool prefetch = [] {
             const char* v = std::getenv("SOTC_COPY_PREFETCH");
             return !v || v[0] != '0';
         }();
-        if (backing && !kCopyGuestView && prefetch && n >= 256 * 1024) {
-            WIN32_MEMORY_RANGE_ENTRY range{const_cast<u8*>(backing), static_cast<SIZE_T>(n)};
+        if (backing && prefetch && n >= 256 * 1024) {
+            // The copy reads the guest address with kCopyGuestView (fork): those PTEs matter.
+            void* const read_from = kCopyGuestView ? reinterpret_cast<void*>(source)
+                                                   : const_cast<u8*>(backing);
+            WIN32_MEMORY_RANGE_ENTRY range{read_from, static_cast<SIZE_T>(n)};
             PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
         }
-        if (backing && kCopyGuestView) {
+        if (backing && BbMemReport::WsDiagEnabled()) {
+            const uint64_t before = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            BbMemReport::WsDiagCopy(backing, reinterpret_cast<const void*>(source), dest, n);
+            std::memcpy(dest, backing, n);
+            BbMemReport::WsDiagCopyDone(before, n);
+        } else if (backing && kCopyGuestView) {
             SotcCopyGuest::runs.fetch_add(1, std::memory_order_relaxed);
             if (!GuardedGuestCopy(dest, reinterpret_cast<const void*>(source), n)) {
                 SotcCopyGuest::faults.fetch_add(1, std::memory_order_relaxed);
+                SotcStats::copy_guest_fallbacks.fetch_add(1, std::memory_order_relaxed);
                 std::memcpy(dest, backing, n);
             }
         } else if (mapped && kCopyGuestView) {
@@ -353,6 +366,7 @@ void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms)
     // only for the SOTC sys line (SOTC_CMD_STATS).
     if (SotcStats::kCmdStats) {
         SotcStats::sys_protects.fetch_add(1, std::memory_order_relaxed);
+        if (SotcStats::kHashStats) SotcStats::hash_tl.protects++;
         SotcStats::sys_protect_bytes.fetch_add(size, std::memory_order_relaxed);
         if (True(perms & MemoryPermission::Write)) {
             SotcStats::sys_unprotects.fetch_add(1, std::memory_order_relaxed);

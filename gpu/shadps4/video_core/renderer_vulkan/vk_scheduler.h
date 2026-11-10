@@ -245,6 +245,7 @@ struct DynamicState {
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
         ++generation;
+        ++invalidations;
     }
 
     /// sotc: voids only the push constant cache. Called after any pass that binds its own
@@ -252,6 +253,10 @@ struct DynamicState {
     void InvalidatePushConstants() {
         push_constant_cache.generation = 0;
     }
+
+    /// sotc: how many times the state was invalidated (a new command buffer, or a pass that bound
+    /// its own pipeline): memos of per-command-buffer state (vertex input) drop with it.
+    u32 invalidations{};
 
     void SetViewports(const Viewports& viewports_) {
         if (!std::ranges::equal(viewports, viewports_)) {
@@ -614,6 +619,10 @@ public:
     /// Makes the calling thread the one recording (shutdown from another thread).
     void ClaimRecorder();
 
+    /// sotc: SOTC_TICKWATCH -- samples this scheduler's timeline into SotcStats::tick_ring
+    /// (the presenter starts it on the draw scheduler; the FLIPGAP detector prints it).
+    void StartTickWatch();
+
     /// Waits until the recording thread has put the submit of tick on the queue. Another
     /// thread that queues work waiting for tick on the same queue must call this first: a wait
     /// queued before its signal blocks the queue for good. kick: the recording thread only.
@@ -757,7 +766,10 @@ public:
     void PopPendingOperations();
 
     /// Starts a new rendering scope with provided state.
-    void BeginRendering(const RenderState& new_state);
+    /// sotc: a non-zero token names a state a caller replays unchanged (BbToggle::DepthFastPath):
+    /// when the scope in progress was begun with that token the state is the same one, no
+    /// comparison needed.
+    void BeginRendering(const RenderState& new_state, u64 token = 0);
 
     /// Ends current rendering scope.
     void EndRendering();
@@ -959,6 +971,7 @@ private:
     std::unique_ptr<SotcGpuTrace::Timeline> gpu_trace;
     std::jthread trace_watch_thread; // sotc: SOTC_TRACE (TraceWatchThread)
     RenderState render_state;
+    u64 render_state_token{}; ///< sotc: see BeginRendering
     bool is_rendering = false;
     vk::UniqueCommandPool ahead_pool;
     vk::CommandBuffer ahead_cmdbuf;
@@ -1002,6 +1015,9 @@ private:
     std::array<ExternalWait, 4> external_waits{};
     u32 num_external_waits{};
     std::mutex external_wait_mutex;
+    /// sotc: SOTC_TICKWATCH (StartTickWatch); the thread uses work_semaphore, declared above.
+    bool tickwatch{};
+    std::jthread tickwatch_thread;
     /// Last member: stops (after running everything queued) before the rest is destroyed.
     std::unique_ptr<CommandRecorder> recorder;
 };

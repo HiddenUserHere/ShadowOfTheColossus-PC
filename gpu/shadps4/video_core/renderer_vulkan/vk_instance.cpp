@@ -204,9 +204,11 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     memory_properties = physical_device.getMemoryProperties();
     // sotc: direct memory access (the launcher's "full water reflections") drew stripes over
     // shadows and water on AMD (issues #57, #28; the players confirmed that turning it off fixes
-    // them): off there unless BB_DIRECT_MEMORY_ACCESS asks for it.
+    // them): off there unless BB_DIRECT_MEMORY_ACCESS asks for it. The same stripes on Intel Arc
+    // (B580, issue #59: turning it off fixes them), so off there too.
     constexpr u32 VendorAmd = 0x1002;
-    if (properties.vendorID == VendorAmd) {
+    constexpr u32 VendorIntel = 0x8086;
+    if (properties.vendorID == VendorAmd || properties.vendorID == VendorIntel) {
         EmulatorSettings.SetDirectMemoryAccessDefault(false);
     }
     // sotc: without shaderInt64 (Intel Iris Xe) the shaders avoid 64-bit integers where they can,
@@ -886,10 +888,41 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
             SotcQueues::LogAsyncPick(async_pick, static_cast<uint32_t>(infos.size()));
         }
     }
-    static constexpr std::array queue_priorities = {1.0f};
+    // sotc: present from the shared graphics queue, like nearly every game: RTSS and friends hook
+    // vkQueuePresentKHR and draw their overlay assuming exactly that (a second queue makes RTSS
+    // flicker). The ~11 s cadence hitch (NVIDIA blocking present up to ~140 ms) is bridged by the
+    // deeper swapchain alone (vk_swapchain.cpp), verified with RTSS on the shared queue.
+    // SOTC_PRESENT_QUEUE: default/0 = shared, 1 = same-family second queue (blocks nobody, but
+    // external overlays flicker), 2 = present from a non-graphics family (own HW engine) — NVIDIA
+    // advertises its compute family but loses the device within seconds under load (driver 617.42,
+    // RTX 5090), so never the default.
+    const u32 family_queue_count = family_properties[queue_family_index].queueCount;
+    const char* pq = std::getenv("SOTC_PRESENT_QUEUE");
+    present_queue_family = queue_family_index;
+    dedicated_present_queue = false;
+    if (pq && (pq[0] == '1' || pq[0] == '2')) {
+        if (pq[0] == '2') {
+            for (std::size_t i = 0; i < family_properties.size(); i++) {
+                const u32 index = static_cast<u32>(i);
+                // sotc: not the transfer or async compute family: one create info per family.
+                if (index != queue_family_index && index != xfer_queue_family_index &&
+                    !(HasAsyncQueue() && index == async_pick.family) &&
+                    QueueFamilyCanPresent(physical_device, index, queue_family_index)) {
+                    present_queue_family = index;
+                    dedicated_present_queue = true;
+                    break;
+                }
+            }
+        }
+        if (!dedicated_present_queue && family_queue_count >= 2) {
+            dedicated_present_queue = true; // second queue in the graphics family
+        }
+    }
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    const bool cross_family = present_queue_family != queue_family_index;
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = 1u,
+        .queueCount = !cross_family && dedicated_present_queue ? 2u : 1u,
         .pQueuePriorities = queue_priorities.data(),
     };
     // sotc: the async queue is queue 1 of the upload family when that family is the only compute
@@ -906,8 +939,18 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
         .queueCount = 1u,
         .pQueuePriorities = queue_priorities.data(),
     };
-    // One entry per family: the transfer family, when there is one, and the async family.
-    boost::container::static_vector<vk::DeviceQueueCreateInfo, 3> queue_infos{queue_info};
+    // sotc: SOTC_PRESENT_QUEUE=2: the present family's own entry (never the transfer or async one).
+    const vk::DeviceQueueCreateInfo present_queue_info = {
+        .queueFamilyIndex = present_queue_family,
+        .queueCount = 1u,
+        .pQueuePriorities = queue_priorities.data(),
+    };
+    // One entry per family: the transfer family, when there is one, the async family and the
+    // present family (SOTC_PRESENT_QUEUE=2).
+    boost::container::static_vector<vk::DeviceQueueCreateInfo, 4> queue_infos{queue_info};
+    if (cross_family) {
+        queue_infos.push_back(present_queue_info);
+    }
     if (HasXferQueue()) {
         queue_infos.push_back(xfer_queue_info);
     }
@@ -1499,10 +1542,19 @@ bool Instance::CreateDevice(Frontend::WindowSDL& window) {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
     graphics_queue = device->getQueue(queue_family_index, 0);
-    // Presents share the graphics queue: submits and presents are serialized by submit_mutex.
-    present_queue = device->getQueue(queue_family_index, 0u);
-    std::fprintf(stderr, "SOTC PRESENT: path shared-queue (one queue, presents under "
-                         "submit_mutex)\n");
+    present_queue = device->getQueue(
+        present_queue_family,
+        dedicated_present_queue && present_queue_family == queue_family_index ? 1 : 0);
+    std::fprintf(stderr, "GPU present queue: %s (family %u, graphics family %u)\n",
+                 present_queue_family != queue_family_index ? "own family"
+                 : dedicated_present_queue                  ? "second graphics-family queue"
+                                                            : "shared with graphics",
+                 present_queue_family, queue_family_index);
+    if (!dedicated_present_queue) {
+        // Presents share the graphics queue: submits and presents are serialized by submit_mutex.
+        std::fprintf(stderr, "SOTC PRESENT: path shared-queue (one queue, presents under "
+                             "submit_mutex)\n");
+    }
     // sotc: SOTC_HOST_IMPORT copies on the transfer queue: without it, the CPU path stays.
     if (host_import_enabled && !HasXferQueue()) {
         host_import_enabled = false;

@@ -384,7 +384,30 @@ static void read_lock_at(const char *site) { if (!exclusive_depth) { lock_site_n
 #define read_lock() read_lock_at(__func__)
 static void read_unlock(void) { if (!exclusive_depth) { --read_depth; rw_rdunlock(); } }
 static Block blocks[LIMIT];
-static Vma *vmas; static size_t vma_count, vma_capacity;
+/* sotc: the VMAs, sorted, in blocks of at most VMA_BLOCK entries (indices stay global: V(i)).
+ * Riding the world keeps ~11k VMAs, and one sorted array moved ~440 KB at every insert and erase:
+ * ~3 s per riding benchmark under the write lock, inside the vma_seq sections the GPU's lock-free
+ * lookups wait out. The block index has a fixed capacity and blocks are never freed, so a
+ * lock-free read that races a change reads stale but valid memory (vma_seq then rejects it). */
+#define VMA_BLOCK 512
+#define VMA_BLOCKS_MAX 8192
+typedef struct { Vma *e; size_t n, first; } VmaBlock; /* first: global index of e[0] */
+static VmaBlock vblocks[VMA_BLOCKS_MAX];
+static size_t vblock_count, vma_count;
+static Vma *vspare[16]; static size_t vspare_count;
+static __thread size_t vblock_hint;
+static size_t vblock_of(size_t i) { /* the block holding global index i (i < vma_count) */
+    const size_t h=vblock_hint;
+    if (h<vblock_count && i-vblocks[h].first<vblocks[h].n) return h;
+    size_t lo=0, hi=vblock_count;
+    while (hi-lo>1) { size_t mid=(lo+hi)/2; if (vblocks[mid].first<=i) lo=mid; else hi=mid; }
+    return vblock_hint=lo;
+}
+static Vma *vreg(size_t i) {
+    const size_t b=vblock_of(i);
+    return &vblocks[b].e[i-vblocks[b].first];
+}
+#define V(i) (*vreg(i))
 #ifndef _WIN32
 static int pool_fd=-1;
 #endif
@@ -420,7 +443,15 @@ typedef struct { uintptr_t start, end; uint64_t phys; int mapped; } HostRegion; 
 typedef struct { uintptr_t start, end; DWORD protect; } ProtRun;
 /* SOTC_COMMIT_CHUNKS=2: a region is lazy while the chunk module's lazy list holds its range (no view yet). */
 static int lazy_region(const HostRegion *r);
-static HostRegion *regions; static size_t region_count, region_capacity;
+/* sotc: the host regions, sorted, in blocks of at most REGION_BLOCK entries. The game's mappings
+ * cut the address range into ~20k views and placeholders, and one sorted array moved ~600 KB at
+ * every insert and erase: ~4.8 s per riding benchmark under the memory write lock, two thirds of
+ * all carve time. A block moves at most REGION_BLOCK entries. Indices stay global (R(i)). */
+#define REGION_BLOCK 512
+typedef struct { HostRegion *e; size_t n, first; } RegionBlock; /* first: global index of e[0] */
+static RegionBlock *rblocks; static size_t rblock_count, rblock_capacity;
+static HostRegion *rspare[8]; static size_t rspare_count; /* blocks ready for splits */
+static size_t region_count, rblock_last;
 static HANDLE section;
 static DWORD win_prot(int prot) {
     if (prot & PROT_EXEC) return (prot & PROT_WRITE) ? PAGE_EXECUTE_READWRITE : (prot & PROT_READ) ? PAGE_EXECUTE_READ : PAGE_EXECUTE;
@@ -433,38 +464,131 @@ static void win_fail(const char *what, uintptr_t address, uint64_t size) {
     fprintf(stderr,"STOP: %s failed at %p (+0x%" PRIx64 "), error %lu\n",what,(void *)address,size,GetLastError());
     exit(21);
 }
-static size_t region_index(uintptr_t a) { /* first region with end > a */
-    size_t lo=0, hi=region_count;
-    while (lo<hi) { size_t mid=(lo+hi)/2; if (regions[mid].end<=a) lo=mid+1; else hi=mid; }
-    return lo;
+static size_t rblock_of(size_t i) { /* the block holding global index i (i < region_count) */
+    if (rblock_last<rblock_count && i-rblocks[rblock_last].first<rblocks[rblock_last].n) return rblock_last;
+    size_t lo=0, hi=rblock_count;
+    while (hi-lo>1) { size_t mid=(lo+hi)/2; if (rblocks[mid].first<=i) lo=mid; else hi=mid; }
+    return rblock_last=lo;
 }
+static HostRegion *reg(size_t i) {
+    const size_t b=rblock_of(i);
+    return &rblocks[b].e[i-rblocks[b].first];
+}
+#define R(i) (*reg(i))
+static size_t region_index(uintptr_t a) { /* first region with end > a */
+    if (!region_count) return 0;
+    size_t lo=0, hi=rblock_count;
+    while (lo<hi) { size_t mid=(lo+hi)/2; if (rblocks[mid].e[rblocks[mid].n-1].end<=a) lo=mid+1; else hi=mid; }
+    if (lo==rblock_count) return region_count;
+    const RegionBlock *b=&rblocks[lo];
+    size_t l=0, h=b->n;
+    while (l<h) { size_t mid=(l+h)/2; if (b->e[mid].end<=a) l=mid+1; else h=mid; }
+    return b->first+l;
+}
+static HostRegion *rblock_alloc(void) {
+    if (rspare_count) return rspare[--rspare_count];
+    HostRegion *e=malloc(REGION_BLOCK*sizeof(*e));
+    if (!e) { fputs("Out of memory (host regions)\n",stderr); exit(1); }
+    return e;
+}
+/* The next `extra` inserts allocate nothing (carve_host stops the other guest threads meanwhile,
+ * and one of them may hold the heap). */
 static void region_reserve(size_t extra) {
-    while (region_count+extra>region_capacity) {
-        size_t capacity=region_capacity ? region_capacity*2 : 256;
-        HostRegion *next=realloc(regions,capacity*sizeof(*regions));
+    if (extra>8) extra=8;
+    while (rspare_count<extra) {
+        HostRegion *e=malloc(REGION_BLOCK*sizeof(*e));
+        if (!e) { fputs("Out of memory (host regions)\n",stderr); exit(1); }
+        rspare[rspare_count++]=e;
+    }
+    while (rblock_count+extra+1>rblock_capacity) {
+        size_t capacity=rblock_capacity ? rblock_capacity*2 : 64;
+        RegionBlock *next=realloc(rblocks,capacity*sizeof(*rblocks));
         if (!next) { fputs("Out of memory (host regions)\n",stderr); exit(1); }
-        regions=next; region_capacity=capacity;
+        rblocks=next; rblock_capacity=capacity;
     }
 }
+static void rblock_renumber(size_t from) {
+    for (size_t b=from; b<rblock_count; ++b) rblocks[b].first=b ? rblocks[b-1].first+rblocks[b-1].n : 0;
+}
 static void region_insert(size_t at, HostRegion r) {
-    region_reserve(1);
-    memmove(regions+at+1,regions+at,(region_count-at)*sizeof(*regions));
-    regions[at]=r; ++region_count;
+    if (rblock_count+2>rblock_capacity) region_reserve(1);
+    if (!rblock_count) {
+        rblocks[0]=(RegionBlock){rblock_alloc(),0,0};
+        rblock_count=1;
+    }
+    size_t b=at==region_count ? rblock_count-1 : rblock_of(at);
+    if (rblocks[b].n==REGION_BLOCK) { /* split it in two halves */
+        memmove(rblocks+b+2,rblocks+b+1,(rblock_count-b-1)*sizeof(*rblocks));
+        HostRegion *e=rblock_alloc();
+        const size_t half=REGION_BLOCK/2;
+        memcpy(e,rblocks[b].e+half,(REGION_BLOCK-half)*sizeof(*e));
+        rblocks[b+1]=(RegionBlock){e,REGION_BLOCK-half,rblocks[b].first+half};
+        rblocks[b].n=half;
+        ++rblock_count;
+        if (at-rblocks[b].first>half) ++b; /* at == first+half stays in block b, at its end */
+    }
+    RegionBlock *k=&rblocks[b];
+    const size_t j=at-k->first;
+    memmove(k->e+j+1,k->e+j,(k->n-j)*sizeof(*k->e));
+    k->e[j]=r; ++k->n; ++region_count;
+    rblock_renumber(b+1);
+    rblock_last=b;
 }
 static void region_erase(size_t at, size_t n) {
-    memmove(regions+at,regions+at+n,(region_count-at-n)*sizeof(*regions)); region_count-=n;
+    while (n) {
+        const size_t b=rblock_of(at);
+        RegionBlock *k=&rblocks[b];
+        const size_t j=at-k->first;
+        const size_t take=k->n-j<n ? k->n-j : n;
+        memmove(k->e+j,k->e+j+take,(k->n-j-take)*sizeof(*k->e));
+        k->n-=take; region_count-=take; n-=take;
+        if (!k->n && rblock_count>1) { /* drop the empty block */
+            if (rspare_count<8) rspare[rspare_count++]=k->e; else free(k->e);
+            memmove(rblocks+b,rblocks+b+1,(rblock_count-b-1)*sizeof(*rblocks));
+            --rblock_count;
+        }
+        rblock_renumber(b);
+        rblock_last=0;
+    }
+}
+/* sotc: something got into a guest range before the reservation (issue #110: error 487, "spamming
+ * the play button and eventually it will launch": an overlay or security product placing memory at
+ * random). Says what is there and exits with RANGE_BUSY_EXIT: sotc.py starts the game again. */
+#define RANGE_BUSY_EXIT 87
+static void range_busy(const char *what, uintptr_t lo, uintptr_t hi) {
+    const DWORD error=GetLastError();
+    fprintf(stderr,"Runtime: cannot reserve %s at %p (+0x%" PRIx64 "), error %lu; already there:\n",what,(void *)lo,(uint64_t)(hi-lo),error);
+    int shown=0;
+    for (uintptr_t at=lo; at<hi && shown<8;) {
+        MEMORY_BASIC_INFORMATION m;
+        if (!VirtualQuery((void *)at,&m,sizeof(m)) || !m.RegionSize) break;
+        if (m.State!=MEM_FREE) {
+            char name[260]="";
+            if (m.Type==MEM_IMAGE && !GetModuleFileNameA((HMODULE)m.AllocationBase,name,sizeof(name))) name[0]=0;
+            fprintf(stderr,"Runtime:   %p +0x%" PRIx64 " %s %s\n",m.BaseAddress,(uint64_t)m.RegionSize,
+                    m.Type==MEM_IMAGE ? "module" : m.Type==MEM_MAPPED ? "mapped" : "private",name);
+            ++shown;
+        }
+        at=(uintptr_t)m.BaseAddress+m.RegionSize;
+    }
+    fflush(NULL);
+    exit(RANGE_BUSY_EXIT);
 }
 /* The guest range is reserved before anything else can be placed there (runtime_start). */
 void runtime_memory_reserve(void) {
     if (region_count) return;
+    /* SOTC_TEST_RANGE_BUSY=n: the first n starts find the range taken (tests sotc.py's retry). */
+    const char *busy_test=getenv("SOTC_TEST_RANGE_BUSY"), *attempt=getenv("SOTC_RANGE_RETRY");
+    if (busy_test && (attempt ? atoi(attempt) : 0)<atoi(busy_test))
+        VirtualAlloc((void *)(USER_MIN+(UINT64_C(1)<<32)),65536,MEM_RESERVE,PAGE_NOACCESS);
     if (!VirtualAlloc2(NULL,(void *)USER_MIN,USER_MAX-USER_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
-        win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
+        range_busy("the PS4 address range",USER_MIN,USER_MAX);
     region_insert(0,(HostRegion){USER_MIN,USER_MAX,0,0});
     /* sotc: Shadow of the Colossus maps fixed ranges below the user area (0x7f0000000),
      * in the PS4 system-managed window. A second placeholder covers it; mappings never
      * span both reservations because the host's low maps lie between them. */
     if (!VirtualAlloc2(NULL,(void *)SYSTEM_LOW_MIN,SYSTEM_LOW_MAX-SYSTEM_LOW_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
-        win_fail("reserving the PS4 system-managed window",SYSTEM_LOW_MIN,SYSTEM_LOW_MAX-SYSTEM_LOW_MIN);
+        range_busy("the PS4 system-managed window",SYSTEM_LOW_MIN,SYSTEM_LOW_MAX);
     region_insert(0,(HostRegion){SYSTEM_LOW_MIN,SYSTEM_LOW_MAX,0,0});
 }
 static int commit_chunks_on(void); /* sotc: SOTC_COMMIT_CHUNKS, defined with the commit switches */
@@ -692,22 +816,22 @@ static int view_split_fine(void) {
     if (v<0) { const char *e=getenv("SOTC_VIEW_SPLIT_FINE"); v=e && e[0]=='1'; }
     return v;
 }
-/* Maps the unmapped placeholder regions[at] from phys as FINE_VIEW views (its first piece ends at
+/* Maps the unmapped placeholder R(at) from phys as FINE_VIEW views (its first piece ends at
  * the next 64 KiB boundary). Returns the index of its last piece. The table must have room for
  * them (region_reserve before stopping the other threads: no heap call meanwhile). */
 static size_t map_fine(size_t at, uint64_t phys) {
-    const uintptr_t start=regions[at].start, end=regions[at].end;
+    const uintptr_t start=R(at).start, end=R(at).end;
     for (uintptr_t x=start; x<end;) {
         uintptr_t y=(x/FINE_VIEW+1)*FINE_VIEW;
         if (y>end) y=end;
         if (y<end) {
             MAP_LOG(MAP_LOG_PLACEHOLDER,x,y,0);
             if (!VirtualFree((void *)x,y-x,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",x,y-x);
-            regions[at].end=y;
+            R(at).end=y;
             region_insert(at+1,(HostRegion){y,end,0,0});
         }
-        regions[at].phys=phys+(x-start); regions[at].mapped=1;
-        view_map(&regions[at],PAGE_READWRITE);
+        R(at).phys=phys+(x-start); R(at).mapped=1;
+        view_map(&R(at),PAGE_READWRITE);
         if (y<end) ++at;
         x=y;
     }
@@ -716,9 +840,9 @@ static size_t map_fine(size_t at, uint64_t phys) {
 /* Sets the protection of [start,end) view by view (VirtualProtect does not cross views). */
 static void protect_views(uintptr_t start, uintptr_t end, DWORD protect) {
     DWORD old;
-    for (size_t i=region_index(start); i<region_count && regions[i].start<end; ++i) {
-        if (!regions[i].mapped || lazy_region(&regions[i])) continue;
-        uintptr_t a=regions[i].start>start ? regions[i].start : start, b=regions[i].end<end ? regions[i].end : end;
+    for (size_t i=region_index(start); i<region_count && R(i).start<end; ++i) {
+        if (!R(i).mapped || lazy_region(&R(i))) continue;
+        uintptr_t a=R(i).start>start ? R(i).start : start, b=R(i).end<end ? R(i).end : end;
         MAP_LOG(MAP_LOG_PROTECT,a,b,protect);
         if (!VirtualProtect((void *)a,b-a,protect,&old)) win_fail("restoring page protection",a,b-a);
     }
@@ -794,11 +918,11 @@ static void carve_log(uintptr_t a, uintptr_t b, uintptr_t lo, uintptr_t hi, uint
 /* Leaves [a,b) as exactly one unmapped placeholder; returns its region index. */
 static size_t carve_host(uintptr_t a, uintptr_t b) {
     size_t first=region_index(a), last=first;
-    if (first==region_count || regions[first].start>a) win_fail("guest range outside the reservation",a,b-a);
-    while (last<region_count && regions[last].start<b) ++last;
-    if (regions[last-1].end<b) win_fail("guest range outside the reservation",a,b-a);
-    uintptr_t lo=regions[first].start, hi=regions[last-1].end;
-    HostRegion left=regions[first], right=regions[last-1];
+    if (first==region_count || R(first).start>a) win_fail("guest range outside the reservation",a,b-a);
+    while (last<region_count && R(last).start<b) ++last;
+    if (R(last-1).end<b) win_fail("guest range outside the reservation",a,b-a);
+    uintptr_t lo=R(first).start, hi=R(last-1).end;
+    HostRegion left=R(first), right=R(last-1);
     int keep_left=left.mapped && lo<a, keep_right=right.mapped && b<hi;
     if (first==last-1 && !left.mapped && lo==a && hi==b) return first;
     /* sotc: SOTC_COMMIT_CHUNKS=2. The upload wait waits for copy threads, which may fault on a closed chunk and need
@@ -857,8 +981,8 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
             const DWORD pr=runs[r].protect&0xff;
             if (pr!=PAGE_READONLY && pr!=PAGE_EXECUTE_READ) continue;
             /* The guest's own protection must allow writes (not a page the game made read-only). */
-            for (size_t v=vma_index(runs[r].start); nostop && v<vma_count && vmas[v].start<runs[r].end; ++v)
-                if (!(host_prot(vmas[v].prot)&PROT_WRITE)) { nostop=0; carve_stop_reason="guest read-only pages"; }
+            for (size_t v=vma_index(runs[r].start); nostop && v<vma_count && V(v).start<runs[r].end; ++v)
+                if (!(host_prot(V(v).prot)&PROT_WRITE)) { nostop=0; carve_stop_reason="guest read-only pages"; }
         }
     }
     if (nostop && stack_hit) {
@@ -886,7 +1010,7 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
         carve_nstopped=runtime_thread_suspend_others(carve_stopped,256);
         carve_stopping=1;
     }
-    for (size_t i=first;i<last;++i) if (regions[i].mapped && !lazy_region(&regions[i])) view_unmap(&regions[i]);
+    for (size_t i=first;i<last;++i) if (R(i).mapped && !lazy_region(&R(i))) view_unmap(&R(i));
     if (lazy_mode) chunks_lazy_cut(a,b); /* [a,b) has no lazy range now; the kept parts stay lazy */
     if (last-first>1) MAP_LOG(MAP_LOG_PLACEHOLDER,lo,hi,0);
     if (last-first>1 && !VirtualFree((void *)lo,hi-lo,MEM_RELEASE|MEM_COALESCE_PLACEHOLDERS))
@@ -897,30 +1021,30 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     if (lo<a) {
         MAP_LOG(MAP_LOG_PLACEHOLDER,lo,a,0);
         if (!VirtualFree((void *)lo,a-lo,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",lo,a-lo);
-        regions[at].end=a;
+        R(at).end=a;
         region_insert(at+1,(HostRegion){a,hi,0,0});
         if (lazy_left) {
-            regions[at].phys=left.phys; regions[at].mapped=1; /* still a lazy range: no view */
+            R(at).phys=left.phys; R(at).mapped=1; /* still a lazy range: no view */
         } else if (keep_left && fine) {
             at=map_fine(at,left.phys);
         } else if (keep_left) {
-            regions[at].phys=left.phys; regions[at].mapped=1;
-            view_map(&regions[at],PAGE_READWRITE);
+            R(at).phys=left.phys; R(at).mapped=1;
+            view_map(&R(at),PAGE_READWRITE);
         }
         ++at;
     }
     if (b<hi) {
         MAP_LOG(MAP_LOG_PLACEHOLDER,a,b,0);
         if (!VirtualFree((void *)a,b-a,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",a,b-a);
-        regions[at].end=b;
+        R(at).end=b;
         region_insert(at+1,(HostRegion){b,hi,0,0});
         if (lazy_right) {
-            regions[at+1].phys=right.phys+(b-right.start); regions[at+1].mapped=1; /* still a lazy range */
+            R(at+1).phys=right.phys+(b-right.start); R(at+1).mapped=1; /* still a lazy range */
         } else if (keep_right && fine) {
             map_fine(at+1,right.phys+(b-right.start));
         } else if (keep_right) {
-            regions[at+1].phys=right.phys+(b-right.start); regions[at+1].mapped=1;
-            view_map(&regions[at+1],PAGE_READWRITE);
+            R(at+1).phys=right.phys+(b-right.start); R(at+1).mapped=1;
+            view_map(&R(at+1),PAGE_READWRITE);
         }
     }
     for (size_t i=0;i<nruns;++i) {
@@ -994,31 +1118,27 @@ static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, ui
     const int by_chunks=commit_chunks_on();
     const int lazy=commit_chunks_lazy();
     if (!by_chunks && (!chunk || size<=chunk)) {
-        regions[i].phys=phys; regions[i].mapped=1;
-        view_map(&regions[i],win_prot(prot));
+        R(i).phys=phys; R(i).mapped=1;
+        view_map(&R(i),win_prot(prot));
         return 0;
     }
     /* sotc: SOTC_VIEW_CHUNK_MB/KB. The carved range is one unmapped placeholder: cutting it at chunk
-     * boundaries splits only placeholders, so no live view is touched and nothing is stopped.
-     * The table gets all the pieces at once (one move of its tail): inserting them one by one moved
-     * the whole tail per piece, quadratic with 64 KiB pieces of a multi-GiB mapping. */
+     * boundaries splits only placeholders, so no live view is touched and nothing is stopped. The
+     * region table is in blocks (region_insert moves at most REGION_BLOCK entries per piece). */
     const uintptr_t end=address+size;
-    size_t pieces=0;
-    for (uintptr_t a=address; a<end; ++pieces) a=piece_end(address,a,end,phys,chunk,by_chunks);
-    region_reserve(pieces-1);
-    memmove(regions+i+pieces,regions+i+1,(region_count-i-1)*sizeof(*regions));
-    region_count+=pieces-1;
-    size_t k=i;
     const DWORD protect=win_prot(prot);
-    for (uintptr_t a=address; a<end; ++k) {
+    for (uintptr_t a=address; a<end; ++i) {
         const uintptr_t b=piece_end(address,a,end,phys,chunk,by_chunks);
-        /* [a,end) is one placeholder here: cut [a,b) off its start. */
-        if (b<end) MAP_LOG(MAP_LOG_PLACEHOLDER,a,b,0);
-        if (b<end && !VirtualFree((void *)a,b-a,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER))
-            win_fail("splitting a placeholder",a,b-a);
-        regions[k]=(HostRegion){a,b,phys+(a-address),1};
+        if (b<end) { /* R(i) is the placeholder [a,end): cut [a,b) off its start */
+            MAP_LOG(MAP_LOG_PLACEHOLDER,a,b,0);
+            if (!VirtualFree((void *)a,b-a,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER))
+                win_fail("splitting a placeholder",a,b-a);
+            R(i).end=b;
+            region_insert(i+1,(HostRegion){b,end,0,0});
+        }
+        R(i).phys=phys+(a-address); R(i).mapped=1;
         if (lazy) chunks_lazy_add(a,b,phys+(a-address),protect); /* SOTC_COMMIT_CHUNKS=2: the view waits for the first touch */
-        else view_map(&regions[k],protect);
+        else view_map(&R(i),protect);
         a=b;
     }
     return 0;
@@ -1034,10 +1154,10 @@ static int host_protect(uintptr_t address, uint64_t size, int prot) {
     const int lazy=commit_chunks_lazy();
     int result=0;
     if (lazy) chunks_lock(); /* a lazy range keeps the protection it gets when viewed: the list is updated */
-    for (size_t i=region_index(address); i<region_count && regions[i].start<end && !result; ++i) {
-        if (!regions[i].mapped) continue;
-        uintptr_t a=regions[i].start>address ? regions[i].start : address, b=regions[i].end<end ? regions[i].end : end;
-        if (lazy && lazy_region(&regions[i])) { chunks_lazy_setprot(a,b,protect); continue; }
+    for (size_t i=region_index(address); i<region_count && R(i).start<end && !result; ++i) {
+        if (!R(i).mapped) continue;
+        uintptr_t a=R(i).start>address ? R(i).start : address, b=R(i).end<end ? R(i).end : end;
+        if (lazy && lazy_region(&R(i))) { chunks_lazy_setprot(a,b,protect); continue; }
         if (!VirtualProtect((void *)a,b-a,protect,&old)) result=-1;
     }
     if (lazy) chunks_unlock();
@@ -1227,7 +1347,11 @@ static void upload_fence_before_lock(uint64_t phys, uint64_t size) {
 static int upload_fence_done(uint64_t phys, uint64_t size) {
     return upload_pre_hi>upload_pre_lo && phys>=upload_pre_lo && phys+size<=upload_pre_hi;
 }
+/* Bytes zeroed for reuse since the last call (GPU report). */
+static uint64_t discarded_bytes;
+uint64_t runtime_memory_discarded(void) { return __atomic_exchange_n(&discarded_bytes,0,__ATOMIC_RELAXED); }
 static void host_discard(uint64_t phys, uint64_t size) {
+    __atomic_add_fetch(&discarded_bytes,size,__ATOMIC_RELAXED);
     if (bbgpu_upload_wait_phys && !upload_fence_done(phys,size)) bbgpu_upload_wait_phys(phys,size);
     if (commit_chunks_on()) { chunks_discard(phys,size); return; } /* closed chunks already read as zero */
     if (!commit_on_demand()) { memset(backing_base+phys,0,size); return; }
@@ -1417,9 +1541,15 @@ static void flex_free(uint64_t phys, uint64_t size) {
     chunks_free_note(phys,size);
 }
 static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
-    size_t lo=0, hi=vma_count;
-    while (lo<hi) { size_t mid=(lo+hi)/2; if (vmas[mid].end<=a) lo=mid+1; else hi=mid; }
-    return lo;
+    if (!vma_count) return 0;
+    size_t lo=0, hi=vblock_count;
+    while (lo<hi) { size_t mid=(lo+hi)/2; if (vblocks[mid].e[vblocks[mid].n-1].end<=a) lo=mid+1; else hi=mid; }
+    if (lo==vblock_count) return vma_count;
+    const VmaBlock *b=&vblocks[lo];
+    size_t l=0, h=b->n;
+    while (l<h) { size_t mid=(l+h)/2; if (b->e[mid].end<=a) l=mid+1; else h=mid; }
+    vblock_hint=lo;
+    return b->first+l;
 }
 /* sotc: odd while the VMA array is being changed in place (insert, erase, field writes). The
  * GPU's lookups read the array without the lock and retry when it changed meanwhile
@@ -1427,49 +1557,97 @@ static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
 static uint64_t vma_seq;
 static void vma_seq_begin(void) { __atomic_add_fetch(&vma_seq,1,__ATOMIC_SEQ_CST); }
 static void vma_seq_end(void) { __atomic_add_fetch(&vma_seq,1,__ATOMIC_RELEASE); }
+/* A lock-free reader follows .e before vma_seq can reject what it read, so .e is always stored
+ * whole: memmove's copy width belongs to the C library, and a torn pointer would be a wild read. */
+static void vblock_set(size_t at, Vma *e, size_t n, size_t first) {
+    __atomic_store_n(&vblocks[at].e,e,__ATOMIC_RELAXED);
+    __atomic_store_n(&vblocks[at].n,n,__ATOMIC_RELAXED);
+    __atomic_store_n(&vblocks[at].first,first,__ATOMIC_RELAXED);
+}
+static Vma *vblock_alloc(void) {
+    if (vspare_count) return vspare[--vspare_count];
+    return malloc(VMA_BLOCK*sizeof(Vma));
+}
+static void vblock_renumber(size_t from) {
+    for (size_t b=from; b<vblock_count; ++b)
+        vblocks[b].first=b ? vblocks[b-1].first+vblocks[b-1].n : 0;
+}
 static int vma_insert(size_t at, Vma v) {
-    if (vma_count==vma_capacity) {
-        size_t capacity=vma_capacity ? vma_capacity*2 : 256;
-        Vma *next=malloc(capacity*sizeof(*vmas));
-        if (!next) return -1;
-        if (vma_count) memcpy(next,vmas,vma_count*sizeof(*vmas));
+    if (!vblock_count) {
+        Vma *e=vblock_alloc();
+        if (!e) return -1;
         vma_seq_begin();
-        __atomic_store_n(&vmas,next,__ATOMIC_RELEASE); /* the old array stays: see vma_seq */
-        vma_capacity=capacity;
+        vblock_set(0,e,0,0);
+        vblock_count=1;
         vma_seq_end();
+    }
+    size_t b=at==vma_count ? vblock_count-1 : vblock_of(at);
+    Vma *spare=NULL;
+    if (vblocks[b].n==VMA_BLOCK) { /* split it: the new block before any change */
+        if (vblock_count==VMA_BLOCKS_MAX || !(spare=vblock_alloc())) return -1;
     }
     dirty(v.start,v.end);
     vma_seq_begin();
-    memmove(vmas+at+1,vmas+at,(vma_count-at)*sizeof(*vmas));
-    vmas[at]=v; ++vma_count;
+    if (spare) {
+        const size_t half=VMA_BLOCK/2;
+        memcpy(spare,vblocks[b].e+half,(VMA_BLOCK-half)*sizeof(*spare));
+        for (size_t x=vblock_count; x>b+1; --x) vblock_set(x,vblocks[x-1].e,vblocks[x-1].n,vblocks[x-1].first);
+        vblock_set(b+1,spare,VMA_BLOCK-half,vblocks[b].first+half);
+        vblocks[b].n=half;
+        ++vblock_count;
+        if (at-vblocks[b].first>half) ++b; /* at == first+half: the end of block b */
+    }
+    VmaBlock *k=&vblocks[b];
+    const size_t j=at-k->first;
+    memmove(k->e+j+1,k->e+j,(k->n-j)*sizeof(*k->e));
+    k->e[j]=v; ++k->n; ++vma_count;
+    vblock_renumber(b+1);
     vma_seq_end();
+    vblock_hint=b;
     return 0;
 }
 static void vma_erase(size_t at, size_t n) {
-    if (n) dirty(vmas[at].start,vmas[at+n-1].end);
+    if (!n) return;
+    dirty(V(at).start,V(at+n-1).end);
     vma_seq_begin();
-    memmove(vmas+at,vmas+at+n,(vma_count-at-n)*sizeof(*vmas)); vma_count-=n;
+    while (n) {
+        const size_t b=vblock_of(at);
+        VmaBlock *k=&vblocks[b];
+        const size_t j=at-k->first;
+        const size_t take=k->n-j<n ? k->n-j : n;
+        memmove(k->e+j,k->e+j+take,(k->n-j-take)*sizeof(*k->e));
+        k->n-=take; vma_count-=take; n-=take;
+        if (!k->n && vblock_count>1) { /* drop the empty block; never freed (lock-free reads) */
+            Vma *e=k->e;
+            for (size_t x=b; x+1<vblock_count; ++x) vblock_set(x,vblocks[x+1].e,vblocks[x+1].n,vblocks[x+1].first);
+            --vblock_count;
+            vblock_set(vblock_count,e,0,0); /* a stale slot keeps a valid block */
+            if (vspare_count<16) vspare[vspare_count++]=e; /* else left to the stale slot */
+        }
+        vblock_renumber(b);
+        vblock_hint=0;
+    }
     vma_seq_end();
 }
 static int split_at(uintptr_t a) {
     size_t i=vma_index(a);
-    if (i==vma_count || vmas[i].start>=a) return 0;
-    Vma right=vmas[i];
+    if (i==vma_count || V(i).start>=a) return 0;
+    Vma right=V(i);
     right.start=a;
     /* sotc: flexible pages have a backing offset too. Kept unchanged, the right half of a
      * split flexible mapping pointed at the left half's storage: the runtime's copies went to
      * the wrong pages and its release freed the left half's pages, still in use, which the
      * next flexible map handed out again (T38: mosaic textures, heap crashes). */
     if (right.kind!=KIND_RESERVED) {
-        right.phys+=a-vmas[i].start;
+        right.phys+=a-V(i).start;
         static unsigned long flex_splits;
         if (right.kind==KIND_FLEXIBLE && flex_splits++ < 8)
             fprintf(stderr,"Runtime: flexible mapping %p-%p split at %p\n",
-                    (void *)vmas[i].start,(void *)vmas[i].end,(void *)a);
+                    (void *)V(i).start,(void *)V(i).end,(void *)a);
     }
-    dirty(vmas[i].start,vmas[i].end);
+    dirty(V(i).start,V(i).end);
     vma_seq_begin();
-    vmas[i].end=a;
+    V(i).end=a;
     vma_seq_end();
     return vma_insert(i+1,right);
 }
@@ -1481,22 +1659,22 @@ static size_t carve(uintptr_t start, uintptr_t end, int *error) {
 static int covered(uintptr_t start, uintptr_t end, int allow_reserved) {
     size_t i=vma_index(start); uintptr_t at=start;
     for (; at<end; ++i) {
-        if (i==vma_count || vmas[i].start>at || (!allow_reserved && vmas[i].kind==KIND_RESERVED)) return 0;
-        at=vmas[i].end;
+        if (i==vma_count || V(i).start>at || (!allow_reserved && V(i).kind==KIND_RESERVED)) return 0;
+        at=V(i).end;
     }
     return 1;
 }
 static int overlaps(uintptr_t start, uintptr_t end, int ignore_reserved) {
-    for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i)
-        if (!ignore_reserved || vmas[i].kind!=KIND_RESERVED) return 1;
+    for (size_t i=vma_index(start); i<vma_count && V(i).start<end; ++i)
+        if (!ignore_reserved || V(i).kind!=KIND_RESERVED) return 1;
     return 0;
 }
 /* First-fit search in the PS4 user range, starting from the hint. */
 static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
     uintptr_t at=align_up(hint<USER_MIN ? USER_MIN : hint, alignment);
     for (size_t i=vma_index(at); at+size<=USER_MAX; ++i) {
-        if (i==vma_count || vmas[i].start>=at+size) return at;
-        at=align_up(vmas[i].end,alignment);
+        if (i==vma_count || V(i).start>=at+size) return at;
+        at=align_up(V(i).end,alignment);
     }
     return 0;
 }
@@ -1546,8 +1724,8 @@ static void views_remove(uint64_t phys, uintptr_t address, uint64_t size) {
          * tracker there would lift (writes then faulted forever): the guest's protection again,
          * and the GPU rereads the page. */
         const size_t j=vma_index(left);
-        if (j<vma_count && vmas[j].start<=left && vmas[j].kind==KIND_DIRECT) {
-            host_protect(left,PAGE,host_prot(vmas[j].prot));
+        if (j<vma_count && V(j).start<=left && V(j).kind==KIND_DIRECT) {
+            host_protect(left,PAGE,host_prot(V(j).prot));
             queue_hook(HOOK_INVALIDATE,left,PAGE);
         }
     }
@@ -1555,13 +1733,13 @@ static void views_remove(uint64_t phys, uintptr_t address, uint64_t size) {
 /* The other guest address of the direct page at [address], or 0. Under the lock. */
 static uintptr_t view_other(uintptr_t address, size_t *vma) {
     size_t i=vma_index(address);
-    if (i==vma_count || vmas[i].start>address || vmas[i].kind!=KIND_DIRECT) return 0;
+    if (i==vma_count || V(i).start>address || V(i).kind!=KIND_DIRECT) return 0;
     if (vma) *vma=i;
-    const uint64_t off=(address-vmas[i].start) & ~(PAGE-1), phys=vmas[i].phys+off, page=phys/PAGE;
+    const uint64_t off=(address-V(i).start) & ~(PAGE-1), phys=V(i).phys+off, page=phys/PAGE;
     if (page>=phys_view_pages) return 0;
-    const uintptr_t at=vmas[i].start+off, *v=phys_views[page];
+    const uintptr_t at=V(i).start+off, *v=phys_views[page];
     const uintptr_t other=v[0]==at ? v[1] : v[1]==at ? v[0] : 0;
-    return other ? other+((address-vmas[i].start)-off) : 0;
+    return other ? other+((address-V(i).start)-off) : 0;
 }
 /* Gives the other addresses of [address,address+size) the GPU's protection (read/write wanted). */
 static void views_protect(uintptr_t address, uint64_t size, int read, int write) {
@@ -1570,8 +1748,8 @@ static void views_protect(uintptr_t address, uint64_t size, int read, int write)
         const uintptr_t other=view_other(at,NULL);
         size_t j=other ? vma_index(other) : vma_count;
         int prot=0;
-        if (j<vma_count && vmas[j].start<=other) {
-            const int guest=host_prot(vmas[j].prot);
+        if (j<vma_count && V(j).start<=other) {
+            const int guest=host_prot(V(j).prot);
             /* writes only: a read of the other address is never stopped (GPU threads read guest
              * memory by address, and a read fault there waited for the GPU itself) */
             const int want=PROT_READ|(write ? PROT_WRITE : 0)|(guest & PROT_EXEC);
@@ -1613,12 +1791,12 @@ static void owner_note(uint64_t phys, uintptr_t address, uint64_t size) {
 }
 static void drop_range(uintptr_t start, uintptr_t end) {
     int error; size_t i=carve(start,end,&error), n=0;
-    while (i+n<vma_count && vmas[i+n].end<=end && vmas[i+n].start>=start) {
-        if (vmas[i+n].kind==KIND_FLEXIBLE) {
-            flexible_bytes-=vmas[i+n].end-vmas[i+n].start;
-            flex_free(vmas[i+n].phys,vmas[i+n].end-vmas[i+n].start);
+    while (i+n<vma_count && V(i+n).end<=end && V(i+n).start>=start) {
+        if (V(i+n).kind==KIND_FLEXIBLE) {
+            flexible_bytes-=V(i+n).end-V(i+n).start;
+            flex_free(V(i+n).phys,V(i+n).end-V(i+n).start);
         }
-        if (vmas[i+n].kind==KIND_DIRECT) views_remove(vmas[i+n].phys,vmas[i+n].start,vmas[i+n].end-vmas[i+n].start);
+        if (V(i+n).kind==KIND_DIRECT) views_remove(V(i+n).phys,V(i+n).start,V(i+n).end-V(i+n).start);
         ++n;
     }
     vma_erase(i,n);
@@ -1752,20 +1930,20 @@ static void views_check(void) {
     last=now; ++checks;
     unsigned long bad=0;
     for (size_t r=0; r<region_count; ++r) {
-        if (!regions[r].mapped) continue;
-        for (uintptr_t at=regions[r].start; at<regions[r].end;) {
+        if (!R(r).mapped) continue;
+        for (uintptr_t at=R(r).start; at<R(r).end;) {
             const size_t i=vma_index(at);
-            if (i==vma_count || vmas[i].start>at) { /* a view where the table has nothing */
+            if (i==vma_count || V(i).start>at) { /* a view where the table has nothing */
                 if (bad++<8 && bad_total<200) fprintf(stderr,"Runtime: VIEW CHECK view %p-%p (offset %#" PRIx64 ") over no mapping at %p\n",
-                    (void *)regions[r].start,(void *)regions[r].end,regions[r].phys,(void *)at);
+                    (void *)R(r).start,(void *)R(r).end,R(r).phys,(void *)at);
                 break;
             }
-            const uintptr_t stop=vmas[i].end<regions[r].end ? vmas[i].end : regions[r].end;
-            const uint64_t view_phys=regions[r].phys+(at-regions[r].start);
-            const uint64_t table_phys=vmas[i].phys+(at-vmas[i].start);
-            if (vmas[i].kind!=KIND_RESERVED && view_phys!=table_phys && bad++<8 && bad_total<200)
+            const uintptr_t stop=V(i).end<R(r).end ? V(i).end : R(r).end;
+            const uint64_t view_phys=R(r).phys+(at-R(r).start);
+            const uint64_t table_phys=V(i).phys+(at-V(i).start);
+            if (V(i).kind!=KIND_RESERVED && view_phys!=table_phys && bad++<8 && bad_total<200)
                 fprintf(stderr,"Runtime: VIEW CHECK %p-%p: view offset %#" PRIx64 ", table %#" PRIx64 " (kind %d, mapping %p-%p)\n",
-                        (void *)at,(void *)stop,view_phys,table_phys,vmas[i].kind,(void *)vmas[i].start,(void *)vmas[i].end);
+                        (void *)at,(void *)stop,view_phys,table_phys,V(i).kind,(void *)V(i).start,(void *)V(i).end);
             at=stop;
         }
     }
@@ -1798,10 +1976,10 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
             size_t live=0; uint64_t live_bytes=0, oldest=0;
             for (size_t k=0;k<npairs;) {
                 size_t ia=vma_index(pairs[k].a), ib=vma_index(pairs[k].b);
-                const int both=ia<vma_count && ib<vma_count && vmas[ia].kind==KIND_DIRECT && vmas[ib].kind==KIND_DIRECT &&
-                    vmas[ia].start<=pairs[k].a && vmas[ib].start<=pairs[k].b &&
-                    vmas[ia].phys+(pairs[k].a-vmas[ia].start)==pairs[k].phys &&
-                    vmas[ib].phys+(pairs[k].b-vmas[ib].start)==pairs[k].phys;
+                const int both=ia<vma_count && ib<vma_count && V(ia).kind==KIND_DIRECT && V(ib).kind==KIND_DIRECT &&
+                    V(ia).start<=pairs[k].a && V(ib).start<=pairs[k].b &&
+                    V(ia).phys+(pairs[k].a-V(ia).start)==pairs[k].phys &&
+                    V(ib).phys+(pairs[k].b-V(ib).start)==pairs[k].phys;
                 const uint64_t age=now-pairs[k].since;
                 if (!both) {
                     if (age>worst_ms) worst_ms=age;
@@ -1814,7 +1992,7 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
                         live,live_bytes>>10,oldest,worst_ms,aliases,alias_pages,alias_faults);
         }
         for (size_t i=0;i<vma_count;++i) {
-            const Vma *v=&vmas[i];
+            const Vma *v=&V(i);
             if (v->kind!=KIND_DIRECT || (v->start<at+size && at<v->end)) continue;
             if (v->phys<p+size && p<v->phys+(v->end-v->start)) {
                 ++aliases;
@@ -1857,15 +2035,15 @@ static ABI int32_t direct_map_named(void **out, uint64_t size, int prot, int fla
 static int32_t unmap_locked(uintptr_t start, uint64_t size) {
     if (start%PAGE || !size) return INVALID;
     uint64_t end=start+align_up(size,PAGE);
-    for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i)
-        if (vmas[i].kind!=KIND_RESERVED) {
-            uintptr_t a=vmas[i].start>start ? vmas[i].start : start, b=vmas[i].end<end ? vmas[i].end : end;
+    for (size_t i=vma_index(start); i<vma_count && V(i).start<end; ++i)
+        if (V(i).kind!=KIND_RESERVED) {
+            uintptr_t a=V(i).start>start ? V(i).start : start, b=V(i).end<end ? V(i).end : end;
             queue_hook(HOOK_UNMAP,a,b-a);
         }
-    for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i) {
-        uintptr_t a=vmas[i].start>start ? vmas[i].start : start, b=vmas[i].end<end ? vmas[i].end : end;
+    for (size_t i=vma_index(start); i<vma_count && V(i).start<end; ++i) {
+        uintptr_t a=V(i).start>start ? V(i).start : start, b=V(i).end<end ? V(i).end : end;
         if (host_unmap(a,b-a)) return INVALID;
-        if (mirror_gpu_visible(vmas[i].kind,vmas[i].prot)) mirror_note(MIRROR_UNMAP,a,b-a); /* sotc: SOTC_MIRROR, after the host unmap */
+        if (mirror_gpu_visible(V(i).kind,V(i).prot)) mirror_note(MIRROR_UNMAP,a,b-a); /* sotc: SOTC_MIRROR, after the host unmap */
     }
     drop_range(start,end);
     return 0;
@@ -1876,7 +2054,7 @@ static size_t unmap_released_vmas_locked(uint64_t start, uint64_t size) {
     /* guard: a failed host_unmap leaves the VMA in place, so bound the scan and skip a VMA that
      * did not shrink the table (no progress), or the loop spins forever holding the lock. */
     for (size_t i=0, guard=0; i<vma_count && guard<vma_count*2+16; ++guard) {
-        Vma v=vmas[i];
+        Vma v=V(i);
         uint64_t length=v.end-v.start;
         if (v.kind==KIND_DIRECT && v.phys<start+size && start<v.phys+length) {
             uint64_t a=v.phys>start ? v.phys : start, b=v.phys+length<start+size ? v.phys+length : start+size;
@@ -2003,11 +2181,11 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     int error; size_t i=carve(start,end,&error);
     if (error) return NO_MEMORY;
     vma_seq_begin();
-    for (; i<vma_count && vmas[i].start<end; ++i) {
+    for (; i<vma_count && V(i).start<end; ++i) {
         /* sotc: SOTC_MIRROR: a protection change that gives or takes GPU access maps or unmaps the mirror pages */
-        const int was=mirror_gpu_visible(vmas[i].kind,vmas[i].prot), now=mirror_gpu_visible(vmas[i].kind,prot);
-        if (was!=now) mirror_note(now ? MIRROR_MAP : MIRROR_UNMAP,vmas[i].start,vmas[i].end-vmas[i].start);
-        vmas[i].prot=prot; if (type>=0) vmas[i].type=type;
+        const int was=mirror_gpu_visible(V(i).kind,V(i).prot), now=mirror_gpu_visible(V(i).kind,prot);
+        if (was!=now) mirror_note(now ? MIRROR_MAP : MIRROR_UNMAP,V(i).start,V(i).end-V(i).start);
+        V(i).prot=prot; if (type>=0) V(i).type=type;
     }
     vma_seq_end();
     queue_hook(HOOK_INVALIDATE,start,end-start);
@@ -2024,16 +2202,16 @@ static ABI int32_t kernel_mprotect(const void *address, uint64_t size, int prot)
 static ABI int32_t query_protection(void *address, void **start, void **end, uint32_t *prot) {
     read_lock();
     size_t i=vma_index((uintptr_t)address);
-    if (i==vma_count || vmas[i].start>(uintptr_t)address || vmas[i].kind==KIND_RESERVED) {
+    if (i==vma_count || V(i).start>(uintptr_t)address || V(i).kind==KIND_RESERVED) {
         read_unlock(); return ACCESS;
     }
     /* Report the whole contiguous run with identical protection. */
     size_t first=i, last=i;
-    while (first && vmas[first-1].end==vmas[first].start && vmas[first-1].kind!=KIND_RESERVED && vmas[first-1].prot==vmas[i].prot) --first;
-    while (last+1<vma_count && vmas[last+1].start==vmas[last].end && vmas[last+1].kind!=KIND_RESERVED && vmas[last+1].prot==vmas[i].prot) ++last;
-    if (start) *start=(void *)vmas[first].start;
-    if (end) *end=(void *)vmas[last].end;
-    if (prot) *prot=(uint32_t)vmas[i].prot;
+    while (first && V(first-1).end==V(first).start && V(first-1).kind!=KIND_RESERVED && V(first-1).prot==V(i).prot) --first;
+    while (last+1<vma_count && V(last+1).start==V(last).end && V(last+1).kind!=KIND_RESERVED && V(last+1).prot==V(i).prot) ++last;
+    if (start) *start=(void *)V(first).start;
+    if (end) *end=(void *)V(last).end;
+    if (prot) *prot=(uint32_t)V(i).prot;
     __atomic_add_fetch(&queries,1,__ATOMIC_RELAXED);
     read_unlock();
     return 0;
@@ -2042,8 +2220,8 @@ static ABI int32_t virtual_query(const void *address, int flags, VirtualQueryInf
     if (!info || info_size!=sizeof(*info)) return INVALID;
     read_lock();
     size_t i=vma_index((uintptr_t)address);
-    if (i==vma_count || (vmas[i].start>(uintptr_t)address && !(flags & 1))) { read_unlock(); return ACCESS; }
-    Vma v=vmas[i];
+    if (i==vma_count || (V(i).start>(uintptr_t)address && !(flags & 1))) { read_unlock(); return ACCESS; }
+    Vma v=V(i);
     memset(info,0,sizeof(*info));
     info->start=v.start; info->end=v.end;
     info->offset=v.kind==KIND_DIRECT ? v.phys : 0;
@@ -2258,7 +2436,7 @@ void *runtime_low_map(size_t size, int prot) {
  * Colossus also waits there for labels its compute queues write: the frame then went ahead
  * without the compute results and the scene was never drawn (black screen in about half of
  * the boots). A BB_TOGGLE_FILE value replaces this default. */
-uint64_t runtime_disabled_optimizations=UINT64_C(1)<<39;
+uint64_t runtime_disabled_optimizations=UINT64_C(1)<<39 | UINT64_C(1)<<59 | UINT64_C(1)<<60; /* sotc: 59, 60 off as in Lukto02 #308 */
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
 __thread sigjmp_buf *runtime_fault_recover;
@@ -2286,9 +2464,9 @@ void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalid
     if (toggles && !watcher) pthread_create(&watcher,NULL,toggle_watcher,(void *)toggles);
     write_lock();
     hook_map=map; hook_unmap=unmap; hook_invalidate=invalidate;
-    for (size_t i=0;i<vma_count;++i) if (vmas[i].kind!=KIND_RESERVED) queue_hook(HOOK_MAP,vmas[i].start,vmas[i].end-vmas[i].start);
+    for (size_t i=0;i<vma_count;++i) if (V(i).kind!=KIND_RESERVED) queue_hook(HOOK_MAP,V(i).start,V(i).end-V(i).start);
     /* sotc: SOTC_MIRROR: the mirror is armed here (the rasterizer exists), so the live GPU-visible mappings are replayed. */
-    for (size_t i=0;i<vma_count;++i) if (mirror_gpu_visible(vmas[i].kind,vmas[i].prot)) mirror_note(MIRROR_MAP,vmas[i].start,vmas[i].end-vmas[i].start);
+    for (size_t i=0;i<vma_count;++i) if (mirror_gpu_visible(V(i).kind,V(i).prot)) mirror_note(MIRROR_MAP,V(i).start,V(i).end-V(i).start);
     write_unlock();
     flush_hooks();
 }
@@ -2336,34 +2514,79 @@ void runtime_memory_cache_stats(uint64_t *misses, uint64_t *stale, uint64_t *fas
     *fast=__atomic_exchange_n(&region_fast_hits,0,__ATOMIC_RELAXED);
 }
 /* sotc: the VMA holding address, read without the lock (0: none there, or the array kept changing:
- * take the lock). A torn read is caught by vma_seq. */
-static int vma_lookup_fast(uintptr_t address, Vma *out) {
-    for (int tries=0; tries<4; ++tries) {
+ * take the lock). A torn read is caught by vma_seq. With gap_lo/gap_hi, an address in no VMA
+ * returns 2 and the unmapped range around it instead of 0. */
+/* sotc: SOTC_SEQ_SPIN (default 256): reads retried while a writer is inside a vma_seq section,
+ * with a short pause between them (~25 us at most). Those sections last a memmove of the VMA
+ * array; with 4 immediate tries the read gave up nearly every time it met one, and the GPU then
+ * took the read lock and waited for the writer's whole map entry (~0.4 ms): ~14k waits per ride. */
+static int seq_spin_tries(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_SEQ_SPIN"); v=e ? atoi(e) : 256; if (v<4) v=4; }
+    return v;
+}
+static inline void seq_pause(int tries) {
+    if (tries<4) return;
+    for (int i=0;i<8;++i) __builtin_ia32_pause();
+}
+static int vma_lookup_gap(uintptr_t address, Vma *out, uintptr_t *gap_lo, uintptr_t *gap_hi) {
+    const int max_tries=seq_spin_tries();
+    for (int tries=0; tries<max_tries; seq_pause(++tries)) {
         const uint64_t s=__atomic_load_n(&vma_seq,__ATOMIC_ACQUIRE);
         if (s & 1) continue;
-        const Vma *v=__atomic_load_n(&vmas,__ATOMIC_ACQUIRE);
-        const size_t n=__atomic_load_n(&vma_count,__ATOMIC_RELAXED);
-        size_t lo=0, hi=n;
+        const size_t nb=__atomic_load_n(&vblock_count,__ATOMIC_RELAXED);
+        if (nb>VMA_BLOCKS_MAX) continue;
+        /* the first block whose last VMA ends above address */
+        size_t lo=0, hi=nb; int torn=0;
         while (lo<hi) {
             size_t mid=(lo+hi)/2;
-            if (__atomic_load_n(&v[mid].end,__ATOMIC_RELAXED)<=address) lo=mid+1; else hi=mid;
+            const Vma *e=__atomic_load_n(&vblocks[mid].e,__ATOMIC_RELAXED);
+            const size_t k=__atomic_load_n(&vblocks[mid].n,__ATOMIC_RELAXED);
+            if (!e || !k || k>VMA_BLOCK) { torn=1; break; }
+            if (__atomic_load_n(&e[k-1].end,__ATOMIC_RELAXED)<=address) lo=mid+1; else hi=mid;
         }
+        if (torn) continue;
         Vma e={0};
-        if (lo<n) {
-            e.start=__atomic_load_n(&v[lo].start,__ATOMIC_RELAXED);
-            e.end=__atomic_load_n(&v[lo].end,__ATOMIC_RELAXED);
-            e.kind=__atomic_load_n(&v[lo].kind,__ATOMIC_RELAXED);
-            e.prot=__atomic_load_n(&v[lo].prot,__ATOMIC_RELAXED);
-            e.phys=__atomic_load_n(&v[lo].phys,__ATOMIC_RELAXED);
+        uintptr_t before=0;
+        int found=0;
+        if (lo>0) {
+            const Vma *pe=__atomic_load_n(&vblocks[lo-1].e,__ATOMIC_RELAXED);
+            const size_t pk=__atomic_load_n(&vblocks[lo-1].n,__ATOMIC_RELAXED);
+            if (!pe || !pk || pk>VMA_BLOCK) continue;
+            before=__atomic_load_n(&pe[pk-1].end,__ATOMIC_RELAXED);
+        }
+        if (lo<nb) {
+            const Vma *be=__atomic_load_n(&vblocks[lo].e,__ATOMIC_RELAXED);
+            const size_t bk=__atomic_load_n(&vblocks[lo].n,__ATOMIC_RELAXED);
+            if (!be || !bk || bk>VMA_BLOCK) continue;
+            size_t l=0, h=bk;
+            while (l<h) {
+                size_t mid=(l+h)/2;
+                if (__atomic_load_n(&be[mid].end,__ATOMIC_RELAXED)<=address) l=mid+1; else h=mid;
+            }
+            if (l<bk) {
+                if (l) before=__atomic_load_n(&be[l-1].end,__ATOMIC_RELAXED);
+                e.start=__atomic_load_n(&be[l].start,__ATOMIC_RELAXED);
+                e.end=__atomic_load_n(&be[l].end,__ATOMIC_RELAXED);
+                e.kind=__atomic_load_n(&be[l].kind,__ATOMIC_RELAXED);
+                e.prot=__atomic_load_n(&be[l].prot,__ATOMIC_RELAXED);
+                e.phys=__atomic_load_n(&be[l].phys,__ATOMIC_RELAXED);
+                found=1;
+            }
         }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (__atomic_load_n(&vma_seq,__ATOMIC_RELAXED)!=s) continue;
-        if (lo==n || e.start>address) return 0;
+        if (!found || e.start>address) {
+            if (!gap_lo) return 0;
+            *gap_lo=before; *gap_hi=!found ? UINTPTR_MAX : e.start;
+            return 2;
+        }
         *out=e;
         return 1;
     }
     return 0;
 }
+static int vma_lookup_fast(uintptr_t address, Vma *out) { return vma_lookup_gap(address,out,NULL,NULL); }
 static __thread CachedRegion region_scratch;
 static const CachedRegion *cached_region_q(uintptr_t address, uintptr_t qend) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
@@ -2441,11 +2664,11 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     int ok=1;
     for (uintptr_t at=address, end=address+size; at<end && ok;) {
         size_t i=vma_index(at);
-        if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
-        uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
-        if (backing_ready(vmas[i].phys+(at-vmas[i].start),n)) { ok=0; break; }
-        if (bbgpu_upload_wait_phys) bbgpu_upload_wait_phys(vmas[i].phys+(at-vmas[i].start),n); /* sotc */
-        memcpy(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
+        if (i==vma_count || V(i).start>at || V(i).kind==KIND_RESERVED) { ok=0; break; }
+        uint64_t n=(V(i).end<end ? V(i).end : end)-at;
+        if (backing_ready(V(i).phys+(at-V(i).start),n)) { ok=0; break; }
+        if (bbgpu_upload_wait_phys) bbgpu_upload_wait_phys(V(i).phys+(at-V(i).start),n); /* sotc */
+        memcpy(backing_base+V(i).phys+(at-V(i).start),(const unsigned char *)data+(at-address),n);
         at+=n;
     }
     read_unlock();
@@ -2455,8 +2678,8 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
 static void cache_region(size_t i, uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
-    const unsigned char *backing=vmas[i].kind!=KIND_RESERVED && backing_base ? backing_base+vmas[i].phys : NULL;
-    const CachedRegion entry={generation,vmas[i].start,vmas[i].end,vmas[i].kind,vmas[i].prot,backing};
+    const unsigned char *backing=V(i).kind!=KIND_RESERVED && backing_base ? backing_base+V(i).phys : NULL;
+    const CachedRegion entry={generation,V(i).start,V(i).end,V(i).kind,V(i).prot,backing};
     region_cache[region_cache_next++ % 8]=entry;
     if (region_direct_on>0) region_direct[region_direct_slot(address)]=entry;
 }
@@ -2478,8 +2701,8 @@ int runtime_memory_alias_release(uintptr_t address) {
     int writable=0;
     read_lock();
     const size_t i=vma_index(address);
-    if (i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED) {
-        const int guest=host_prot(vmas[i].prot);
+    if (i<vma_count && V(i).start<=address && V(i).kind!=KIND_RESERVED) {
+        const int guest=host_prot(V(i).prot);
         writable=(guest & PROT_WRITE)!=0;
         if (writable) host_protect(address & ~(uintptr_t)4095,4096,guest);
     }
@@ -2490,6 +2713,23 @@ int runtime_memory_alias_release(uintptr_t address) {
 uint64_t runtime_memory_generation(void) {
     if (runtime_disabled_optimizations & 1) return 1;
     return __atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+}
+/* sotc: SOTC_GAP_FAST=0: lookups of unmapped addresses take the read lock. At area changes the
+ * GPU's lookups that land in a gap waited for the game's map batches although the answer (nothing
+ * is mapped there) needs no lock: the gap is seen in a consistent (vma_seq) read and used when no
+ * write since the generation read first changed [check_lo,check_hi) - a gap that exists only
+ * during a write lies in its dirty range. 1: [*lo,*hi) is the gap around at (hi UINTPTR_MAX past
+ * the last VMA); 0: unknown, take the lock. check_hi 0: check the whole gap. */
+static int gap_fast(uintptr_t at, uintptr_t check_hi, uintptr_t *lo, uintptr_t *hi) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_GAP_FAST"); on=!(v && v[0]=='0') && region_log_on(); }
+    if (!on || !backing_base || exclusive_depth || (runtime_disabled_optimizations & 1)) return 0;
+    const uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+    Vma e;
+    if (vma_lookup_gap(at,&e,lo,hi)!=2) return 0;
+    const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
+    const uintptr_t a=check_hi ? at : *lo, b=check_hi ? (check_hi<*hi ? check_hi : *hi) : *hi;
+    return (now==generation && !(now & 1)) || region_unchanged(a,b,generation & ~(uint64_t)1,now);
 }
 /* sotc: the GPU reads guest memory through the backing view on every upload; the per-thread
  * region cache spares it the table lock (a winpthread rwlock, slow) and the binary search. */
@@ -2507,13 +2747,16 @@ const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
         const uint64_t offset=(uint64_t)(c->backing-backing_base)+(address-c->start);
         return backing_ready(offset,1) ? NULL : c->backing+(address-c->start);
     }
+    if (c && c->kind==KIND_RESERVED) return NULL;
+    uintptr_t gap_lo, gap_hi;
+    if (!c && gap_fast(address,address+1,&gap_lo,&gap_hi)) return NULL;
     read_lock();
     size_t i=vma_index(address);
     const unsigned char *p=NULL;
-    if (i<vma_count && vmas[i].start<=address) {
+    if (i<vma_count && V(i).start<=address) {
         cache_region(i,address);
-        if (vmas[i].kind!=KIND_RESERVED && backing_base) {
-            const uint64_t offset=vmas[i].phys+(address-vmas[i].start);
+        if (V(i).kind!=KIND_RESERVED && backing_base) {
+            const uint64_t offset=V(i).phys+(address-V(i).start);
             if (!backing_ready(offset,1)) p=backing_base+offset;
         }
     }
@@ -2521,145 +2764,54 @@ const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
     return p;
 }
 /* Mapped length from address, up to size, across adjacent mappings. */
-/* sotc: mapped length of [address, address+size) from the cached regions alone, walking
- * adjacent mappings (buffers that span two VMAs missed the one-region check every time and took
- * the read lock); 0 when a region on the way is not cached. */
-static uint64_t cached_mapped_length(uintptr_t address, uint64_t size) {
-    if (runtime_disabled_optimizations & 1) return 0;
-    uint64_t length=0;
-    for (unsigned hops=0; length<size && hops<4; ++hops) {
-        const CachedRegion *c=cached_region_q(address+length,address+size);
-        if (!c || c->kind==KIND_RESERVED) return 0;
-        length=c->end-address;
-    }
-    return length>=size ? size : 0;
-}
-/* sotc: true when address lies in no VMA (a gap, or past the last one), read without the lock like
- * vma_lookup_fast; 0 also when the array kept changing (the caller takes the lock). */
-static int vma_gap_fast(uintptr_t address) {
-    for (int tries=0; tries<4; ++tries) {
-        const uint64_t s=__atomic_load_n(&vma_seq,__ATOMIC_ACQUIRE);
-        if (s & 1) continue;
-        const Vma *v=__atomic_load_n(&vmas,__ATOMIC_ACQUIRE);
-        const size_t n=__atomic_load_n(&vma_count,__ATOMIC_RELAXED);
-        size_t lo=0, hi=n;
-        while (lo<hi) {
-            size_t mid=(lo+hi)/2;
-            if (__atomic_load_n(&v[mid].end,__ATOMIC_RELAXED)<=address) lo=mid+1; else hi=mid;
-        }
-        const int gap=lo==n || __atomic_load_n(&v[lo].start,__ATOMIC_RELAXED)>address;
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (__atomic_load_n(&vma_seq,__ATOMIC_RELAXED)!=s) continue;
-        return gap;
-    }
-    return 0;
-}
-/* sotc: SOTC_CLAMP_FAST=1 (default off). The GPU clamps every buffer bind to the mapped memory, and an
- * unbounded V# (a 64 MiB window) always ends past its mapping: cached_mapped_length answers only a
- * fully mapped range, so those clamps took the read lock, ~6% of the draw thread in the frames of an
- * area load, waiting for the guest's map batches (user's session, 3 Nov). The same walk as the locked
- * loop below, from the cached regions: adjacent mappings add up, and a reserved region or a gap ends
- * it with the length so far. 0: not answered (an uncached region, too many hops), take the lock. */
-static int cached_clamp(uintptr_t address, uint64_t size, uint64_t *out) {
-    uint64_t length=0;
-    for (unsigned hops=0; length<size && hops<8; ++hops) {
-        const uintptr_t at=address+length;
+/* sotc: SOTC_CLAMP_FAST=0 takes the read lock whenever the range is not mapped to its end. On a
+ * world-streaming ride the GPU's clamps waited ~6 s per 5 minutes for the game's map batches,
+ * nearly all of them for ranges that run into a reserved range or a gap (2.5M lookups), where
+ * the answer is just where the mapping stops. That end is read without the lock too: a reserved
+ * region the cache holds, or a gap seen in a consistent read of the VMAs that no write since
+ * touched (as for mapped regions in cached_region_q). 1: *length is the mapped length from
+ * address (capped at size); 0: unknown, take the lock. */
+static int mapped_length_fast(uintptr_t address, uint64_t size, uint64_t *length) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_CLAMP_FAST"); on=!(v && v[0]=='0') && region_log_on(); }
+    if ((runtime_disabled_optimizations & 1) || size>UINTPTR_MAX-address) return 0;
+    uint64_t n=0;
+    int end_seen=0;
+    for (unsigned hops=0; n<size && hops<4 && !end_seen; ++hops) {
+        const uintptr_t at=address+n;
         const CachedRegion *c=cached_region_q(at,address+size);
-        if (!c) {
-            if (!vma_gap_fast(at)) return 0;
-            *out=length;
-            return 1;
+        if (c) {
+            if (c->kind==KIND_RESERVED) {
+                if (!on) return 0;
+                end_seen=1;
+                continue;
+            }
+            n=c->end-address;
+            continue;
         }
-        if (c->kind==KIND_RESERVED) {
-            *out=length;
-            return 1;
-        }
-        length=c->end-address;
+        uintptr_t lo, hi;
+        if (!on || !gap_fast(at,address+size,&lo,&hi)) return 0;
+        end_seen=1;
     }
-    if (length<size) return 0;
-    *out=size;
+    if (n<size && !end_seen) return 0;
+    *length=n<size ? n : size;
     return 1;
 }
-static int clamp_fast_on(void) {
-    static int on=-1;
-    if (on<0) { const char *v=getenv("SOTC_CLAMP_FAST"); on=v && v[0]=='1'; }
-    return on;
-}
-/* sotc: SOTC_CLAMP_GAP=0 off. Whether no mapping holds [address, address+1) and the gap there is
- * unchanged since the table generation read first, without the lock (as cached_region_q's fast
- * path): the VMA array is read under vma_seq and the gap up to the next mapping is checked with
- * region_unchanged. 0 when unsure (take the lock). */
-static int gap_fast(uintptr_t address) {
-    static int on=-1;
-    if (on<0) { const char *v=getenv("SOTC_CLAMP_GAP"); on=!(v && v[0]=='0'); }
-    if (!on || !region_log_on() || (runtime_disabled_optimizations & 1)) return 0;
-    const uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
-    for (int tries=0; tries<4; ++tries) {
-        const uint64_t s=__atomic_load_n(&vma_seq,__ATOMIC_ACQUIRE);
-        if (s & 1) continue;
-        const Vma *v=__atomic_load_n(&vmas,__ATOMIC_ACQUIRE);
-        const size_t n=__atomic_load_n(&vma_count,__ATOMIC_RELAXED);
-        size_t lo=0, hi=n;
-        while (lo<hi) {
-            size_t mid=(lo+hi)/2;
-            if (__atomic_load_n(&v[mid].end,__ATOMIC_RELAXED)<=address) lo=mid+1; else hi=mid;
-        }
-        uintptr_t next=UINTPTR_MAX;
-        if (lo<n) next=__atomic_load_n(&v[lo].start,__ATOMIC_RELAXED);
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (__atomic_load_n(&vma_seq,__ATOMIC_RELAXED)!=s) continue;
-        if (next<=address) return 0; /* mapped there after all */
-        const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
-        const uintptr_t end=next==UINTPTR_MAX ? address+1 : next;
-        return (now==generation && !(now & 1)) ||
-               region_unchanged(address,end,generation & ~(uint64_t)1,now);
-    }
-    return 0;
-}
+/* sotc: 0.73: our lock-free gap check (SOTC_CLAMP_GAP, 0.72.2) is replaced by Oussama268's
+ * mapped_length_fast (SOTC_CLAMP_FAST), which covers the same case; the counter stays at 0. */
 static uint64_t clamp_gap_hits;
-/* sotc: a range that runs past the mapped memory (buffers the game declares near 4 GB long, cut
- * to what is mapped) always took the read lock: cached_mapped_length only answers whole ranges.
- * The mapped part comes from the cached regions and the end is a gap confirmed without the lock
- * (gap_fast). At area changes the binds waited 8-10 ms per frame for map batches here (forest
- * entrance, 5 Nov). */
-static int clamp_fast_partial(uintptr_t address, uint64_t size, uint64_t *out) {
-    if (runtime_disabled_optimizations & 1) return 0;
-    uint64_t length=0;
-    for (unsigned hops=0; length<size && hops<4; ++hops) {
-        const CachedRegion *c=cached_region_q(address+length,address+size);
-        if (!c) {
-            if (!gap_fast(address+length)) return 0;
-            *out=length;
-            __atomic_add_fetch(&clamp_gap_hits,1,__ATOMIC_RELAXED);
-            return 1;
-        }
-        if (c->kind==KIND_RESERVED) {
-            *out=length;
-            __atomic_add_fetch(&clamp_gap_hits,1,__ATOMIC_RELAXED);
-            return 1;
-        }
-        length=c->end-address;
-    }
-    if (length>=size) { *out=size; return 1; }
-    return 0;
-}
 uint64_t runtime_memory_clamp_gap_hits(void) {
     return __atomic_exchange_n(&clamp_gap_hits,0,__ATOMIC_RELAXED);
 }
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
-    if (size && cached_mapped_length(address,size)==size) return size;
-    if (size && clamp_fast_on() && !(runtime_disabled_optimizations & 1)) {
-        uint64_t length;
-        if (cached_clamp(address,size,&length)) return length;
-    }
-    uint64_t fast=0;
-    if (size && clamp_fast_partial(address,size,&fast)) return fast;
+    uint64_t fast;
+    if (size && mapped_length_fast(address,size,&fast)) return fast;
     read_lock();
     uint64_t length=0;
     for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {
-        if (vmas[i].start>address+length || vmas[i].kind==KIND_RESERVED) break;
-        cache_region(i,vmas[i].start>address ? vmas[i].start : address);
-        length=vmas[i].end-address;
+        if (V(i).start>address+length || V(i).kind==KIND_RESERVED) break;
+        cache_region(i,V(i).start>address ? V(i).start : address);
+        length=V(i).end-address;
     }
     read_unlock();
     return length<size ? length : size;
@@ -2668,14 +2820,20 @@ uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
 int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, int *mapped) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region_q(address,0);
     if (c) { *start=c->start; *end=c->end; *mapped=c->kind!=KIND_RESERVED; return 1; }
+    uintptr_t gap_lo, gap_hi;
+    if (gap_fast(address,0,&gap_lo,&gap_hi)) {
+        if (gap_hi==UINTPTR_MAX) return 0;
+        *start=gap_lo; *end=gap_hi; *mapped=0;
+        return 1;
+    }
     read_lock();
     size_t i=vma_index(address);
     int found=i<vma_count;
-    if (found && vmas[i].start<=address) {
+    if (found && V(i).start<=address) {
         cache_region(i,address);
-        *start=vmas[i].start; *end=vmas[i].end; *mapped=vmas[i].kind!=KIND_RESERVED;
+        *start=V(i).start; *end=V(i).end; *mapped=V(i).kind!=KIND_RESERVED;
     } else if (found) {
-        *start=i ? vmas[i-1].end : 0; *end=vmas[i].start; *mapped=0;
+        *start=i ? V(i-1).end : 0; *end=V(i).start; *mapped=0;
     }
     read_unlock();
     return found;
@@ -2707,14 +2865,14 @@ int runtime_memory_copy_out(uintptr_t source, unsigned char *dest, uint64_t size
     while (at<end) {
         const size_t i=vma_index(at);
         uintptr_t stop;
-        if (i<vma_count && vmas[i].start<=at) {
-            stop=vmas[i].end<end ? vmas[i].end : end;
+        if (i<vma_count && V(i).start<=at) {
+            stop=V(i).end<end ? V(i).end : end;
             cache_region(i,at);
-            if (vmas[i].kind==KIND_RESERVED || backing_ready(vmas[i].phys+(at-vmas[i].start),stop-at))
+            if (V(i).kind==KIND_RESERVED || backing_ready(V(i).phys+(at-V(i).start),stop-at))
                 memset(dest+(at-source),0,stop-at); /* reserved, or a chunk Windows refused to open: zeros */
-            else memcpy(dest+(at-source),backing_base+vmas[i].phys+(at-vmas[i].start),stop-at);
+            else memcpy(dest+(at-source),backing_base+V(i).phys+(at-V(i).start),stop-at);
         } else {
-            stop=i<vma_count && vmas[i].start<end ? vmas[i].start : end;
+            stop=i<vma_count && V(i).start<end ? V(i).start : end;
             memset(dest+(at-source),0,stop-at);
         }
         at=stop;
@@ -2730,7 +2888,7 @@ void runtime_memory_describe(uintptr_t address, char *out, size_t capacity) {
     const size_t i=vma_index(address);
     int kind=0, prot=-1;
     uintptr_t start=0, end=0;
-    if (i<vma_count && vmas[i].start<=address) { kind=vmas[i].kind; prot=vmas[i].prot; start=vmas[i].start; end=vmas[i].end; }
+    if (i<vma_count && V(i).start<=address) { kind=V(i).kind; prot=V(i).prot; start=V(i).start; end=V(i).end; }
     read_unlock();
     unsigned long host=0;
 #ifdef _WIN32
@@ -2748,7 +2906,13 @@ void runtime_memory_describe(uintptr_t address, char *out, size_t capacity) {
  * first, dirty()) may have saved and restored the old protection: it is then set again under the
  * lock, after that write. */
 #ifdef _WIN32
-/* sotc: SOTC_PROTECT_SPAN=1 (off by default). A range that crosses view chunks gets one
+/* sotc: SOTC_PROTECT_SPAN=0: only a range inside one region is protected without the lock. GPU
+ * ranges that cross into another mapping, a reserved range or a gap (which the locked path skips)
+ * took the lock and waited for map batches on the ride benchmark. Up to 8 pieces are resolved
+ * first (cached regions, gaps seen consistently: gap_fast), then protected; the final check
+ * covers the whole range as before. */
+/* sotc: SOTC_PROTECT_SPAN_CHUNKS=1 (off by default; was SOTC_PROTECT_SPAN=1 before upstream 0.74
+ * gave that name to the multi-region pieces above). A piece that crosses view chunks gets one
  * VirtualProtect call when the system accepts it, instead of one per chunk. Each call is a system
  * call that rewrites page tables and flushes TLBs, and the draw thread spends ~6% in them.
  *
@@ -2766,38 +2930,57 @@ void runtime_memory_describe(uintptr_t address, char *out, size_t capacity) {
  * Refusal sets state 2 for good, so the attempt is not retried. */
 static int protect_span_on(void) {
     static int on=-1;
-    if (on<0) { const char *v=getenv("SOTC_PROTECT_SPAN"); on=v && v[0]=='1'; }
+    if (on<0) { const char *v=getenv("SOTC_PROTECT_SPAN_CHUNKS"); on=v && v[0]=='1'; }
     return on;
 }
 static int protect_span_state; /* 0 untried, 1 accepted, 2 refused (sticky) */
 static int protect_fast(uintptr_t address, uint64_t size, int read, int write) {
-    static int on=-1;
+    static int on=-1, span=-1;
     if (on<0) { const char *v=getenv("SOTC_PROTECT_FAST"); on=!(v && v[0]=='0') && region_log_on(); }
-    if (!on || exclusive_depth || (runtime_disabled_optimizations & 1) || !size || commit_chunks_lazy()) return 0;
+    if (span<0) { const char *v=getenv("SOTC_PROTECT_SPAN"); span=!(v && v[0]=='0'); }
+    if (!on || exclusive_depth || (runtime_disabled_optimizations & 1) || !size || size>UINTPTR_MAX-address ||
+        commit_chunks_lazy()) return 0; /* SOTC_COMMIT_CHUNKS=2: lazy ranges keep their protection in the chunk list */
     const uint64_t before=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
-    const CachedRegion *c=cached_region_q(address,address+size);
-    if (!c || c->kind==KIND_RESERVED || address+size>c->end) return 0;
-    const int guest=host_prot(c->prot);
-    const int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
-    const DWORD protect=win_prot(guest & want);
-    const uint64_t chunk=view_chunk();
-    int spanned=0;
-    if (chunk && protect_span_on() && __atomic_load_n(&protect_span_state,__ATOMIC_RELAXED)!=2 &&
-        address/chunk != (address+size-1)/chunk) {
-        DWORD old;
-        if (VirtualProtect((void *)address,(SIZE_T)size,protect,&old)) {
-            __atomic_store_n(&protect_span_state,1,__ATOMIC_RELAXED);
-            spanned=1;
+    struct { uintptr_t a, b; DWORD protect; } piece[8];
+    int pieces=0;
+    for (uintptr_t at=address, end=address+size; at<end;) {
+        const CachedRegion *c=cached_region_q(at,end);
+        uintptr_t next;
+        if (c) {
+            next=c->end<end ? c->end : end;
+            if (c->kind!=KIND_RESERVED) {
+                if (pieces==8) return 0;
+                const int guest=host_prot(c->prot);
+                const int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
+                piece[pieces].a=at; piece[pieces].b=next; piece[pieces].protect=win_prot(guest & want);
+                ++pieces;
+            }
         } else {
+            uintptr_t lo, hi;
+            if (!gap_fast(at,end,&lo,&hi)) return 0;
+            next=hi<end ? hi : end;
+        }
+        if (!span && next<end) return 0;
+        at=next;
+    }
+    const uint64_t chunk=view_chunk();
+    for (int i=0;i<pieces;++i) {
+        if (chunk && protect_span_on() && __atomic_load_n(&protect_span_state,__ATOMIC_RELAXED)!=2 &&
+            piece[i].a/chunk != (piece[i].b-1)/chunk) {
+            DWORD old;
+            if (VirtualProtect((void *)piece[i].a,(SIZE_T)(piece[i].b-piece[i].a),piece[i].protect,&old)) {
+                __atomic_store_n(&protect_span_state,1,__ATOMIC_RELAXED);
+                continue;
+            }
             __atomic_store_n(&protect_span_state,2,__ATOMIC_RELAXED);
         }
-    }
-    for (uintptr_t at=address, end=address+size; !spanned && at<end;) {
-        uintptr_t next=chunk ? (at/chunk+1)*chunk : end;
-        if (next>end) next=end;
-        DWORD old;
-        if (!VirtualProtect((void *)at,next-at,protect,&old)) return 0;
-        at=next;
+        for (uintptr_t at=piece[i].a, end=piece[i].b; at<end;) {
+            uintptr_t next=chunk ? (at/chunk+1)*chunk : end;
+            if (next>end) next=end;
+            DWORD old;
+            if (!VirtualProtect((void *)at,next-at,piece[i].protect,&old)) return 0;
+            at=next;
+        }
     }
     /* an odd generation is a write under way, which may have reached this range since */
     const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
@@ -2820,11 +3003,11 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
     /* sotc: adjacent VMAs that end up with the same protection share one host_protect call
      * (VirtualProtect is a system call; the draw thread re-protects ranges per binding). */
     uintptr_t run_a=0, run_b=0; int run_prot=-1;
-    for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {
-        if (vmas[i].kind==KIND_RESERVED) continue;
-        uintptr_t a=vmas[i].start>address ? vmas[i].start : address;
-        uintptr_t b=vmas[i].end<address+size ? vmas[i].end : address+size;
-        int guest=host_prot(vmas[i].prot);
+    for (size_t i=vma_index(address); i<vma_count && V(i).start<address+size; ++i) {
+        if (V(i).kind==KIND_RESERVED) continue;
+        uintptr_t a=V(i).start>address ? V(i).start : address;
+        uintptr_t b=V(i).end<address+size ? V(i).end : address+size;
+        int guest=host_prot(V(i).prot);
         int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
         int prot=guest & want;
         if (run_prot==prot && run_b==a) { run_b=b; continue; }
@@ -2836,14 +3019,15 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
-    if (size && cached_mapped_length(address,size)==size) return 1;
+    uint64_t fast;
+    if (size && mapped_length_fast(address,size,&fast)) return fast==size;
     read_lock();
     int result=covered(address,address+size,0);
     if (result) {
         uintptr_t at=address;
         for (size_t i=vma_index(address); i<vma_count && at<address+size; ++i) {
             cache_region(i,at);
-            at=vmas[i].end;
+            at=V(i).end;
         }
     }
     read_unlock();
@@ -2911,9 +3095,9 @@ int runtime_memory_hold_range(uint64_t guest_addr, uint64_t size) {
     int ok=1;
     for (uintptr_t at=guest_addr, end=guest_addr+size; at<end && ok;) {
         const size_t i=vma_index(at);
-        if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED || h.n==HOLD_PIECES) { ok=0; break; }
-        const uintptr_t stop=vmas[i].end<end ? vmas[i].end : end;
-        h.phys[h.n]=vmas[i].phys+(at-vmas[i].start);
+        if (i==vma_count || V(i).start>at || V(i).kind==KIND_RESERVED || h.n==HOLD_PIECES) { ok=0; break; }
+        const uintptr_t stop=V(i).end<end ? V(i).end : end;
+        h.phys[h.n]=V(i).phys+(at-V(i).start);
         h.length[h.n]=stop-at;
         ++h.n;
         at=stop;

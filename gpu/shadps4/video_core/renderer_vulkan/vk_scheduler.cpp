@@ -147,6 +147,29 @@ void Scheduler::ClaimRecorder() {
     }
 }
 
+void Scheduler::StartTickWatch() {
+    if (!SotcStats::kTickWatch || tickwatch) {
+        return;
+    }
+    tickwatch = true;
+    tickwatch_thread = std::jthread([this](std::stop_token stoken) {
+        Common::SetCurrentThreadName("shadPS4:SotcTickWatch");
+        u64 last_gpu = ~0ull;
+        u64 last_sub = ~0ull;
+        while (!stoken.stop_requested()) {
+            work_semaphore.Refresh();
+            const u64 gpu = work_semaphore.KnownGpuTick();
+            const u64 sub = work_semaphore.CurrentTick();
+            if (gpu != last_gpu || sub != last_sub) {
+                SotcStats::PushTick(0, gpu, sub);
+                last_gpu = gpu;
+                last_sub = sub;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+    });
+}
+
 void Scheduler::RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&& func) {
     const vk::CommandBuffer cmdbuf = CommandBuffer();
     if (!recorder || !CommandRecorder::IsFake(cmdbuf)) {
@@ -187,14 +210,21 @@ void Scheduler::WaitSubmitted(u64 tick, bool kick) {
     }
 }
 
-void Scheduler::BeginRendering(const RenderState& new_state) {
+void Scheduler::BeginRendering(const RenderState& new_state, u64 token) {
     SotcDrawMerge::NoteBind(); // sotc: SOTC_DRAW_MERGE_STATS=1 (a render pass begin outside a draw)
-    if (is_rendering && render_state == new_state) {
-        return;
+    if (is_rendering) {
+        if (token != 0 && token == render_state_token) {
+            return;
+        }
+        if (render_state == new_state) {
+            render_state_token = token;
+            return;
+        }
     }
     EndRendering();
     is_rendering = true;
     render_state = new_state;
+    render_state_token = token;
 
     // sotc: A1. Under the unified layouts a feedback attachment is GENERAL, and Vulkan needs the feedback loop
     // declared for it: VkAttachmentFeedbackLoopInfoEXT with feedbackLoopEnable, chained to its attachment info. It
@@ -412,8 +442,10 @@ void Scheduler::SubmitAheadAndWait() {
         .pCommandBuffers = &ahead_cmdbuf,
     };
     {
+        const s64 tw0 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
         std::unique_lock lk{submit_mutex, std::defer_lock};
         LockSubmit(lk);
+        const s64 tw1 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
         const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, *ahead_fence);
         if (submit_result == vk::Result::eErrorDeviceLost) {
             instance.ReportDeviceFault();
@@ -421,6 +453,12 @@ void Scheduler::SubmitAheadAndWait() {
         }
         ASSERT_MSG(submit_result == vk::Result::eSuccess, "Ahead submit failed: {}",
                    vk::to_string(submit_result));
+        if (SotcStats::kTickWatch) {
+            const s64 tw2 = static_cast<s64>(SotcStats::NowNs());
+            SotcStats::PushTick(3, 0,
+                                (static_cast<u64>((tw1 - tw0) / 1000) << 32) |
+                                    static_cast<u64>((tw2 - tw1) / 1000));
+        }
     }
     if (work_semaphore.SpinMarker(Semaphore::MarkerSlot::Ahead, ahead_sequence) &&
         work_semaphore.TrustMarker()) {
@@ -1289,8 +1327,9 @@ void AsyncCompute::WaitValue(u64 value) {
 }
 
 // The queue submit of SubmitExecution, from the command processor or the recording thread.
-static void QueueSubmit(const Instance& instance, const SubmitInfo& info,
-                        std::span<const vk::CommandBuffer> cmd_buffers) {
+// Returns (submit_mutex wait us << 32) | vkQueueSubmit us when SOTC_TICKWATCH is on, else 0.
+static u64 QueueSubmit(const Instance& instance, const SubmitInfo& info,
+                       std::span<const vk::CommandBuffer> cmd_buffers) {
     // One stage mask per wait semaphore; SubmitInfo can carry up to 4 waits (it used to provide
     // only 2 masks, so a third/fourth wait read past the array).
     static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
@@ -1327,14 +1366,21 @@ static void QueueSubmit(const Instance& instance, const SubmitInfo& info,
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
+    const s64 t0 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
     std::unique_lock lk{Scheduler::submit_mutex, std::defer_lock};
     LockSubmit(lk);
+    const s64 t1 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     if (submit_result == vk::Result::eErrorDeviceLost) {
         instance.ReportDeviceFault();
         UNREACHABLE_MSG("Device lost during submit");
     }
+    if (!SotcStats::kTickWatch) {
+        return 0;
+    }
+    const s64 t2 = static_cast<s64>(SotcStats::NowNs());
+    return (static_cast<u64>((t1 - t0) / 1000) << 32) | static_cast<u64>((t2 - t1) / 1000);
 }
 
 void Scheduler::RequireExternalWait(vk::Semaphore sem, u64 value, vk::PipelineStageFlags stages) {
@@ -1445,6 +1491,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
+    if (tickwatch) {
+        SotcStats::PushTick(1, signal_value,
+                            (static_cast<u64>(info.num_wait_semas) << 8) | cmd_buffers.size());
+    }
+
     if (recorder) {
         // The submit runs on the recording thread after the commands of these command buffers.
         recorder->Run(CommandRecorder::BlockCategory::Other,
@@ -1474,7 +1525,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                 if (gpu_trace) { // sotc: SOTC_TRACE_GPU, before the submit as well
                     gpu_trace->Submitted(gpu_pair, signal_value, SotcTrace::Now());
                 }
-                QueueSubmit(instance, info, real);
+                const u64 queue_us = QueueSubmit(instance, info, real);
+                if (tickwatch) {
+                    SotcStats::PushTick(2, signal_value, queue_us);
+                }
             }
             recorded_submit_tick.store(signal_value, std::memory_order_release);
             recorded_submit_tick.notify_all();
@@ -1491,7 +1545,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         if (gpu_trace) { // sotc: SOTC_TRACE_GPU, before the submit
             gpu_trace->Submitted(gpu_pair, signal_value, SotcTrace::Now());
         }
-        QueueSubmit(instance, info, cmd_buffers);
+        const u64 queue_us = QueueSubmit(instance, info, cmd_buffers);
+        if (tickwatch) {
+            SotcStats::PushTick(2, signal_value, queue_us);
+        }
     }
 
     work_semaphore.Refresh();

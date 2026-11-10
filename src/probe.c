@@ -562,6 +562,60 @@ void runtime_profile_finish(void) {
     InterlockedExchange(&profile_stop,1);
     WaitForSingleObject(profile_done,20000);
 }
+/* sotc: SOTC_THREAD_TIMES=1: per-thread CPU time over the profile window (SOTC_PROFILE_DELAY to
+ * +SOTC_PROFILE_SECONDS), with the flip count, to see which thread gains or loses busy time
+ * between two flip modes without picking a thread up front. */
+typedef struct { DWORD id; ULONGLONG cycles; char name[32]; } ThreadTimeRow;
+static int thread_times_snapshot(ThreadTimeRow *rows, int max) {
+    typedef HRESULT (WINAPI *Describe)(HANDLE, PWSTR *);
+    static Describe describe;
+    if (!describe) describe=(Describe)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
+    int n=0;
+    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    THREADENTRY32 te={.dwSize=sizeof(te)};
+    for (BOOL ok=Thread32First(snapshot,&te); ok && n<max; ok=Thread32Next(snapshot,&te)) {
+        if (te.th32OwnerProcessID!=GetCurrentProcessId()) continue;
+        HANDLE t=OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,te.th32ThreadID);
+        if (!t) continue;
+        ThreadTimeRow *r=&rows[n];
+        r->id=te.th32ThreadID; r->name[0]=0;
+        if (!QueryThreadCycleTime(t,&r->cycles)) r->cycles=0;
+        PWSTR text=NULL;
+        if (describe && SUCCEEDED(describe(t,&text)) && text) {
+            WideCharToMultiByte(CP_UTF8,0,text,-1,r->name,sizeof(r->name),NULL,NULL);
+            LocalFree(text);
+        }
+        CloseHandle(t); ++n;
+    }
+    CloseHandle(snapshot);
+    return n;
+}
+static DWORD WINAPI thread_times(void *unused) {
+    (void)unused;
+    const char *delay=getenv("SOTC_PROFILE_DELAY"), *seconds=getenv("SOTC_PROFILE_SECONDS");
+    Sleep((delay ? atoi(delay) : 20)*1000);
+    static ThreadTimeRow before[256], after[256];
+    const uint64_t flips0=bbgpu_flip_count();
+    const int nb=thread_times_snapshot(before,256);
+    const ULONGLONG t0=GetTickCount64();
+    Sleep((seconds ? atoi(seconds) : 15)*1000);
+    const int na=thread_times_snapshot(after,256);
+    const double ms=(double)(GetTickCount64()-t0);
+    const uint64_t frames=bbgpu_flip_count()-flips0;
+    fprintf(stderr,"SOTC thread times: %.0f ms, %llu flips\n",ms,(unsigned long long)frames);
+    for (int i=0;i<na;++i) {
+        ULONGLONG start=0;
+        for (int j=0;j<nb;++j) if (before[j].id==after[i].id) { start=before[j].cycles; break; }
+        if (after[i].cycles<=start) continue;
+        /* Cycles, not time; report both raw and per-flip so two runs compare by share. */
+        const double mcycles=(double)(after[i].cycles-start)/1e6;
+        if (mcycles<1.0) continue;
+        fprintf(stderr,"  tid %6lu %-32s %10.1f Mcycles  %8.3f Mc/flip\n",
+                (unsigned long)after[i].id,after[i].name[0]?after[i].name:"?",
+                mcycles,frames?mcycles/(double)frames:0.0);
+    }
+    return 0;
+}
 static DWORD WINAPI profiler(void *name) {
     typedef HRESULT (WINAPI *Describe)(HANDLE, PWSTR *);
     Describe describe=(Describe)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
@@ -1055,9 +1109,18 @@ static int helper_single_step(EXCEPTION_POINTERS *info) {
     if (!step_page) return 0;
     MEMORY_BASIC_INFORMATION m;
     DWORD old;
-    /* Only if nobody (the tracker) changed the page meanwhile. */
-    if (VirtualQuery((void *)step_page,&m,sizeof(m)) && m.Protect==PAGE_READONLY)
-        VirtualProtect((void *)step_page,4096,step_protect,&old);
+    /* Only if nobody (the tracker) changed the page meanwhile. Read-only does not prove that: it is
+     * also what the tracker leaves when a readback lifts the read protection of a page it still
+     * watches for writes. Restoring no-access then left a page no tracker change would ever touch
+     * again, and whoever read it next faulted forever (HandleGuestFault repairs that now). */
+    if (VirtualQuery((void *)step_page,&m,sizeof(m)) && m.Protect==PAGE_READONLY) {
+        if (step_protect!=PAGE_NOACCESS || bbgpu_page_read_watched(step_page))
+            VirtualProtect((void *)step_page,4096,step_protect,&old);
+        else {
+            static LONG logged;
+            if (InterlockedIncrement(&logged)<=32) fprintf(stderr,"SOTC helper read: the tracker lifted %p during the step, kept\n",(void *)step_page);
+        }
+    }
     step_page=0;
     info->ContextRecord->EFlags&=~(DWORD)0x100;
     return 1;
@@ -1472,15 +1535,65 @@ static struct fault_entry *fault_ring_add(const EXCEPTION_POINTERS *info) {
 }
 /* Which handler path resolved the current exception (fault ring diagnostics). */
 static _Thread_local int fault_path;
-/* sotc: SOTC_COPY_GUEST_VIEW (gpu/shim/bbgpu.cpp GuardedGuestCopy). A host thread copying guest
- * memory through the guest's own addresses arms this guard; a fault inside [lo, hi) (a page the
- * GPU tracking read-protected, or one the guest unmapped) resumes at the copy's recovery point
- * before any other handler runs, and the copy falls back to the backing view. Page tracking must
- * not see that fault: its readback could wait for the command processor, which may be waiting for
- * this thread. Single shot: the handler clears buf. */
-__thread uintptr_t bb_copy_guard_lo, bb_copy_guard_hi;
-__thread unsigned long long *bb_copy_guard_buf;
+/* sotc: faults raised while this thread is already handling one (nested in the handler). A
+ * handler that keeps faulting recursed until its stack ran out, and the process died without a
+ * report (once, 4 Nov, ride benchmark: a call at the top of the GPU fault path on a spent stack).
+ * The chain is logged at 12 levels and reported as a crash (fatal_exception: log, minidump) at 24;
+ * legitimate nesting stays at 2 or 3. */
+static _Thread_local int fault_depth;
+static _Thread_local struct { uint64_t code, addr, rip; } fault_chain[12];
+static LONG vectored_fault_body(EXCEPTION_POINTERS *info);
+static LONG fatal_exception(EXCEPTION_POINTERS *info);
+/* sotc: the same access fault resolved over and over on one thread: the handler says it fixed the
+ * page and it did not, a freeze with one thread busy in the exception dispatcher (seen once in ~70
+ * rides, draw thread, nothing in the log). Names the place at 4096 repeats and at each 16x after; changes nothing. */
+void runtime_memory_describe(uintptr_t address, char *out, size_t capacity);
+static _Thread_local uintptr_t fault_loop_addr, fault_loop_rip;
+static _Thread_local unsigned long fault_loop_count;
+static void fault_loop_note(EXCEPTION_POINTERS *info, LONG result) {
+    const EXCEPTION_RECORD *record=info->ExceptionRecord;
+    if (record->ExceptionCode!=EXCEPTION_ACCESS_VIOLATION || record->NumberParameters<2 || result!=EXCEPTION_CONTINUE_EXECUTION) return;
+    const uintptr_t addr=(uintptr_t)record->ExceptionInformation[1], rip=(uintptr_t)info->ContextRecord->Rip;
+    if (addr!=fault_loop_addr || rip!=fault_loop_rip) {
+        fault_loop_addr=addr; fault_loop_rip=rip; fault_loop_count=0;
+        return;
+    }
+    const unsigned long count=++fault_loop_count;
+    if (count<4096 || (count & (count-1))) return;
+    if ((count & 0x11111111UL)==0) return; /* powers of 16 only */
+    char state[160]="";
+    runtime_memory_describe(addr,state,sizeof(state));
+    MEMORY_BASIC_INFORMATION m={0};
+    VirtualQuery((void *)addr,&m,sizeof(m));
+    fprintf(stderr,"SOTC FAULT LOOP: %lu times %s at %p, rip %#llx (exe+%#llx, image+%#llx), thread %lu, path %d, host protect %#lx; %s\n",
+            count,record->ExceptionInformation[0]==1 ? "write" : "read",(void *)addr,(unsigned long long)rip,
+            (unsigned long long)(rip-(uintptr_t)GetModuleHandleA(NULL)),(unsigned long long)(rip-(uintptr_t)image),
+            GetCurrentThreadId(),fault_path,(unsigned long)m.Protect,state);
+    fflush(stderr);
+}
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
+    const EXCEPTION_RECORD *record=info->ExceptionRecord;
+    if (fault_depth<12) {
+        fault_chain[fault_depth].code=record->ExceptionCode;
+        fault_chain[fault_depth].addr=record->NumberParameters>=2 ? record->ExceptionInformation[1] : 0;
+        fault_chain[fault_depth].rip=info->ContextRecord->Rip;
+    }
+    if (fault_depth==12 || fault_depth==24) {
+        fprintf(stderr,"SOTC NESTED FAULTS: %d levels in the exception handler (thread %lu), first ones:\n",fault_depth,GetCurrentThreadId());
+        for (int i=0;i<12;++i)
+            fprintf(stderr,"  #%d code %#llx addr %#llx rip %#llx (image+%#llx)\n",i,(unsigned long long)fault_chain[i].code,
+                    (unsigned long long)fault_chain[i].addr,(unsigned long long)fault_chain[i].rip,
+                    (unsigned long long)(fault_chain[i].rip-(uintptr_t)GetModuleHandleA(NULL)));
+        fflush(stderr);
+        if (fault_depth==24) return fatal_exception(info);
+    }
+    ++fault_depth;
+    const LONG result=vectored_fault_body(info);
+    --fault_depth;
+    fault_loop_note(info,result);
+    return result;
+}
+static LONG vectored_fault_body(EXCEPTION_POINTERS *info) {
     NT_TIB *tib=(NT_TIB *)NtCurrentTeb();
     const uintptr_t sp=(uintptr_t)__builtin_frame_address(0);
     struct fault_entry *entry=fault_ring ? fault_ring_add(info) : NULL;
@@ -1568,6 +1681,14 @@ static void bpe_observe_fault(const EXCEPTION_POINTERS *info) {
         runtime_memory_map_log_dump(addr,bpe_fault_ns,reserved);
     }
 }
+/* sotc: SOTC_COPY_GUEST_VIEW (gpu/shim/bbgpu.cpp GuardedGuestCopy; HiddenUserHere, upstream PR
+ * #339). A host thread copying guest memory through the guest's own addresses arms this guard; a
+ * fault inside [lo, hi) (a page the GPU tracking read-protected, or one the guest unmapped)
+ * resumes at the copy's recovery point before any other handler runs, and the copy falls back to
+ * the backing view. Page tracking must not see that fault: its readback could wait for the
+ * command processor, which may be waiting for this thread. Single shot: the handler clears buf. */
+__thread uintptr_t bb_copy_guard_lo, bb_copy_guard_hi;
+__thread unsigned long long *bb_copy_guard_buf;
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
@@ -1582,6 +1703,45 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && pool_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && release_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
+    /* sotc: game objects found cleared (their first qword 0) where the game uses them: crashes
+     * after loading a save and at the ending, always under the frames 0x39a73/0x39ab6 <- 0x38ad2
+     * <- 0x33586. Each case resumes where the game itself goes when the object is absent:
+     *   0x564d24 / 0x564da6  eboot 0x660fc0 gave no component for a list entry (r12 = 0): the next
+     *                        object (0x564d92) or the next entry (0x564d00); the most frequent
+     *                        crash, 4 times since 3 Nov, 30-40 s after loading a save;
+     *   0x144c60 / 0x14934f  destroying an object whose vtable is gone (rax = 0): its slot is
+     *                        cleared without the destructor (0x144c71) / skipped (0x149360); the
+     *                        "Fim" screen of the ending, 9 Nov;
+     *   0x14cce7             a reference released on no object (r14 = 0): return (0x14ced6); the
+     *                        ending, 5 Nov.
+     * SOTC_FIX_NULL_OBJECTS=0 (or SOTC_FIX_564D24=0) off. */
+    if (code==EXCEPTION_ACCESS_VIOLATION && image) {
+        static int fix=-1;
+        if (fix<0) {
+            const char *v=getenv("SOTC_FIX_NULL_OBJECTS"), *w=getenv("SOTC_FIX_564D24");
+            fix=!((v && v[0]=='0') || (w && w[0]=='0'));
+        }
+        CONTEXT *c=info->ContextRecord;
+        const uintptr_t at=(uintptr_t)c->Rip-(uintptr_t)image;
+        uintptr_t resume=0;
+        if (fix) {
+            if (c->R12==0 && at==0x564d24) resume=0x564d92;
+            else if (c->R12==0 && at==0x564da6) resume=0x564d00;
+            else if (c->Rax==0 && at==0x144c60) resume=0x144c71;
+            else if (c->Rax==0 && at==0x14934f) resume=0x149360;
+            else if (c->R14==0 && at==0x14cce7) resume=0x14ced6;
+        }
+        if (resume) {
+            c->Rip=(DWORD64)(uintptr_t)(image+resume);
+            static volatile LONG skipped;
+            const LONG n=InterlockedIncrement(&skipped);
+            if (n<=8 || (n & (n-1))==0)
+                fprintf(stderr,"SOTC FIX null object at guest %#llx skipped (resumes at %#llx; %ld so far)\n",
+                        (unsigned long long)at,(unsigned long long)resume,(long)n);
+            fault_path=3;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && bb_copy_guard_buf &&
         (uintptr_t)record->ExceptionInformation[1]>=bb_copy_guard_lo &&
         (uintptr_t)record->ExceptionInformation[1]<bb_copy_guard_hi) {
@@ -2310,6 +2470,7 @@ int main(int argc, char **argv) {
         CreateThread(NULL,0,strcmp(getenv("SOTC_PROFILE"),"*") ? profiler : profiler_all,
                      (void *)getenv("SOTC_PROFILE"),0,NULL);
     }
+    if (getenv("SOTC_THREAD_TIMES")) CreateThread(NULL,0,thread_times,NULL,0,NULL);
     SetUnhandledExceptionFilter(unhandled_fault);
     sotc_install_fail_fast_diagnostics(); /* sotc: W1, the terminate / SIGABRT / invalid-parameter lines */
     if (getenv("BB_STRICT_HANDLES")) {

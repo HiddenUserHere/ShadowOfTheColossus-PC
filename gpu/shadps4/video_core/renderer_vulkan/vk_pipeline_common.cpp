@@ -180,6 +180,10 @@ LayoutCache::Layouts LayoutCache::Get(const Request& request, Owned& owned) {
     return result;
 }
 
+namespace DrawPhase { // sotc: SOTC_DRAW_PHASES laps defined in vk_rasterizer.cpp
+void SubPipe(unsigned which);
+}
+
 Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
                    bool is_compute_ /*= false*/)
@@ -931,6 +935,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
         cmdbuf.pushConstants(pipeline_layout, stage_flags, sizeof(push_data), sizeof(bindless_slots),
                              &bindless_slots);
     }
+    static const bool phases = std::getenv("SOTC_DRAW_PHASES") != nullptr;
+    if (phases) {
+        DrawPhase::SubPipe(0);
+    }
 
     // sotc: SOTC_BINDLESS_SAMP: the global sampler set is bound beside set 0, before any early out. Its index is the
     // one the SPIR-V names (BindlessSetIndex): set 1, or the set after the stage sets with SOTC_STAGE_BINDINGS (a
@@ -965,6 +973,9 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, std::span<const u32> 
 
     if (uses_push_descriptors) {
         cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, set_writes);
+        if (phases) {
+            DrawPhase::SubPipe(1);
+        }
         return;
     }
 

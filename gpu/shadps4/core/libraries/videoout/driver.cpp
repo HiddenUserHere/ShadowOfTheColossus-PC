@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -35,6 +36,7 @@
 #include "video_core/page_manager.h" // sotc: SOTC_PROTECT_ASYNC stats
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
+#include "bbport_mem_report.h"
 #include "bbport_overlay.h"
 #include "bbport_threads.h"
 #include "video_core/renderer_vulkan/vk_bda_table.h" // sotc: SOTC_BDA report
@@ -605,6 +607,16 @@ void VideoOutDriver::PresentJobThread(std::stop_token token) {
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    {
+        const u64 age = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - req.arrival)
+                            .count();
+        SotcStats::flip_age_ns.fetch_add(age, std::memory_order_relaxed);
+        SotcStats::flip_age_count.fetch_add(1, std::memory_order_relaxed);
+        if (age > SotcStats::flip_age_max_ns.load(std::memory_order_relaxed)) {
+            SotcStats::flip_age_max_ns.store(age, std::memory_order_relaxed);
+        }
+    }
     // sotc: SOTC_FRAME_HASH, the flip number this frame is presented as (the fetch_add below).
     if (req.frame) {
         req.frame->sotc_flip_index = SotcStats::flip_count.load(std::memory_order_relaxed) + 1;
@@ -613,10 +625,13 @@ void VideoOutDriver::Flip(const Request& req) {
     // counts as a flip below (count, flip events, VO label) without a second present.
     if (req.frame) {
         // Update HDR status before presenting, and present the frame.
+        // sotc: present_since_ns tells SubmitFlipInternal's SOTC_FLIP_QUEUE wait a present is stuck.
+        present_since_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
         RunPresentJob([frame = req.frame, hdr = req.port->is_hdr] {
             presenter->SetHDR(hdr);
             presenter->Present(frame);
         });
+        present_since_ns.store(0, std::memory_order_relaxed);
     }
     const uint64_t sotc_flip = SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (SotcTrace::kOn) { // sotc: SOTC_TRACE, the game's flip on the frames track
@@ -811,6 +826,7 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(SotcStats::ab_ignored.exchange(0)));
                 SotcStats::ab_window.store(w + 1, std::memory_order_relaxed);
             }
+            bool mem_line_due = false; // sotc: SOTC MEM walk, also off this thread
             {
                 std::sort(frame_ms.begin(), frame_ms.end());
                 const auto pct = [&](double p) {
@@ -871,6 +887,25 @@ void VideoOutDriver::Flip(const Request& req) {
                 if (!allocs.empty()) {
                     ReportPrintf(report, "SOTC ALLOC %s\n", allocs.c_str());
                 }
+                if (const std::string ws = BbMemReport::WsDiagLine(); !ws.empty()) {
+                    ReportPrintf(report, "SOTC WS %s; host heap %llu MiB (VMA blocks %llu MiB)\n",
+                                 ws.c_str(),
+                                 static_cast<unsigned long long>(SotcStats::host_heap_usage.load() >> 20),
+                                 static_cast<unsigned long long>(SotcStats::host_vma_block_bytes.load() >> 20));
+                }
+                // sotc: heaps vs other private memory, every 12th report (a minute at 5 s),
+                // only under SOTC_MEM=1. The walk grows with the address space's regions
+                // (180 ms fresh, 800+ ms after 20 min of play) and stalls the game once a
+                // minute even when run off the flip thread: HeapSummary locks the heaps and
+                // the VirtualQuery loop contends the VM lock the game's page protections
+                // need. Computed in the writer thread below so an enabled walk at least
+                // never blocks the flip.
+                static const bool mem_diag = [] {
+                    const char* v = std::getenv("SOTC_MEM");
+                    return v && v[0] == '1';
+                }();
+                static u32 mem_reports = 0;
+                mem_line_due = mem_diag && mem_reports++ % 12 == 0;
                 if (const uint64_t translate = SotcStats::compile_phase_ns[0].exchange(0)) {
                     const auto take = [](int i) {
                         return SotcStats::compile_phase_ns[i].exchange(0) / 1e6;
@@ -962,9 +997,29 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::stale_refreshes.exchange(0)));
             }
-            ReportPrintf(report, "SOTC readback finish: %llu for bytes the guest asked\n",
+            if (const u64 ages = SotcStats::flip_age_count.exchange(0)) {
+                ReportPrintf(report, "SOTC flip wait: %.1f ms average, %.1f ms worst (%llu flips)\n",
+                             SotcStats::flip_age_ns.exchange(0) / 1e6 / ages,
+                             SotcStats::flip_age_max_ns.exchange(0) / 1e6,
+                             static_cast<unsigned long long>(ages));
+            }
+            ReportPrintf(report,
+                         "SOTC readback finish: %llu for bytes the guest asked, %llu binds, "
+                         "%llu window, %llu hot; dirty retries %llu, hot dropped %llu, "
+                         "requeued %llu\n",
                          static_cast<unsigned long long>(
-                             SotcStats::readback_finish_asked.exchange(0)));
+                             SotcStats::readback_finish_asked.exchange(0)),
+                         static_cast<unsigned long long>(
+                             SotcStats::readback_finish_binds.exchange(0)),
+                         static_cast<unsigned long long>(
+                             SotcStats::readback_finish_window.exchange(0)),
+                         static_cast<unsigned long long>(
+                             SotcStats::readback_finish_hot.exchange(0)),
+                         static_cast<unsigned long long>(
+                             SotcStats::readback_dirty_retries.exchange(0)),
+                         static_cast<unsigned long long>(
+                             SotcStats::rb_dirty_hot_dropped.exchange(0)),
+                         static_cast<unsigned long long>(SotcStats::rb_requeues.exchange(0)));
             if (SotcStats::kShadowCullHle) // sotc: SOTC_HLE_SHADOW_CULL (sotc_shadow_cull.cpp)
                 ReportPrintf(report, "SOTC HLE shadow cull: %llu dispatches, %llu sections, %llu bits kept conservatively, %.2f ms/s; GPU fallbacks: layout %llu, input GPU-written %llu, bounds %llu, write refused %llu, SOTC_RB_PREV %llu\n",
                              static_cast<unsigned long long>(SotcStats::shadow_cull_dispatches.exchange(0)), static_cast<unsigned long long>(SotcStats::shadow_cull_sections.exchange(0)), static_cast<unsigned long long>(SotcStats::shadow_cull_kept.exchange(0)), SotcStats::shadow_cull_ns.exchange(0) / 1e6 / seconds,
@@ -1947,6 +2002,23 @@ void VideoOutDriver::Flip(const Request& req) {
                                  SotcStats::heap_guard_repeats.exchange(0)),
                              static_cast<unsigned long long>(
                                  SotcStats::heap_guard_stale_hits.exchange(0)));
+            }
+            {
+                auto x = [](std::atomic<uint64_t>& v) {
+                    return static_cast<unsigned long long>(v.exchange(0));
+                };
+                ReportPrintf(report,
+                             "SOTC guard diag: builds world %llu batch %llu; cover miss %llu %llu %llu %llu; "
+                             "find ok %llu why %llu %llu %llu %llu %llu %llu; pieces ok %llu bad %llu out %llu fence-in %llu chain %llu\n",
+                             x(SotcStats::hg_build_path[0]), x(SotcStats::hg_build_path[1]),
+                             x(SotcStats::hg_cover_why[0]), x(SotcStats::hg_cover_why[1]),
+                             x(SotcStats::hg_cover_why[2]), x(SotcStats::hg_cover_why[3]),
+                             x(SotcStats::hg_find_why[0]), x(SotcStats::hg_find_why[1]),
+                             x(SotcStats::hg_find_why[2]), x(SotcStats::hg_find_why[3]),
+                             x(SotcStats::hg_find_why[4]), x(SotcStats::hg_find_why[5]),
+                             x(SotcStats::hg_find_why[6]), x(SotcStats::hg_piece[0]), x(SotcStats::hg_piece[1]),
+                             x(SotcStats::hg_piece[2]), x(SotcStats::hg_piece[3]),
+                             x(SotcStats::hg_piece[4]));
             }
             if (grace_marks || grace_caps || grace_bytes || reg_spins || carves) {
                 ReportPrintf(report,
@@ -2970,8 +3042,13 @@ void VideoOutDriver::Flip(const Request& req) {
             flips = 0;
             // The flip thread does not wait for the log: one stderr write took 7-10 ms (bench log
             // file, Radeon RX 6650 XT session), ~15 of them a frame of 80-100 ms every 5 s.
-            std::thread([text = std::move(report)] {
+            std::thread([text = std::move(report), mem_line_due] {
                 std::fwrite(text.data(), 1, text.size(), stderr);
+                if (mem_line_due) {
+                    if (const std::string mem = BbMemReport::Line(); !mem.empty()) {
+                        std::fprintf(stderr, "SOTC MEM %s\n", mem.c_str());
+                    }
+                }
             }).detach();
             window_start = now;
         }
@@ -3126,6 +3203,9 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         const auto& buffer = port->buffer_slots[index];
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
+        // sotc: the game configures the output mode as BT.2020 PQ and then as Any, so the
+        // buffer format decides (A2R10G10B10 BT.2020 PQ when its HDR option is on).
+        port->is_hdr = group.attrib.pixel_format == PixelFormat::A2R10G10B10Bt2020Pq;
         // sotc: SOTC_FLIP_THREAD: the copy of the buffer is recorded here, and the frame is taken
         // and presented on the flip thread, which requests it in flip order (on_frame). Otherwise
         // (the switch is off, or the flip needs the draw thread) it is PrepareFrame, as before.
@@ -3138,12 +3218,15 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
                     sotc_staged_flips.push_back({port, flip_arg, index, is_eop});
                     return;
                 }
+                // sotc: the flip pacer's arrival is when the flip thread hands the frame over.
+                const auto arrival = std::chrono::steady_clock::now();
                 requests.push({
                     .frame = queued,
                     .port = port,
                     .flip_arg = flip_arg,
                     .index = index,
                     .eop = is_eop,
+                    .arrival = arrival,
                 });
                 for (const auto& staged : sotc_staged_flips) {
                     requests.push({
@@ -3152,6 +3235,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
                         .flip_arg = staged.flip_arg,
                         .index = staged.index,
                         .eop = staged.eop,
+                        .arrival = arrival,
                     });
                 }
                 sotc_staged_flips.clear();
@@ -3167,13 +3251,37 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 
     release_early_vo_label();
 
-    std::scoped_lock lock{mutex};
+    const auto arrival = std::chrono::steady_clock::now();
+    // sotc: at most SOTC_FLIP_QUEUE (default 1) flips wait for the present thread. The early label
+    // above lets the game run ahead of a frame limit, so the waiting flips filled the whole frame
+    // pool, which follows the swapchain: with its 8 images every frame was shown 8 frames late
+    // (measured 266 ms at the 30 FPS cap, issue #128, from 0.70-opt12). The command processor waits
+    // here instead, as the game does on the PS4. Not while a present is stuck (NVIDIA blocks one up
+    // to ~140 ms every ~11 s): the deep pool is there to bridge that without a hitch; the backlog
+    // is gone a few frames later. 0: no limit, as before.
+    static const size_t flip_queue = [] {
+        const char* v = std::getenv("SOTC_FLIP_QUEUE");
+        return v && v[0] ? size_t(std::strtoul(v, nullptr, 10)) : size_t{1};
+    }();
+    std::unique_lock lock{mutex};
+    if (flip_queue != 0 && requests.size() >= flip_queue) {
+        constexpr u64 stuck_ns = 20'000'000;
+        const auto give_up = arrival + std::chrono::milliseconds(200); // paused, or shutting down
+        while (requests.size() >= flip_queue && std::chrono::steady_clock::now() < give_up) {
+            const u64 since = present_since_ns.load(std::memory_order_relaxed);
+            if (since != 0 && SotcStats::NowNs() - since > stuck_ns) {
+                break;
+            }
+            flip_taken_cv.wait_for(lock, std::chrono::milliseconds(2));
+        }
+    }
     requests.push({
         .frame = frame,
         .port = port,
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
+        .arrival = arrival,
     });
     if (SotcDetFlip::kOn) {
         det_request_cv.notify_one();
@@ -3243,6 +3351,7 @@ void VideoOutDriver::PresentThreadDet(std::stop_token token) {
                                         [this] { return !requests.empty(); })) {
                 request = requests.front();
                 requests.pop();
+                flip_taken_cv.notify_all(); // sotc: SOTC_FLIP_QUEUE
             }
         }
         if (!request.port) { // sotc: SOTC_FLIP_COALESCE: a request may have no frame (port is the test)
@@ -3272,6 +3381,7 @@ void VideoOutDriver::PresentThreadDet(std::stop_token token) {
                 }
                 joined = requests.front();
                 requests.pop();
+                flip_taken_cv.notify_all(); // sotc: SOTC_FLIP_QUEUE
             }
             Flip(joined);
             emit_vblanks(vblanks_per_flip());
@@ -3288,11 +3398,24 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     const std::chrono::nanoseconds vblank_period(1000000000 /
                                                  EmulatorSettings.GetVblankFrequency());
 
+    // sotc: take flips on a finer grid than the vblank. With flips only at vblank boundaries, a
+    // frame that misses one waits for the next: at 120 Hz every frame time is a multiple of
+    // 8.33 ms, and a scene hovering around 10 ms shows as 8/17/8 ms judder. So the thread ticks
+    // SOTC_FLIP_SUBTICKS (default 8) times per vblank and may flip on any tick, while the guest
+    // still sees vblanks at BB_VBLANK_HZ (raising BB_VBLANK_HZ wakes the guest more and slows it).
+    static const u32 flip_subticks = [] {
+        const char* v = std::getenv("SOTC_FLIP_SUBTICKS");
+        const long n = v ? std::strtol(v, nullptr, 10) : 8;
+        return u32(std::clamp(n, 1l, 16l));
+    }();
+    const std::chrono::nanoseconds tick_period = vblank_period / flip_subticks;
+
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     BbThreads::PlaceThread(BbThreads::Role::Present);
-    Common::SetCurrentThreadRealtime(vblank_period);
+    Common::SetCurrentThreadRealtime(tick_period);
 
-    Common::AccurateTimer timer{vblank_period};
+    Common::AccurateTimer timer{tick_period};
+    u32 subtick = 0;
 
     // sotc: the flip rate is the minimum interval between two flips, counted from the last flip,
     // as on the console: a 30 FPS frame that misses its vblank is shown one vblank later (50 ms).
@@ -3387,12 +3510,30 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
         return false;
     };
+    // sotc: the uncapped game paces itself on flip completions. The vblank grid snapped every
+    // flip to 8.33 ms multiples: a scene hovering around 10 ms shows as alternating 8/17 ms
+    // frames (the judder of heavy scenes). Instead, pace flips at the game's own production
+    // rate: release a flip at last flip + EMA of the submit intervals, so release stays smooth
+    // when submits arrive in bursts, and never hold one past submit + a vblank period, which is
+    // the worst the grid did. SOTC_FLIP_PACER=0 starts on the vblank grid, and F6 switches
+    // while playing (SotcFpsCap::flip_pacer, bbport_overlay.cpp).
+    auto last_flip_time = std::chrono::steady_clock::now();
+    auto prev_arrival = last_flip_time;
+    std::chrono::nanoseconds arrival_ema = vblank_period;
+    // sotc: the FPS limit (the launcher's 60 FPS mode) paced the same way. It took a flip only
+    // once limit_vblanks vblanks had passed, so a frame slower than the limit waited for the next
+    // 8.33 ms boundary: at 40-55 FPS the frames alternated 16.7 / 25 ms. With the pacer a flip
+    // goes out as soon as it is due on its own timeline (limit_next), at subtick resolution;
+    // limit_next advances by exactly one limit period while the game keeps up, so the cap stays
+    // at 60 and is not rounded up to the tick grid.
+    auto limit_next = last_flip_time;
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
         if (!requests.empty()) {
             const auto request = requests.front();
             requests.pop();
+            flip_taken_cv.notify_all();
             return request;
         }
         return {};
@@ -3411,6 +3552,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
                 joined = requests.front();
                 requests.pop();
+                flip_taken_cv.notify_all(); // sotc: SOTC_FLIP_QUEUE
             }
             Flip(joined);
         }
@@ -3482,6 +3624,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 pacer_taken.push_back(requests.front());
                 requests.pop();
             }
+            flip_taken_cv.notify_all(); // sotc: SOTC_FLIP_QUEUE waits in SubmitFlipInternal
         }
         std::ptrdiff_t newest = -1;
         for (std::ptrdiff_t i = 0; i < std::ptrdiff_t(pacer_taken.size()); ++i) {
@@ -3510,6 +3653,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         presenter->SetNextPresentTarget(on_time_target);
         Flip(pacer_taken[newest]);
         presenter->SetNextPresentTarget(0);
+        last_flip_time = std::chrono::steady_clock::now(); // sotc: the flip pacer's timeline too
+        prev_arrival = pacer_taken[newest].arrival;
         for (std::size_t i = std::size_t(newest) + 1; i < pacer_taken.size(); ++i) {
             Flip(pacer_taken[i]); // SOTC_FLIP_COALESCE flips that joined this frame
         }
@@ -3529,9 +3674,18 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return true;
     };
 
+    const auto peek_arrival = [this]() -> std::optional<std::chrono::steady_clock::time_point> {
+        std::scoped_lock lk{mutex};
+        if (requests.empty()) {
+            return std::nullopt;
+        }
+        return requests.front().arrival;
+    };
+
     while (!token.stop_requested()) {
         timer.Start();
         const u64 tick_start_ns = steady_ns(); // sotc: SOTC_PACER, the end of this tick
+        const bool vblank_subtick = subtick == 0; // sotc: SOTC_PACER redraws stay on the vblank grid
         // sotc: SOTC_FLIP_OFFTHREAD: the present thread moves a frame whose present is done to the
         // draw thread's ready queue (vk_presenter.cpp RefillReadyFrames). Non-blocking; off by default.
         // The presenter may not exist yet when this thread starts (gnmdriver RegisterLib creates it).
@@ -3540,7 +3694,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         if (DebugState.IsGuestThreadsPaused()) {
-            DrawLastFrame();
+            if (subtick == 0) {
+                DrawLastFrame();
+            }
+            subtick = (subtick + 1) % flip_subticks;
             timer.End();
             continue;
         }
@@ -3568,8 +3725,41 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             take_request = true;
         } else if (flip_rate <= 0) {
             const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
-            const u64 limit_vblanks = live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
-            take_request = limit_vblanks == 0 || vblank_status.count - last_flip_vblank >= limit_vblanks;
+            u64 limit_vblanks = live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
+            // sotc: SOTC_FPS_DYNAMIC: the 60 FPS limit lowered while the game cannot keep it.
+            if (const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
+                dyn > 0 && limit_vblanks == vblanks_for(60)) {
+                limit_vblanks = vblanks_for(dyn); // the vblank grid's rounding; paced: exact
+            }
+            const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
+            if (limit_vblanks != 0 && !paced) {
+                take_request = vblank_status.count - last_flip_vblank >= limit_vblanks;
+            } else if (limit_vblanks != 0) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto arrival = peek_arrival();
+                take_request = arrival && now + tick_period / 2 >= limit_next &&
+                               (now + tick_period / 2 >= last_flip_time + arrival_ema ||
+                                now >= *arrival + vblank_period);
+                if (take_request) {
+                    // sotc: the dynamic FPS step at its exact period (48 on a 144 Hz screen is not
+                    // a whole number of 120 Hz vblanks).
+                    const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
+                    const std::chrono::nanoseconds limit_period =
+                        dyn > 0 && limit_vblanks == vblanks_for(dyn)
+                            ? std::chrono::nanoseconds{1'000'000'000 / dyn}
+                            : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  vblank_period * limit_vblanks);
+                    limit_next = (now - limit_next < tick_period ? limit_next : now) + limit_period;
+                }
+            } else if (!paced) {
+                take_request = subtick == 0;
+            } else if (const auto arrival = peek_arrival()) {
+                const auto now = std::chrono::steady_clock::now();
+                take_request =
+                    now >= last_flip_time + arrival_ema || now >= *arrival + vblank_period;
+            } else {
+                take_request = false;
+            }
         } else {
             const u64 interval = u64(flip_rate + 1) * vblanks_per_60hz;
             take_request = vblank_status.count - last_flip_vblank >= interval;
@@ -3621,65 +3811,128 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (!display_pacing) {
             gate_id = 0;
         } else if (flipped) {
-            presenter->WaitPresented(presenter->LastPresentId(), 0);
+            // sotc: the record poll once per vblank (subtick 0), as before the flip subticks: a
+            // timed-out present wait on every subtick would multiply the driver calls.
+            if (subtick == 0) {
+                presenter->WaitPresented(presenter->LastPresentId(), 0);
+            }
             if (take_request) {
                 take_request = gate_open();
             }
         }
-        if (take_request) {
-            const auto request = receive_request();
-            if (request.port) { // sotc: SOTC_FLIP_COALESCE, see Flip (a request may have no frame)
-                last_flip_count = vblank_status.count;
+        const auto request = take_request ? receive_request() : Request{};
+        if (!request.port) { // sotc: SOTC_FLIP_COALESCE, see Flip (a request may have no frame)
+            // sotc: redraws without a flip stay on the vblank grid, not the subtick grid.
+            if (subtick == 0 && timer.GetTotalWait().count() < 0) { // Dont draw too fast
+                if (!main_port.is_open) {
+                    DrawBlankFrame();
+                } else if (!prep_painting && (ImGui::Core::MustKeepDrawing() || BbOverlay::LoadingShown())) {
+                    // sotc: also the port's loading screen while the game shows nothing.
+                    DrawLastFrame();
+                }
             }
-            if (!request.port) {
-                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
-                    if (!main_port.is_open) {
-                        DrawBlankFrame();
-                    } else if (!prep_painting && (ImGui::Core::MustKeepDrawing() || BbOverlay::LoadingShown())) {
-                        // sotc: also the port's loading screen while the game shows nothing.
-                        DrawLastFrame();
+        } else {
+            last_flip_count = vblank_status.count;
+            // sotc: SOTC_LOW_LATENCY, start of the frame: NVIDIA sleep / AMD anti-lag / the
+            // generic wait for the previous frame's GPU work. No-op when the switch is off.
+            presenter->LowLatencyFrameStart();
+            Flip(request);
+            flip_joined(request.port); // sotc: SOTC_FLIP_COALESCE
+            last_flip_vblank = vblank_status.count;
+            last_flip_time = std::chrono::steady_clock::now();
+            // sotc: track the game's production rate from the submit intervals (clamped so a
+            // load stall doesn't poison it).
+            const auto delta = std::clamp(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(request.arrival -
+                                                                     prev_arrival),
+                std::chrono::nanoseconds{0}, std::chrono::nanoseconds{100'000'000});
+            prev_arrival = request.arrival;
+            arrival_ema += (delta - arrival_ema) / 8;
+            flipped = true;
+            // sotc: SOTC_ADAPTIVE_LOAD (sotc_adaptive.h): the flip interval against the
+            // interval the live cap or frame limit aims at (0: uncapped without a limit).
+            if (SotcAdaptive::kEnabled) {
+                u64 target_ns = 0;
+                if (flip_rate > 0) {
+                    target_ns = u64(flip_rate + 1) * 1'000'000'000ULL / 60;
+                } else {
+                    const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
+                    const u64 limit_vblanks =
+                        live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
+                    target_ns = limit_vblanks * 1'000'000'000ULL /
+                                std::max<u64>(1, EmulatorSettings.GetVblankFrequency());
+                }
+                SotcAdaptive::OnFlip(steady_ns(), target_ns);
+            }
+            if (display_pacing) {
+                // The present Flip just made is the last id (Flip presents synchronously here).
+                const u64 last = presenter->LastPresentId();
+                const double target_fps = 60.0 / double(flip_rate + 1);
+                const double refresh_hz = measured_refresh_hz();
+                const u64 in_flight =
+                    refresh_hz > 0.0
+                        ? std::max<u64>(1, u64(std::llround(refresh_hz / target_fps)))
+                        : 1;
+                gate_id = last >= in_flight ? last - in_flight + 1 : 0;
+                gate_since_ns = steady_ns();
+            }
+            // sotc: SOTC_FPS_DYNAMIC (sotc_fps_cap.h): the game's own frame interval decides.
+            if (SotcFpsCap::dynamic_low > 0 && flip_rate <= 0) {
+                enum class Dyn { High, Low, Probe };
+                static Dyn state = Dyn::High;
+                static std::chrono::nanoseconds slow{0}, total{0};
+                static auto since = last_flip_time;
+                const int live = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
+                const bool at_60 = (live >= 0 ? vblanks_for(live) : start_limit_vblanks) ==
+                                   vblanks_for(60);
+                // A frame counts as slow below 50 FPS: 50-60 FPS stays at the 60 limit (the step only
+                // takes over where the game really cannot keep up).
+                constexpr auto frame_60 = std::chrono::nanoseconds{1'000'000'000 / 50};
+                const auto set = [&](Dyn next, int limit) {
+                    state = next;
+                    since = last_flip_time;
+                    slow = total = std::chrono::nanoseconds{0};
+                    SotcFpsCap::dynamic_limit.store(limit, std::memory_order_relaxed);
+                    std::fprintf(stderr, "SOTC FPS DYNAMIC: %s\n",
+                                 next == Dyn::High   ? "60"
+                                 : next == Dyn::Low  ? "low"
+                                                     : "trying 60");
+                };
+                if (!at_60) {
+                    if (state != Dyn::High) {
+                        set(Dyn::High, 0);
+                    }
+                } else if (state == Dyn::High) {
+                    // Slow time builds up and drains back: a run of slow frames lowers it.
+                    slow = delta > frame_60 ? slow + delta
+                                            : std::max(std::chrono::nanoseconds{0}, slow - delta);
+                    if (slow > std::chrono::milliseconds{1500}) {
+                        set(Dyn::Low, SotcFpsCap::dynamic_low);
+                    }
+                } else if (state == Dyn::Low) {
+                    if (last_flip_time - since > std::chrono::seconds{10}) {
+                        set(Dyn::Probe, 0);
+                    }
+                } else { // Probe: 60 again for 2 s; back to low when over a quarter was slow
+                    total += delta;
+                    if (delta > frame_60) {
+                        slow += delta;
+                    }
+                    if (last_flip_time - since > std::chrono::seconds{2}) {
+                        if (slow * 4 > total) {
+                            set(Dyn::Low, SotcFpsCap::dynamic_low);
+                        } else {
+                            set(Dyn::High, 0);
+                        }
                     }
                 }
-            } else {
-                // sotc: SOTC_LOW_LATENCY, start of the frame: NVIDIA sleep / AMD anti-lag / the
-                // generic wait for the previous frame's GPU work. No-op when the switch is off.
-                presenter->LowLatencyFrameStart();
-                Flip(request);
-                flip_joined(request.port); // sotc: SOTC_FLIP_COALESCE
-                last_flip_vblank = vblank_status.count;
-                flipped = true;
-                // sotc: SOTC_ADAPTIVE_LOAD (sotc_adaptive.h): the flip interval against the
-                // interval the live cap or frame limit aims at (0: uncapped without a limit).
-                if (SotcAdaptive::kEnabled) {
-                    u64 target_ns = 0;
-                    if (flip_rate > 0) {
-                        target_ns = u64(flip_rate + 1) * 1'000'000'000ULL / 60;
-                    } else {
-                        const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
-                        const u64 limit_vblanks =
-                            live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
-                        target_ns = limit_vblanks * 1'000'000'000ULL /
-                                    std::max<u64>(1, EmulatorSettings.GetVblankFrequency());
-                    }
-                    SotcAdaptive::OnFlip(steady_ns(), target_ns);
-                }
-                if (display_pacing) {
-                    // The present Flip just made is the last id (Flip presents synchronously here).
-                    const u64 last = presenter->LastPresentId();
-                    const double target_fps = 60.0 / double(flip_rate + 1);
-                    const double refresh_hz = measured_refresh_hz();
-                    const u64 in_flight =
-                        refresh_hz > 0.0
-                            ? std::max<u64>(1, u64(std::llround(refresh_hz / target_fps)))
-                            : 1;
-                    gate_id = last >= in_flight ? last - in_flight + 1 : 0;
-                    gate_since_ns = steady_ns();
-                }
-                FRAME_END;
             }
+            FRAME_END;
         }
 
-        {
+        // sotc: the vblank fires on the first subtick of each vblank period, keeping the same
+        // flip-then-vblank order the thread had when it ticked once per vblank.
+        if (subtick == 0) {
             // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
             std::scoped_lock lock{main_port.vo_mutex};
 
@@ -3702,6 +3955,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();
         }
+        subtick = (subtick + 1) % flip_subticks;
 
         // sotc: SOTC_PACER step (see above), after this tick's vblank so the game's vblanks keep the
         // timer's rate. It may sleep until the present call time when that falls inside this tick
@@ -3722,12 +3976,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             }
             if (pacer.pending_id == 0 && !pacer.locked) {
                 // Not anchored (first paced frame, or after a skipped/stuck present): at once.
-                if (!pacer_present(0, pace_rate) && timer.GetTotalWait().count() < 0 &&
+                if (!pacer_present(0, pace_rate) && vblank_subtick && timer.GetTotalWait().count() < 0 &&
                     !prep_painting && (ImGui::Core::MustKeepDrawing() || BbOverlay::LoadingShown())) {
                     DrawLastFrame(); // as the timer path does when no flip is queued
                 }
             } else if (pacer.pending_id == 0) {
-                const u64 tick_end_ns = tick_start_ns + u64(vblank_period.count());
+                const u64 tick_end_ns = tick_start_ns + u64(tick_period.count()); // sotc: one subtick
                 while (true) {
                     const u64 call_ns = pacer.slot_target_ns - u64(kPacerLead * vblank_ns);
                     u64 now = steady_ns();

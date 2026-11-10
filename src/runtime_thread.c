@@ -168,13 +168,16 @@ GuestThread *runtime_thread_current(void) {
 }
 /* Host threads that call guest code (HLE decoders invoking guest callbacks) need
  * a TCB/TLS like guest threads; the record lives until process exit. */
+static void set_host_name(const char *name);
 void runtime_thread_attach_host(const char *name) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "host");
+    set_host_name(t->name);
 }
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
+    set_host_name(t->name);
 #ifdef _WIN32
     /* sotc: the main thread runs the game's main loop and its heap allocator (eboot+0x49030), so a
      * live view split must stop it too: without an OS handle runtime_thread_suspend_others skipped
@@ -300,6 +303,23 @@ static void set_host_name(const char *name) {
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
     pthread_setname_np(pthread_self(),host);
+#ifdef _WIN32
+    /* sotc: also publish the name as the Win32 thread description, so the sampling profiler
+     * (SOTC_PROFILE matches GetThreadDescription) can pick guest threads by name. */
+    typedef HRESULT (WINAPI *SetDescription)(HANDLE,PCWSTR);
+    static SetDescription set_description;
+    static int looked;
+    if (!looked) {
+        set_description=(SetDescription)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                               "SetThreadDescription");
+        looked=1;
+    }
+    if (set_description) {
+        wchar_t wide[16];
+        for (int i=0;i<16;++i) wide[i]=(unsigned char)host[i];
+        set_description(GetCurrentThread(),wide);
+    }
+#endif
 }
 #ifdef _WIN32
 #define exit_setjmp(t) bb_setjmp((t)->exit_jump)
@@ -520,6 +540,25 @@ static void *host_start(void *p) {
 #ifdef _WIN32
     /* sotc: host thread ids of guest threads, for traces that print GetCurrentThreadId. */
     if (getenv("SOTC_THREAD_IDS")) fprintf(stderr,"Runtime: guest thread '%s' is host thread %lu\n",t->name,GetCurrentThreadId());
+    /* sotc: on 4 CPU threads or fewer the game's job workers (busy-wait style) starve the update,
+     * render and GPU threads, and the sound and file threads that mostly sleep wait behind them
+     * (AjncSystem #267; the same fix as the God of War 3 port's, first made in the MMadmer fork).
+     * Workers go below normal, sound threads highest, file and loading threads above normal.
+     * Bigger CPUs are left alone. SOTC_JOB_PRIORITY=0 turns it off. */
+    {
+        DWORD_PTR process_mask=0, system_mask=0;
+        const char *off=getenv("SOTC_JOB_PRIORITY");
+        if (!(off && off[0]=='0') &&
+            GetProcessAffinityMask(GetCurrentProcess(),&process_mask,&system_mask) &&
+            __builtin_popcountll((unsigned long long)process_mask)<=4) {
+            if (t->attr.prio<400 || strstr(t->name,"Sound") || strstr(t->name,"sndx"))
+                SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_HIGHEST);
+            else if (!strncmp(t->name,"BPE JobWorker",13))
+                SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+            else if (!strncmp(t->name,"SceFios",7) || !strcmp(t->name,"Resource Loading"))
+                SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
 #endif
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
@@ -725,6 +764,9 @@ static ABI int32_t thread_rename(GuestThread *t,const char *name) {
     if (!name) return ERR(22);
     snprintf(t->name,sizeof(t->name),"%s",name);
     if (t==current) set_host_name(t->name);
+#ifdef _WIN32
+    if (getenv("SOTC_THREAD_IDS")) fprintf(stderr,"Runtime: guest thread renamed to '%s'\n",t->name);
+#endif
     return 0;
 }
 static ABI int32_t thread_equal(GuestThread *a,GuestThread *b) { return a==b; }

@@ -368,6 +368,8 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         default:
             // sotc: SNORM_NZ is only defined for the 8- and 16-bit formats. Elsewhere, no
             // conversion: the value stays the plain integer the Sint remap of the number format gives.
+            // A sharp read from memory the game has not filled yet (a cold shader cache translates
+            // shaders early) can hold any format: it must not end the game.
             ReportFormatFallback("snorm_nz conversion", u32(data_fmt), u32(num_fmt));
             return NumberConversion::None;
         }
