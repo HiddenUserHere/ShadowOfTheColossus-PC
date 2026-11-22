@@ -139,11 +139,16 @@ void Scheduler::RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&&
     // would end the deferred buffer on the producer, before its func has recorded into it, which is
     // invalid. So the deferred buffer is pushed unended here and SubmitThreadLoop records and ends it.
     // EndSegment closes the buffer before it (ended by the producer) and opens the deferred one.
-    if (pass_recording && !is_rendering) {
-        EndSegment();
-        open_segments.push_back(Segment{sessions.back().primary, std::move(func)});
-        BeginSegmentBuffer();
-        dynamic_state.Invalidate();
+    // sotc: N2-122: with the pass recorder the func runs right away on the producer, in the
+    // command buffer being recorded. The deferred segment above (N2-94) recorded it into a
+    // separate buffer by the submit thread, but the commands that depend on it (a compute
+    // pipeline still compiling binds itself here, then DispatchDirect records vkCmdDispatch)
+    // went into the NEXT segment, which had no pipeline bound: the NVIDIA driver crashed in
+    // vkCmdDispatch reading the null bound-pipeline state (nvoglv64.dll+0xe1c18e, seen whenever
+    // compute pipelines were not in the cache yet). Waiting here costs what the path without a
+    // recording thread always cost.
+    if (pass_recording) {
+        func(vk::CommandBuffer{CommandBuffer()});
         return;
     }
     // sotc: W5 (N2-94): inside a rendering scope the func runs right away on the producer (it
