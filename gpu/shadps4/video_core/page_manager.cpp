@@ -67,10 +67,15 @@ static u64 ImageBaseAddress() {
 #include "common/spin_lock.h"
 #endif
 
-// sotc: the game image's base (probe.c), for SOTC_STALE_READS' eboot offsets.
+// sotc: the game image's base (probe.c), for SOTC_STALE_READS' eboot offsets and the native
+// render backend's image-anchored globals (DAT_02ee3ce0 et al, guest_bridge.h).
 static std::atomic<uint64_t> guest_image{0};
 extern "C" void bb_set_guest_image(uintptr_t base) {
     guest_image.store(base, std::memory_order_relaxed);
+}
+
+extern "C" u64 bb_get_guest_image(void) {
+    return guest_image.load(std::memory_order_relaxed);
 }
 
 namespace VideoCore {

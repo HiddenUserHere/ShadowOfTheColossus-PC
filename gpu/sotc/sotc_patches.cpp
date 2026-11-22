@@ -13,6 +13,7 @@
 #include "core/signals.h"
 #include "cpu_patches.h"
 #include "dwarf.h"
+#include "hooks.h"
 #include "sotc_patches.h"
 
 extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult* result) {
@@ -95,4 +96,45 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
 // from the exception (the red zone is not safe there, but the game keeps running).
 extern "C" int sotc_handle_illegal(void* context) {
     return Core::Signals::Instance()->DispatchIllegalInstruction(context) ? 1 : 0;
+}
+
+// sotc: native render backend (branch native/render-vk13). Detours the RenderJob function entries
+// selected by SOTC_RENDER to their host C++ replacements (gpu/sotc/hooks.cpp, gpu/native/).
+extern "C" int sotc_install_render_hooks(void* image, uint64_t module_size, void* trampoline,
+                                         uint64_t trampoline_size, uint64_t* installed,
+                                         uint64_t* failed) {
+    const std::span<const Core::SotcHooks::Hook> hooks = Core::SotcHooks::RenderJobHooks();
+    if (hooks.empty()) {
+        if (installed) {
+            *installed = 0;
+        }
+        if (failed) {
+            *failed = 0;
+        }
+        return 0;
+    }
+    // sotc: the CPU patchers own the head of the trampoline area (Xbyak grows from the base up);
+    // the hooks must allocate above their cursor or their thunks overwrite patch trampolines
+    // (observed: a patched TCB/SSE4a site jumping into a hook thunk corrupted guest state ~13 s
+    // into a run). 16-byte align the skip; keep the hooks out of the patchers' growth room.
+    const u64 patch_used = (Core::UsedTrampolineSize() + 15u) & ~u64{15u};
+    const u64 reserve = 64 * 1024u;
+    if (patch_used + reserve >= trampoline_size) {
+        LOG_WARNING(Core, "SOTC render hooks: trampoline area too small after CPU patches "
+                    "({} bytes used)", patch_used);
+        if (installed) {
+            *installed = 0;
+        }
+        if (failed) {
+            *failed = hooks.size();
+        }
+        return -1;
+    }
+    const u64 count = Core::SotcHooks::Install(image, module_size,
+                                               static_cast<u8*>(trampoline) + patch_used,
+                                               trampoline_size - patch_used, hooks, failed);
+    if (installed) {
+        *installed = count;
+    }
+    return 1;
 }

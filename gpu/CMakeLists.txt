@@ -154,6 +154,9 @@ set(COMMON
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp sotc/*.cpp)
+# sotc: native render backend (branch native/render-vk13, docs/engine/native-render-map.md). The
+# RenderJob rewrite issues Vulkan directly, bypassing the statically-linked GNM library.
+file(GLOB NATIVE_SOURCES CONFIGURE_DEPENDS native/*.cpp)
 # Windows: a DLL cannot leave the runtime_* symbols for bb-probe.exe to resolve, so the
 # library is static there and linked into the executable.
 if (WIN32)
@@ -161,7 +164,7 @@ if (WIN32)
 else()
     set(BBGPU_KIND SHARED)
 endif()
-add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
+add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES} ${NATIVE_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
@@ -258,7 +261,7 @@ if (fsr_fg_count EQUAL fsr_fg_count_after)
 endif()
 list(APPEND fsr_fg_sources ${FSR_FG_PATCHED})
 set_property(TARGET ffx_vulkan_fsr3_vk_framegeneration_3_1_6 PROPERTY SOURCES ${fsr_fg_sources})
-target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
+target_include_directories(bbgpu PRIVATE . shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.

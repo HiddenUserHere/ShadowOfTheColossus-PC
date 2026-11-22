@@ -37,6 +37,14 @@ namespace Vulkan {
 /// used by the command processor
 /// Copied arrays stay inside these chunks until their commands have run, so the producer does not
 /// have to keep the original argument memory alive
+
+
+class CommandRecorder;
+
+/// sotc: the one recorder of the process (set in its constructor, cleared in its destructor); a
+/// command queued by Run below runs against it. Defined in vk_recorder.cpp.
+CommandRecorder*& TheRecorder();
+
 class CommandRecorder {
 public:
     CommandRecorder();
@@ -65,7 +73,10 @@ public:
     void Run(F&& func) {
         using T = std::decay_t<F>;
         static_assert(alignof(T) <= BlockAlign, "Closure over-aligned for the stream");
-        void* payload = Allocate(sizeof(T), BlockKind::Command, &Invoke<T>);
+        // sotc: a command queued from another thread runs on the recording thread; an op queued
+        // there records through this same instance (one recorder per process).
+        void* payload = Allocate(sizeof(T), BlockKind::Command,
+                                 [](void* p) { TheRecorder()->Invoke<T>(p); });
         new (payload) T(std::forward<F>(func));
         Publish();
     }
@@ -123,6 +134,19 @@ public:
     /// stops the recorder
     void ClaimProducer();
 
+    /// sotc: lets a thread that records for the producer issue the commands itself (a native draw
+    /// whose hooks run on the command processor, with the stream recorded on its own thread): the
+    /// commands are the stream's last operations and must run on the recording thread after them,
+    /// so the stream is handed over for this batch. Only threads other than the recording thread
+    /// do this; the previous producer must have stopped recording (HoldRecorder ensures it). The
+    /// stream goes back to the producer at the batch's next Publish.
+    void BeginBatch();
+
+    /// sotc: sub-batches recorded inside a batch keep their parent's ownership.
+    bool InBatch() const noexcept {
+        return in_batch;
+    }
+
     /// Connect a fake command buffer handle to the real buffer allocated by the consumer before
     /// queued commands use it
     void Bind(VkCommandBuffer fake, VkCommandBuffer real) noexcept;
@@ -142,6 +166,7 @@ public:
     }
 
     static constexpr size_t BlockAlign = 16;
+
     static constexpr u32 NumFakeHandles = 1U << 16;
 
 private:
@@ -162,9 +187,14 @@ private:
     };
 
     template <typename T>
-    static void Invoke(void* payload) {
+    void Invoke(void* payload) {
         T& func = *static_cast<T*>(payload);
+        // sotc: an op that records its own commands (RunAfterRecorded) may own the stream already;
+        // its nested commands must not end that ownership.
+        const bool outer = thread_command;
+        thread_command = true;
         func();
+        thread_command = outer;
         func.~T();
     }
 
@@ -193,6 +223,12 @@ private:
     u32 unpublished{};
     u32 producer_tid{};
     u32 producer_switches{};
+    /// sotc: a thread other than the recording thread is between BeginBatch and the batch's end
+    /// (only that thread adds commands then, so a plain flag is enough).
+    bool in_batch{};
+    /// sotc: true while a command queued with Run is running on the recording thread: its nested
+    /// commands are that op's, which may already own the stream.
+    bool thread_command{};
 
     // State written by the consumer while it runs queued commands and advances through the stream
     // chunks

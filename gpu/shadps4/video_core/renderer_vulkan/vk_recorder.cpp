@@ -36,7 +36,7 @@ using Dispatch = std::remove_cvref_t<decltype(VULKAN_HPP_DEFAULT_DISPATCHER)>;
 
 constexpr u32 NumFakeHandles = CommandRecorder::NumFakeHandles;
 alignas(64) u8 g_fake_handles[NumFakeHandles];
-CommandRecorder* g_recorder{};
+
 
 u32 CurrentThreadId() {
 #ifdef _WIN32
@@ -84,8 +84,8 @@ struct GenericThunk<Member, R(VKAPI_PTR*)(VkCommandBuffer, Args...)> {
         if constexpr (!std::is_void_v<R> || (IsInputPointer<Args>::value || ...)) {
             FailUncovered(name);
         } else {
-            g_recorder->CountCommand();
-            g_recorder->Run([cmdbuf, args...] { real(g_recorder->Real(cmdbuf), args...); });
+            TheRecorder()->CountCommand();
+            TheRecorder()->Run([cmdbuf, args...] { real(TheRecorder()->Real(cmdbuf), args...); });
         }
     }
 };
@@ -126,7 +126,7 @@ void VKAPI_CALL CmdPipelineBarrier2(VkCommandBuffer cmdbuf, const VkDependencyIn
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, info);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(sizeof(VkDependencyInfo) + info->memoryBarrierCount * sizeof(VkMemoryBarrier2) +
                 info->bufferMemoryBarrierCount * sizeof(VkBufferMemoryBarrier2) +
                 info->imageMemoryBarrierCount * sizeof(VkImageMemoryBarrier2) + 256);
@@ -140,8 +140,8 @@ void VKAPI_CALL CmdPipelineBarrier2(VkCommandBuffer cmdbuf, const VkDependencyIn
     for (u32 i = 0; i < info->imageMemoryBarrierCount; ++i) {
         CheckNoChain(info->pImageMemoryBarriers[i].pNext, "VkImageMemoryBarrier2");
     }
-    g_recorder->CountCommand();
-    rec.Run([cmdbuf, copy] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy); });
+    TheRecorder()->CountCommand();
+    rec.Run([cmdbuf, copy] { RealOf<Member>()(TheRecorder()->Real(cmdbuf), copy); });
 }
 
 template <auto Member>
@@ -154,15 +154,15 @@ void VKAPI_CALL CmdPipelineBarrier(VkCommandBuffer cmdbuf, VkPipelineStageFlags 
         return RealOf<Member>()(cmdbuf, src_stage, dst_stage, flags, num_memory, memory, num_buffer,
                                 buffer, num_image, image);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(num_memory * sizeof(VkMemoryBarrier) + num_buffer * sizeof(VkBufferMemoryBarrier) +
                 num_image * sizeof(VkImageMemoryBarrier) + 256);
     const auto* memory_copy = rec.Copy(memory, num_memory);
     const auto* buffer_copy = rec.Copy(buffer, num_buffer);
     const auto* image_copy = rec.Copy(image, num_image);
-    g_recorder->CountCommand();
+    TheRecorder()->CountCommand();
     rec.Run([=] {
-        RealOf<Member>()(g_recorder->Real(cmdbuf), src_stage, dst_stage, flags, num_memory,
+        RealOf<Member>()(TheRecorder()->Real(cmdbuf), src_stage, dst_stage, flags, num_memory,
                          memory_copy, num_buffer, buffer_copy, num_image, image_copy);
     });
 }
@@ -224,7 +224,7 @@ template <auto Member>
 void InvokePushDescriptorSet(void* payload) {
     const auto* push = static_cast<const PushDescriptorPayload*>(payload);
     const auto* writes = reinterpret_cast<const VkWriteDescriptorSet*>(push + 1);
-    RealOf<Member>()(g_recorder->Real(push->cmdbuf), push->bind_point, push->layout, push->set,
+    RealOf<Member>()(TheRecorder()->Real(push->cmdbuf), push->bind_point, push->layout, push->set,
                      push->num_writes, writes);
 }
 
@@ -240,7 +240,7 @@ void VKAPI_CALL CmdPushDescriptorSet(VkCommandBuffer cmdbuf, VkPipelineBindPoint
         CheckNoChain(writes[i].pNext, "VkWriteDescriptorSet");
         bytes += ArrayBytes(writes[i]);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     auto* push = static_cast<PushDescriptorPayload*>(
         rec.AllocateCommand(bytes, &InvokePushDescriptorSet<Member>));
     *push = {cmdbuf, layout, bind_point, set, num_writes};
@@ -276,12 +276,12 @@ void VKAPI_CALL CmdPushConstants(VkCommandBuffer cmdbuf, VkPipelineLayout layout
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, layout, stages, offset, size, values);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(size + 256);
     const auto* copy = rec.Copy(static_cast<const u8*>(values), size);
-    g_recorder->CountCommand();
+    TheRecorder()->CountCommand();
     rec.Run(
-        [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), layout, stages, offset, size, copy); });
+        [=] { RealOf<Member>()(TheRecorder()->Real(cmdbuf), layout, stages, offset, size, copy); });
 }
 
 const VkDebugUtilsLabelEXT* CopyLabel(CommandRecorder& rec, const VkDebugUtilsLabelEXT* label) {
@@ -298,9 +298,9 @@ void VKAPI_CALL CmdDebugLabel(VkCommandBuffer cmdbuf, const VkDebugUtilsLabelEXT
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, label);
     }
-    const auto* copy = CopyLabel(*g_recorder, label);
-    g_recorder->CountCommand();
-    g_recorder->Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy); });
+    const auto* copy = CopyLabel(*TheRecorder(), label);
+    TheRecorder()->CountCommand();
+    TheRecorder()->Run([=] { RealOf<Member>()(TheRecorder()->Real(cmdbuf), copy); });
 }
 
 template <auto Member>
@@ -308,7 +308,7 @@ void VKAPI_CALL CmdBeginRendering(VkCommandBuffer cmdbuf, const VkRenderingInfo*
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, info);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(sizeof(VkRenderingInfo) +
                 (info->colorAttachmentCount + 2) * sizeof(VkRenderingAttachmentInfo) + 256);
     CheckNoChain(info->pNext, "VkRenderingInfo");
@@ -319,8 +319,8 @@ void VKAPI_CALL CmdBeginRendering(VkCommandBuffer cmdbuf, const VkRenderingInfo*
     for (u32 i = 0; i < info->colorAttachmentCount; ++i) {
         CheckNoChain(info->pColorAttachments[i].pNext, "VkRenderingAttachmentInfo");
     }
-    g_recorder->CountCommand();
-    rec.Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy); });
+    TheRecorder()->CountCommand();
+    rec.Run([=] { RealOf<Member>()(TheRecorder()->Real(cmdbuf), copy); });
 }
 
 /// Queue buffer and image copy, resolve or blit commands together with the region arrays they need
@@ -335,11 +335,11 @@ struct RegionsThunk<Member, Region, void(Pre...)> {
         if (!CommandRecorder::IsFake(cmdbuf)) {
             return RealOf<Member>()(cmdbuf, pre..., count, regions);
         }
-        auto& rec = *g_recorder;
+        auto& rec = *TheRecorder();
         rec.Reserve(count * sizeof(Region) + 256);
         const auto* copy = rec.Copy(regions, count);
-        g_recorder->CountCommand();
-        rec.Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), pre..., count, copy); });
+        TheRecorder()->CountCommand();
+        rec.Run([=] { RealOf<Member>()(TheRecorder()->Real(cmdbuf), pre..., count, copy); });
     }
 };
 
@@ -350,12 +350,12 @@ void VKAPI_CALL CmdBlitImage(VkCommandBuffer cmdbuf, VkImage src, VkImageLayout 
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, src, src_layout, dst, dst_layout, count, regions, filter);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(count * sizeof(VkImageBlit) + 256);
     const auto* copy = rec.Copy(regions, count);
-    g_recorder->CountCommand();
+    TheRecorder()->CountCommand();
     rec.Run([=] {
-        RealOf<Member>()(g_recorder->Real(cmdbuf), src, src_layout, dst, dst_layout, count, copy,
+        RealOf<Member>()(TheRecorder()->Real(cmdbuf), src, src_layout, dst, dst_layout, count, copy,
                          filter);
     });
 }
@@ -367,13 +367,13 @@ void VKAPI_CALL CmdClearImage(VkCommandBuffer cmdbuf, VkImage image, VkImageLayo
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, image, layout, value, count, ranges);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(sizeof(Value) + count * sizeof(VkImageSubresourceRange) + 256);
     const auto* value_copy = rec.Copy(value);
     const auto* ranges_copy = rec.Copy(ranges, count);
-    g_recorder->CountCommand();
+    TheRecorder()->CountCommand();
     rec.Run([=] {
-        RealOf<Member>()(g_recorder->Real(cmdbuf), image, layout, value_copy, count, ranges_copy);
+        RealOf<Member>()(TheRecorder()->Real(cmdbuf), image, layout, value_copy, count, ranges_copy);
     });
 }
 
@@ -383,11 +383,11 @@ void VKAPI_CALL CmdUpdateBuffer(VkCommandBuffer cmdbuf, VkBuffer buffer, VkDevic
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, buffer, offset, size, data);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(size + 256);
     const auto* copy = rec.Copy(static_cast<const u8*>(data), size);
-    g_recorder->CountCommand();
-    rec.Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), buffer, offset, size, copy); });
+    TheRecorder()->CountCommand();
+    rec.Run([=] { RealOf<Member>()(TheRecorder()->Real(cmdbuf), buffer, offset, size, copy); });
 }
 
 /// Copy viewport and scissor arrays for both the first-and-count commands and the WithCount
@@ -398,11 +398,11 @@ void VKAPI_CALL CmdSetFirstArray(VkCommandBuffer cmdbuf, u32 first, u32 count,
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, first, count, elements);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(count * sizeof(Element) + 256);
     const auto* copy = rec.Copy(elements, count);
-    g_recorder->CountCommand();
-    rec.Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), first, count, copy); });
+    TheRecorder()->CountCommand();
+    rec.Run([=] { RealOf<Member>()(TheRecorder()->Real(cmdbuf), first, count, copy); });
 }
 
 template <auto Member, typename Element>
@@ -410,11 +410,11 @@ void VKAPI_CALL CmdSetArray(VkCommandBuffer cmdbuf, u32 count, const Element* el
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, count, elements);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(count * sizeof(Element) + 256);
     const auto* copy = rec.Copy(elements, count);
-    g_recorder->CountCommand();
-    rec.Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), count, copy); });
+    TheRecorder()->CountCommand();
+    rec.Run([=] { RealOf<Member>()(TheRecorder()->Real(cmdbuf), count, copy); });
 }
 
 template <auto Member>
@@ -424,8 +424,8 @@ void VKAPI_CALL CmdSetBlendConstants(VkCommandBuffer cmdbuf, const float constan
     }
     std::array<float, 4> copy;
     std::memcpy(copy.data(), constants, sizeof(copy));
-    g_recorder->CountCommand();
-    g_recorder->Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy.data()); });
+    TheRecorder()->CountCommand();
+    TheRecorder()->Run([=] { RealOf<Member>()(TheRecorder()->Real(cmdbuf), copy.data()); });
 }
 
 template <auto Member>
@@ -436,13 +436,13 @@ void VKAPI_CALL CmdSetVertexInput(VkCommandBuffer cmdbuf, u32 num_bindings,
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, num_bindings, bindings, num_attributes, attributes);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(num_bindings * sizeof(*bindings) + num_attributes * sizeof(*attributes) + 256);
     const auto* bindings_copy = rec.Copy(bindings, num_bindings);
     const auto* attributes_copy = rec.Copy(attributes, num_attributes);
-    g_recorder->CountCommand();
+    TheRecorder()->CountCommand();
     rec.Run([=] {
-        RealOf<Member>()(g_recorder->Real(cmdbuf), num_bindings, bindings_copy, num_attributes,
+        RealOf<Member>()(TheRecorder()->Real(cmdbuf), num_bindings, bindings_copy, num_attributes,
                          attributes_copy);
     });
 }
@@ -453,13 +453,13 @@ void VKAPI_CALL CmdBindVertexBuffers(VkCommandBuffer cmdbuf, u32 first, u32 coun
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, first, count, buffers, offsets);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(count * (sizeof(VkBuffer) + sizeof(VkDeviceSize)) + 256);
     const auto* buffers_copy = rec.Copy(buffers, count);
     const auto* offsets_copy = rec.Copy(offsets, count);
-    g_recorder->CountCommand();
+    TheRecorder()->CountCommand();
     rec.Run([=] {
-        RealOf<Member>()(g_recorder->Real(cmdbuf), first, count, buffers_copy, offsets_copy);
+        RealOf<Member>()(TheRecorder()->Real(cmdbuf), first, count, buffers_copy, offsets_copy);
     });
 }
 
@@ -470,15 +470,15 @@ void VKAPI_CALL CmdBindVertexBuffers2(VkCommandBuffer cmdbuf, u32 first, u32 cou
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, first, count, buffers, offsets, sizes, strides);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(count * (sizeof(VkBuffer) + 3 * sizeof(VkDeviceSize)) + 256);
     const auto* buffers_copy = rec.Copy(buffers, count);
     const auto* offsets_copy = rec.Copy(offsets, count);
     const auto* sizes_copy = rec.Copy(sizes, count);
     const auto* strides_copy = rec.Copy(strides, count);
-    g_recorder->CountCommand();
+    TheRecorder()->CountCommand();
     rec.Run([=] {
-        RealOf<Member>()(g_recorder->Real(cmdbuf), first, count, buffers_copy, offsets_copy,
+        RealOf<Member>()(TheRecorder()->Real(cmdbuf), first, count, buffers_copy, offsets_copy,
                          sizes_copy, strides_copy);
     });
 }
@@ -492,13 +492,13 @@ void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer cmdbuf, VkPipelineBindPoin
         return RealOf<Member>()(cmdbuf, bind_point, layout, first, count, sets, num_dynamic,
                                 dynamic_offsets);
     }
-    auto& rec = *g_recorder;
+    auto& rec = *TheRecorder();
     rec.Reserve(count * sizeof(VkDescriptorSet) + num_dynamic * sizeof(u32) + 256);
     const auto* sets_copy = rec.Copy(sets, count);
     const auto* offsets_copy = rec.Copy(dynamic_offsets, num_dynamic);
-    g_recorder->CountCommand();
+    TheRecorder()->CountCommand();
     rec.Run([=] {
-        RealOf<Member>()(g_recorder->Real(cmdbuf), bind_point, layout, first, count, sets_copy,
+        RealOf<Member>()(TheRecorder()->Real(cmdbuf), bind_point, layout, first, count, sets_copy,
                          num_dynamic, offsets_copy);
     });
 }
@@ -510,8 +510,8 @@ void VKAPI_CALL CmdSetCheckpoint(VkCommandBuffer cmdbuf, const void* marker) {
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, marker);
     }
-    g_recorder->CountCommand();
-    g_recorder->Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), marker); });
+    TheRecorder()->CountCommand();
+    TheRecorder()->Run([=] { RealOf<Member>()(TheRecorder()->Real(cmdbuf), marker); });
 }
 
 // The scheduler begins recorded command buffers after the recording thread allocates them
@@ -534,8 +534,8 @@ VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer cmdbuf) {
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return real_end(cmdbuf);
     }
-    g_recorder->Run([cmdbuf] {
-        const VkResult result = real_end(g_recorder->Real(cmdbuf));
+    TheRecorder()->Run([cmdbuf] {
+        const VkResult result = real_end(TheRecorder()->Real(cmdbuf));
         ASSERT_MSG(result == VK_SUCCESS, "cp_record_thread: vkEndCommandBuffer failed: {}",
                    vk::to_string(vk::Result{result}));
     });
@@ -546,7 +546,7 @@ VkResult VKAPI_CALL ResetCommandBuffer(VkCommandBuffer cmdbuf, VkCommandBufferRe
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return real_reset(cmdbuf, flags);
     }
-    g_recorder->Run([cmdbuf, flags] { real_reset(g_recorder->Real(cmdbuf), flags); });
+    TheRecorder()->Run([cmdbuf, flags] { real_reset(TheRecorder()->Real(cmdbuf), flags); });
     return VK_SUCCESS;
 }
 
@@ -640,10 +640,15 @@ bool CommandRecorder::IsFake(VkCommandBuffer cmdbuf) noexcept {
     return offset < NumFakeHandles;
 }
 
+CommandRecorder*& TheRecorder() {
+    static CommandRecorder* recorder{};
+    return recorder;
+}
+
 CommandRecorder::CommandRecorder() {
-    ASSERT_MSG(g_recorder == nullptr, "cp_record_thread: only one recorded scheduler is supported");
+    ASSERT_MSG(TheRecorder() == nullptr, "cp_record_thread: only one recorded scheduler is supported");
     InstallThunks();
-    g_recorder = this;
+    TheRecorder() = this;
     write_chunk = AcquireChunk();
     first_chunk = write_chunk;
     producer_tid = CurrentThreadId();
@@ -655,7 +660,7 @@ CommandRecorder::~CommandRecorder() {
     thread.request_stop();
     WakeConsumer();
     thread.join();
-    g_recorder = nullptr;
+    TheRecorder() = nullptr;
     std::scoped_lock lk{free_mutex};
     for (Chunk* chunk : free_chunks) {
         delete chunk;
@@ -689,6 +694,18 @@ void CommandRecorder::CheckProducer() {
     if (tid == producer_tid) [[likely]] {
         return;
     }
+    // sotc: the thread of a batch (BeginBatch), and the recording thread while it runs one on
+    // its ops that record for themselves (Scheduler::RunAfterRecorded: the native draws) own the
+    // stream until the batch's next Publish. The stream goes back to the producer at that Publish.
+    if (in_batch) {
+        return;
+    }
+    if (IsRecordingThread() && !thread_command) {
+        in_batch = true;
+        LOG_INFO(Render_Vulkan, "cp_record_thread: recording thread takes the stream (producer {})",
+                 tid);
+        return;
+    }
     // Let the command processor take over once from the thread that created the renderer, and let
     // shutdown call ClaimProducer if it changes threads
     // Any other producer change means two threads could record into the same stream, which this
@@ -699,9 +716,39 @@ void CommandRecorder::CheckProducer() {
         producer_tid = tid;
         return;
     }
-    UNREACHABLE_MSG("cp_record_thread: thread {} records on the scheduler of thread {}; the command "
-                    "stream has one producer",
-                    tid, producer_tid);
+    // sotc: the producer moving between the command processor and the recording thread is the
+    // batched path above not having given the stream back yet (Scheduler::CommitRecordedCommands
+    // and RunAfterRecorded are the points that do): let the batch's own Kick close it instead of
+    // stopping the game, which is what a real second writer would have to be stopped for.
+    if (std::this_thread::get_id() == thread.get_id() && !thread_command) {
+        in_batch = true;
+        LOG_INFO(Render_Vulkan, "cp_record_thread: recording thread takes the stream again (producer "
+                                "{})",
+                 tid);
+        return;
+    }
+    // sotc: the batched producers move the stream between the command processor and the recording
+    // thread (CommitRecordedCommands: a native batch hands over, the guest keeps recording). That
+    // move is not worth stopping a game over; a real second writer is a different thread and still
+    // stops here.
+    producer_tid = tid;
+    LOG_WARNING(Render_Vulkan, "cp_record_thread: producer thread moving {} -> {} (batched)",
+                producer_tid, tid);
+}
+
+void CommandRecorder::BeginBatch() {
+    if (IsRecordingThread()) {
+        // The recording thread's own ops (Scheduler::RunAfterRecorded) take the stream in
+        // CheckProducer.
+        return;
+    }
+    ASSERT_MSG(!in_batch, "cp_record_thread: a batch started while another one is open");
+    in_batch = true;
+    const u32 tid = CurrentThreadId();
+    LOG_INFO(Render_Vulkan, "cp_record_thread: thread {} records a batch for the stream (producer "
+                            "{})",
+             tid, producer_tid);
+    producer_tid = tid;
 }
 
 void CommandRecorder::ClaimProducer() {
@@ -735,6 +782,17 @@ void CommandRecorder::Reserve(size_t bytes) {
 }
 
 void CommandRecorder::Publish() {
+    // sotc: a batch (BeginBatch) and the ops the recording thread replays (Scheduler::
+    // RunAfterRecorded: the native draws) own the stream while they record, whoever added them.
+    // The batch's own Kick closes it; an op gives the stream back here, before the commands that
+    // follow it queue, so the producer's next Publish -- the command processor adding its sets and
+    // draws again -- finds the stream free instead of finding a second producer.
+    if (in_batch && !thread_command) {
+        in_batch = false;
+        producer_tid = CurrentThreadId();
+        LOG_INFO(Render_Vulkan, "cp_record_thread: the stream goes back to the producer ({})",
+                 producer_tid);
+    }
     CheckProducer();
     // Publish commands in batches so the producer and consumer do not keep competing over the
     // committed cache line

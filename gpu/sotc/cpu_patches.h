@@ -55,6 +55,10 @@ struct RedZonePatchResult {
 void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_area_ptr,
                          u64 trampoline_area_size);
 
+/// sotc: bytes the instruction patchers have already emitted into a trampoline area. A second
+/// user of the same area (the render hooks) must allocate above this.
+u64 UsedTrampolineSize();
+
 /// Applies CPU patches that need to be done before beginning executions.
 void PrePatchInstructions(u64 segment_addr, u64 segment_size);
 

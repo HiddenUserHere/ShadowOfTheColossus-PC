@@ -450,6 +450,12 @@ public:
         return render_state;
     }
 
+    /// sotc: commits the commands the producer has recorded so far as a stream op (no fake
+    /// handle, so it is not a guest command): the record thread replays them while the producer
+    /// keeps recording, and the stream order stays the producer's. For HoldRecorder, where the
+    /// producer's scope cannot be ended from another thread.
+    void CommitRecordedCommands();
+
     /// Returns the current pipeline dynamic state tracking.
     DynamicState& GetDynamicState() {
         return dynamic_state;
@@ -504,6 +510,20 @@ public:
     [[nodiscard]] bool HasRecordThread() const noexcept {
         return recorder != nullptr;
     }
+
+    /// sotc: makes func the stream's next operations from the calling thread (not the recording
+    /// thread): what was recorded so far is submitted and replayed, the stream is handed over for
+    /// func, and it goes back to the producer when func returns. For a few commands per event (a
+    /// native draw). Without a recording thread func runs right away.
+    void HoldRecorder(Common::UniqueFunction<void>&& func);
+
+    /// sotc: true while a thread holds the stream (HoldRecorder, from a nested call of the same
+    /// thread too).
+    [[nodiscard]] bool RecorderHeld() const noexcept;
+
+    /// sotc: closes the stream batch a hold opened (no-op without one).
+    void ReleaseRecorder();
+
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {

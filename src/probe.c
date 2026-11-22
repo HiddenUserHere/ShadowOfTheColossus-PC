@@ -248,6 +248,33 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
     }
     snprintf(out,size,"%p",(void *)address);
 }
+/* sotc: the frame-pointer chain of a stopped thread (guest and host code keep frame pointers),
+ * named with describe_address; `label` prefixes each line. Bounded and read-checked, so a corrupt
+ * frame stops it instead of faulting. */
+static void print_rbp_chain(uintptr_t rbp, const char *label) {
+    char where[MAX_PATH+64];
+    for (int depth=0; depth<24 && rbp; ++depth) {
+        uintptr_t frame[2];
+        SIZE_T got=0;
+        if (!ReadProcessMemory(GetCurrentProcess(),(void *)rbp,frame,sizeof(frame),&got) || got!=sizeof(frame) || frame[0]<=rbp) break;
+        describe_address(where,sizeof(where),frame[1]);
+        fprintf(stderr,"  %s#%d %s\n",label,depth,where);
+        rbp=frame[0];
+    }
+}
+/* sotc: the runtime (runtime_fiber.c) reports a fiber stack overflow with this thread's host
+ * chain, named with describe_address (guest offsets for image frames, module+offset for hooks). */
+uintptr_t bb_runtime_backtrace(void **frames, int max) {
+#ifdef _WIN32
+    USHORT n=(USHORT)CaptureStackBackTrace(1,(DWORD)max,frames,NULL);
+    return n;
+#else
+    return 0;
+#endif
+}
+void bb_runtime_describe(char *out, size_t size, uintptr_t address) {
+    describe_address(out,size,address);
+}
 /* sotc: BB_STACKS_TRIGGER=<file>: when the file appears it is removed and every other thread is
  * suspended in turn and reported (name, rip, frame-pointer chain) to stderr: hangs without a
  * debugger. Guest code keeps frame pointers. */
@@ -948,6 +975,9 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     fprintf(stderr,"  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
             c->R8,c->R9,c->R10,c->R11,c->R12,c->R13,c->R14,c->R15);
     if (gpu_enabled) bbgpu_dump_guest_writes(info);
+    /* sotc: the crashed thread's caller chain before the rbp-chain dump below (which also carries
+     * each frame's locals). A guest fault inside a hook then names the guest caller. */
+    print_rbp_chain((uintptr_t)c->Rbp,"");
     /* rbp chain (guest and host code keep frame pointers). */
     uintptr_t rbp=(uintptr_t)c->Rbp;
     for (int depth=0; depth<24 && rbp; ++depth) {
@@ -1711,6 +1741,14 @@ static void apply_sotc_cpu_patches(const char *path, const Segment *segments, ui
     if (request.tsc_clock)
         printf("CPU patches: %" PRIu64 " rdtsc read QPC, %" PRIu64 " left on the TSC\n",
                result.rdtsc, result.rdtsc_unpatched);
+    /* sotc: native render backend (branch native/render-vk13). Detours the RenderJob entries
+     * selected by SOTC_RENDER; a no-op when it is unset. The trampoline area is the same one the
+     * CPU patches use (the last 16 KiB stay reserved for the engine command line). */
+    uint64_t hooks_installed=0, hooks_failed=0;
+    if (sotc_install_render_hooks(image,size,image+round_page(size),SOTC_TRAMPOLINE_SIZE-16384,
+                                  &hooks_installed,&hooks_failed))
+        printf("Render hooks: %" PRIu64 " installed, %" PRIu64 " failed (SOTC_RENDER=%s)\n",
+               hooks_installed,hooks_failed,getenv("SOTC_RENDER")?getenv("SOTC_RENDER"):"");
 }
 /* sotc: extra engine command line (cvars such as +r_motionBlurEnable=0), described by
  * scripts/sotc_modes.py: SOTCCMD1, the image offset of the `lea rsi,[rip+x]` that loads the

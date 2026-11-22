@@ -4,8 +4,11 @@
 #pragma once
 
 #include <chrono>
+#include <deque>
+#include <memory>
 #include <cstdlib>
 #include <unordered_map>
+#include <vector>
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -17,6 +20,7 @@
 
 namespace AmdGpu {
 struct Liverpool;
+union Regs;
 }
 
 namespace Core {
@@ -27,6 +31,7 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+
 
 /// sotc: SOTC_DRAW_PHASES=1: TSC timers per phase of a graphics draw on the draw thread (and of
 /// its capture on the command processor), by class (depth-only, G-buffer, other), printed every
@@ -75,6 +80,40 @@ public:
     void DispatchDirect(const Pipeline* resolved = nullptr, bool use_resolved = false);
     void DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved = nullptr,
                           bool use_resolved = false);
+
+    /// sotc: the native render backend's draw issuance (phase 2.2/2.7 at cutover). The native
+    /// hooks derive a draw from the guest's own structures and publish it here instead of a PM4
+    /// draw packet; `DrawNative` runs on the command processor (the draw thread's back-op ring)
+    /// and reuses the emulated draw's own GPU-state path — PrepareRenderState (target images,
+    // layout transitions, image registration), BindResources (descriptors, buffers, user data),
+    // BeginRendering (viewport/scissor/depth range/colour masks through the scheduler) and the
+    // vertex/index binds — with the pipeline, write masks and SGPR offsets the native derivation
+    // provides. A draw with no published request is not issued.
+    struct NativeDrawRequest {
+        const GraphicsPipeline* pipeline{};
+        /// The guest register image this draw derives from, copied with the request. The command
+        /// processor's own register image is replaced by it before the state path runs (the
+        /// back-op ring only sends the chunks it judged changed); null keeps the registers.
+        std::unique_ptr<AmdGpu::Regs> regs;
+        bool is_indexed{};
+        bool fullscreen{};   ///< 0x93690: draw a 3-vertex triangle (prim 0x11) instead
+        u32 first_vertex{};  ///< AUTO: vertexOffset / INDEX: firstIndex
+        u32 index_count{};   ///< INDEX: count
+        u32 instances{1};
+        u32 first_instance{};
+        u32 index_type{};    ///< AmdGpu::IndexType (0 = Index16, 1 = Index32)
+        VAddr index_base{};  ///< INDEX: index buffer base address
+        vk::Buffer args{};   ///< indirect: the args table (DrawIndexedIndirectCommand layout)
+        u64 args_offset{};
+        u32 args_stride{};   ///< indirect: 16 (plain) or 20 (indexed)
+        /// The registers this draw derives from (published with the request; applied verbatim).
+        std::vector<u32> reg_chunks;
+        std::array<AmdGpu::CbDbExtent, 8> cb_extent{};
+        AmdGpu::CbDbExtent db_extent{};
+    };
+    void DrawNative(const NativeDrawRequest& request);
+    /// Publishes `request` for the next native draw op (command processor context only).
+    void PushNativeDraw(NativeDrawRequest&& request);
 
     /// sotc: the pipeline lookups of the draws and dispatches alone (command processor thread).
     const Pipeline* LookupGraphicsPipeline(u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
@@ -175,6 +214,9 @@ public:
     vk::ImageView TakeHudless(VAddr address, vk::Format format);
 
 private:
+    /// sotc: the published native draw request plus the command processor's own draw state.
+    std::deque<NativeDrawRequest> native_draw_queue;
+    void ApplyNativeChunks(const std::vector<u32>& reg_chunks);
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     /// sotc: BbToggle::DepthFastPath (docs/sotc/DEPTH-FASTPATH.md). BeginRendering for a depth-only

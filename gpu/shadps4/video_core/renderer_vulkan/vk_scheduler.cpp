@@ -46,6 +46,7 @@ void Scheduler::ClaimRecorder() {
     }
 }
 
+
 void Scheduler::StartTickWatch() {
     if (!SotcStats::kTickWatch || tickwatch) {
         return;
@@ -115,6 +116,52 @@ void Scheduler::RunAfterRecorded(Common::UniqueFunction<void>&& func) {
     }
     recorder->Run([func = std::move(func)] { func(); });
     recorder->Kick();
+}
+
+void Scheduler::CommitRecordedCommands() {
+    if (!recorder) {
+        return;
+    }
+    recorder->Run([] {});
+}
+
+void Scheduler::HoldRecorder(Common::UniqueFunction<void>&& func) {
+    if (!recorder) {
+        func();
+        return;
+    }
+    if (recorder->IsRecordingThread()) {
+        RunAfterRecorded(std::move(func));
+        return;
+    }
+    if (recorder->InBatch()) {
+        // Only the batch's own thread records then (a nested hold on the same thread).
+        func();
+        return;
+    }
+    // The stream is closed at the end of the recorder's own scope (EndRendering queues a real
+    // beginRendering, not a guest command) and the commands up to here are queued for the
+    // recording thread in stream order: the hand-over then adds the func's commands after them.
+    if (is_rendering) {
+        EndRendering();
+    }
+    CommitRecordedCommands();
+    recorder->ClaimProducer();
+    recorder->BeginBatch();
+    func();
+    // Close the batch: its commands are published and the producer gets the stream back before it
+    // records anything else (the next AddSet/AddDraw from the command processor).
+    recorder->Kick();
+}
+
+bool Scheduler::RecorderHeld() const noexcept {
+    return recorder != nullptr && recorder->InBatch();
+}
+
+void Scheduler::ReleaseRecorder() {
+    if (recorder && recorder->InBatch()) {
+        recorder->Kick();
+    }
 }
 
 void Scheduler::BeginRecorded(vk::CommandBuffer fake) {
@@ -204,6 +251,12 @@ void Scheduler::BeginRendering(const RenderState& new_state, u64 token) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
+    // sotc: a native batch leaves its rendering scope on the stream; the producer's own scope
+    // starts after the batch (the batch stays the handler's: its RecordDeferred path does not
+    // open the producer's scope though it records through the producer's command buffer).
+    if (recorder && recorder->InBatch()) {
+        ReleaseRecorder();
+    }
     // sotc: the graphics command buffer even while a cull dispatch is recorded (SOTC_CULL_QUEUE).
     sessions.back().primary.beginRendering(rendering_info);
 }
@@ -428,6 +481,11 @@ void Scheduler::BeginSession() {
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    // sotc: a native batch records its own rendering scope, which it leaves on the stream: the
+    // next commands open theirs at its end.
+    if (recorder && recorder->InBatch()) {
+        ReleaseRecorder();
+    }
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();

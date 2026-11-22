@@ -28,6 +28,12 @@ typedef struct {
 } SotcPatchResult;
 int sotc_patch_eboot(const SotcPatchRequest *request, SotcPatchResult *result);
 int sotc_handle_illegal(void *exception_pointers);
+/* sotc: native render backend (branch native/render-vk13). Detours the RenderJob function entries
+ * selected by SOTC_RENDER to their host C++ replacements (gpu/sotc/hooks.cpp, gpu/native/). Off
+ * (returns 0) when SOTC_RENDER is unset. `image` is the mapped eboot base; the trampoline area is
+ * the same one sotc_patch_eboot uses. */
+int sotc_install_render_hooks(void *image, uint64_t module_size, void *trampoline,
+                              uint64_t trampoline_size, uint64_t *installed, uint64_t *failed);
 #ifdef __cplusplus
 }
 #endif

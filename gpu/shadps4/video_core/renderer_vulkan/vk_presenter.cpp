@@ -15,6 +15,7 @@
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
+#include "native/native_renderer.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
@@ -503,6 +504,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
+    // sotc: native render backend (branch native/render-vk13). When SOTC_RENDER selects a stage,
+    // create the native renderer over the reused device/scheduler. It is a no-op (null) otherwise.
+    Native::Get(instance, draw_scheduler);
     // sotc: SOTC_TICKWATCH samples the draw scheduler's timeline (FLIPGAP diagnosis).
     draw_scheduler.StartTickWatch();
     const u32 num_images = swapchain.GetImageCount();

@@ -32,6 +32,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "native/native_stream_ops.h" // sotc: native RenderJob ops in the PM4 stream
 #include "video_core/renderdoc.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
@@ -825,6 +826,15 @@ void Liverpool::HashStatsReport(std::string& out, double seconds) {
     out += line;
 }
 
+void Liverpool::SubmitNativeDraw(Common::UniqueFunction<void>&& issue) {
+    // sotc: the native stage issues from the thread that reaches it, whichever that is: the
+    // command processor (its own scheduler is the draw stream it plays) or the draw thread (the
+    // back-op ring), and either may still find its stream owned by another producer (a
+    // presentation thread submits between frames). The issue itself takes the stream over for the
+    // duration of its commands (native_draw.cpp).
+    issue();
+}
+
 void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
     if (!back_threaded) {
         rasterizer->Draw(is_indexed, index_offset);
@@ -1407,6 +1417,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     BackOrRun(
                         [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); },
                         false);
+                    break;
+                }
+                case PM4CmdNop::PayloadType::SotcNativeOp: {
+                    // sotc: a native RenderJob operation (gpu/native/native_stream_ops.h), run
+                    // where the draws are recorded, in stream order with them.
+                    if (nop->header.count.Value() >= 1) {
+                        const u32 id = nop->data_block[1];
+                        BackOrRun([id] { Native::StreamOps::Run(id); }, false);
+                    }
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {

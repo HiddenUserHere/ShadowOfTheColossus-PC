@@ -73,6 +73,12 @@ public:
         return *rasterizer.get();
     }
 
+    /// sotc: the native backend's draw issuance records through the shared Liverpool (the draw
+    /// thread's back-op ring), the same instance the rasterizer drives.
+    AmdGpu::Liverpool& GetLiverpool() const {
+        return *liverpool;
+    }
+
     bool IsHDRSupported() const {
         return swapchain.HasHDR();
     }

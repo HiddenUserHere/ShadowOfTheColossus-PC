@@ -35,6 +35,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/sotc_stats.h"
+// sotc: the fill side (N2-10) of the material-key pipeline cache (native/native_fill.h).
+#include "native/native_fill.h"
 
 namespace Vulkan {
 
@@ -959,6 +961,29 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
     program.AddPermut(t.module, std::move(*t.spec));
 }
 
+/// sotc: N2-10 — the CM-side positional signature (see native/native_fill.h). HW stage index ->
+/// GNM ordinal is +1 ({Fragment→PS, Vertex→VS, Geometry→GS, Export→ES, Hull→HS, Local→LS}); a
+/// disabled stage leaves its slot 0, exactly like a key without that record.
+bool StageSignatureFromRegs(const AmdGpu::Regs& regs, Native::Bind::Fill::StageSig& out) {
+    out = {};
+    for (u32 hw = 0; hw < 6; ++hw) {
+        if (!regs.stage_enable.IsStageEnabled(hw)) {
+            continue; // Fragment/Vertex are always on; the rest follow VGT_SHADER_STAGES_EN
+        }
+        const AmdGpu::ShaderProgram* pgm = regs.ProgramForStage(hw);
+        if (pgm == nullptr || pgm->address == 0) {
+            return false;
+        }
+        // PGM_HI != 0: the guest driver rejects such a record ("Invalid shader address"), so no
+        // key can name it. Zeroing the slot instead would collide with an absent stage.
+        if ((pgm->address >> 32) != 0) {
+            return false;
+        }
+        out.va[hw + 1] = static_cast<u32>(pgm->address);
+    }
+    return true;
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
     // sotc: finished translations must be installed before the stages are looked up.
@@ -1085,6 +1110,19 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
     last_graphics_pipeline = it->second.get();
     last_graphics_params = params;
+    // sotc: N2-10 fill side. The draw hooks derive the guest material block's content key; this
+    // thread is the only one that builds pipelines, from these registers. Publish the match with
+    // the same positional shader-program signature (native/native_fill.h). Without a unique
+    // pending key nothing is remembered, so this costs a short scan on the command processor.
+    // Only the tail registers: a hit there also sets last_graphics_pipeline, which the key and
+    // pipe memos below return without passing here (those draws are covered on their next
+    // non-memo hit, and async-installed pipelines are covered when they are first used).
+    {
+        Native::Bind::Fill::StageSig sig{};
+        if (StageSignatureFromRegs(liverpool->regs, sig)) {
+            Native::Bind::Fill::TryRememberSignature(sig, it->second.get());
+        }
+    }
     return it->second.get();
 }
 

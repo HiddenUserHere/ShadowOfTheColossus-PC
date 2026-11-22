@@ -379,6 +379,12 @@ public:
     }
 #endif
 
+public:
+    /// sotc: the native backend issues a draw from a hook. The guest state the hook reads is
+    /// live on the calling thread, so the issue runs there, synchronously (the hook returns once
+    /// the commands are recorded); the issue takes the stream's recorder over for that while.
+    void SubmitNativeDraw(Common::UniqueFunction<void>&& issue);
+
 private:
     struct Task {
         struct promise_type {

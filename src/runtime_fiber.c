@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* probe.c: the overflow report names this thread's host chain (bb-probe.exe only). */
+uintptr_t bb_runtime_backtrace(void **frames, int max);
+void bb_runtime_describe(char *out, size_t size, uintptr_t address);
 
 #define FIBER_ERROR_NULL ((int32_t)UINT32_C(0x80590001))
 #define FIBER_ERROR_ALIGNMENT ((int32_t)UINT32_C(0x80590002))
@@ -32,6 +35,8 @@ typedef struct FiberContext {
     struct Fiber *current_fiber, *prev_fiber;
     uint64_t arg_on_run_to, arg_on_return, return_val;
     void *host_limit, *host_base; /* the run point's thread stack (TEB limits, Windows) */
+    /* sotc: diagnostics only (a fiber stack overflow names the code that ran on it). */
+    uint64_t saved_rbp; int saved_rbp_valid;
 } FiberContext;
 _Static_assert(__builtin_offsetof(FiberContext,fpucw)==0x70 && __builtin_offsetof(FiberContext,mxcsr)==0x74,"context layout");
 typedef struct {
@@ -259,7 +264,19 @@ static void stack_prepare(Fiber *f) {
 static void check_overflow(FiberContext *ctx) {
     Fiber *f=ctx->current_fiber;
     if (f && f->addr_context && *(uint64_t *)f->addr_context!=STACK_SIGNATURE) {
-        fprintf(stderr,"STOP: stack overflow in fiber '%s' (context 0x%llx bytes)\n",f->name,(unsigned long long)f->size_context);
+        /* The host call chain of the thread that is ending the fiber run: a guest frame ends it
+         * (image address), otherwise the host code around the fiber call names the hook. */
+        fprintf(stderr,"STOP: stack overflow in fiber '%s' (context 0x%llx bytes) entry=%p\n",f->name,
+                (unsigned long long)f->size_context,(void *)f->entry);
+        /* Host chain of this thread (where the fiber run ended); probe.c's describe_address
+         * names image frames as guest offsets and host code as module+offset. */
+        void *frames[24];
+        const uintptr_t depth=bb_runtime_backtrace(frames,24);
+        for (uintptr_t i=0;i<depth;++i) {
+            char where[160];
+            bb_runtime_describe(where,sizeof(where),(uintptr_t)frames[i]);
+            fprintf(stderr,"  #%d %s\n",(int)i,where);
+        }
         abort();
     }
 }

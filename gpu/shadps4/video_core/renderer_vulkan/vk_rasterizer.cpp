@@ -1267,6 +1267,113 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
     return {vertex_offset, instance_offset};
 }
 
+// sotc: Liverpool::RegChunkDwords (private there); one register chunk of the back-op ring.
+static constexpr u32 kRegChunkDwords = 64;
+
+void Rasterizer::PushNativeDraw(NativeDrawRequest&& request) {
+    native_draw_queue.emplace_back(std::move(request));
+}
+
+void Rasterizer::ApplyNativeChunks(const std::vector<u32>& reg_chunks) {
+    // Same layout Liverpool::ExecuteBackOp uses (chunk, mask lo, mask hi, values); the draw
+    // registers are this thread's own image (DrawRegs() == regs off the draw thread).
+    auto& regs = liverpool->regs;
+    for (size_t i = 0; i < reg_chunks.size();) {
+        const u32 chunk = reg_chunks[i];
+        const u64 mask = u64{reg_chunks[i + 1]} | (u64{reg_chunks[i + 2]} << 32);
+        const u32* values = &reg_chunks[i + 3];
+        u32* dst = &regs.reg_array[chunk * kRegChunkDwords];
+        if (mask == ~u64{0}) {
+            std::memcpy(dst, values, kRegChunkDwords * sizeof(u32));
+            i += 3 + kRegChunkDwords;
+        } else {
+            u32 n = 0;
+            for (u64 m = mask; m != 0; m &= m - 1) {
+                dst[std::countr_zero(m)] = values[n++];
+            }
+            i += 3 + n;
+        }
+    }
+}
+
+void Rasterizer::DrawNative(const NativeDrawRequest& request) {
+    // sotc: called on the thread that records the stream (the recording thread for a native draw
+    // issued by Draw::IssueFromRegs, the command processor without it), inside the hold that
+    // frames the batch: the commands below land on the stream directly.
+    auto* pipeline = const_cast<GraphicsPipeline*>(request.pipeline);
+    native_draw_queue.pop_front();
+    if (pipeline == nullptr || liverpool->IsBackThreaded()) {
+        // The published request carries the pipeline the command processor looked up; on the draw
+        // thread (back_threading off) the native path is not entered at all (ExecuteBackOp
+        // applies the staged registers and the request before calling this).
+        return;
+    }
+    // The request's registers become the command processor's draw registers: the whole native
+    // state path below (PrepareRenderState, BindResources, CommitDynamicState) reads them.
+    if (request.regs) {
+        // The chunks the back-op ring staged for this op, then the request's own register image
+        // on top: the request is the draw's state, and it may hold words the ring did not send.
+        ApplyNativeChunks(request.reg_chunks);
+        liverpool->regs = *request.regs;
+    }
+    auto& regs = liverpool->regs;
+    regs.num_indices = request.is_indexed ? request.index_count : request.first_vertex;
+    regs.num_instances.num_instances = request.instances;
+    if (request.is_indexed) {
+        regs.index_buffer_type.index_type = static_cast<AmdGpu::IndexType>(request.index_type);
+        regs.index_base_address.base_addr_lo = u32(request.index_base);
+        regs.index_base_address.base_addr_hi = u32(u64(request.index_base) >> 32);
+    }
+
+    const auto& key = pipeline->GetGraphicsKey();
+    PrepareRenderState(pipeline);
+    if (!BindResources(pipeline)) {
+        SotcStats::Drop(1, regs.color_buffers[0].Address(), 2);
+        ResetBindings(false);
+        return;
+    }
+    RenderState state_storage;
+    u64 state_token = 0;
+    const RenderState& state = BeginRenderingFast(pipeline, state_storage, state_token);
+    RefreshImageLayouts();
+    BindVertexBuffers(pipeline);
+    if (request.is_indexed) {
+        BindIndexBuffer(0);
+    }
+    if (needs_barrier) {
+        runtime.FlushBarriers();
+    }
+    if (!fast_bind_hit) {
+        pipeline->BindResources(set_writes, push_data);
+    }
+    CommitDynamicState(pipeline, request.is_indexed);
+    scheduler.BeginRendering(state, state_token);
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    GpuTimesBefore(cmdbuf, SotcGpuTimes::KDraw, pipeline); // sotc: SOTC_GPU_TIMES
+    if (request.args != vk::Buffer{}) {
+        // 0x86b3d0 / 0x86b150: the args the guest's own table holds (counts, offsets).
+        if (request.is_indexed) {
+            cmdbuf.drawIndexedIndirect(request.args, request.args_offset, 1, request.args_stride);
+        } else {
+            cmdbuf.drawIndirect(request.args, request.args_offset, 1, request.args_stride);
+        }
+    } else if (request.is_indexed) {
+        cmdbuf.drawIndexed(request.index_count, request.instances, request.first_vertex, 0,
+                           request.first_instance);
+    } else if (request.fullscreen) {
+        // 0x93690's 0x86ac10(cb, 3, 0): the fullscreen triangle the 2.1 recorder draws.
+        cmdbuf.draw(3, request.instances, 0, request.first_instance);
+    } else {
+        cmdbuf.draw(request.first_vertex, request.instances, 0, request.first_instance);
+    }
+    GpuTimesAfter(cmdbuf);
+    DebugState.IncDrawCall();
+    ResetBindings(false);
+    FlushPeriodic();
+    (void)key;
+}
+
 void Rasterizer::EliminateFastClear() {
     auto& col_buf = liverpool->DrawRegs().color_buffers[0];
     if (!col_buf || !col_buf.info.fast_clear) {

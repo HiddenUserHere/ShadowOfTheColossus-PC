@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bitset>
@@ -609,15 +610,35 @@ struct PatchModule {
     /// Code generator for writing trampoline patches.
     Xbyak::CodeGenerator trampoline_gen;
 
+    /// Base of the trampoline area (kept so UsedTrampolineSize can report the cursor).
+    u8* trampoline_base{};
+
     /// Prevents repeated generation attempts after the fixed trampoline area is exhausted.
     bool trampoline_exhausted{};
 
     PatchModule(u8* module_ptr, const u64 module_size, u8* trampoline_ptr,
                 const u64 trampoline_size)
         : start(module_ptr), end(module_ptr + module_size), patch_gen(module_size, module_ptr),
-          trampoline_gen(trampoline_size, trampoline_ptr) {}
+          trampoline_gen(trampoline_size, trampoline_ptr), trampoline_base(trampoline_ptr) {}
 };
 static std::map<u64, PatchModule> modules;
+
+u64 UsedTrampolineSize() {
+    // Bytes the instruction patchers have already emitted into a trampoline area (Xbyak grows
+    // from the base up). A second user of the same area — the render hooks — must allocate
+    // above this, or its thunks overwrite patch trampolines (observed: a patched TCB/SSE4a site
+    // jumping into a hook thunk corrupted guest state ~13 s into a run).
+    u64 used = 0;
+    for (const auto& [_, module] : modules) {
+        if (module.trampoline_base == nullptr) {
+            continue;
+        }
+        const u64 end = reinterpret_cast<u64>(module.trampoline_gen.getCurr()) -
+                        reinterpret_cast<u64>(module.trampoline_base);
+        used = std::max(used, end);
+    }
+    return used;
+}
 
 static bool HandleTrampolineError(PatchModule* module, const Xbyak::Error& error) {
     if (static_cast<int>(error) != Xbyak::ERR_CODE_IS_TOO_BIG) {

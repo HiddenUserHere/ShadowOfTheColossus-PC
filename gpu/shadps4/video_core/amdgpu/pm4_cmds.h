@@ -243,6 +243,9 @@ struct PM4CmdNop {
         PrepareFlipLabel = 0x68750778u,     ///< Flip marker with label address
         PrepareFlipInterrupt = 0x68750780u, ///< Flip marker with interrupt
         PrepareFlipInterruptLabel = 0x68750781u, ///< Flip marker with interrupt and label
+        // sotc: native render backend (gpu/native/native_stream_ops.h): data_block[1] is the id
+        // of a native operation queued by a RenderJob hook, run by the command processor here.
+        SotcNativeOp = 0x68750f01u,
     };
 };
 
