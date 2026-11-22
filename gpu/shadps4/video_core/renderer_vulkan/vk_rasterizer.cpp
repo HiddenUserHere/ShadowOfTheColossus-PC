@@ -58,6 +58,106 @@
 
 namespace Vulkan {
 
+// sotc: W5 pass segments (N2-94, SOTC_PASS_RECORDER). A segment is one primary command buffer.
+// A cut never changes what is recorded, only where the submit thread gets its command buffers.
+// Cuts happen at a render target change, before a compute block that follows rendering, and in
+// FlushPeriodic. Nothing runs here unless the pass recorder is on.
+//
+// A cut drops every bind recorded in the ended buffer (pipeline, vertex and index buffers,
+// descriptors, dynamic state). So the draw paths cut before they record anything: right after
+// BeginRenderingFast, before RefreshImageLayouts, the bindings and CommitDynamicState.
+//
+// Coverage (N2-94 H11, W5 boundaries; round 3 fixer):
+//   item                                        | done      | evidence
+//   (a) render target change cut                | yes       | CutSegmentForState after BeginRenderingFast in
+//                                               |           | DrawDirect, DrawIndexed/Draw, DrawIndirect (direct
+//                                               |           | args and general path); also when no rendering is
+//                                               |           | open (BeginHudless after EndRendering: seg_last
+//                                               |           | compare, not IsRendering)
+//   (a') UI shadow draw (BeginUiShadow)         | deviation | no cut (H11 r4: kept, needs orchestrator acceptance
+//                                               |           | or a re-bind-aware placement): the shadow draw reuses
+//                                               |           | the main draw's pipeline, vertex/index and descriptor
+//                                               |           | binds, which a cut would drop. seg_last = shadow (token 0) is set
+//                                               |           | after its BeginRendering, so the next draw's cut
+//                                               |           | sees the open shadow state
+//   (b) compute block after rendering           | yes       | DispatchDirect, DispatchIndirect (EndSegment before
+//                                               |           | their barriers, so the barriers land in the segment
+//                                               |           | that consumes them; then the dispatch's BindResources);
+//                                               |           | CullVerifyRun (debug) EndSegment in place of EndRendering
+//   (b') barriers before a cut (H11 r4)         | yes       | BeginHudless: the cut moved before the clear and
+//                                               |           | to_target barriers (cmdbuf captured after it).
+//                                               |           | DispatchDirect/DispatchIndirect: cut before
+//                                               |           | FlushBarriers. Residual, not owned here: BeginRendering
+//                                               |           | (FlushBarriers ~5745, Transit) runs before the cut at
+//                                               |           | the draw paths, so its barriers stay in the ended segment
+//   (a'') BeginHudless cut order (H11 r4)       | yes       | cut after EndRendering and before its barriers, with
+//                                               |           | the state built from state + target (no other input)
+//   (c) FlushPeriodic cut after 256 draws       | yes       | seg_draws/seg_tick in FlushPeriodic: draws since the
+//                                               |           | last submit (CurrentTick moved); cut_long_segment is
+//                                               |           | called only on the no-flush exits, reset on a cut
+//   (d) readback early flush                    | yes       | submits (Flush closes the segment), no call needed
+//   (d') FlushIdle skip                         | yes       | EndSegment on the skip when commands are pending and
+//                                               |           | no rendering is open (SOTC_IDLE_FLUSH=0 default: the
+//                                               |           | cut is the only effect; never ends a render pass)
+//   (e) fast-bind memo on every cut (H11 r3)    | yes       | every cut clears fast_bind.valid (the memo is keyed by
+//                                               |           | the tick, which a cut does not move). A draw cut also
+//                                               |           | clears fast_bind_hit, so its pipeline->BindResources
+//                                               |           | runs in the new segment (set_writes and push_data stay
+//                                               |           | the memo's: the memo guarantees them). The hudless
+//                                               |           | composite cuts before its own binds, not after
+//   (f) draw count reset on every cut (H11 r3)  | yes       | EndPassSegment resets seg_draws (file scope)
+//   (g) CullVerifyRun cut only when rendering   | yes       | EndSegment only while IsRendering(), like DispatchDirect
+//                                               |           | and the compute path; otherwise EndRendering
+constexpr u32 kPassSegmentDraws = 256;
+
+// sotc: the rendering state last begun under the pass recorder (shared by the cut and the begin).
+static RenderState seg_last{};
+static u64 seg_last_token = 0;
+static bool seg_last_valid = false;
+// sotc: FlushPeriodic's count of draws in the open segment (W5 (c)); a cut restarts it.
+static u64 seg_tick = 0;
+static u32 seg_draws = 0;
+
+// sotc: ends the open segment and restarts the draw count. The caller clears Rasterizer's fast_bind.valid
+// (a member, so it is not reachable from here): the segment's binds are gone after this call.
+static void EndPassSegment(Scheduler& sched) {
+    sched.EndSegment();
+    seg_draws = 0;
+}
+
+// sotc: the render target cut (N2-94 W5 (a)). The draw paths call it right after BeginRenderingFast,
+// before anything of the draw is recorded. It cuts whether or not a rendering scope is open: after an
+// explicit EndRendering (BeginHudless) the next pass is still a render target change. EndSegment ends
+// an open scope itself. The state is recorded here, because the same draw path begins it right after
+// (BeginRenderingSegmented), which must not cut a second time. Returns true when it cut; the caller
+// then clears fast_bind.valid (and fast_bind_hit in a draw).
+static bool CutSegmentForState(Scheduler& sched, const RenderState& next, u64 token) {
+    if (!sched.PassRecording() || !seg_last_valid) {
+        return false;
+    }
+    // The same test Scheduler::BeginRendering makes: the same token, or an equal state.
+    const bool same = (token != 0 && token == seg_last_token) || seg_last == next;
+    if (same) {
+        return false;
+    }
+    EndPassSegment(sched); // sotc: render target change: a new segment for the new pass
+    seg_last = next;
+    seg_last_token = token;
+    return true;
+}
+
+// sotc: the callers run CutSegmentForState with the same state and token right before, so the cut
+// inside never fires here (BeginHudless cuts itself before its binds, see there).
+static void BeginRenderingSegmented(Scheduler& sched, const RenderState& next, u64 token = 0) {
+    CutSegmentForState(sched, next, token);
+    sched.BeginRendering(next, token);
+    if (sched.PassRecording()) {
+        seg_last = next;
+        seg_last_token = token;
+        seg_last_valid = true;
+    }
+}
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -1301,7 +1401,9 @@ void Rasterizer::DrawNative(const NativeDrawRequest& request) {
     // issued by Draw::IssueFromRegs, the command processor without it), inside the hold that
     // frames the batch: the commands below land on the stream directly.
     auto* pipeline = const_cast<GraphicsPipeline*>(request.pipeline);
-    native_draw_queue.pop_front();
+    if (!native_draw_queue.empty()) { // sotc: the queue is never filled; popping it was UB
+        native_draw_queue.pop_front();
+    }
     if (pipeline == nullptr || liverpool->IsBackThreaded()) {
         // The published request carries the pipeline the command processor looked up; on the draw
         // thread (back_threading off) the native path is not entered at all (ExecuteBackOp
@@ -1335,6 +1437,11 @@ void Rasterizer::DrawNative(const NativeDrawRequest& request) {
     RenderState state_storage;
     u64 state_token = 0;
     const RenderState& state = BeginRenderingFast(pipeline, state_storage, state_token);
+    if (CutSegmentForState(scheduler, state, state_token)) { // sotc: W5 (N2-94): before any recording
+        // sotc: N2-94 H11: a memo hit skipped pipeline->BindResources in the ended segment; rebind here.
+        fast_bind.valid = false;
+        fast_bind_hit = false;
+    }
     RefreshImageLayouts();
     BindVertexBuffers(pipeline);
     if (request.is_indexed) {
@@ -1347,7 +1454,7 @@ void Rasterizer::DrawNative(const NativeDrawRequest& request) {
         pipeline->BindResources(set_writes, push_data);
     }
     CommitDynamicState(pipeline, request.is_indexed);
-    scheduler.BeginRendering(state, state_token);
+    BeginRenderingSegmented(scheduler, state, state_token);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
     GpuTimesBefore(cmdbuf, SotcGpuTimes::KDraw, pipeline); // sotc: SOTC_GPU_TIMES
@@ -1950,16 +2057,28 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
         return false;
     }
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
     const vk::ImageSubresourceRange color_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-    if (!hudless_clear.image) {
-        if (!CreateHudlessImage(instance, vk::Format::eR8G8B8A8Unorm, 1, 1,
-                                vk::ImageUsageFlagBits::eSampled |
-                                    vk::ImageUsageFlagBits::eTransferDst,
-                                hudless_clear.image, hudless_clear.rt_view,
-                                hudless_clear.allocation)) {
-            return false;
-        }
+    const bool clear_new = !hudless_clear.image;
+    if (clear_new &&
+        !CreateHudlessImage(instance, vk::Format::eR8G8B8A8Unorm, 1, 1,
+                            vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+                            hudless_clear.image, hudless_clear.rt_view,
+                            hudless_clear.allocation)) {
+        return false;
+    }
+    // sotc: N2-94 H11 (W5 (a)): the cut comes before every barrier and clear of the composite, which
+    // belong to its segment (a cut after them would strand them in the ended one). The state needs
+    // only the target, so it is built here. BeginRenderingSegmented below then does not cut again.
+    RenderState hudless_state = state;
+    auto& attachment = hudless_state.color_attachments[0];
+    attachment.image_view = target.rt_view;
+    attachment.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+    attachment.is_clear = 0;
+    if (CutSegmentForState(scheduler, hudless_state, 0)) {
+        fast_bind.valid = false;
+    }
+    const auto cmdbuf = scheduler.CommandBuffer();
+    if (clear_new) {
         const auto to_clear = vk::ImageMemoryBarrier2{
             .dstStageMask = vk::PipelineStageFlagBits2::eClear,
             .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
@@ -2002,12 +2121,7 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     ui.imageView = hudless_clear.rt_view;
     ui.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
     pipeline->BindResources(set_writes, push_data);
-    RenderState hudless_state = state;
-    auto& attachment = hudless_state.color_attachments[0];
-    attachment.image_view = target.rt_view;
-    attachment.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
-    attachment.is_clear = 0;
-    scheduler.BeginRendering(hudless_state);
+    BeginRenderingSegmented(scheduler, hudless_state);
     target.fresh = true;
     static bool reported = false;
     if (!std::exchange(reported, true)) {
@@ -2173,7 +2287,16 @@ bool Rasterizer::BeginUiShadow(const GraphicsPipeline* pipeline, const RenderSta
     depth.stencil_clear = false;
     shadow.width = static_cast<u16>(width);
     shadow.height = static_cast<u16>(height);
+    // sotc: W5 (N2-94): no cut here. The shadow draw in DrawDirect/DrawIndexed reuses the main draw's
+    // pipeline, vertex/index and descriptor binds, which a new primary buffer would not have.
     scheduler.BeginRendering(shadow);
+    if (scheduler.PassRecording()) {
+        // sotc: N2-94 W5 (a'): the shadow rendering stays open after this draw, so it is the state
+        // the next draw's cut compares against (no cut here, see above).
+        seg_last = shadow;
+        seg_last_token = 0;
+        seg_last_valid = true;
+    }
 
     Scissors scissors = dynamic.scissors;
     for (auto& sc : scissors) {
@@ -2264,6 +2387,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     RenderState state_storage;
     u64 state_token = 0;
     const RenderState& state = BeginRenderingFast(pipeline, state_storage, state_token);
+    if (CutSegmentForState(scheduler, state, state_token)) { // sotc: W5 (N2-94): before any recording
+        // sotc: N2-94 H11: a memo hit skipped pipeline->BindResources in the ended segment; rebind here.
+        fast_bind.valid = false;
+        fast_bind_hit = false;
+    }
     RefreshImageLayouts();
 
     BindVertexBuffers(pipeline);
@@ -2279,7 +2407,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         pipeline->BindResources(set_writes, push_data);
     }
     CommitDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state, state_token);
+    BeginRenderingSegmented(scheduler, state, state_token);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -2401,6 +2529,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     RenderState state_storage;
     u64 state_token = 0;
     const RenderState& state = BeginRenderingFast(pipeline, state_storage, state_token);
+    if (CutSegmentForState(scheduler, state, state_token)) { // sotc: W5 (N2-94): before any recording
+        // sotc: N2-94 H11: a memo hit skipped pipeline->BindResources in the ended segment; rebind here.
+        fast_bind.valid = false;
+        fast_bind_hit = false;
+    }
     ui_shadow_broken |= ui_shadow_hit; // sotc: indirect draws are not redrawn (BeginUiShadow)
     RefreshImageLayouts();
 
@@ -2435,7 +2568,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             pipeline->BindResources(set_writes, push_data);
         }
         CommitDynamicState(pipeline, is_indexed);
-        scheduler.BeginRendering(state, state_token);
+        BeginRenderingSegmented(scheduler, state, state_token);
         const auto cmdbuf = scheduler.CommandBuffer();
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
         GpuTimesBefore(cmdbuf, SotcGpuTimes::KDrawIndirect, pipeline); // sotc: SOTC_GPU_TIMES
@@ -2513,7 +2646,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         pipeline->BindResources(set_writes, push_data);
     }
     CommitDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state, state_token);
+    BeginRenderingSegmented(scheduler, state, state_token);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -2762,11 +2895,19 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
         return;
     }
 
+    // sotc: N2-94 H11 (W5 (b)): the cut comes before the barriers, so they are recorded into the
+    // segment that consumes them (see DispatchIndirect).
+    // sotc: W5: the first compute block after rendering starts a new segment.
+    const bool cut_pass =
+        !cull_session.queue && scheduler.PassRecording() && scheduler.IsRendering();
+    if (cut_pass) {
+        EndPassSegment(scheduler); // ends the rendering scope too
+        fast_bind.valid = false;   // sotc: N2-94 H11: the memo's binds are in the ended segment
+    }
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
-
-    if (!cull_session.queue) {
+    if (!cull_session.queue && !cut_pass) {
         scheduler.EndRendering(); // sotc: the cull queue leaves the render pass alone
     }
     pipeline->BindResources(set_writes, push_data);
@@ -2864,7 +3005,13 @@ void Rasterizer::CullVerifyRun(const ComputePipeline* pipeline, u32 x, u32 y, u3
     cull_verify.armed = false;
     auto* slot = static_cast<CullQueue::VerifySlot*>(cull_verify.slot);
     const u64 range = cull_verify.range;
-    scheduler.EndRendering();
+    if (scheduler.PassRecording() && scheduler.IsRendering()) {
+        // sotc: N2-94 W5 (b): the compute block after rendering starts a segment (ends the scope too)
+        EndPassSegment(scheduler);
+        fast_bind.valid = false; // sotc: N2-94 H11: the memo's binds are in the ended segment
+    } else {
+        scheduler.EndRendering();
+    }
     runtime.FlushBarriers();
     const vk::MemoryBarrier2 barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -2946,13 +3093,23 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     DispPhase::Mark(DispPhase::BbRest);
 
     const bool disp_barrier = needs_barrier;
+    const bool disp_rendering = scheduler.IsRendering();
+    // sotc: N2-94 H11 (W5 (b)): the cut comes before the barriers, so they are recorded into the
+    // segment that consumes them (a barrier left in the ended segment would never order the dispatch).
+    const bool disp_cut = scheduler.PassRecording() && disp_rendering;
+    if (disp_cut) {
+        // sotc: W5: the compute block after rendering starts a segment
+        EndPassSegment(scheduler);
+        fast_bind.valid = false; // sotc: N2-94 H11: the memo's binds are in the ended segment
+    }
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
     DispPhase::Mark(DispPhase::Barrier);
 
-    const bool disp_rendering = scheduler.IsRendering();
-    scheduler.EndRendering();
+    if (!disp_cut) {
+        scheduler.EndRendering();
+    }
     DispPhase::Mark(DispPhase::EndRend);
     pipeline->BindResources(set_writes, push_data);
     DispPhase::Mark(DispPhase::PipeBind);
@@ -3476,11 +3633,31 @@ void Rasterizer::FlushPeriodic() {
         scheduler.Flush();
         return;
     }
+    // sotc: W5 (c): a segment that has recorded more than kPassSegmentDraws draws is cut at the next
+    // point outside a render pass, but only where this call decides NOT to flush (a flush submits and
+    // closes the segment anyway). FlushPeriodic runs once per draw or dispatch, so it counts those.
+    // The count restarts when a submit moves the tick on (a submit closes the segment) and after a cut.
+    const bool pass_recording = scheduler.PassRecording();
+    if (pass_recording) {
+        const u64 seg_now = scheduler.CurrentTick();
+        if (seg_now != seg_tick) {
+            seg_tick = seg_now;
+            seg_draws = 0;
+        }
+        ++seg_draws;
+    }
+    const auto cut_long_segment = [&] { // sotc: W5 (c), called on the no-flush exits below
+        if (pass_recording && seg_draws > kPassSegmentDraws && !scheduler.IsRendering()) {
+            EndPassSegment(scheduler);
+            fast_bind.valid = false; // sotc: N2-94 H11: the memo's binds are in the ended segment
+        }
+    };
     if (every == 0) {
         // sotc: without periodic submits, look for cold arena memory every 1024 commands.
         if ((++evict_poll & 1023) == 0 && !scheduler.IsRendering()) {
             buffer_cache.MaybeEvictCold(std::chrono::steady_clock::now());
         }
+        cut_long_segment();
         return;
     }
     // sotc: submit by recording time instead (SOTC_FLUSH_US, default 1000 where the periodic
@@ -3507,16 +3684,19 @@ void Rasterizer::FlushPeriodic() {
         // sotc: the clock is read every 8th command (~40 us at the Shrine against 1000 us),
         // not on every one (~0.5% of the command processor in QueryPerformanceCounter).
         if ((commands_since_submit & 7) != 0) {
+            cut_long_segment();
             return;
         }
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed = now - commands_since;
         const auto limit = std::chrono::microseconds(flush_us);
         if (elapsed < limit || (scheduler.IsRendering() && elapsed < limit * 4)) {
+            cut_long_segment();
             return;
         }
         // sotc: cold arena memory goes back at a submit point outside a render pass.
         if (!scheduler.IsRendering() && buffer_cache.MaybeEvictCold(now)) {
+            cut_long_segment();
             return;
         }
         scheduler.Flush();
@@ -3524,10 +3704,12 @@ void Rasterizer::FlushPeriodic() {
     }
     if (commands_since_submit < every ||
         (scheduler.IsRendering() && commands_since_submit < u64{every} * 4)) {
+        cut_long_segment();
         return;
     }
     if (!scheduler.IsRendering() &&
         buffer_cache.MaybeEvictCold(std::chrono::steady_clock::now())) {
+        cut_long_segment();
         return;
     }
     scheduler.Flush();
@@ -6618,10 +6800,14 @@ void Rasterizer::FlushIdle() {
     }();
     // Commands recorded since the last submit (FlushPeriodic counts them; any submit moves the
     // tick on, so a stale count is not taken for pending work).
-    if (mode == 0 || commands_since_submit == 0 || scheduler.CurrentTick() != commands_tick) {
-        return;
-    }
-    if (mode == 1 && scheduler.IsRendering()) {
+    // sotc: W5 (d'): a skipped idle flush with commands pending closes the open segment, outside a
+    // render pass only (a cut there would end the pass; no submit follows the skip).
+    const bool pending = commands_since_submit != 0 && scheduler.CurrentTick() == commands_tick;
+    if (mode == 0 || !pending || (mode == 1 && scheduler.IsRendering())) {
+        if (pending && scheduler.PassRecording() && !scheduler.IsRendering()) {
+            EndPassSegment(scheduler);
+            fast_bind.valid = false; // sotc: N2-94 H11: the memo's binds are in the ended segment
+        }
         return;
     }
     scheduler.Flush();

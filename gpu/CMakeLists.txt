@@ -156,7 +156,7 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavut
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp sotc/*.cpp)
 # sotc: native render backend (branch native/render-vk13, docs/engine/native-render-map.md). The
 # RenderJob rewrite issues Vulkan directly, bypassing the statically-linked GNM library.
-file(GLOB NATIVE_SOURCES CONFIGURE_DEPENDS native/*.cpp)
+file(GLOB NATIVE_SOURCES CONFIGURE_DEPENDS native/*.cpp native/gnm/*.cpp)
 # Windows: a DLL cannot leave the runtime_* symbols for bb-probe.exe to resolve, so the
 # library is static there and linked into the executable.
 if (WIN32)

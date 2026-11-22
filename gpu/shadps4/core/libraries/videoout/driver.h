@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "native/native_progress.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
@@ -60,8 +61,12 @@ struct VideoOutPort {
     }
 
     void SignalVoLabel() {
-        std::scoped_lock lk{vo_mutex};
-        vo_cv.notify_one();
+        {
+            std::scoped_lock lk{vo_mutex};
+            vo_cv.notify_one();
+        }
+        // sotc: W1 (SOTC_CP_EVENTS, N2-94): a native flip-done wait may be parked on this label.
+        Native::Progress::Notify();
     }
 
     [[nodiscard]] int NumRegisteredBuffers() const {

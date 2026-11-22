@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstring> // sotc: NativeSetRegs
+
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -19,6 +21,8 @@
 #include <vector>
 #include <queue>
 
+#include "native/native_oplist.h"
+#include "native/native_stats.h"
 #include "common/assert.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
@@ -42,6 +46,10 @@ struct VideoOutPort;
 // sotc: BbToggle::MicroCostSweep (gpu/shim/bbport_toggles.h) is read by OnBackThread below; the
 // header is not included here because the shader tests include this one without the runtime.
 extern "C" std::uint64_t runtime_disabled_optimizations;
+
+namespace AmdGpu {
+struct PM4CmdReleaseMem; // sotc: Liverpool::NativeReleaseMem
+}
 
 namespace AmdGpu {
 
@@ -108,6 +116,11 @@ public:
         }
     }
 
+    /// sotc: N2-94 (SOTC_SUBMIT_IDLE=cp): no submission left on any queue (the draw thread may
+    /// still be recording).
+    bool IsCpIdle() const {
+        return num_submits == 0;
+    }
     bool IsGpuIdle() const {
         return num_submits == 0 &&
                back_tail.load(std::memory_order_acquire) == back_head.load(std::memory_order_acquire);
@@ -380,10 +393,130 @@ public:
 #endif
 
 public:
-    /// sotc: the native backend issues a draw from a hook. The guest state the hook reads is
-    /// live on the calling thread, so the issue runs there, synchronously (the hook returns once
-    /// the commands are recorded); the issue takes the stream's recorder over for that while.
-    void SubmitNativeDraw(Common::UniqueFunction<void>&& issue);
+    // sotc: native backend facade (gpu/native/gnm/, plan "100% native in one phase"). Native ops
+    // that the GNM boundary emits instead of PM4 run INLINE on the command processor thread at
+    // their stream position (Native::StreamOps kRunOnCpBit) and drive the same state and submit
+    // paths the PM4 handlers use, with decoded values instead of parsed packets. Every member
+    // below may only be called from the command processor thread (inside such an op).
+
+    /// The register image the PM4 handlers write (`regs`); write through it, then mark.
+    Regs& NativeRegs() noexcept {
+        return regs;
+    }
+    /// SET_*_REG / ClearState equivalents: copy into the image and mark the chunks for the draw
+    /// thread (MarkRegs), exactly as the handlers do. `abs_dword` is the absolute register dword
+    /// (Regs::ContextRegWordOffset + offset, ShRegWordOffset + offset, ...).
+    void NativeSetRegs(u32 abs_dword, const u32* values, u32 num_dwords) {
+        std::memcpy(&regs.reg_array[abs_dword], values, num_dwords * sizeof(u32));
+        MarkRegs(abs_dword, num_dwords);
+    }
+    void NativeMarkRegs(u32 abs_dword, u32 num_dwords) {
+        MarkRegs(abs_dword, num_dwords);
+    }
+    void NativeMarkField(const void* field, size_t bytes) {
+        MarkRegs(field, bytes);
+    }
+    void NativeClearState() {
+        regs.SetDefaults();
+        MarkRegs(0, Regs::NumRegs);
+    }
+    /// The CB/DB surface-extent hints the SetContextReg handler takes from the guest's trailing
+    /// NOP (liverpool.cpp SetContextReg): a native target bind passes them explicitly.
+    void NativeSetCbExtent(u32 color_buffer, u32 raw) {
+        last_cb_extent[color_buffer].raw = raw;
+    }
+    void NativeSetDbExtent(u32 raw) {
+        last_db_extent.raw = raw;
+    }
+    /// The compute state of the queue being processed (graphics queue's cs_state for SET_SH_REG
+    /// 0x200+ on the gfx ring; the ASC queue's own state inside ProcessCompute).
+    ComputeProgram& NativeCsRegs() {
+        return curr_qid >= 0 ? GetCsRegs() : mapped_queues[GfxQueueId].cs_state;
+    }
+    ComputeProgram& NativeGfxCsRegs() {
+        return mapped_queues[GfxQueueId].cs_state;
+    }
+    // sotc: the native draw/dispatch entry points share the emulated SubmitDraw/SubmitDispatch
+    // (the native register file IS this register image, so a separate DrawNative is not needed,
+    // gap N2-88); they only add the acceptance counters.
+    void NativeSubmitDraw(bool is_indexed, u32 index_offset) {
+        Native::Stats::Add(Native::Stats::NativeDraws);
+        SubmitDraw(is_indexed, index_offset);
+    }
+    void NativeSubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u32 stride,
+                                  u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
+                                  u16 instance_sgpr_offset) {
+        Native::Stats::Add(Native::Stats::NativeDraws);
+        SubmitDrawIndirect(is_indexed, address, offset, stride, max_count, count_address,
+                           vertex_sgpr_offset, instance_sgpr_offset);
+    }
+    void NativeSubmitDispatch(bool indirect, VAddr address, u32 offset, u32 size) {
+        Native::Stats::Add(Native::Stats::NativeDispatches);
+        SubmitDispatch(indirect, address, offset, size);
+    }
+    /// Work for the draw thread in stream order (BackOrRun): Vulkan recording, fences, buffer
+    /// fills/copies. `writes_memory`: the work writes guest memory from the CPU side.
+    void NativeBack(Common::UniqueFunction<void>&& func, bool writes_memory) {
+        if (!back_threaded) {
+            func();
+            return;
+        }
+        QueueBackFunc(std::move(func), writes_memory, 4);
+    }
+    /// Waits until every queued draw-thread op has run (before reading GPU-written memory on the
+    /// command processor, as CondExec does).
+    void NativeDrainBack() {
+        DrainBack();
+    }
+    void NativeWaitBackWrites() {
+        WaitBackWrites();
+    }
+    /// The fence write the EOP/EOS/ReleaseMem handlers use (invalidate, then backing write).
+    /// sotc: W1 (SOTC_CP_EVENTS, N2-94 plan). Any thread that changes a value a queue may be
+    /// waiting on (label / fence / VO label writes, priority-thread callbacks, draw-thread memory
+    /// ops) calls this: it bumps the progress epoch and wakes the command processor if it sleeps
+    /// on it. Cheap when nobody sleeps (one relaxed increment + one acquire load).
+    void NotifyProgress() {
+        // seq_cst: pairs with the sleeper's seq_cst store of cp_epoch_sleeping + epoch re-check.
+        progress_epoch.fetch_add(1, std::memory_order_seq_cst);
+        if (cp_epoch_sleeping.load(std::memory_order_seq_cst)) {
+            std::scoped_lock lk{submit_mutex};
+            submit_cv.notify_all();
+        }
+    }
+    void NativeWriteFenceValue(void* address, u64 data, u32 num_bytes) {
+        WriteFenceValue(address, data, num_bytes);
+    }
+    Vulkan::Rasterizer* NativeRasterizer() noexcept {
+        return rasterizer;
+    }
+    /// SET_BASE (opcode 0x11) state: the base address the indirect draw/dispatch packets add
+    /// their data_offset to.
+    VAddr NativeIndirectArgsAddr() const noexcept {
+        return indirect_args_addr;
+    }
+    void NativeSetIndirectArgsAddr(VAddr address) noexcept {
+        indirect_args_addr = address;
+    }
+    /// The constant engine state the CE packets (WRITE_CONST_RAM, DUMP_CONST_RAM, CE/DE counters)
+    /// operate on; see ProcessCeUpdate / ProcessGraphics. Command processor thread only.
+    auto& NativeCblock() noexcept {
+        return cblock;
+    }
+    /// SOTC_CP_STRICT as the handlers see it (publish GPU-written memory too).
+    bool NativeBackStrict() const noexcept {
+        return back_strict;
+    }
+    /// The pipe id of the compute (ASC) queue whose stream is running the current native op
+    /// (set by ProcessCompute's NOP handler); the RELEASE_MEM interrupt uses it.
+    u32 NativeAscPipeId() const noexcept {
+        return native_asc_pipe_id;
+    }
+    /// The compute RELEASE_MEM semantics (end-of-pipe fence, interrupt, GDS store, late labels),
+    /// the same code the PM4 handler runs. `pipe_id`: NativeAscPipeId() of the issuing queue.
+    void NativeReleaseMem(const PM4CmdReleaseMem& release, u32 pipe_id) {
+        ExecReleaseMem(release, pipe_id);
+    }
 
 private:
     struct Task {
@@ -442,13 +575,54 @@ private:
     void AdvanceReadPointer(u32* read_addr, u32 dwords, u32 ring_size_dw);
     void Process(std::stop_token stoken);
 
+    /// sotc: W3 (SOTC_NATIVE_CP, N2-94 plan). A submission run by the native command processor:
+    /// the OpList built at submit time plus the executor's cursors. Owned by the queue entry
+    /// (Submission::native), freed when the entry is done.
+    struct NativeQueueEntry {
+        Native::OpList list;    ///< DCB (graphics) or ACB slice (compute)
+        Native::OpList ce_list; ///< CCB ops (graphics only; empty when none)
+        u32 cursor{};           ///< next item of `list` (or of ib_stack.back() when nested)
+        u32 ce_cursor{};        ///< next item of `ce_list`
+        struct IbFrame {
+            Native::OpList list;
+            u32 cursor{};
+        };
+        std::vector<IbFrame> ib_stack; ///< nested SotcNativeIb buffers being run
+        u32 vqid{};                    ///< queue index (0 = graphics, else gnm_vqid)
+        bool is_compute{};
+        bool started{};                ///< prefetch / cblock reset done
+        u32 polls{};                   ///< polls of the wait it is parked on (W0 counters)
+        u64 park_start_ns{};           ///< when it parked on that wait
+        bool label_parked{};           ///< N2-112: parked on a pending label write
+        u64 park_epoch{};              ///< N2-112: progress_epoch read before that poll
+        u32 read_advanced{};           ///< compute: dwords the ring read pointer was moved by
+    };
+    enum class NativeRunResult : u8 {
+        Done,   ///< every item ran; the entry can be popped
+        Parked, ///< stopped at a wait whose predicate is false; resume later from the cursor
+    };
+    /// Runs `entry` on the command processor thread from its cursor until done or parked
+    /// (liverpool_native_cp.cpp). Sets cp_progress when it ran at least one item.
+    NativeRunResult RunNativeEntry(NativeQueueEntry& entry);
+    /// W4 (SOTC_BACK_BATCH): queues the draw-thread native ops `ids` (bit 30 clear) as ONE
+    /// back-ring entry that runs StreamOps::Run for each in order (liverpool.cpp, owner H02).
+    /// Without the switch it queues one entry per id (BackOrRun). `writes_memory`: any id has
+    /// bit 31.
+    void NativeBackRunIds(const u32* ids, u32 count, bool writes_memory);
+
+    /// One queued submission: a PM4 coroutine (task) or a native entry (native != nullptr).
+    struct Submission {
+        Task::Handle task{};
+        NativeQueueEntry* native{};
+    };
+
     struct GpuQueue {
         std::mutex m_access{};
         std::atomic<u32> dcb_buffer_offset;
         std::atomic<u32> ccb_buffer_offset;
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
-        std::queue<Task::Handle> submits{};
+        std::queue<Submission> submits{};
         ComputeProgram cs_state{};
         // sotc: lock-free hint for Process()'s round-robin so it can skip m_access entirely for
         // queues with nothing queued, instead of locking every queue every pass just to find
@@ -468,6 +642,8 @@ private:
     u32 num_mapped_queues{1u}; // GFX is always available
 
     VAddr indirect_args_addr{};
+    u32 native_asc_pipe_id{}; ///< sotc: see NativeAscPipeId
+    void ExecReleaseMem(const PM4CmdReleaseMem& release, u32 pipe_id); ///< sotc
     u32 num_counter_pairs{};
     u64 pixel_counter{};
 
@@ -511,6 +687,10 @@ private:
     u32 back_tid{}; // sotc: the draw thread's (IsGpuSideThreadId)
 #endif
     s32 curr_qid{-1};
+    /// sotc: W1 progress epoch (NotifyProgress); cp_epoch_sleeping is set while the command
+    /// processor sleeps on submit_cv waiting for it to move.
+    std::atomic<u64> progress_epoch{0};
+    std::atomic<bool> cp_epoch_sleeping{false};
     /// sotc: BbToggle::CpPollBackoff. Command processor thread only. Set by a packet wait loop
     /// the first time a resume reaches it (the resume got that far, so it made progress); a resume
     /// that only re-checks a wait that is still false leaves it clear, and Process then counts the

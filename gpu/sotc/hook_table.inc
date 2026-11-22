@@ -57,6 +57,24 @@ extern "C" void NativeCamera_caed0(void* renderer, void* view_cfg, void* ctx);
 extern "C" void NativeFrame_cefa0(void* renderer);
 extern "C" void NativeFrame_90ea0(void* owner, void* backend);
 
+// GNM boundary detours (stage "native-gnm", gpu/native/gnm/): the twelve worker fragments,
+// first their callback declarations.
+#define SOTC_GNM_DECLS
+#include "hook_gnm_w01.inc"
+#include "hook_gnm_w02.inc"
+#include "hook_gnm_w03.inc"
+#include "hook_gnm_w04.inc"
+#include "hook_gnm_w05.inc"
+#include "hook_gnm_w06.inc"
+#include "hook_gnm_w07.inc"
+#include "hook_gnm_w08.inc"
+#include "hook_gnm_w09.inc"
+#include "hook_gnm_w10.inc"
+#include "hook_gnm_w11.inc"
+#include "hook_gnm_w12.inc"
+#include "hook_gnm_w13.inc"
+#undef SOTC_GNM_DECLS
+
 struct RenderJobHookEntry {
     u64 va;                 // guest VA (image offset) of the function entry
     void* callback;         // host C++ replacement
@@ -121,6 +139,20 @@ static const RenderJobHookEntry kRenderJobHookTable[] = {
     // the guest body while any frame step is emulated.
     { 0xcefa0, (void*)&NativeFrame_cefa0, "0xcefa0 FrameBody", "native-frame" },
     { 0x90ea0, (void*)&NativeFrame_90ea0, "0x90ea0 FrameFence", "native-frame" },
+    // GNM boundary detours (stage "native-gnm"): the rows of the twelve worker fragments.
+    #include "hook_gnm_w01.inc"
+    #include "hook_gnm_w02.inc"
+    #include "hook_gnm_w03.inc"
+    #include "hook_gnm_w04.inc"
+    #include "hook_gnm_w05.inc"
+    #include "hook_gnm_w06.inc"
+    #include "hook_gnm_w07.inc"
+    #include "hook_gnm_w08.inc"
+    #include "hook_gnm_w09.inc"
+    #include "hook_gnm_w10.inc"
+    #include "hook_gnm_w11.inc"
+    #include "hook_gnm_w12.inc"
+    #include "hook_gnm_w13.inc"
 };
 // clang-format on
 

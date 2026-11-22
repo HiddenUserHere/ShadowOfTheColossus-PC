@@ -1,6 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// sotc: N2-94 (W5) coverage: RecordDeferred / HasRecordThread / PassRecording users in H12's files
+// item                                                  | done? | evidence
+// vk_pipeline_cache.cpp GetComputePipeline async defer  | yes   | deferred also when PassRecording()
+//                                                       |       | (was HasRecordThread() only)
+// vk_compute_pipeline.cpp BindWhenReady RecordDeferred  | yes   | already deferred; comment only, the
+//                                                       |       | deferred segment is H10's RecordDeferred
+// vk_pipeline_common.cpp BindResources descriptors      | no    | desc_heap.Commit and updateDescriptorSets touch
+//                                                       |       | the descriptor heap: stay on the producer
+// no change when PassRecording() is false               | yes   | the edit is an OR with PassRecording()
+
 #include <cstdlib>
 #include <cstring>
 #include <ranges>
@@ -1240,8 +1250,11 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         // Shader collection replaces modules and erases their pipelines: built here then.
         // Without a recording thread the command processor itself would wait for the worker.
         // The presenter's Finish at shutdown runs every deferred bind before the workers stop.
+        // sotc: N2-94 (W5): under the pass recorder the deferred bind becomes a deferred segment
+        // recorded by the submit thread (Scheduler::RecordDeferred), so it is deferred too.
         const bool deferred = !async_workers.empty() && AsyncComputeEnabled() &&
-                              scheduler.HasRecordThread() && !EmulatorSettings.IsShaderCollect();
+                              (scheduler.HasRecordThread() || scheduler.PassRecording()) &&
+                              !EmulatorSettings.IsShaderCollect();
         const auto sync_start = std::chrono::steady_clock::now();
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],

@@ -79,7 +79,16 @@ AmdGpu::Regs& Draw::GuestRegs() const {
 // draw objects keep their register image in their own call frame now.
 
 bool Draw::IssueFromRegs(const DrawRequest& request) const {
-    if (request.regs == nullptr) {
+    // Superseded (plan "100% native in one phase"): this path copied the command processor's LIVE
+    // registers at hook time (wrong state, wrong moment) and Rasterizer::DrawNative dropped the
+    // draw when the command processor is back-threaded. Native draws now come from the GNM
+    // boundary as stream ops (gpu/native/gnm/w09_draws.cpp -> Liverpool::NativeSubmitDraw).
+    // Declining keeps every hooked draw object on its guest body until then.
+    static const bool legacy = [] {
+        const char* e = std::getenv("SOTC_NATIVE_LEGACY_DRAW");
+        return e && e[0] == '1';
+    }();
+    if (!legacy || request.regs == nullptr) {
         return false;
     }
     if (Current() == nullptr || !presenter) {

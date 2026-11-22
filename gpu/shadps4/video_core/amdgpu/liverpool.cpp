@@ -12,6 +12,8 @@
 #include <deque>
 #include <mutex>
 #include <new>
+#include <memory>   // sotc: N2-94 native queue entries
+#include <optional> // sotc: N2-94 stop callback of the draw thread
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -20,6 +22,7 @@
 #include <x86intrin.h>
 #endif
 
+#include "native/native_progress.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
@@ -32,7 +35,11 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "native/native_labels.h"     // sotc: virtual labels (N2-94 W2)
+#include "native/native_oplist.h"     // sotc: op lists of the native command processor (W3)
+#include "native/native_stats.h"      // sotc: native cutover counters
 #include "native/native_stream_ops.h" // sotc: native RenderJob ops in the PM4 stream
+#include "native/native_switches.h"   // sotc: N2-94 switches (default off)
 #include "video_core/renderdoc.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
@@ -123,7 +130,115 @@ static inline u64 HashTicks() {
 #endif
 }
 
+// sotc: N2-94 coverage of the command processor side (owner H02, slice W1 + W4 CP side + W3 submit).
+//   item                                              | done? | evidence
+//   Process(): native entries run by RunNativeEntry    | yes   | Process, front.native branch
+//   CpEvents(): sleep on progress_epoch, 1 ms cap      | yes   | Process no_progress, CpEvents branch
+//   BackBlock(): untimed back_cv wait + stop callback  | yes   | BackLoop idle branch, stop_wake
+//   BackPublish seq_cst pairing verified (no change)   | yes   | BackPublish / BackLoop sleeper store+predicate
+//   BackBatch(): BackAlloc skips empty dirty scan      | yes   | BackAlloc early return
+//   BackBatch(): NativeBackRunIds one Func op          | yes   | NativeBackRunIds
+//   NotifyProgress: WriteFenceValue, ExecReleaseMem,   | yes   | WriteFenceValue, ExecReleaseMem, BackLoop
+//     draw thread after each op (CpEvents only)        |       | BackLoop: accepted superset (BackOp has no
+//   VirtualLabels: ExecReleaseMem Record/Retire        | yes   | ExecReleaseMem, LabelRetire (retired when the
+//                                                      |       |   op's func dies: after the write, or a
+//                                                      |       |   dropped op at shutdown); inline: no record
+//   NativeCp: SubmitGfx/SubmitAsc OpList entries       | yes   | SubmitGfx, SubmitAsc, AscSliceTail
+//   NativeCp: compute slice tail forces PM4 path       | yes   | g_asc_carry (reset in ctor and dtor)
+//   W0: wait counters at the NOP wait handlers         | yes   | NoteNativeWait, NativeWaitCounted: no clock
+//                                                      |       |   read and no WaitFinished unless NativeCp
+//                                                      |       |   or SOTC_FPS (Stats::Add is NOT gated itself)
+//   OpListsFallback counted only with NativeCp         | yes   | SubmitGfx / SubmitAsc fallback branches
+//   IsCopyGpuBuffers keeps the PM4 path                | yes   | SubmitGfx / SubmitAsc conditions
+//   ~Liverpool: delete queued native entries (leak),   | yes   | ~Liverpool; outside the SPEC list, default-off
+//     reset g_asc_carry                                |       |   no-op (no native entries without NativeCp).
+//                                                      |       |   Lead to accept (or move to core_requests).
+namespace {
+/// sotc: W0 (N2-94) counters run only with the native command processor (SOTC_NATIVE_CP) or with
+/// SOTC_FPS: Native::Stats::WaitFinished and the clock reads are skipped otherwise, so the default
+/// path pays nothing for them (Native::Stats::Add itself is not gated by the stats switch).
+bool NativeWaitCounted() {
+    return Native::Switch::NativeCp() || SotcStats::kFpsLog;
+}
+
+/// sotc: W0 (N2-94): the start clock of a wait, read at its first failing poll only when counted.
+u64 NativeWaitClock() {
+    return NativeWaitCounted() ? SotcStats::NowNs() : 0;
+}
+
+/// sotc: W2 (N2-94): holds a label token recorded by ExecReleaseMem. The token is retired when the
+/// op's function is destroyed: after the real write on the draw thread (BackLoop clears op.func),
+/// or when the ring drops the op unrun (shutdown), so Native::Labels never keeps it pending.
+class LabelRetire {
+public:
+    explicit LabelRetire(u64 token_) : token{token_} {}
+    LabelRetire(LabelRetire&& other) noexcept : token{std::exchange(other.token, u64{0})} {}
+    LabelRetire(const LabelRetire&) = delete;
+    LabelRetire& operator=(const LabelRetire&) = delete;
+    LabelRetire& operator=(LabelRetire&&) = delete;
+    ~LabelRetire() {
+        Release();
+    }
+    // sotc: N2-94 round 2: retire now, so the caller can notify the command processor after the
+    // retire (a woken waiter must not still see the label pending). Idempotent.
+    void Release() {
+        if (token) {
+            Native::Labels::Retire(std::exchange(token, u64{0}));
+        }
+    }
+
+private:
+    u64 token;
+};
+
+/// sotc: W0 (N2-94): one native wait passed. `polls` = predicate evaluations (the passing one
+/// included); the clock was read at the first failing poll only, so a wait that never yielded
+/// costs no clock read.
+void NoteNativeWait(u32 polls, u64 blocked_start_ns) {
+    if (!NativeWaitCounted()) {
+        return;
+    }
+    if (polls <= 1) {
+        Native::Stats::WaitFinished(polls, 0, Native::Stats::WaitSat::First);
+        return;
+    }
+    Native::Stats::WaitFinished(polls, (SotcStats::NowNs() - blocked_start_ns) / 1000,
+                                Native::Stats::WaitSat::Yield);
+}
+
+/// sotc: W3 (N2-94): the dwords of a packet that the compute ring slice `acb` ends within, given
+/// `carry` dwords of such a packet already pending at its start. A PM4 packet is its header plus
+/// (count + 1) dwords; a type 2 filler is one dword. Returns the dwords still pending after the
+/// slice (0 when it ends on a packet boundary).
+u64 AscSliceTail(std::span<const u32> acb, u64 carry) {
+    const u64 size = acb.size();
+    u64 pos = carry;
+    while (pos < size) {
+        const u32 header = acb[pos];
+        if ((header >> 30) == 2) {
+            pos += 1;
+            continue;
+        }
+        pos += u64{(header >> 16) & 0x3fff} + 2;
+    }
+    return pos > size ? pos - size : 0;
+}
+
+/// sotc: W3 (N2-94): per compute queue, the pending tail of the last slice (AscSliceTail). The next
+/// slice of that queue keeps the PM4 path while a tail is pending (the parser buffers it).
+std::mutex g_asc_carry_mutex;
+std::array<u64, Liverpool::NumTotalQueues> g_asc_carry{};
+} // namespace
+
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+    // sotc: W1 (SOTC_CP_EVENTS, N2-94): code without a Liverpool pointer notifies through here.
+    Native::Progress::SetNotifier(
+        [](void* self) { static_cast<Liverpool*>(self)->NotifyProgress(); }, this);
+    // sotc: W3 (N2-94): the compute carry belongs to this instance; a new one starts without it.
+    {
+        std::scoped_lock lk{g_asc_carry_mutex};
+        g_asc_carry.fill(0);
+    }
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     // sotc: SOTC_CP_THREADS=0 binds and records the draws on the command processor thread.
     const char* threads = std::getenv("SOTC_CP_THREADS");
@@ -173,6 +288,21 @@ Liverpool::~Liverpool() {
         back_thread.request_stop();
         back_thread.join();
     }
+    // sotc: N2-94 round 2: both threads are joined, so the queues are ours. A native submission
+    // still queued at shutdown owns its NativeQueueEntry (released into Submission at submit time)
+    // and nothing else frees it; delete it here. Queued coroutine tasks (Submission::task) are not
+    // freed here: that is the pre-existing behaviour, left as it was.
+    for (auto& queue : mapped_queues) {
+        while (!queue.submits.empty()) {
+            delete queue.submits.front().native;
+            queue.submits.pop();
+        }
+    }
+    // sotc: W3 (N2-94): both threads are gone; drop the compute carry of this instance.
+    {
+        std::scoped_lock lk{g_asc_carry_mutex};
+        g_asc_carry.fill(0);
+    }
 }
 
 static inline void CpuRelax() {
@@ -219,6 +349,16 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     back_tid = gettid();
 #endif
     u64 tail = back_tail.load(std::memory_order_relaxed);
+    // sotc: W1 (SOTC_BACK_BLOCK): the idle wait below has no timeout, so a stop request wakes it
+    // through this callback (the wait predicate checks the stop token too).
+    auto wake_on_stop = [this] {
+        std::scoped_lock lk{back_mutex};
+        back_cv.notify_all();
+    };
+    std::optional<std::stop_callback<decltype(wake_on_stop)>> stop_wake;
+    if (Native::Switch::BackBlock()) {
+        stop_wake.emplace(stoken, wake_on_stop);
+    }
     while (!stoken.stop_requested()) {
         if (num_commands.load(std::memory_order_acquire)) {
             ProcessCommands();
@@ -268,13 +408,22 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             }
             if (!ready) {
                 std::unique_lock lk{back_mutex};
+                // sotc: the sleeper's seq_cst store of back_sleeping precedes its predicate's seq_cst
+                // loads, and BackPublish stores back_head (seq_cst) before loading back_sleeping
+                // (seq_cst): one of the two sees the other, so no publish is lost. Producers of
+                // commands and finishes notify under back_mutex (WakeBack).
                 back_sleeping.store(true, std::memory_order_seq_cst);
-                back_cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
+                const auto has_work = [&] {
                     return back_head.load(std::memory_order_seq_cst) != tail ||
                            num_commands.load(std::memory_order_seq_cst) ||
                            num_finishes.load(std::memory_order_seq_cst) ||
                            stoken.stop_requested();
-                });
+                };
+                if (Native::Switch::BackBlock()) {
+                    back_cv.wait(lk, has_work);
+                } else {
+                    back_cv.wait_for(lk, std::chrono::milliseconds(1), has_work);
+                }
                 back_sleeping.store(false, std::memory_order_relaxed);
             }
             continue;
@@ -342,6 +491,13 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             }
         }
         op.func = {};
+        // sotc: W1 (SOTC_CP_EVENTS): the op may have written a label or memory the command processor
+        // waits on. Every op counts (BackOp has no writes_memory flag; the bit is only in BackPublish).
+        // sotc: N2-94 round 4: narrowing this to writes_memory ops needs a BackOp::writes_memory field
+        // set by BackPublish (liverpool.h, not H02-owned); until then the superset stays (CpEvents only).
+        // sotc: N2-94 integration (run 69): no per-op notify. It woke the command processor after
+        // every draw-thread op (polls 593k/s -> 867k/s). Every label / memory writer notifies itself
+        // (WriteFenceValue, ExecReleaseMem, W06 WRITE_DATA, W07 EOP/EOS, W12 flip tail).
         ++tail;
         back_tail.store(tail, std::memory_order_seq_cst);
         if (drain_waiting.load(std::memory_order_seq_cst)) {
@@ -400,6 +556,13 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
     // path) every dirty chunk goes whole (mask all ones); the shadow follows either way.
     op.reg_chunks.clear();
     op.verify_chunks.clear();
+    // sotc: W4 (SOTC_BACK_BATCH): no register changed since the last op, so the delta scan below
+    // would find nothing; the op carries only the extents.
+    if (Native::Switch::BackBatch() && dirty_list.empty()) {
+        op.cb_extent = last_cb_extent;
+        op.db_extent = last_db_extent;
+        return op;
+    }
     // sotc: BbToggle::DepthFastPath also needs the changed dwords (the draw thread tells render
     // register changes from per-draw ones by them); the old path needs both bits set.
     const bool whole = BbToggle::Disabled(BbToggle::DrawFixedCostOpt) &&
@@ -826,14 +989,6 @@ void Liverpool::HashStatsReport(std::string& out, double seconds) {
     out += line;
 }
 
-void Liverpool::SubmitNativeDraw(Common::UniqueFunction<void>&& issue) {
-    // sotc: the native stage issues from the thread that reaches it, whichever that is: the
-    // command processor (its own scheduler is the draw stream it plays) or the draw thread (the
-    // back-op ring), and either may still find its stream owned by another producer (a
-    // presentation thread submits between frames). The issue itself takes the stream over for the
-    // duration of its commands (native_draw.cpp).
-    issue();
-}
 
 void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
     if (!back_threaded) {
@@ -929,6 +1084,10 @@ void Liverpool::WriteFenceValue(void* address, u64 data, u32 num_bytes) {
     }
     auto* memory = Core::Memory::Instance();
     ASSERT(memory->TryWriteBacking(address, &data, num_bytes, 2));
+    // sotc: W1 (SOTC_CP_EVENTS): the fence value is written; wake the command processor if it waits.
+    if (Native::Switch::CpEvents()) {
+        NotifyProgress();
+    }
 }
 
 void Liverpool::ProcessCommands() {
@@ -1061,11 +1220,32 @@ void Liverpool::Process(std::stop_token stoken) {
             if (stall_since_ns == 0) {
                 stall_since_ns = now_ns;
             }
-            if (now_ns - stall_since_ns < 500'000) {
+            // sotc: N2-94 integration (run 69): with SOTC_CP_EVENTS the writers wake the command
+            // processor, so it sleeps right after the short spin instead of yielding for 500 us.
+            if (!Native::Switch::CpEvents() && now_ns - stall_since_ns < 500'000) {
                 std::this_thread::yield();
                 return;
             }
             const u32 submits = num_submits.load(std::memory_order_relaxed);
+            if (Native::Switch::CpEvents()) {
+                // sotc: W1 (SOTC_CP_EVENTS): sleep until something changed a value a queue may wait
+                // on (NotifyProgress moves the epoch and wakes submit_cv while cp_epoch_sleeping is
+                // set), or a submit / command arrived. Game-CPU writes (rewind bit, CPU-zeroed
+                // slots) and video-out flips the notifier does not see are caught by the 1 ms cap.
+                const u64 epoch = progress_epoch.load(std::memory_order_seq_cst);
+                const auto woken = [&] {
+                    return num_ordered || (num_commands && !back_threaded) ||
+                           num_submits != submits ||
+                           progress_epoch.load(std::memory_order_seq_cst) != epoch;
+                };
+                std::unique_lock lk{submit_mutex};
+                cp_epoch_sleeping.store(true, std::memory_order_seq_cst);
+                if (!woken()) {
+                    submit_cv.wait_for(lk, std::chrono::milliseconds(1), woken);
+                }
+                cp_epoch_sleeping.store(false, std::memory_order_relaxed);
+                return;
+            }
             std::unique_lock lk{submit_mutex};
             submit_cv.wait_for(lk, std::chrono::microseconds(100), [&] {
                 return num_ordered || (num_commands && !back_threaded) || num_submits != submits;
@@ -1085,7 +1265,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 continue;
             }
 
-            Task::Handle task{};
+            Submission front{};
             {
                 std::scoped_lock lock{queue.m_access};
                 if (queue.submits.empty()) {
@@ -1096,12 +1276,38 @@ void Liverpool::Process(std::stop_token stoken) {
                     }
                     continue;
                 }
-                task = queue.submits.front();
+                front = queue.submits.front();
             }
+            // sotc: W3 (SOTC_NATIVE_CP): a native entry runs on the op-list executor, without a
+            // coroutine. Parked: the executor set cp_progress when it ran an item.
+            if (front.native) {
+                cp_progress = false;
+                // sotc: N2-94 integration: virtual labels match within one submission only.
+                Native::Labels::SetSubmission(reinterpret_cast<u64>(front.native));
+                const NativeRunResult result = RunNativeEntry(*front.native);
+                if (had_commands || cp_progress || result == NativeRunResult::Done) {
+                    progress();
+                } else {
+                    no_progress();
+                }
+                if (result == NativeRunResult::Done) {
+                    delete front.native;
+                    std::scoped_lock lock{queue.m_access};
+                    queue.submits.pop();
+                    queue.has_work.store(!queue.submits.empty(), std::memory_order_release);
+
+                    --num_submits;
+                    std::scoped_lock lock2{submit_mutex};
+                    submit_cv.notify_all();
+                }
+                continue;
+            }
+            Task::Handle task = front.task;
             // sotc: cp_parse_ns is only printed with SOTC_FPS=1: no clock reads nor fetch_add
             // otherwise (the profiler showed them on every task.resume()).
             const u64 parse_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
             cp_progress = false;
+            Native::Labels::SetSubmission(reinterpret_cast<u64>(task.address()));
             task.resume();
             if (SotcStats::kFpsLog) {
                 SotcStats::cp_parse_ns.fetch_add(SotcStats::NowNs() - parse_start,
@@ -1139,8 +1345,18 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
-        BackOrRun([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle); },
-                  false);
+        // sotc: N2-94 W4 experiment (SOTC_SUBMIT_IDLE=cp): the GpuIdle interrupt that releases
+        // sceGnmSubmitDone's submission lock fires as soon as the command processor has drained,
+        // not after the draw thread too. Everything the next frame submits is still queued behind
+        // this frame's work on the single draw ring, so stream order is kept; what the next frame
+        // stops waiting for is only the draw thread's recording. Virtual labels do not rely on this
+        // barrier (N2-96 same-submission rule, N2-103).
+        if (Native::Switch::SubmitIdleCp()) {
+            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+        } else {
+            BackOrRun([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle); },
+                      false);
+        }
     }
 }
 
@@ -1235,7 +1451,32 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
-            // const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+            // sotc: native ops placed in the constant command buffer (CE packets replaced by the
+            // native backend, gpu/native/native_stream_ops.h) run here, in CE stream order.
+            const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+            if (nop->header.count.Value() >= 1 &&
+                nop->data_block[0] == PM4CmdNop::PayloadType::SotcNativeWait) {
+                // A native CE wait (e.g. WAIT_ON_DE_COUNTER_DIFF): yield like the handler.
+                const u32 id = nop->data_block[1];
+                u32 polls = 0;
+                u64 blocked_start = 0;
+                while (true) { // sotc: W0 counters around the wait (N2-94)
+                    ++polls;
+                    if (Native::StreamOps::Poll(id)) {
+                        break;
+                    }
+                    if (polls == 1) {
+                        blocked_start = NativeWaitClock();
+                    }
+                    YIELD_CE();
+                }
+                NoteNativeWait(polls, blocked_start);
+                break;
+            }
+            if (nop->header.count.Value() >= 1 &&
+                nop->data_block[0] == PM4CmdNop::PayloadType::SotcNativeOp) {
+                Native::StreamOps::Run(nop->data_block[1]);
+            }
             break;
         }
         case PM4ItOpcode::WriteConstRam: {
@@ -1337,6 +1578,28 @@ void Liverpool::PrefetchComputeShaders(std::span<const u32> cb, ComputeProgram& 
                 rasterizer->PrefetchComputeShader(cs);
             }
             break;
+        case PM4ItOpcode::Nop: {
+            // sotc: follow native INDIRECT_BUFFERs too (SotcNativeIb).
+            const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+            // sotc: a native op's prefetch shadow (gpu/native/gnm/gnm_common.h Shadow, gap N2-88):
+            // payload, id, kShadowTag, then copies of the compute packets the op replaced.
+            if (count >= 4 && nop->data_block[0] == PM4CmdNop::PayloadType::SotcNativeOp &&
+                nop->data_block[2] == 0x68750f10u) {
+                PrefetchComputeShaders({&nop->data_block[3], count - 3}, cs, depth);
+                break;
+            }
+            if (count >= 3 && nop->data_block[0] == PM4CmdNop::PayloadType::SotcNativeIb &&
+                depth < 4) {
+                // sotc: 4-dword native IB (N2-108): addr lo, addr hi 8 bits | size << 8.
+                const u64 ib_addr = u64(nop->data_block[1]) | (u64(nop->data_block[2] & 0xffu) << 32);
+                const u32 ib_size = nop->data_block[2] >> 8;
+                if (ib_addr != 0 && ib_size != 0) {
+                    PrefetchComputeShaders({reinterpret_cast<const u32*>(ib_addr), ib_size}, cs,
+                                           depth + 1);
+                }
+            }
+            break;
+        }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* ib = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             if (depth < 4 && ib->Address<const u32>() && ib->ib_size != 0) {
@@ -1398,6 +1661,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
                 SotcOps::CpPacket(static_cast<u32>(opcode), count + 1, false);
             }
+            if (opcode != PM4ItOpcode::Nop) { // sotc: native cutover counter (native_stats.h)
+                Native::Stats::Pm4Packet(static_cast<u32>(opcode), false);
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1419,12 +1685,86 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         false);
                     break;
                 }
+                case PM4CmdNop::PayloadType::SotcNativeIb: {
+                    // sotc: native INDIRECT_BUFFER, the IndirectBuffer handler below verbatim.
+                    // sotc: 4-dword native IB (N2-108): addr lo, addr hi 8 bits | size << 8.
+                    if (nop->header.count.Value() >= 2) {
+                        const u64 ib_addr =
+                            u64(nop->data_block[1]) | (u64(nop->data_block[2] & 0xffu) << 32);
+                        const u32 ib_size = nop->data_block[2] >> 8;
+                        auto task = ProcessGraphics(
+                            {reinterpret_cast<const u32*>(ib_addr), ib_size}, {}, true);
+                        RESUME_GFX(task);
+                        while (!task.handle.done()) {
+                            YIELD_GFX();
+                            RESUME_GFX(task);
+                        }
+                        FreeTaskFrame(task.handle);
+                    }
+                    break;
+                }
+                case PM4CmdNop::PayloadType::SotcNativeWaitCe: {
+                    // sotc: a native WAIT_ON_CE_COUNTER: drive the CE task until the predicate
+                    // holds, exactly as the WaitOnCeCounter handler does.
+                    if (nop->header.count.Value() >= 1) {
+                        const u32 id = nop->data_block[1];
+                        // sotc: W0 counters (N2-94); a wait the CE task ended without satisfying
+                        // is not counted.
+                        u32 polls = 0;
+                        u64 blocked_start = 0;
+                        bool satisfied = false;
+                        while (true) {
+                            ++polls;
+                            if (Native::StreamOps::Poll(id)) {
+                                satisfied = true;
+                                break;
+                            }
+                            if (ce_task.handle.done()) {
+                                break;
+                            }
+                            if (polls == 1) {
+                                blocked_start = NativeWaitClock();
+                            }
+                            RESUME_GFX(ce_task);
+                        }
+                        if (satisfied) {
+                            NoteNativeWait(polls, blocked_start);
+                        }
+                    }
+                    break;
+                }
+                case PM4CmdNop::PayloadType::SotcNativeWait: {
+                    // sotc: a native WAIT_REG_MEM equivalent (native_stream_ops.h EmitWait).
+                    if (nop->header.count.Value() >= 1) {
+                        const u32 id = nop->data_block[1];
+                        bool first_poll = true;
+                        u32 polls = 0; // sotc: W0 counters (N2-94)
+                        u64 blocked_start = 0;
+                        while (true) {
+                            ++polls;
+                            if (Native::StreamOps::Poll(id)) {
+                                break;
+                            }
+                            if (polls == 1) {
+                                blocked_start = NativeWaitClock();
+                            }
+                            YIELD_WAIT_GFX(first_poll);
+                        }
+                        NoteNativeWait(polls, blocked_start);
+                    }
+                    break;
+                }
                 case PM4CmdNop::PayloadType::SotcNativeOp: {
                     // sotc: a native RenderJob operation (gpu/native/native_stream_ops.h), run
                     // where the draws are recorded, in stream order with them.
                     if (nop->header.count.Value() >= 1) {
                         const u32 id = nop->data_block[1];
-                        BackOrRun([id] { Native::StreamOps::Run(id); }, false);
+                        if (id & Native::StreamOps::kRunOnCpBit) {
+                            Native::StreamOps::Run(id); // state/submit op: inline, here
+                        } else {
+                            BackOrRun([id] { Native::StreamOps::Run(id); },
+                                      (id & Native::StreamOps::kWritesMemoryBit) != 0);
+                        }
                     }
                     break;
                 }
@@ -2217,6 +2557,70 @@ void Liverpool::AdvanceReadPointer(u32* read_addr, u32 dwords, u32 ring_size_dw)
     }
 }
 
+// sotc: the compute RELEASE_MEM handler body (shared by the PM4 handler and the native backend's
+// NativeReleaseMem). Queued for the draw thread exactly as before.
+void Liverpool::ExecReleaseMem(const PM4CmdReleaseMem& release_ref, u32 pipe_id) {
+    const PM4CmdReleaseMem release = release_ref;
+    // sotc: W2 (SOTC_NATIVE_VLABELS, N2-94): the 32/64-bit label write is queued to the draw thread
+    // here, on the command processor, so it is recorded here and retired after the real write on
+    // the draw thread. Not recorded when the draw thread runs the op inline (back_threaded off:
+    // the write is already done when the op returns), nor on the late-label path (SOTC_VIS_DIRECT:
+    // decided on the draw thread, so such a label is never pending here).
+    u64 label_token = 0;
+    const auto data_sel = release.data_sel.Value();
+    if (Native::Switch::VirtualLabels() && back_threaded && !SotcStats::kVisDirect &&
+        (data_sel == DataSelect::Data32Low || data_sel == DataSelect::Data64)) {
+        const bool qword = data_sel == DataSelect::Data64;
+        label_token = Native::Labels::Record(
+            reinterpret_cast<VAddr>(release.Address<u8*>()),
+            qword ? u64{release.DataQWord()} : u64{release.DataDWord()}, qword ? 8u : 4u);
+    }
+    // sotc: the token is retired when this op's function dies (LabelRetire): after the write, or
+    // when the ring drops the op unrun.
+    BackOrRun([this, release, pipe_id, retire = LabelRetire{label_token}]() mutable {
+                if (rasterizer) {
+                    rasterizer->OnFence();
+                }
+                // sotc: SOTC_VIS_DIRECT: as the end-of-pipe label above (not for a GDS store, whose
+                // copy must be recorded here).
+                const VAddr release_label = reinterpret_cast<VAddr>(release.Address<u8*>());
+                if (rasterizer && release.data_sel.Value() != DataSelect::GdsMemStore &&
+                    SotcStats::kVisDirect &&
+                    (rasterizer->VisWritesInFlight() || LateLabelPending(release_label))) {
+                    SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
+                    const VAddr label = release_label;
+                    LateLabelAdd(label);
+                    rasterizer->InvalidateMemory(label, 8, true);
+                    rasterizer->GetScheduler().DeferPriorityOperation([release, pipe_id, label] {
+                        release.SignalFence(
+                            [pipe_id] {
+                                Platform::IrqC::Instance()->Signal(
+                                    static_cast<Platform::InterruptId>(pipe_id));
+                            },
+                            [](VAddr, u16, u16) {});
+                        LateLabelDone(label);
+                    });
+                    rasterizer->Flush();
+                    return;
+                }
+                release.SignalFence(
+                    [pipe_id] {
+                        Platform::IrqC::Instance()->Signal(
+                            static_cast<Platform::InterruptId>(pipe_id));
+                    },
+                    [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                        rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
+                                               true);
+                    });
+                // sotc: the real write is done. Retire the label first (W2, N2-94 round 2), then wake
+                // a command processor waiting on it (W1), so a woken waiter never sees it pending.
+                retire.Release();
+                if (Native::Switch::CpEvents()) {
+                    NotifyProgress();
+                }
+    }, back_strict);
+}
+
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
@@ -2284,11 +2688,63 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
             SotcOps::CpPacket(static_cast<u32>(opcode), header->type3.NumWords() + 1, true);
         }
+        if (opcode != PM4ItOpcode::Nop) { // sotc: native cutover counter (native_stats.h)
+            Native::Stats::Pm4Packet(static_cast<u32>(opcode), true);
+        }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+            // sotc: native INDIRECT_BUFFER on the compute queues (the IndirectBuffer handler).
+            // sotc: 4-dword native IB (N2-108): addr lo, addr hi 8 bits | size << 8.
+            if (nop->header.count.Value() >= 2 &&
+                nop->data_block[0] == PM4CmdNop::PayloadType::SotcNativeIb) {
+                const u64 ib_addr =
+                    u64(nop->data_block[1]) | (u64(nop->data_block[2] & 0xffu) << 32);
+                const u32 ib_size = nop->data_block[2] >> 8;
+                auto task = ProcessCompute<true>({reinterpret_cast<const u32*>(ib_addr), ib_size},
+                                                 vqid);
+                RESUME_ASC(task, vqid);
+                while (!task.handle.done()) {
+                    YIELD_ASC(vqid);
+                    RESUME_ASC(task, vqid);
+                }
+                FreeTaskFrame(task.handle);
+                break;
+            }
+            // sotc: native waits on the compute queues (native_stream_ops.h EmitWait).
+            if (nop->header.count.Value() >= 1 &&
+                nop->data_block[0] == PM4CmdNop::PayloadType::SotcNativeWait) {
+                const u32 id = nop->data_block[1];
+                bool first_poll = true;
+                u32 polls = 0; // sotc: W0 counters (N2-94)
+                u64 blocked_start = 0;
+                while (true) {
+                    ++polls;
+                    if (Native::StreamOps::Poll(id)) {
+                        break;
+                    }
+                    if (polls == 1) {
+                        blocked_start = NativeWaitClock();
+                    }
+                    YIELD_WAIT_ASC(vqid, first_poll);
+                }
+                NoteNativeWait(polls, blocked_start);
+                break;
+            }
+            // sotc: native ops on the compute queues too (gpu/native/native_stream_ops.h).
+            if (nop->header.count.Value() >= 1 &&
+                nop->data_block[0] == PM4CmdNop::PayloadType::SotcNativeOp) {
+                const u32 id = nop->data_block[1];
+                native_asc_pipe_id = queue.pipe_id; // NativeAscPipeId() for the op
+                if (id & Native::StreamOps::kRunOnCpBit) {
+                    Native::StreamOps::Run(id);
+                } else {
+                    BackOrRun([id] { Native::StreamOps::Run(id); },
+                              (id & Native::StreamOps::kWritesMemoryBit) != 0);
+                }
+            }
             break;
         }
         case PM4ItOpcode::IndirectBuffer: {
@@ -2489,42 +2945,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::ReleaseMem: {
             const PM4CmdReleaseMem release = *reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            BackOrRun([this, release, pipe_id = queue.pipe_id] {
-                if (rasterizer) {
-                    rasterizer->OnFence();
-                }
-                // sotc: SOTC_VIS_DIRECT: as the end-of-pipe label above (not for a GDS store, whose
-                // copy must be recorded here).
-                const VAddr release_label = reinterpret_cast<VAddr>(release.Address<u8*>());
-                if (rasterizer && release.data_sel.Value() != DataSelect::GdsMemStore &&
-                    SotcStats::kVisDirect &&
-                    (rasterizer->VisWritesInFlight() || LateLabelPending(release_label))) {
-                    SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
-                    const VAddr label = release_label;
-                    LateLabelAdd(label);
-                    rasterizer->InvalidateMemory(label, 8, true);
-                    rasterizer->GetScheduler().DeferPriorityOperation([release, pipe_id, label] {
-                        release.SignalFence(
-                            [pipe_id] {
-                                Platform::IrqC::Instance()->Signal(
-                                    static_cast<Platform::InterruptId>(pipe_id));
-                            },
-                            [](VAddr, u16, u16) {});
-                        LateLabelDone(label);
-                    });
-                    rasterizer->Flush();
-                    return;
-                }
-                release.SignalFence(
-                    [pipe_id] {
-                        Platform::IrqC::Instance()->Signal(
-                            static_cast<Platform::InterruptId>(pipe_id));
-                    },
-                    [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                        rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
-                                               true);
-                    });
-            }, back_strict);
+            // sotc: body moved to ExecReleaseMem so the native backend runs the same logic.
+            ExecReleaseMem(release, queue.pipe_id);
             break;
         }
         case PM4ItOpcode::EventWrite: {
@@ -2586,10 +3008,37 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
-    auto task = ProcessGraphics(dcb, ccb);
+    // sotc: W3 (SOTC_NATIVE_CP, N2-94): an all-native buffer becomes an op list that the command
+    // processor runs without a coroutine. The copy path (SOTC_COPY_GPU_BUFFERS) keeps the PM4 path,
+    // and so does a buffer BuildOpList refuses (a non-NOP packet, an empty buffer).
+    std::unique_ptr<NativeQueueEntry> native{};
+    if (Native::Switch::NativeCp() && !EmulatorSettings.IsCopyGpuBuffers()) {
+        auto entry = std::make_unique<NativeQueueEntry>();
+        if (Native::BuildOpList(dcb, entry->list) &&
+            (ccb.empty() || Native::BuildOpList(ccb, entry->ce_list))) {
+            entry->vqid = GfxQueueId;
+            entry->is_compute = false;
+            Native::CountOpList(entry->list);
+            if (!ccb.empty()) {
+                Native::CountOpList(entry->ce_list);
+            }
+            native = std::move(entry);
+            Native::Stats::Add(Native::Stats::OpListsBuilt);
+        }
+    }
+    Submission submission{};
+    if (native) {
+        submission.native = native.release();
+    } else {
+        if (Native::Switch::NativeCp()) { // sotc: counted only with the switch (N2-94)
+            Native::Stats::Add(Native::Stats::OpListsFallback);
+        }
+        auto task = ProcessGraphics(dcb, ccb);
+        submission.task = task.handle;
+    }
     {
         std::scoped_lock lock{queue.m_access};
-        queue.submits.emplace(task.handle);
+        queue.submits.push(submission);
         queue.has_work.store(true, std::memory_order_release);
     }
 
@@ -2603,10 +3052,39 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
-    const auto& task = ProcessCompute(acb, vqid);
+    // sotc: W3 (SOTC_NATIVE_CP, N2-94). A compute ring slice that ends inside a packet makes
+    // BuildOpList fail, and the PM4 parser buffers that tail: the next slice of the queue keeps the
+    // PM4 path while a tail is pending. The tail is found here by a header scan of the slice, with
+    // the switch off nothing is scanned.
+    std::unique_ptr<NativeQueueEntry> native{};
+    if (Native::Switch::NativeCp() && !EmulatorSettings.IsCopyGpuBuffers()) {
+        std::scoped_lock lk{g_asc_carry_mutex};
+        const u64 carry = g_asc_carry[gnm_vqid];
+        g_asc_carry[gnm_vqid] = AscSliceTail(acb, carry);
+        if (carry == 0) {
+            auto entry = std::make_unique<NativeQueueEntry>();
+            if (Native::BuildOpList(acb, entry->list)) {
+                entry->vqid = gnm_vqid;
+                entry->is_compute = true;
+                Native::CountOpList(entry->list);
+                native = std::move(entry);
+                Native::Stats::Add(Native::Stats::OpListsBuilt);
+            }
+        }
+    }
+    Submission submission{};
+    if (native) {
+        submission.native = native.release();
+    } else {
+        if (Native::Switch::NativeCp()) { // sotc: counted only with the switch (N2-94)
+            Native::Stats::Add(Native::Stats::OpListsFallback);
+        }
+        const auto& task = ProcessCompute(acb, vqid);
+        submission.task = task.handle;
+    }
     {
         std::scoped_lock lock{queue.m_access};
-        queue.submits.emplace(task.handle);
+        queue.submits.push(submission);
         queue.has_work.store(true, std::memory_order_release);
     }
 
@@ -2614,6 +3092,31 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
     submit_cv.notify_one();
+}
+
+// sotc: W4 (N2-94, SOTC_BACK_BATCH): the draw-thread native ops `ids` (bit 30 clear, in stream
+// order) run as ONE back-ring entry (a Func op), so a run of them costs one publish. Without the
+// switch, or without the draw thread, one entry per id as before. The caller passes only ids
+// that run on the draw thread.
+void Liverpool::NativeBackRunIds(const u32* ids, u32 count, bool writes_memory) {
+    if (count == 0) {
+        return;
+    }
+    if (Native::Switch::BackBatch() && back_threaded) {
+        std::vector<u32> batch(ids, ids + count);
+        BackOrRun(
+            [batch = std::move(batch)] {
+                for (const u32 id : batch) {
+                    Native::StreamOps::Run(id);
+                }
+            },
+            writes_memory);
+        return;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        const u32 id = ids[i];
+        BackOrRun([id] { Native::StreamOps::Run(id); }, writes_memory);
+    }
 }
 
 } // namespace AmdGpu

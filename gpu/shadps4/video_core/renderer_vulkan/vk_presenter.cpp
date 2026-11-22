@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
+#include "native/native_switches.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -497,9 +498,15 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
           // sotc: Vulkan commands of the command processor recorded on a thread of their own
           // (cp_record_thread of Pink-shadPS4, luizgustavs): canyon of the attract demo
           // 24 -> 28 FPS. SOTC_RECORD_THREAD=0 records them on the command processor.
+          // sotc: SOTC_PASS_RECORDER (W5, N2-94 plan): the producer records real command buffers
+          // per pass segment and a submit thread takes them (vk_scheduler_segments.cpp), so the
+          // closure recorder is not created.
+          if (Native::Switch::PassRecorder()) {
+              return false;
+          }
           const char* v = std::getenv("SOTC_RECORD_THREAD");
           return !v || v[0] != '0';
-      }()},
+      }(), Native::Switch::PassRecorder()},
       present_scheduler{instance}, flip_scheduler{instance},
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},

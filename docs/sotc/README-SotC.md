@@ -177,3 +177,20 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_HDR_WHITE=nits` | com HDR: o branco do jogo em nits (padrão 200; a saída do próprio jogo tem ~100) |
 | `SOTC_EVICT_ASYNC=0` | a devolução de memória fria das arenas espera a GPU no processador de comandos, como antes (~44 ms por vez) |
 | `SOTC_UI_HIRES=0` | com DLSS, a interface (textos, logos, HUD) volta a ser desenhada na resolução de renderização e ampliada, em vez de na resolução de saída |
+
+## Renderização nativa
+
+A renderização nativa é o padrão (`SOTC_RENDER` não definida = `native-pass,native-gnm`). Os interruptores
+abaixo já vêm ligados; `0` desliga cada um. São para diagnóstico: deixe-os como estão, salvo se algo falhar.
+
+| Variável | Efeito |
+|---|---|
+| `SOTC_RENDER=off` | volta à renderização emulada (sem o caminho nativo) |
+| `SOTC_REC_BLOCK=0` | 0 desliga: a thread do gravador de comandos espera sem tempo limite, em vez de consultar |
+| `SOTC_BACK_BLOCK=0` | 0 desliga: a thread de desenho espera sem tempo limite, em vez de consultar |
+| `SOTC_CP_EVENTS=0` | 0 desliga: o processador de comandos dorme no marcador de progresso, em vez de consultar a cada 100 µs quando todas as filas esperam |
+| `SOTC_NATIVE_VLABELS=0` | 0 desliga: as esperas nativas cujo rótulo já tem escrita pendente ficam paradas sem nova consulta até a escrita real (menos uso de CPU) |
+| `SOTC_NATIVE_CP=0` | 0 desliga: as submissões nativas voltam ao analisador PM4 em vez do executor de lista de operações |
+| `SOTC_BACK_BATCH=0` | 0 desliga: as operações seguidas da thread de desenho deixam de ser agrupadas numa só entrada do anel |
+| `SOTC_PASS_RECORDER=0` | 0 desliga: a thread de desenho deixa de gravar cada segmento de passe num command buffer real |
+| `SOTC_SUBMIT_IDLE=cp` | experimental, desligado: o SubmitDone espera só o processador de comandos esvaziar (rejeitado: o processador girava com o anel de desenhos cheio) |

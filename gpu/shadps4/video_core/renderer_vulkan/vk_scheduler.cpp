@@ -1,7 +1,33 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// sotc: W5 pass recorder (SOTC_PASS_RECORDER, N2-94 plan), Vulkan::Scheduler core. Owner: H10.
+//
+// Coverage (N2-94, H10), this file:
+// item                                                      | done? | evidence
+// ----------------------------------------------------------|-------|-------------------------------
+// Ctor: pass_recording = pass_recorder && !record_thread    | yes   | Scheduler::Scheduler
+// Dtor: submit thread stopped and joined first              | yes   | Scheduler::~Scheduler
+// Shutdown: open_segments and their funcs are dropped       | yes   | comment in ~Scheduler (accepted)
+// RecordDeferred pass branch (close, mark, open)            | deviation | RecordDeferred: deferred segment left open, SPEC 2nd EndSegment omitted (needs orchestrator acceptance)
+// QueueSubmit linkage: external, forward-declared in segments | nit  | needs decl in vk_scheduler.h (core_request, not owned)
+// RunAfterRecorded / HoldRecorder in pass mode              | yes   | RunAfterRecorded, HoldRecorder
+// HoldRecorder pass: runs func on the caller, no hold       | yes   | HoldRecorder (no stream to hold)
+// Sync (SPEC name) in pass mode                             | no    | no Scheduler::Sync in the tree (see below)
+// EndSession pass: ends upload + last segment on producer   | yes   | EndSession (SPEC: end in SubmitExecution)
+// SubmitExecution pass: batch built, QueueSegmentBatch      | yes   | SubmitExecution
+// SubmitExecution pass: tickwatch gate is kTickWatch        | yes   | SubmitExecution (no plain bool read)
+// WaitSubmitted / RecordedSubmitTick in pass mode           | yes   | WaitSubmitted; accessor is core_request
+// PopPendingOperations after queueing (pass), not after GPU | note  | SubmitExecution: safe, Semaphore::Wait blocks
+// work_semaphore.Refresh() before the batch is queued       | note  | SubmitExecution: reads the counter only
+// Deferred funcs run on GpuSubmit concurrently with producer| risk  | not checked; see RecordDeferred comment
+// RecordedSubmitTick reads recorded_submit_tick in pass mode| core  | vk_scheduler.h:499 (core_request)
+// EndRendering: PublishNow with RecBlock                    | yes   | EndRendering
+// Coverage of the segment files: see vk_scheduler_segments.cpp
+
 #include <limits>
+#include "native/native_progress.h"
+#include "native/native_switches.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -20,21 +46,38 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
-Scheduler::Scheduler(const Instance& instance, bool record_thread)
+Scheduler::Scheduler(const Instance& instance, bool record_thread, bool pass_recorder)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
     if (record_thread) {
         recorder = std::make_unique<CommandRecorder>();
         LOG_INFO(Render_Vulkan, "Vulkan commands are recorded on their own thread");
     }
+    // sotc: W5 (N2-94): the pass recorder is the producer's own command buffers, submitted by the
+    // submit thread. It never runs together with the recording thread.
+    pass_recording = pass_recorder && !record_thread;
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
+    if (pass_recording) {
+        StartSubmitThread();
+        LOG_INFO(Render_Vulkan, "Vulkan pass segments are submitted on their own thread");
+    }
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
 }
 
 Scheduler::~Scheduler() {
+    // sotc: W5 (N2-94): the submit thread goes first. It drains the batches already queued (the
+    // queued submits are still sent), then exits before any member it uses is destroyed.
+    // Shutdown limits (accepted): segments still in open_segments (never handed to SubmitExecution)
+    // are dropped without being submitted, and so are the RunAfterRecorded and deferred funcs
+    // queued in them. Pass mode only runs at shutdown after the frame loop has stopped.
+    if (submit_thread.joinable()) {
+        submit_thread.request_stop();
+        submit_queue_cv.notify_all();
+        submit_thread.join();
+    }
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
@@ -90,6 +133,21 @@ void Scheduler::StartTickWatch() {
 }
 
 void Scheduler::RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&& func) {
+    // sotc: W5 (N2-94): outside a rendering scope the func is recorded by the submit thread: the
+    // segment that holds it is closed here and the producer continues in a fresh one.
+    // Deviation from the SPEC order (EndSegment, mark deferred, EndSegment): the second EndSegment
+    // would end the deferred buffer on the producer, before its func has recorded into it, which is
+    // invalid. So the deferred buffer is pushed unended here and SubmitThreadLoop records and ends it.
+    // EndSegment closes the buffer before it (ended by the producer) and opens the deferred one.
+    if (pass_recording && !is_rendering) {
+        EndSegment();
+        open_segments.push_back(Segment{sessions.back().primary, std::move(func)});
+        BeginSegmentBuffer();
+        dynamic_state.Invalidate();
+        return;
+    }
+    // sotc: W5 (N2-94): inside a rendering scope the func runs right away on the producer (it
+    // cannot be recorded into a segment of its own): the cost is the same as without the pass.
     const vk::CommandBuffer cmdbuf = CommandBuffer();
     if (!recorder || !CommandRecorder::IsFake(cmdbuf)) {
         func(vk::CommandBuffer{cmdbuf});
@@ -110,6 +168,15 @@ void Scheduler::RunCullHook() const {
 }
 
 void Scheduler::RunAfterRecorded(Common::UniqueFunction<void>&& func) {
+    if (pass_recording) {
+        // sotc: W5 (N2-94): a segment without command buffer marks a func that runs after the
+        // next submit of the batch it is in (SubmitExecution moves it out of the segments).
+        open_segments.push_back(Segment{
+            vk::CommandBuffer{},
+            Common::UniqueFunction<void, vk::CommandBuffer>{
+                [func = std::move(func)](vk::CommandBuffer) mutable { func(); }}});
+        return;
+    }
     if (!recorder) {
         func();
         return;
@@ -126,6 +193,7 @@ void Scheduler::CommitRecordedCommands() {
 }
 
 void Scheduler::HoldRecorder(Common::UniqueFunction<void>&& func) {
+    // sotc: W5 (N2-94): the pass recorder has no stream to hold: func runs right away.
     if (!recorder) {
         func();
         return;
@@ -173,10 +241,12 @@ void Scheduler::BeginRecorded(vk::CommandBuffer fake) {
 }
 
 void Scheduler::WaitSubmitted(u64 tick, bool kick) {
-    if (!recorder || recorded_submit_tick.load(std::memory_order_acquire) >= tick) {
+    // sotc: W5 (N2-94): the pass recorder's submits are queued by the submit thread too.
+    if ((!recorder && !pass_recording) ||
+        recorded_submit_tick.load(std::memory_order_acquire) >= tick) {
         return;
     }
-    if (kick) {
+    if (kick && recorder) {
         recorder->Kick();
     }
     const SotcStats::SplitTimer submit_split{SotcStats::SplitWaitSubmit};
@@ -271,11 +341,27 @@ void Scheduler::EndRendering() {
     is_rendering = false;
     // sotc: the graphics command buffer even while a cull dispatch is recorded (SOTC_CULL_QUEUE).
     sessions.back().primary.endRendering();
+    // sotc: W4 (N2-94): with RecBlock a rendering scope is a pass boundary for the recording thread.
+    if (recorder && Native::Switch::RecBlock()) {
+        recorder->PublishNow();
+    }
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
     auto& upload_cmdbuf = sessions.back().upload;
     if (upload_cmdbuf) {
+        return upload_cmdbuf;
+    }
+    if (pass_recording) {
+        // sotc: W5 (N2-94): the upload is a segment placed here in the stream: the segments closed
+        // before it run first, the producer's current segment (pushed later) after it. It is ended
+        // by EndSegment or EndSession.
+        const vk::CommandBufferBeginInfo begin_info = {
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        };
+        upload_cmdbuf = command_pool.Commit();
+        Check(upload_cmdbuf.begin(begin_info));
+        open_segments.push_back(Segment{upload_cmdbuf, {}});
         return upload_cmdbuf;
     }
     if (recorder) {
@@ -466,12 +552,17 @@ void Scheduler::PopPendingOperations() {
 void Scheduler::BeginSession() {
     EndSession();
 
-    auto& session = sessions.emplace_back();
+    sessions.emplace_back();
 
-    if (recorder) {
+    if (pass_recording) {
+        // sotc: W5 (N2-94): a real command buffer from the pool, as without the recorder.
+        BeginSegmentBuffer();
+    } else if (recorder) {
+        auto& session = sessions.back();
         session.primary = recorder->NewFakeHandle();
         recorder->Run([this, fake = session.primary] { BeginRecorded(fake); });
     } else {
+        auto& session = sessions.back();
         const vk::CommandBufferBeginInfo begin_info = {
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
         };
@@ -506,7 +597,22 @@ void Scheduler::EndSession() {
         on_session();
     }
 
-    const auto& session = sessions.back();
+    auto& session = sessions.back();
+    if (pass_recording) {
+        // sotc: W5 (N2-94): the session's last segment (and its open upload) are ended here by the
+        // producer, as the non-pass path does, and join the segments of the submit being recorded in
+        // stream order; SubmitExecution sends them. Each buffer is ended exactly once (EndSegment
+        // ends the ones it closes; a deferred segment is ended by SubmitThreadLoop instead).
+        EndRendering();
+        if (session.upload) {
+            Check(session.upload.end());
+            session.upload = vk::CommandBuffer{};
+        }
+        Check(session.primary.end());
+        open_segments.push_back(Segment{session.primary, {}});
+        return;
+    }
+
     if (session.upload) {
         Check(session.upload.end());
     }
@@ -515,10 +621,14 @@ void Scheduler::EndSession() {
     Check(session.primary.end());
 }
 
-// The queue submit of SubmitExecution, from the command processor or the recording thread.
-// Returns (submit_mutex wait us << 32) | vkQueueSubmit us when SOTC_TICKWATCH is on, else 0.
-static u64 QueueSubmit(const Instance& instance, const SubmitInfo& info,
-                       std::span<const vk::CommandBuffer> cmd_buffers) {
+// The queue submit of SubmitExecution, from the command processor, the recording thread or the
+// submit thread (pass recorder). Returns (submit_mutex wait us << 32) | vkQueueSubmit us when
+// SOTC_TICKWATCH is on, else 0. Not static: the submit thread (vk_scheduler_segments.cpp) calls it.
+u64 QueueSubmit(const Instance& instance, const SubmitInfo& info,
+                std::span<const vk::CommandBuffer> cmd_buffers);
+
+u64 QueueSubmit(const Instance& instance, const SubmitInfo& info,
+                std::span<const vk::CommandBuffer> cmd_buffers) {
     // One stage mask per wait semaphore; SubmitInfo can carry up to 4 waits (it used to provide
     // only 2 masks, so a third/fourth wait read past the array). sotc: the masks now come with
     // the SubmitInfo (same defaults; SOTC_CULL_QUEUE's waits block all commands).
@@ -586,6 +696,50 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 
     EndSession();
+
+    if (pass_recording) {
+        // sotc: W5 (N2-94): the segments go to the submit thread, which records the deferred ones,
+        // submits them with QueueSubmit and then runs the after-submit funcs. Nothing is queued here.
+        info.AddSignal(work_semaphore.Handle(), signal_value);
+        SegmentBatch batch;
+        batch.info = info;
+        batch.tick = signal_value;
+        std::vector<Common::UniqueFunction<void, vk::CommandBuffer>> after_funcs;
+        batch.segments.reserve(open_segments.size());
+        for (Segment& segment : open_segments) {
+            if (segment.cmdbuf) {
+                batch.segments.push_back(std::move(segment));
+            } else {
+                after_funcs.push_back(std::move(segment.deferred)); // RunAfterRecorded marker
+            }
+        }
+        open_segments.clear();
+        if (!after_funcs.empty()) {
+            batch.after_submit = [funcs = std::move(after_funcs)]() mutable {
+                for (auto& func : funcs) {
+                    func(vk::CommandBuffer{});
+                }
+            };
+        }
+        sessions.clear();
+        // sotc: N2-94 H10 fix: the producer gates on the compile-time constant too (the plain bool
+        // `tickwatch` is written by StartTickWatch on another thread: a data race).
+        if (SotcStats::kTickWatch) {
+            SotcStats::PushTick(1, signal_value,
+                                (static_cast<u64>(info.num_wait_semas) << 8) |
+                                    batch.segments.size());
+        }
+        QueueSegmentBatch(std::move(batch));
+
+        // sotc: the batch is queued, not yet submitted: Refresh only reads the counter.
+        work_semaphore.Refresh();
+        BeginSession();
+        // sotc: pass mode runs pending ops here, before the GPU submit. Safe: a pending op that
+        // waits on a tick blocks in Semaphore::Wait until the submit thread signals it. The
+        // non-pass path runs them after its QueueSubmit; the order differs only in this way.
+        PopPendingOperations();
+        return;
+    }
 
     boost::container::small_vector<vk::CommandBuffer, 8> cmd_buffers;
     for (const auto& session : sessions) {
@@ -657,6 +811,8 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
         }
 
         op.callback();
+        // sotc: W1 (SOTC_CP_EVENTS, N2-94): a late label may have been written.
+        Native::Progress::Notify();
     }
 }
 

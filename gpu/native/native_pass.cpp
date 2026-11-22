@@ -144,7 +144,8 @@ bool Rt::Eop::WaitLabel(const Label& label, u64 cb) {
     // the in-flight work the game may wait on. The EOP packet's data_sel (Data32Low, value 0)
     // and int_sel (None) reproduce the guest's packet shape: only the label dword is written,
     // no GfxEop interrupt is raised from the pass functions (their 0x86eb60 calls pass
-    // int_sel=0; the frame-slot labels that do interrupt are 0x90e30/0x90da0, not these).
+    // int_sel=0). The frame fence 0x90e30 does not interrupt either: its third argument to
+    // 0x86eb60 is data_sel 2 (Data64), int_sel stays None (REA, N2-94).
     rasterizer.OnFence();
     const u64 address = label.address;
     scheduler.DeferPriorityOperation([address] {

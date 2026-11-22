@@ -36,6 +36,7 @@
 #include "video_core/sotc_live.h"
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
+#include "native/native_stats.h" // sotc: native cutover counters
 
 extern Frontend::WindowSDL* g_window;
 static const Vulkan::Instance* s_instance = nullptr;
@@ -2512,6 +2513,8 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
             if (now - second_start >= std::chrono::seconds(1)) {
                 std::fprintf(stderr, "SOTC SCREEN FPS %.0fs: lowest %.0f, now %.0f\n",
                              std::chrono::duration<float>(now - start).count(), lowest, shown);
+                // sotc: native cutover counters, same cadence (gpu/native/native_stats.h).
+                Native::Stats::ReportSecond(std::chrono::duration<float>(now - start).count());
                 second_start = now;
                 lowest = 1e9f;
             }

@@ -246,6 +246,16 @@ struct PM4CmdNop {
         // sotc: native render backend (gpu/native/native_stream_ops.h): data_block[1] is the id
         // of a native operation queued by a RenderJob hook, run by the command processor here.
         SotcNativeOp = 0x68750f01u,
+        // sotc: a native wait (native_stream_ops.h EmitWait): data_block[1] is its id; the
+        // command processor polls it and yields like WAIT_REG_MEM.
+        SotcNativeWait = 0x68750f02u,
+        // sotc: a native wait on the CE counter (DE side): the graphics parser resumes the CE
+        // task until the predicate holds (WaitOnCeCounter semantics).
+        SotcNativeWaitCe = 0x68750f03u,
+        // sotc: a native INDIRECT_BUFFER (native_stream_ops.h EmitIb): data_block[1..2] = the
+        // buffer address (lo, hi), data_block[3] = its size in dwords; the parser runs it as a
+        // nested task exactly like IT_INDIRECT_BUFFER.
+        SotcNativeIb = 0x68750f04u,
     };
 };
 

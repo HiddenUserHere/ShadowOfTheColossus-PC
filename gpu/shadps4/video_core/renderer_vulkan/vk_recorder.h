@@ -45,6 +45,18 @@ class CommandRecorder;
 /// command queued by Run below runs against it. Defined in vk_recorder.cpp.
 CommandRecorder*& TheRecorder();
 
+// sotc: N2-94 coverage (owned: vk_recorder.h, vk_recorder.cpp), H09
+// item                                            | done? | evidence
+// ------------------------------------------------|-------|-----------------------------------------
+// W1 untimed consumer wait (SOTC_REC_BLOCK)        | yes   | ConsumerLoop: wait(lk, pred) when RecBlock
+// W1 wake protocol re-verified and documented      | yes   | comment block at ConsumerLoop sleep path
+// W1 stop_token wakes the untimed wait             | yes   | std::stop_callback notifies wake_cv
+// W1 optional spin kept                            | yes   | SpinTime loop unchanged
+// W4 PublishBatch runtime (32 / 256 with block)    | yes   | publish_batch set in constructor
+// W4 PublishNow() for pass boundaries              | yes   | inline in this header; call site is H10
+// Default path (switch off)                        | yes   | timed wait_for and PublishBatch 32 unchanged
+// W5 submit thread (SOTC_PASS_RECORDER)            | no    | not in H09 spec for this worker
+
 class CommandRecorder {
 public:
     CommandRecorder();
@@ -118,6 +130,14 @@ public:
     /// its short timed wait
     /// A Kick makes every command already queued visible before the submit or drain can continue
     void Kick();
+
+    /// sotc: N2-94 W1/W4. Publish the pending batch, if any, at a pass boundary (EndRendering, submit).
+    /// Costs nothing when nothing is pending, unlike Kick, which always stores and fences.
+    void PublishNow() {
+        if (unpublished != 0 || commands_counted != 0) {
+            Kick();
+        }
+    }
 
     /// Count this deferred Vulkan call for performance statistics and report the accumulated calls
     /// at the next Kick
@@ -211,7 +231,11 @@ private:
 
     static constexpr size_t MaxChunksInFlight = 256; ///< Allow up to 64 MiB of queued commands before the producer waits for the recording thread to
 ///< catch up
-    static constexpr u32 PublishBatch = 32;
+    /// sotc: N2-94 W4. Commands published per batch: 32 by default, 256 with SOTC_REC_BLOCK (the
+    /// consumer then sleeps untimed, so a larger batch costs fewer wake-ups).
+    static constexpr u32 PublishBatchDefault = 32;
+    static constexpr u32 PublishBatchBlock = 256;
+    u32 publish_batch{PublishBatchDefault};
 
     // State written by the producer while it adds commands and publishes batches to the recording
     // thread

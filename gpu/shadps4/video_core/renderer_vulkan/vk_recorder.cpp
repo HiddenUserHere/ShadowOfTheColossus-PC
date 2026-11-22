@@ -6,7 +6,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <optional>
+#include <stop_token>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -18,6 +20,7 @@
 #include "common/logging/log.h"
 #include "common/perf_stats.h"
 #include "common/thread.h"
+#include "native/native_switches.h"
 #include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/sotc_stats.h"
 
@@ -652,6 +655,8 @@ CommandRecorder::CommandRecorder() {
     write_chunk = AcquireChunk();
     first_chunk = write_chunk;
     producer_tid = CurrentThreadId();
+    // sotc: N2-94 W4. Bigger publish batches only with the untimed consumer wait (SOTC_REC_BLOCK).
+    publish_batch = Native::Switch::RecBlock() ? PublishBatchBlock : PublishBatchDefault;
     thread = std::jthread([this](std::stop_token stoken) { ConsumerLoop(stoken); });
 }
 
@@ -797,7 +802,7 @@ void CommandRecorder::Publish() {
     // Publish commands in batches so the producer and consumer do not keep competing over the
     // committed cache line
     // Every Kick publishes the whole pending batch before submits or drains need to observe it
-    if (++unpublished >= PublishBatch) {
+    if (++unpublished >= publish_batch) {
         PublishAll();
     }
 }
@@ -960,6 +965,31 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         return sleep;
     }();
 
+    // sotc: N2-94 W1. Wake protocol, re-verified for the untimed wait (SOTC_REC_BLOCK):
+    //  - Producer (PublishAll / Kick): stores committed (release), seq_cst fence, then
+    //    WakeIfSleeping loads consumer_sleeping and exchanges it to false; only the winner calls
+    //    WakeConsumer, which sets wake_flag under wake_mutex and notifies.
+    //  - Consumer: stores consumer_sleeping = true, seq_cst fence, re-checks committed, then takes
+    //    wake_mutex and waits on (wake_flag || stop). The predicate is evaluated under the mutex and
+    //    WakeConsumer sets wake_flag under the same mutex, so a notify cannot fall between the
+    //    re-check and the wait: either the re-check sees the new committed, or the producer sees
+    //    sleeping and its wake_flag is visible to the predicate.
+    //  - A stale wake_flag left from an earlier wake only makes one extra loop pass (harmless).
+    //  - Stop: request_stop() on the jthread is caught by the stop_callback below, which takes
+    //    wake_mutex and notifies, so the untimed wait returns (the predicate also checks the token).
+    // Without the switch the timed wait_for (SleepTime) stays exactly as before.
+    const bool block = Native::Switch::RecBlock();
+    std::optional<std::stop_callback<std::function<void()>>> wake_on_stop;
+    if (block) {
+        wake_on_stop.emplace(stoken, std::function<void()>{[this] {
+            {
+                std::scoped_lock lk{wake_mutex};
+                wake_flag = true;
+            }
+            wake_cv.notify_all();
+        }});
+    }
+
     Chunk* chunk = first_chunk;
     Chunk* previous = nullptr;
     u32 pos = 0;
@@ -981,8 +1011,12 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (chunk->committed.load(std::memory_order_acquire) == pos) {
                     std::unique_lock lk{wake_mutex};
-                    wake_cv.wait_for(lk, SleepTime,
-                                     [&] { return wake_flag || stoken.stop_requested(); });
+                    if (block) {
+                        wake_cv.wait(lk, [&] { return wake_flag || stoken.stop_requested(); });
+                    } else {
+                        wake_cv.wait_for(lk, SleepTime,
+                                         [&] { return wake_flag || stoken.stop_requested(); });
+                    }
                     wake_flag = false;
                 }
                 consumer_sleeping.store(false, std::memory_order_relaxed);

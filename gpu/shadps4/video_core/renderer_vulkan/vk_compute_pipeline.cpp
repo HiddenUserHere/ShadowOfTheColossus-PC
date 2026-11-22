@@ -158,6 +158,8 @@ void ComputePipeline::BindWhenReady() const {
         scheduler.CommandBuffer().bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
         return;
     }
+    // sotc: N2-94 (W5): under PassRecording this closure becomes a deferred segment recorded by the
+    // submit thread once the pipeline is ready; the lambda touches only the pipeline object.
     scheduler.RecordDeferred([this](vk::CommandBuffer cmdbuf) {
         if (!ready.load(std::memory_order_acquire)) {
             const auto start = std::chrono::steady_clock::now();

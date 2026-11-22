@@ -23,6 +23,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "native/native_switches.h"
+#include "native/native_labels.h"
+#include "native/gnm/gnm_common.h" // sotc: native GNM boundary
 
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
@@ -175,6 +178,10 @@ int PS4_SYSV_ABI sceGnmBeginWorkload(u32 workload_stream, u64* workload) {
 
 s32 PS4_SYSV_ABI sceGnmComputeWaitOnAddress(u32* cmdbuf, u32 size, uintptr_t addr, u32 mask,
                                             u32 cmp_func, u32 ref) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().ComputeWaitOnAddress; native != nullptr && native(cmdbuf, size, addr, mask, cmp_func, ref)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 0xe)) {
@@ -375,6 +382,10 @@ int PS4_SYSV_ABI sceGnmDisableMipStatsReport() {
 
 s32 PS4_SYSV_ABI sceGnmDispatchDirect(u32* cmdbuf, u32 size, u32 threads_x, u32 threads_y,
                                       u32 threads_z, u32 flags) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DispatchDirect; native != nullptr && native(cmdbuf, size, threads_x, threads_y, threads_z, flags)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 9) && ((s32)(threads_x | threads_y | threads_z) > -1)) {
@@ -391,6 +402,10 @@ s32 PS4_SYSV_ABI sceGnmDispatchDirect(u32* cmdbuf, u32 size, u32 threads_x, u32 
 }
 
 s32 PS4_SYSV_ABI sceGnmDispatchIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 flags) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DispatchIndirect; native != nullptr && native(cmdbuf, size, data_offset, flags)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 7)) {
@@ -407,6 +422,10 @@ s32 PS4_SYSV_ABI sceGnmDispatchIndirect(u32* cmdbuf, u32 size, u32 data_offset, 
 }
 
 s32 PS4_SYSV_ABI sceGnmDispatchIndirectOnMec(u32* cmdbuf, u32 size, VAddr args, u32 modifier) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DispatchIndirectOnMec; native != nullptr && native(cmdbuf, size, args, modifier)) {
+        return ORBIS_OK;
+    }
     if (cmdbuf != nullptr && size == 8 && args != 0 && ((args & 3u) == 0)) {
         cmdbuf[0] = 0xc0021602 | (modifier & 1u);
         *(VAddr*)(&cmdbuf[1]) = args;
@@ -419,6 +438,13 @@ s32 PS4_SYSV_ABI sceGnmDispatchIndirectOnMec(u32* cmdbuf, u32 size, VAddr args, 
 }
 
 u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DispatchInitDefaultHardwareState; native != nullptr) {
+        u32 written = 0;
+        if (native(cmdbuf, size, &written)) {
+            return written;
+        }
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size < HwInitPacketSize) {
@@ -454,6 +480,10 @@ u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 
 s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr_t index_addr,
                                  u32 flags, u32 type) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawIndex; native != nullptr && native(cmdbuf, size, index_count, index_addr, flags, type)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 10) && (index_addr != 0) && (index_addr & 1) == 0 &&
@@ -474,6 +504,10 @@ s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr
 }
 
 s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32 flags) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawIndexAuto; native != nullptr && native(cmdbuf, size, index_count, flags)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 7) &&
@@ -490,6 +524,10 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32
 s32 PS4_SYSV_ABI sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 shader_stage,
                                          u32 vertex_sgpr_offset, u32 instance_sgpr_offset,
                                          u32 flags) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawIndexIndirect; native != nullptr && native(cmdbuf, size, data_offset, shader_stage, vertex_sgpr_offset, instance_sgpr_offset, flags)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 9) && (shader_stage < ShaderStages::Max) &&
@@ -517,6 +555,10 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirectCountMulti(u32* cmdbuf, u32 size, u32 da
                                                    u32 max_count, u64 count_addr, u32 shader_stage,
                                                    u32 vertex_sgpr_offset, u32 instance_sgpr_offset,
                                                    u32 flags) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawIndexIndirectCountMulti; native != nullptr && native(cmdbuf, size, data_offset, max_count, count_addr, shader_stage, vertex_sgpr_offset, instance_sgpr_offset, flags)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if ((!sceKernelIsNeoMode() || !UseNeoCompatSequences) && cmdbuf && (size == 16) &&
@@ -553,6 +595,10 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirectCountMulti(u32* cmdbuf, u32 size, u32 da
 int PS4_SYSV_ABI sceGnmDrawIndexIndirectMulti(u32* cmdbuf, u32 size, u32 data_offset, u32 max_count,
                                               u32 shader_stage, u32 vertex_sgpr_offset,
                                               u32 instance_sgpr_offset, u32 flags) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawIndexIndirectMulti; native != nullptr && native(cmdbuf, size, data_offset, max_count, shader_stage, vertex_sgpr_offset, instance_sgpr_offset, flags)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 11) && (vertex_sgpr_offset < 0x10u) && (instance_sgpr_offset < 0x10u) &&
@@ -587,6 +633,10 @@ int PS4_SYSV_ABI sceGnmDrawIndexMultiInstanced() {
 
 s32 PS4_SYSV_ABI sceGnmDrawIndexOffset(u32* cmdbuf, u32 size, u32 index_offset, u32 index_count,
                                        u32 flags) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawIndexOffset; native != nullptr && native(cmdbuf, size, index_offset, index_count, flags)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 9)) {
@@ -604,6 +654,10 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexOffset(u32* cmdbuf, u32 size, u32 index_offset, 
 
 s32 PS4_SYSV_ABI sceGnmDrawIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 shader_stage,
                                     u32 vertex_sgpr_offset, u32 instance_sgpr_offset, u32 flags) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawIndirect; native != nullptr && native(cmdbuf, size, data_offset, shader_stage, vertex_sgpr_offset, instance_sgpr_offset, flags)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 9) && (shader_stage < ShaderStages::Max) &&
@@ -636,6 +690,10 @@ int PS4_SYSV_ABI sceGnmDrawIndirectCountMulti() {
 s32 PS4_SYSV_ABI sceGnmDrawIndirectMulti(u32* cmdbuf, u32 size, u32 data_offset, u32 max_count,
                                          u32 shader_stage, u32 vertex_sgpr_offset,
                                          u32 instance_sgpr_offset, u32 flags) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawIndirectMulti; native != nullptr && native(cmdbuf, size, data_offset, max_count, shader_stage, vertex_sgpr_offset, instance_sgpr_offset, flags)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && size == 11 && shader_stage < ShaderStages::Max && vertex_sgpr_offset < 0x10 &&
@@ -660,6 +718,13 @@ s32 PS4_SYSV_ABI sceGnmDrawIndirectMulti(u32* cmdbuf, u32 size, u32 data_offset,
 }
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawInitDefaultHardwareState; native != nullptr) {
+        u32 written = 0;
+        if (native(cmdbuf, size, 0, &written)) {
+            return written;
+        }
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size < HwInitPacketSize) {
@@ -685,6 +750,13 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 }
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState175(u32* cmdbuf, u32 size) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawInitDefaultHardwareState; native != nullptr) {
+        u32 written = 0;
+        if (native(cmdbuf, size, 175, &written)) {
+            return written;
+        }
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size < HwInitPacketSize) {
@@ -703,6 +775,13 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState175(u32* cmdbuf, u32 size) {
 }
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState200(u32* cmdbuf, u32 size) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawInitDefaultHardwareState; native != nullptr) {
+        u32 written = 0;
+        if (native(cmdbuf, size, 200, &written)) {
+            return written;
+        }
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size < HwInitPacketSize) {
@@ -739,6 +818,13 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState200(u32* cmdbuf, u32 size) {
 }
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState350(u32* cmdbuf, u32 size) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawInitDefaultHardwareState; native != nullptr) {
+        u32 written = 0;
+        if (native(cmdbuf, size, 350, &written)) {
+            return written;
+        }
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size < HwInitPacketSize) {
@@ -775,6 +861,13 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState350(u32* cmdbuf, u32 size) {
 }
 
 u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState(u32* cmdbuf, u32 size) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawInitToDefaultContextState; native != nullptr) {
+        u32 written = 0;
+        if (native(cmdbuf, size, 0, &written)) {
+            return written;
+        }
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     constexpr auto CtxInitPacketSize = 0x20u;
@@ -791,6 +884,13 @@ u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState(u32* cmdbuf, u32 size) {
 }
 
 u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState400(u32* cmdbuf, u32 size) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().DrawInitToDefaultContextState; native != nullptr) {
+        u32 written = 0;
+        if (native(cmdbuf, size, 400, &written)) {
+            return written;
+        }
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     constexpr auto CtxInitPacketSize = 0x100u;
@@ -1052,6 +1152,10 @@ void PS4_SYSV_ABI sceGnmGpuPaDebugLeave() {
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertDingDongMarker(u32* cmdbuf, u32 size) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().InsertDingDongMarker; native != nullptr && native(cmdbuf, size)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf == nullptr || size != 4) {
@@ -1062,6 +1166,10 @@ s32 PS4_SYSV_ABI sceGnmInsertDingDongMarker(u32* cmdbuf, u32 size) {
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertPopMarker(u32* cmdbuf, u32 size) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().InsertPopMarker; native != nullptr && native(cmdbuf, size)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 6)) {
@@ -1074,6 +1182,10 @@ s32 PS4_SYSV_ABI sceGnmInsertPopMarker(u32* cmdbuf, u32 size) {
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertPushColorMarker(u32* cmdbuf, u32 size, const char* marker, u32 color) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().InsertPushColorMarker; native != nullptr && native(cmdbuf, size, marker, color)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && marker) {
@@ -1097,6 +1209,10 @@ s32 PS4_SYSV_ABI sceGnmInsertPushColorMarker(u32* cmdbuf, u32 size, const char* 
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertPushMarker(u32* cmdbuf, u32 size, const char* marker) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().InsertPushMarker; native != nullptr && native(cmdbuf, size, marker)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && marker) {
@@ -1123,6 +1239,10 @@ int PS4_SYSV_ABI sceGnmInsertSetColorMarker() {
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertSetMarker(u32* cmdbuf, u32 size, const char* marker) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().InsertSetMarker; native != nullptr && native(cmdbuf, size, marker)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && marker) {
@@ -1150,6 +1270,10 @@ int PS4_SYSV_ABI sceGnmInsertThreadTraceMarker() {
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertWaitFlipDone(u32* cmdbuf, u32 size, s32 vo_handle, u32 buf_idx) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().InsertWaitFlipDone; native != nullptr && native(cmdbuf, size, vo_handle, buf_idx)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size != 7) {
@@ -1380,6 +1504,10 @@ int PS4_SYSV_ABI sceGnmSdmaOpen() {
 }
 
 s32 PS4_SYSV_ABI sceGnmSetCsShader(u32* cmdbuf, u32 size, const u32* cs_regs) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetCsShader; native != nullptr && native(cmdbuf, size, cs_regs)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x18) {
@@ -1408,6 +1536,10 @@ s32 PS4_SYSV_ABI sceGnmSetCsShader(u32* cmdbuf, u32 size, const u32* cs_regs) {
 
 s32 PS4_SYSV_ABI sceGnmSetCsShaderWithModifier(u32* cmdbuf, u32 size, const u32* cs_regs,
                                                u32 modifier) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetCsShaderWithModifier; native != nullptr && native(cmdbuf, size, cs_regs, modifier)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x18) {
@@ -1441,6 +1573,10 @@ s32 PS4_SYSV_ABI sceGnmSetCsShaderWithModifier(u32* cmdbuf, u32 size, const u32*
 
 s32 PS4_SYSV_ABI sceGnmSetEmbeddedPsShader(u32* cmdbuf, u32 size, u32 shader_id,
                                            u32 shader_modifier) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetEmbeddedPsShader; native != nullptr && native(cmdbuf, size, shader_id, shader_modifier)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (shader_id > 1) {
@@ -1510,6 +1646,10 @@ s32 PS4_SYSV_ABI sceGnmSetEmbeddedPsShader(u32* cmdbuf, u32 size, u32 shader_id,
 
 s32 PS4_SYSV_ABI sceGnmSetEmbeddedVsShader(u32* cmdbuf, u32 size, u32 shader_id,
                                            u32 shader_modifier) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetEmbeddedVsShader; native != nullptr && native(cmdbuf, size, shader_id, shader_modifier)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (shader_id != 0) {
@@ -1561,6 +1701,10 @@ s32 PS4_SYSV_ABI sceGnmSetEmbeddedVsShader(u32* cmdbuf, u32 size, u32 shader_id,
 }
 
 s32 PS4_SYSV_ABI sceGnmSetEsShader(u32* cmdbuf, u32 size, const u32* es_regs, u32 shader_modifier) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetEsShader; native != nullptr && native(cmdbuf, size, es_regs, shader_modifier)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size < 0x14) {
@@ -1597,6 +1741,10 @@ int PS4_SYSV_ABI sceGnmSetGsRingSizes() {
 }
 
 s32 PS4_SYSV_ABI sceGnmSetGsShader(u32* cmdbuf, u32 size, const u32* gs_regs) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetGsShader; native != nullptr && native(cmdbuf, size, gs_regs)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size < 0x1d) {
@@ -1625,6 +1773,10 @@ s32 PS4_SYSV_ABI sceGnmSetGsShader(u32* cmdbuf, u32 size, const u32* gs_regs) {
 }
 
 s32 PS4_SYSV_ABI sceGnmSetHsShader(u32* cmdbuf, u32 size, const u32* hs_regs, u32 param4) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetHsShader; native != nullptr && native(cmdbuf, size, hs_regs, param4)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
     if (!cmdbuf || size < 0x1E) {
         return -1;
@@ -1655,6 +1807,10 @@ s32 PS4_SYSV_ABI sceGnmSetHsShader(u32* cmdbuf, u32 size, const u32* hs_regs, u3
 }
 
 s32 PS4_SYSV_ABI sceGnmSetLsShader(u32* cmdbuf, u32 size, const u32* ls_regs, u32 shader_modifier) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetLsShader; native != nullptr && native(cmdbuf, size, ls_regs, shader_modifier)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size < 0x17) {
@@ -1688,6 +1844,10 @@ s32 PS4_SYSV_ABI sceGnmSetLsShader(u32* cmdbuf, u32 size, const u32* ls_regs, u3
 }
 
 s32 PS4_SYSV_ABI sceGnmSetPsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetPsShader; native != nullptr && native(cmdbuf, size, ps_regs)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x27) {
@@ -1725,6 +1885,10 @@ s32 PS4_SYSV_ABI sceGnmSetPsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
 }
 
 s32 PS4_SYSV_ABI sceGnmSetPsShader350(u32* cmdbuf, u32 size, const u32* ps_regs) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetPsShader350; native != nullptr && native(cmdbuf, size, ps_regs)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x27) {
@@ -1823,6 +1987,10 @@ s32 PS4_SYSV_ABI sceGnmSetVgtControl(u32* cmdbuf, u32 size, u32 prim_group_sz_mi
 }
 
 s32 PS4_SYSV_ABI sceGnmSetVsShader(u32* cmdbuf, u32 size, const u32* vs_regs, u32 shader_modifier) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SetVsShader; native != nullptr && native(cmdbuf, size, vs_regs, shader_modifier)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x1c) {
@@ -2116,6 +2284,13 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
     ASSERT_MSG(VideoOut::sceVideoOutGetBufferLabelAddress(vo_handle, &label_addr) == 16,
                "sceVideoOutGetBufferLabelAddress call failed");
 
+    // sotc: native GNM boundary (gap N2-85): the whole 64-dword tail becomes one native op.
+    if (const auto native = ::Native::Gnm::GetTable().FlipTail;
+        native != nullptr &&
+        native(cmdbuf, 64, (label_addr + buf_idx * sizeof(label_addr)) & ~0x3ull, backup.data())) {
+        return ORBIS_OK;
+    }
+
     // Write event to lock the VO surface
     auto* write_lock = reinterpret_cast<PM4CmdWriteData*>(cmdbuf);
     write_lock->header = PM4Type3Header{PM4ItOpcode::WriteData, 3};
@@ -2177,6 +2352,25 @@ static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_
         DebugState.PauseGuestThreads();
     }
 
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h, gap N2-84). The per-frame init
+    // packet runs as one native op from a host ring slot instead of the PM4 InitSequence table.
+    // The ring outlives the op: SubmitDone waits for the GPU before the next init packet.
+    if (send_init_packet) {
+        const bool neo = sceKernelIsNeoMode() != 0;
+        const u32 variant = sdk_version < Common::ElfInfo::FW_200   ? 0u
+                            : sdk_version < Common::ElfInfo::FW_400 ? 200u
+                                                                    : 350u;
+        if (const auto native = ::Native::Gnm::GetTable().SubmitInitPacket;
+            native != nullptr && (!neo || !UseNeoCompatSequences)) {
+            static std::array<std::array<u32, 3>, 16> init_ring{};
+            static u32 init_ring_next = 0;
+            auto& slot = init_ring[init_ring_next++ % init_ring.size()];
+            if (native(variant, slot.data(), static_cast<u32>(slot.size()))) {
+                liverpool->SubmitGfx(std::span<const u32>(slot.data(), slot.size()), {});
+                send_init_packet = false;
+            }
+        }
+    }
     if (send_init_packet) {
         if (sdk_version < Common::ElfInfo::FW_200) {
             liverpool->SubmitGfx(InitSequence, {});
@@ -2258,6 +2452,13 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffers(u32 count, u32* dcb_gpu_addrs
 s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SubmitAndFlipCommandBuffersForWorkload; native != nullptr) {
+        s32 native_result = 0;
+        if (native(workload, count, dcb_gpu_addrs, dcb_sizes_in_bytes, ccb_gpu_addrs, ccb_sizes_in_bytes, vo_handle, buf_idx, flip_mode, flip_arg, &native_result)) {
+            return native_result;
+        }
+    }
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
 
     if (count != 0) {
@@ -2313,6 +2514,13 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                                                        u32* dcb_sizes_in_bytes,
                                                        const u32* ccb_gpu_addrs[],
                                                        u32* ccb_sizes_in_bytes) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SubmitCommandBuffersForWorkload; native != nullptr) {
+        s32 native_result = 0;
+        if (native(workload, count, dcb_gpu_addrs, dcb_sizes_in_bytes, ccb_gpu_addrs, ccb_sizes_in_bytes, &native_result)) {
+            return native_result;
+        }
+    }
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
 
@@ -2353,14 +2561,25 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 }
 
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().SubmitDone; native != nullptr) {
+        s32 native_result = 0;
+        if (native(&native_result)) {
+            return native_result;
+        }
+    }
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
-    if (!liverpool->IsGpuIdle()) {
+    // sotc: N2-94 (SOTC_SUBMIT_IDLE=cp): with the command processor drained the lock is not
+    // needed even while the draw thread still records (see Liverpool::Process).
+    if (Native::Switch::SubmitIdleCp() ? !liverpool->IsCpIdle() : !liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
     liverpool->SubmitDone();
+    // sotc: N2-94: frame boundary of the virtual label table (counts entries still pending).
+    Native::Labels::SubmitBoundary();
     send_init_packet = true;
     ++frames_submitted;
     DebugState.IncGnmFrameNum();
@@ -2391,6 +2610,10 @@ int PS4_SYSV_ABI sceGnmUnregisterResource() {
 }
 
 s32 PS4_SYSV_ABI sceGnmUpdateGsShader(u32* cmdbuf, u32 size, const u32* gs_regs) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().UpdateGsShader; native != nullptr && native(cmdbuf, size, gs_regs)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size < 0x1d) {
@@ -2422,6 +2645,10 @@ s32 PS4_SYSV_ABI sceGnmUpdateGsShader(u32* cmdbuf, u32 size, const u32* gs_regs)
 }
 
 int PS4_SYSV_ABI sceGnmUpdateHsShader(u32* cmdbuf, u32 size, const u32* hs_regs, u32 ls_hs_config) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().UpdateHsShader; native != nullptr && native(cmdbuf, size, hs_regs, ls_hs_config)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x1c) {
@@ -2455,6 +2682,10 @@ int PS4_SYSV_ABI sceGnmUpdateHsShader(u32* cmdbuf, u32 size, const u32* hs_regs,
 }
 
 s32 PS4_SYSV_ABI sceGnmUpdatePsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().UpdatePsShader; native != nullptr && native(cmdbuf, size, ps_regs)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x27) {
@@ -2498,6 +2729,10 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader(u32* cmdbuf, u32 size, const u32* ps_regs)
 }
 
 s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_regs) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().UpdatePsShader350; native != nullptr && native(cmdbuf, size, ps_regs)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x27) {
@@ -2544,6 +2779,10 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_re
 
 s32 PS4_SYSV_ABI sceGnmUpdateVsShader(u32* cmdbuf, u32 size, const u32* vs_regs,
                                       u32 shader_modifier) {
+    // sotc: native GNM boundary (gpu/native/gnm/gnm_common.h)
+    if (const auto native = ::Native::Gnm::GetTable().UpdateVsShader; native != nullptr && native(cmdbuf, size, vs_regs, shader_modifier)) {
+        return ORBIS_OK;
+    }
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x1c) {

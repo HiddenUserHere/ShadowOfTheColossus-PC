@@ -130,9 +130,26 @@ extern "C" int sotc_install_render_hooks(void* image, uint64_t module_size, void
         }
         return -1;
     }
+    // The patchers keep emitting at run time (TryPatchJit on access-violation / illegal-instruction
+    // faults) from their cursor upward, so the hooks and their child trampolines must start ABOVE
+    // the growth room, not at patch_used (gap N2-80: with 105 detours and child trampolines the
+    // run-time patches overwrote them and the guest corrupted its own data at start-up). The hooks
+    // take the upper half of what is left, the patchers keep the lower half (at least `reserve`).
+    const u64 room = std::max<u64>(reserve, (trampoline_size - patch_used) / 2);
+    const u64 hooks_at = (patch_used + room + 15u) & ~u64{15u};
+    if (hooks_at >= trampoline_size) {
+        LOG_WARNING(Core, "SOTC render hooks: no trampoline room above the patch growth area");
+        if (installed) {
+            *installed = 0;
+        }
+        if (failed) {
+            *failed = hooks.size();
+        }
+        return -1;
+    }
     const u64 count = Core::SotcHooks::Install(image, module_size,
-                                               static_cast<u8*>(trampoline) + patch_used,
-                                               trampoline_size - patch_used, hooks, failed);
+                                               static_cast<u8*>(trampoline) + hooks_at,
+                                               trampoline_size - hooks_at, hooks, failed);
     if (installed) {
         *installed = count;
     }

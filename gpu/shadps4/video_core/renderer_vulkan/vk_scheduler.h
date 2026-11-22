@@ -7,7 +7,9 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <deque>
 #include <queue>
+#include <vector>
 
 #include "common/interval_set.h"
 #include "common/unique_function.h"
@@ -372,7 +374,9 @@ class Scheduler {
 public:
     /// record_thread: Vulkan commands are recorded and submitted on a thread of their own
     /// (cp_record_thread of Pink-shadPS4, vk_recorder.h).
-    explicit Scheduler(const Instance& instance, bool record_thread = false);
+    /// sotc: pass_recorder: W5 (SOTC_PASS_RECORDER, N2-94) for the draw scheduler only.
+    explicit Scheduler(const Instance& instance, bool record_thread = false,
+                       bool pass_recorder = false);
     ~Scheduler();
 
     /// Makes the calling thread the one recording (shutdown from another thread).
@@ -566,6 +570,46 @@ public:
     }
 
     static std::mutex submit_mutex;
+
+    // sotc: W5 pass recorder (SOTC_PASS_RECORDER, N2-94 plan; vk_scheduler_segments.cpp). The
+    // producer (GpuDraw) records real command buffers, one per pass segment; SubmitExecution hands
+    // the segments of a submit to the submit thread (shadPS4:GpuSubmit), which runs QueueSubmit.
+    /// True when this scheduler runs the pass recorder (set at construction).
+    [[nodiscard]] bool PassRecording() const noexcept {
+        return pass_recording;
+    }
+    /// Closes the current segment and starts the next one. Only outside a rendering scope (ends
+    /// it first when one is open). No-op without the pass recorder.
+    void EndSegment();
+
+private:
+    /// One command buffer of a submit. `deferred`, when set, is recorded into `cmdbuf` by the
+    /// submit thread right before the submit (RecordDeferred under the pass recorder: e.g. a
+    /// compute pipeline still compiling); `cmdbuf` was begun by the producer.
+    struct Segment {
+        vk::CommandBuffer cmdbuf{};
+        Common::UniqueFunction<void, vk::CommandBuffer> deferred{};
+    };
+    /// What SubmitExecution hands to the submit thread.
+    struct SegmentBatch {
+        std::vector<Segment> segments;
+        SubmitInfo info{};
+        u64 tick{};
+        Common::UniqueFunction<void> after_submit{}; ///< RunAfterRecorded work of this batch
+    };
+    void StartSubmitThread();
+    void SubmitThreadLoop(std::stop_token stoken);
+    void QueueSegmentBatch(SegmentBatch&& batch);
+    /// Producer: begins a new segment command buffer from command_pool (BeginSegmentBuffer) and
+    /// makes it sessions.back().primary.
+    void BeginSegmentBuffer();
+
+    bool pass_recording{};
+    std::vector<Segment> open_segments; ///< producer: segments of the submit being recorded
+    std::mutex submit_queue_mutex;
+    std::condition_variable_any submit_queue_cv;
+    std::deque<SegmentBatch> submit_queue;
+    std::jthread submit_thread; ///< declared before `recorder`; stopped in ~Scheduler
 
 private:
     void EndSession();

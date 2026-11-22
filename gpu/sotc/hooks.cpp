@@ -230,16 +230,96 @@ void* OriginalEntry(u64 guest_va) {
 std::span<const Hook> RenderJobHooks() {
     static const std::vector<Hook> hooks = [] {
         std::vector<Hook> v;
+        // sotc: N2-109: the validated native render is the default (runs 62-75, N2-108): an unset
+        // SOTC_RENDER means "native-pass,native-gnm"; SOTC_RENDER=off (or any unknown stage name)
+        // installs nothing, the emulated path.
         const char* stage = std::getenv("SOTC_RENDER");
-        if (!stage || stage[0] == '\0') {
+        if (!stage) {
+            stage = "native-pass,native-gnm";
+        }
+        if (stage[0] == '\0') {
             return v;
         }
         // hook_table.inc lists every RenderJob entry hook and the stage that enables it; the
         // stage named by SOTC_RENDER selects the subset to install. One entry can be listed under
         // several stages (0x93ef0: the pass stage and the shadow stage both need it); the first
         // matching row in table order wins, so one detour is installed per entry.
+        // SOTC_RENDER may name several stages separated by commas (e.g. "native-pass,native-gnm").
+        auto stage_wanted = [stage](const char* name) {
+            const std::size_t len = std::strlen(name);
+            for (const char* p = stage; *p != '\0';) {
+                const char* end = std::strchr(p, ',');
+                const std::size_t n = end ? static_cast<std::size_t>(end - p) : std::strlen(p);
+                if ((n == len && std::strncmp(p, name, len) == 0) ||
+                    (n == 6 && std::strncmp(p, "native", 6) == 0)) {
+                    return true;
+                }
+                if (end == nullptr) {
+                    break;
+                }
+                p = end + 1;
+            }
+            return false;
+        };
+        // GNM boundary rows carry their class: "native-gnm:<class>". They are installed only when
+        // the native-gnm stage is named AND the class is on in SOTC_NATIVE_GNM (comma list or
+        // "all"): a class that is off keeps the guest function untouched, so no detour signature
+        // can affect it (gap N2-73: a detour declared with the wrong ABI corrupted the guest even
+        // when it only forwarded to the guest body).
+        auto gnm_class_on = [](const char* cls) {
+            // sotc: N2-109: unset = every class (as Native::Gnm::ParseMask); empty = none.
+            const char* list = std::getenv("SOTC_NATIVE_GNM");
+            if (list == nullptr) {
+                list = "all";
+            }
+            if (list[0] == '\0') {
+                return false;
+            }
+            if (std::strcmp(list, "all") == 0) {
+                return true;
+            }
+            const std::size_t len = std::strlen(cls);
+            for (const char* p = list; *p != '\0';) {
+                const char* end = std::strchr(p, ',');
+                const std::size_t n = end ? static_cast<std::size_t>(end - p) : std::strlen(p);
+                if (n == len && std::strncmp(p, cls, len) == 0) {
+                    return true;
+                }
+                if (end == nullptr) {
+                    break;
+                }
+                p = end + 1;
+            }
+            return false;
+        };
+        // SOTC_NATIVE_GNM_SKIP: comma list of guest VAs (hex) whose rows are never installed, to
+        // bisect a single detour inside a class.
+        auto va_skipped = [](u64 va) {
+            const char* list = std::getenv("SOTC_NATIVE_GNM_SKIP");
+            for (const char* p = list; p != nullptr && *p != '\0';) {
+                char* end = nullptr;
+                const u64 v = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    break;
+                }
+                if (v == va) {
+                    return true;
+                }
+                p = (*end == ',') ? end + 1 : end;
+            }
+            return false;
+        };
         for (const RenderJobHookEntry& e : kRenderJobHookTable) {
-            if (std::strcmp(stage, e.stage) != 0 && std::strcmp(stage, "native") != 0) {
+            if (va_skipped(e.va)) {
+                continue;
+            }
+            const char* colon = std::strchr(e.stage, ':');
+            if (colon != nullptr) {
+                const std::string base(e.stage, static_cast<std::size_t>(colon - e.stage));
+                if (!stage_wanted(base.c_str()) || !gnm_class_on(colon + 1)) {
+                    continue;
+                }
+            } else if (!stage_wanted(e.stage)) {
                 continue;
             }
             bool listed = false;
