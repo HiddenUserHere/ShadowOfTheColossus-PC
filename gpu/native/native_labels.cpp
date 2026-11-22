@@ -111,7 +111,7 @@ struct Entry {
     u64 seq = 0;     ///< ordinal of the latest Record for this address (g_next_seq at that time)
     u32 pending = 0; ///< unretired Record calls for this address
     u32 gen = 0;     ///< generation of the claim (0 = never used)
-    bool used = false;       ///< a live or tombstone entry (keeps probe chains intact)
+    bool used = false;       ///< a live entry (N2-117: no tombstones, see EraseLocked)
 };
 
 std::mutex g_mutex;
@@ -124,7 +124,7 @@ bool g_exclude_overflow = false;
 u32 g_next_gen = 1;
 u64 g_next_seq = 1;
 std::atomic<u64> g_owner{0};
-thread_local bool g_park_hint = false; ///< sotc: N2-112 (Satisfies -> TakeParkHint) ///< sotc: current submission (command processor thread)
+thread_local bool g_park_hint = false; ///< sotc: N2-112 (Satisfies -> TakeParkHint)
 
 u32 HashAddr(u64 addr) {
     // Labels are 4- or 8-byte aligned; fold the address so neighbouring labels spread.
@@ -157,8 +157,35 @@ int FindLocked(u64 addr) {
     return -1;
 }
 
-u64 MakeToken(u32 slot, u32 gen) {
-    return (static_cast<u64>(gen) << 32) | static_cast<u64>(slot + 1);
+// sotc: N2-117: the token is the label address (bit 63 set so it is never 0). Entries move when a
+// neighbour is erased (backward-shift deletion), so a slot index cannot be a token; the pending
+// count per address balances Record/Retire pairs, and an entry is erased only at pending 0, when no
+// token for it is outstanding.
+constexpr u64 kTokenBit = 1ull << 63;
+u64 MakeToken(u64 addr) {
+    return addr | kTokenBit;
+}
+
+/// Erases slot `i` of a linear-probing table without tombstones: every later entry of the cluster
+/// whose home slot does not lie cyclically in (i, j] moves back into the hole. N2-117: before,
+/// retired entries stayed as tombstones for good, the table filled up with them and every lookup of
+/// an address not in it walked up to all 1024 slots (6.8% of the command processor in run 77).
+void EraseLocked(u32 i) {
+    u32 j = i;
+    for (;;) {
+        j = (j + 1) & (kSlots - 1);
+        if (!g_table[j].used) {
+            break;
+        }
+        const u32 k = HashAddr(g_table[j].addr);
+        const bool in_range = i <= j ? (i < k && k <= j) : (i < k || k <= j);
+        if (in_range) {
+            continue;
+        }
+        g_table[i] = g_table[j];
+        i = j;
+    }
+    g_table[i] = Entry{};
 }
 
 } // namespace
@@ -178,33 +205,19 @@ u64 Record(u64 addr, u64 value, u32 bytes) {
     // Existing entry for the address: overwrite the pending value (newest write wins).
     int slot = FindLocked(addr);
     if (slot < 0) {
-        // Claim the first tombstone or empty slot on the probe chain (chain stays intact because
-        // tombstones keep their addr and used flag).
         u32 i = HashAddr(addr);
-        int free_slot = -1;
-        for (u32 n = 0; n < kSlots; ++n) {
-            const Entry& e = g_table[i];
-            if (!e.used) {
-                if (free_slot < 0) {
-                    free_slot = static_cast<int>(i);
-                }
-                break;
-            }
-            if (e.pending == 0 && free_slot < 0) {
-                free_slot = static_cast<int>(i);
-                // Keep scanning: the address may still exist further along the chain.
-            }
+        for (u32 n = 0; n < kSlots && g_table[i].used; ++n) {
             i = (i + 1) & (kSlots - 1);
         }
-        if (free_slot < 0) {
-            return 0; // table full of pending entries: caller keeps polling
+        if (g_table[i].used) {
+            return 0; // table full of pending entries: the caller keeps polling
         }
-        Entry& e = g_table[static_cast<u32>(free_slot)];
-        e.addr = addr;
-        e.gen = g_next_gen++;
-        e.used = true;
-        e.pending = 0;
-        slot = free_slot;
+        Entry& fresh = g_table[i];
+        fresh.addr = addr;
+        fresh.gen = g_next_gen++;
+        fresh.used = true;
+        fresh.pending = 0;
+        slot = static_cast<int>(i);
     }
 
     Entry& e = g_table[static_cast<u32>(slot)];
@@ -214,7 +227,7 @@ u64 Record(u64 addr, u64 value, u32 bytes) {
     e.owner = g_owner.load(std::memory_order_relaxed);
     ++e.pending;
     Native::Stats::Add(Native::Stats::LabelsRecorded);
-    return MakeToken(static_cast<u32>(slot), e.gen);
+    return MakeToken(addr);
 }
 
 void Retire(u64 token) {
@@ -226,18 +239,22 @@ void Retire(u64 token) {
     if (token == 0) {
         return;
     }
-    const u32 slot_plus_one = static_cast<u32>(token & 0xffffffffu);
-    const u32 gen = static_cast<u32>(token >> 32);
-    if (slot_plus_one == 0 || slot_plus_one > kSlots) {
+    if ((token & kTokenBit) == 0) {
         return;
     }
     std::lock_guard lock(g_mutex);
-    Entry& e = g_table[slot_plus_one - 1];
-    if (!e.used || e.gen != gen || e.pending == 0) {
+    const int slot = FindLocked(token & ~kTokenBit);
+    if (slot < 0) {
+        return;
+    }
+    Entry& e = g_table[static_cast<u32>(slot)];
+    if (e.pending == 0) {
         return;
     }
     // Only the count goes down: a newer Record of the same address keeps its value pending.
-    --e.pending;
+    if (--e.pending == 0) {
+        EraseLocked(static_cast<u32>(slot));
+    }
     Native::Stats::Add(Native::Stats::LabelsRetired);
     // sotc: N2-112: a wait may be parked on this write; wake the command processor. Called with
     // g_mutex held is fine: Notify only bumps an atomic and signals a condition variable.
@@ -306,16 +323,14 @@ void Exclude(u64 addr) {
         // sotc: round 4. The refusal cannot be kept for this address, so fail safe: drop every pending
         // entry and refuse all further Record / Satisfies. Waits poll the real memory from now on.
         g_exclude_overflow = true;
-        for (Entry& e : g_table) {
-            e.pending = 0;
-        }
+        g_table.fill(Entry{});
         return;
     }
     g_excluded[g_excluded_count++] = addr;
     // Purge a write recorded before this call: the address must never be treated as pending again.
     const int slot = FindLocked(addr);
     if (slot >= 0) {
-        g_table[static_cast<u32>(slot)].pending = 0;
+        EraseLocked(static_cast<u32>(slot));
     }
 }
 

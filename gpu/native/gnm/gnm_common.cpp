@@ -25,9 +25,36 @@ constexpr const char* kClassNames[static_cast<u32>(Class::Count)] = {
     "sync",     "shaders", "draws", "dispatch", "ce",     "submit", "ib",
 };
 
+// sotc: N2-116: the native-gnm stage must be selected by SOTC_RENDER (unset = the default
+// "native-pass,native-gnm"; "native" selects every stage). Without it the sceGnm* driver seams in
+// gnmdriver.cpp, which consult this mask and not the hook table, stayed native under
+// SOTC_RENDER=off (the emulated reference of an A/B benchmark was not emulated).
+bool GnmStageSelected() {
+    const char* stage = std::getenv("SOTC_RENDER");
+    if (stage == nullptr) {
+        return true;
+    }
+    for (const char* p = stage; *p != '\0';) {
+        const char* end = std::strchr(p, ',');
+        const std::size_t n = end ? static_cast<std::size_t>(end - p) : std::strlen(p);
+        if ((n == 10 && std::strncmp(p, "native-gnm", 10) == 0) ||
+            (n == 6 && std::strncmp(p, "native", 6) == 0)) {
+            return true;
+        }
+        if (end == nullptr) {
+            break;
+        }
+        p = end + 1;
+    }
+    return false;
+}
+
 u32 ParseMask() {
     // sotc: N2-109: every class is on by default (SOTC_NATIVE_GNM unset = "all"); an empty value
     // turns every class off.
+    if (!GnmStageSelected()) {
+        return 0;
+    }
     const char* e = std::getenv("SOTC_NATIVE_GNM");
     if (e == nullptr) {
         e = "all";
